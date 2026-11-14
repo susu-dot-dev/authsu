@@ -2,6 +2,7 @@
   "name": "authsu",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "build": "go run github.com/syumai/workers-go/cmd/workers-assets-gen && tinygo build -o ./build/app.wasm -target wasm -no-debug ./...",
     "deploy": "wrangler deploy",
