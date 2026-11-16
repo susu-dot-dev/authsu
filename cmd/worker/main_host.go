@@ -1,0 +1,16 @@
+//go:build !(js && wasm)
+
+// Command worker is the Cloudflare Worker entrypoint. It only runs as
+// js/wasm; this host stub exists so `go build ./...`, `go vet` and linters
+// work on a developer machine.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	fmt.Fprintln(os.Stderr, "authsu runs as a Cloudflare Worker; use `make dev`.")
+	os.Exit(1)
+}
