@@ -1,0 +1,56 @@
+# Shared toolchain setup for the CI jobs. A local composite action: no third-party
+# code, and every `uses:` below is pinned to a full commit SHA like in ci.yml.
+# Callers opt in to each tool, so a job only pays for what it runs. See
+# docs/devops.md ("Continuous integration").
+name: Setup toolchain
+description: Install the pinned Go, golangci-lint, Node and TinyGo as requested.
+
+inputs:
+  lint:
+    description: Install golangci-lint
+    default: "false"
+  node:
+    description: Install Node and run npm ci
+    default: "false"
+  tinygo:
+    description: Install the checksum-verified TinyGo
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Load pinned tool versions
+      # $GITHUB_ENV accepts only NAME=value lines, so drop comments and blanks.
+      shell: bash
+      run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' tools.env >> "$GITHUB_ENV"
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+    - if: inputs.lint == 'true'
+      uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      with:
+        version: v${{ env.GOLANGCI_LINT_VERSION }}
+        install-only: true
+    - if: inputs.node == 'true'
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 22
+        cache: npm
+    - if: inputs.node == 'true'
+      shell: bash
+      run: npm ci --ignore-scripts
+    # Cache only the downloaded tarball (not the extracted tree): a cache is
+    # unsigned, and install-tinygo.sh re-verifies the tarball against the
+    # SHA-256 in tools.env on every run, so a bad cache entry is discarded.
+    - if: inputs.tinygo == 'true'
+      name: Cache TinyGo download
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .tools/cache
+        key: tinygo-${{ runner.os }}-${{ env.TINYGO_VERSION }}-${{ env.TINYGO_LINUX_AMD64_SHA256 }}
+    - if: inputs.tinygo == 'true'
+      name: Install TinyGo (checksum-verified, pinned in tools.env)
+      shell: bash
+      run: |
+        ./scripts/install-tinygo.sh
+        echo "$PWD/.tools/tinygo/bin" >> "$GITHUB_PATH"
