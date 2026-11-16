@@ -8,6 +8,10 @@ SHELL := /bin/bash
 
 include tools.env
 
+# Local D1 state (git-ignored via .wrangler). Dev and e2e use different
+# directories so e2e can wipe its own state without touching dev data.
+DEV_STATE := .wrangler/state
+
 # Tags for dev builds and local development. Never used by `deploy`.
 DEV_TAGS := debug_routes
 
@@ -98,9 +102,17 @@ build: ## Production build (no flags) -> build/
 build-dev: ## Dev build (DEV_TAGS) -> build/
 	GO_TAGS="$(DEV_TAGS)" npm run build
 
+.PHONY: migrate-local
+migrate-local: ## Apply D1 migrations to the local dev database
+	npx wrangler d1 migrations apply DB --local --persist-to $(DEV_STATE)
+
+.PHONY: db-reset
+db-reset: ## Delete local dev database state
+	rm -rf $(DEV_STATE)
+
 .PHONY: dev
-dev: ## Run the Worker locally on :8787 (dev flags)
-	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local
+dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1)
+	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --persist-to $(DEV_STATE)
 
 .PHONY: clean
 clean: ## Remove build outputs

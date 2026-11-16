@@ -17,5 +17,20 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_id": "6ae7ad67-1698-45d5-8fc7-df6cff311140",
+			"migrations_dir": "migrations"
+		}
+	],
+	"previews": {
+		"d1_databases": [
+			{
+				"binding": "DB",
+				"database_id": "9fdd4990-ea5a-4ec1-b67b-cfa5a14f619d"
+			}
+		]
+	}
 }
