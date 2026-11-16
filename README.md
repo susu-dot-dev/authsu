@@ -24,7 +24,8 @@ It is written in Go, compiled to WebAssembly with [TinyGo](https://tinygo.org), 
 make setup   # npm ci, go mod download, verify tool versions
 make dev     # migrate the local database and serve the Worker on :8787
 curl http://localhost:8787/healthz
-make check   # the pre-commit gate: format, tidy, vet, lint, tests, coverage
+make check   # fast gate: format, tidy, vet, lint, tests, coverage
+make ci      # everything CI runs, including e2e; slow, run once before committing
 make help    # every target
 ```
 
