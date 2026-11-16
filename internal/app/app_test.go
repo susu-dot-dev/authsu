@@ -44,7 +44,7 @@ func TestHealthz(t *testing.T) {
 
 			req := httptest.NewRequestWithContext(t.Context(), tt.method, tt.path, nil)
 			rec := httptest.NewRecorder()
-			app.NewHandler(app.Deps{}).ServeHTTP(rec, req)
+			app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -76,7 +76,7 @@ func TestDiagnosticsWiring(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeDiagnostics{}
-	handler := app.NewHandler(app.Deps{Diagnostics: fake})
+	handler := app.NewHandler(app.Deps{Diagnostics: fake}, app.Platform{})
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fake", nil))
@@ -94,7 +94,7 @@ func TestNilDiagnosticsRegistersNothing(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/info", nil)
-	app.NewHandler(app.Deps{}).ServeHTTP(rec, req)
+	app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)

@@ -192,8 +192,10 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 - Run twice: `make test-e2e` against the **dev build** (`DEV_TAGS` on) and `make test-e2e-prod` against the **production build** (no tags). Tests that depend on a flag must assert both sides, so the production run proves dev-only behaviour is absent.
 - E2E exists for what the host cannot see: TinyGo `net/http` differences (notably `http.ServeMux` never matches method-qualified patterns like `"GET /x"`; use plain paths and dispatch on `r.Method`), the D1 driver, real SQLite behaviour, and Wrangler wiring.
 - Dev and e2e use separate state directories so tests never touch data created while developing.
+- **Secrets.** The harness starts the Worker with `FIRST_RUN_SECRET` set to a fixed, throwaway constant (`firstRunSecret` in `e2e/harness_test.go`), so tests can compute what the Worker should have stored for it. It writes the secret to `e2e.env` inside the state directory and passes it with `wrangler dev --env-file`. The repository root is never read or written, so a developer's own `.dev.vars` is neither used by a test run nor overwritten by one. Wrangler loads `--env-file` values even when a `.dev.vars` exists (checked: the Worker saw the test value, not the `.dev.vars` one). Never put a real secret in the constant. A new secret means a new line in `writeEnvFile`.
+- **Inspecting the database.** Tests reach the Worker's simulated D1 with `wrangler d1 execute DB --local --persist-to <state> --json` (the `query` helper in `e2e/firstrun_test.go`). Use it to assert on what was actually stored, which the HTTP response alone cannot show.
+- **The database is shared and tests run in source order.** There is one Worker and one database for the whole run. A test that needs the invitations or users tables to be empty must run before the tests that fill them, and must clean up what it adds. `TestFirstRun` fills them and finishes with a user, so it runs last among the first-run tests.
 - **Linting:** e2e code is linted like everything else, except that `gosec` is excluded under `e2e/` (see `.golangci.yml`): the harness launches `npx` and clears a state directory named by an environment variable by design. The one process-wide fixture (`target`) carries a `//nolint:gochecknoglobals` with its reason.
-- **Current coverage of behaviour:** `/healthz` only (status, body, wrong method, unknown path). Flag assertions (`/debug/info` present in dev, absent in prod) are not tested yet, so nothing automatically proves the production build omits dev routes until a test asserts it.
 
 ## Continuous integration
 
@@ -244,4 +246,3 @@ Bumping a tool means editing `tools.env` only. Checksums for downloaded tools ar
   - the `replace` of `workers-go` with the fork carrying D1 batch support, which should be dropped once upstream releases it.
 
   The job fails when a pin is behind (exit 1) or when a lookup itself failed (exit 2), so a broken check is never mistaken for "all current". The token stays read-only, so there is no issue or comment: a failed scheduled run, and GitHub's notification for it, is the reminder.
-
