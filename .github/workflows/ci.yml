@@ -6,7 +6,10 @@
 #     and verified against the SHA-256 pinned in tools.env.
 #   - Go comes from go.mod; Node dependencies from package-lock.json.
 #   - No secrets, read-only token, no deploy step.
-# CI runs the same `make` targets a developer runs locally.
+# CI runs the same `make` targets a developer runs locally. `make ci` is the
+# local equivalent of all jobs below; here it is split into parallel jobs, each
+# calling a subset of the same targets, so wall time is the slowest job rather
+# than the sum. Toolchain setup lives in .github/actions/setup.
 name: CI
 
 on:
@@ -22,38 +25,87 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: Check
+  lint:
+    name: Lint
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Load pinned tool versions
-        # $GITHUB_ENV accepts only NAME=value lines, so drop comments and blanks.
-        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' tools.env >> "$GITHUB_ENV"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+          lint: "true"
+      - run: make fmt-check tidy-check vet lint
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: v${{ env.GOLANGCI_LINT_VERSION }}
-          install-only: true
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: make test coverage
+
+  size:
+    name: Wasm size
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci --ignore-scripts
-      # Cache only the downloaded tarball (not the extracted tree): a cache is
-      # unsigned, and install-tinygo.sh re-verifies the tarball against the
-      # SHA-256 in tools.env on every run, so a bad cache entry is discarded.
-      - name: Cache TinyGo download
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          persist-credentials: false
+      - uses: ./.github/actions/setup
         with:
-          path: .tools/cache
-          key: tinygo-${{ runner.os }}-${{ env.TINYGO_VERSION }}-${{ env.TINYGO_LINUX_AMD64_SHA256 }}
-      - name: Install TinyGo (checksum-verified, pinned in tools.env)
-        run: npm run setup:ci
-      - run: echo "$PWD/.tools/tinygo/bin" >> "$GITHUB_PATH"
-      - run: make ci
+          tinygo: "true"
+      - run: make size
+
+  e2e:
+    name: E2E (${{ matrix.build }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # `dev` builds with DEV_TAGS, `prod` with no tags. See docs/devops.md.
+        include:
+          - build: dev
+            target: test-e2e
+          - build: prod
+            target: test-e2e-prod
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          node: "true"
+          tinygo: "true"
+      - run: make ${{ matrix.target }}
+
+  # The single required status check on `main`. It depends on every other job,
+  # so adding a job above only requires adding it to `needs` here, not changing
+  # branch protection. `always()` makes it run (and fail) even when a needed job
+  # failed or was cancelled; a skipped job also counts as a failure.
+  ci:
+    name: CI
+    if: always()
+    needs: [lint, test, size, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed
+        env:
+          # Space-separated results of every job in `needs`.
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          [ -n "$RESULTS" ] || { echo "::error::no job results"; exit 1; }
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a required job finished with result: $r"
+              exit 1
+            fi
+          done

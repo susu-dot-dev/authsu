@@ -196,7 +196,21 @@ GitHub Actions, Linux only (`ubuntu-24.04`). Triggers: push to `main` and pull r
 - CI loads `tools.env` into the job environment, so versions and checksums are never duplicated in the workflow. `$GITHUB_ENV` accepts only `NAME=value` lines, so the step filters out comments and blank lines with `grep`; keep `tools.env` to plain `KEY=value` assignments.
 - `npm ci --ignore-scripts` is safe for e2e: the `workerd` binary ships as a platform optional dependency (`@cloudflare/workerd-linux-64`) and runs without its postinstall script. This was verified by installing with `--ignore-scripts` in a clean clone and running `make test-e2e`.
 
-**Jobs:** a `check` job that runs `make ci` (`make check`, which is tool versions, format, tidy check, vet, lint, unit tests and the coverage gate, plus the wasm size budget and both e2e runs). Vulnerability scanning and pin upkeep run on a schedule instead, in `.github/workflows/scheduled.yml`. A separate `e2e` job is a later optimisation if CI time warrants it. The job is a required status check on `main` via branch protection.
+**Jobs:** `make ci` is the local, serial equivalent of everything CI runs. The workflow splits it into parallel jobs that each call a subset of the same `make` targets, so wall time is the slowest job instead of the sum:
+
+| Job | Targets | Needs |
+|---|---|---|
+| `lint` | `fmt-check tidy-check vet lint` | Go, golangci-lint |
+| `test` | `test coverage` | Go |
+| `size` | `size` | Go, TinyGo |
+| `e2e` (matrix: `dev`, `prod`) | `test-e2e` / `test-e2e-prod` | Go, Node, TinyGo |
+
+- `check-tools` is not run in CI: it only verifies a developer's local installs, and CI installs the pinned versions itself.
+- If you add a target to `make ci` or `make check`, add it to the matching job in `ci.yml` too, or CI will silently stop running it.
+- Toolchain setup is the local composite action `.github/actions/setup` (loads `tools.env`, then installs Go and, on request, golangci-lint, Node plus `npm ci`, and TinyGo with the tarball cache described above). Jobs opt in to each tool, so `test` does not pay for TinyGo or Node. It is first-party code in this repository, and every action it uses is SHA-pinned.
+- The two e2e builds run on separate runners, so they cannot collide on `E2E_STATE` or ports.
+- **One required check.** The `CI` job (`needs` every other job, `if: always()`) fails unless every needed job succeeded; cancelled and skipped count as failures. Branch protection on `main` requires only `CI`, so adding a job means adding it to the `needs` list in `ci.yml`, not changing repository settings. A job missing from `needs` is not gated, so keep the list complete.
+- Vulnerability scanning and pin upkeep run on a schedule instead, in `.github/workflows/scheduled.yml`.
 
 ## Cloudflare Workers Builds
 
