@@ -1,0 +1,59 @@
+# Security-sensitive project: keep the third-party supply chain minimal. See
+# docs/devops.md ("Continuous integration").
+#   - Only actions/* and golangci/golangci-lint-action, each pinned to a full
+#     commit SHA (version in the trailing comment).
+#   - TinyGo is downloaded from the official release by scripts/install-tinygo.sh
+#     and verified against the SHA-256 pinned in tools.env.
+#   - Go comes from go.mod; Node dependencies from package-lock.json.
+#   - No secrets, read-only token, no deploy step.
+# CI runs the same `make` targets a developer runs locally.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Load pinned tool versions
+        # $GITHUB_ENV accepts only NAME=value lines, so drop comments and blanks.
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' tools.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v${{ env.GOLANGCI_LINT_VERSION }}
+          install-only: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # Cache only the downloaded tarball (not the extracted tree): a cache is
+      # unsigned, and install-tinygo.sh re-verifies the tarball against the
+      # SHA-256 in tools.env on every run, so a bad cache entry is discarded.
+      - name: Cache TinyGo download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/cache
+          key: tinygo-${{ runner.os }}-${{ env.TINYGO_VERSION }}-${{ env.TINYGO_LINUX_AMD64_SHA256 }}
+      - name: Install TinyGo (checksum-verified, pinned in tools.env)
+        run: npm run setup:ci
+      - run: echo "$PWD/.tools/tinygo/bin" >> "$GITHUB_PATH"
+      - run: make ci

@@ -1,58 +1,43 @@
-# worker-template-tinygo
+# authsu
 
-- A template for starting a Cloudflare Worker project with tinygo.
-- This template uses [`workers-go`](https://github.com/syumai/workers-go) package to run an HTTP server.
+A self-hosted, passkey-only authentication service that runs as a Cloudflare Worker. Accounts have no usernames or passwords: an account is a passkey, and the only way to get one is an invitation from an admin.
 
-## Usage
+It is written in Go, compiled to WebAssembly with [TinyGo](https://tinygo.org), and run on Cloudflare Workers through [`workers-go`](https://github.com/syumai/workers-go). Data lives in D1 (SQLite).
 
-- `main.go` includes simple HTTP server implementation. Feel free to edit this code and implement your own HTTP server.
+> **Status:** early. The tooling and project structure are in place; the invitation, registration and first-run flows described in the design docs are not built yet. Today the Worker serves only `/healthz`.
 
 ## Requirements
 
-- Node.js
-- TinyGo 0.42.0 or later
-  - TinyGo 0.41.x cannot build `net/http` for Wasm (see [tinygo-org/tinygo#5350](https://github.com/tinygo-org/tinygo/issues/5350)).
+| Tool | Version |
+|---|---|
+| Go | the version in `go.mod` |
+| TinyGo | pinned in `tools.env` |
+| golangci-lint | pinned in `tools.env` |
+| Node.js and npm | Node 22.12 or later (Wrangler is the only JavaScript tooling) |
+| make | any |
 
-## Getting Started
+`make check-tools` fails if your TinyGo or golangci-lint differs from the pin. On Linux amd64, `npm run setup:ci` installs the pinned TinyGo into `.tools/` for you.
 
-- Create a new worker project using this template.
-
-```console
-npm create cloudflare@latest -- --template github.com/syumai/workers-go/_templates/cloudflare/worker-tinygo
-```
-
-- Initialize a project.
+## Quick start
 
 ```console
-cd my-app # A directory of the project created by the above command
-go mod init
-go mod tidy
-npm start # start running dev server
-curl http://localhost:8787/hello # outputs "Hello!"
+make setup   # npm ci, go mod download, verify tool versions
+make dev     # migrate the local database and serve the Worker on :8787
+curl http://localhost:8787/healthz
+make check   # the pre-commit gate: format, tidy, vet, lint, tests, coverage
+make help    # every target
 ```
 
-## Development
+Run the Worker through `make dev`, not `npx wrangler dev`: the Makefile builds with the dev flags and applies migrations, while Wrangler on its own builds the production configuration.
 
-### Commands
+## Documentation
 
-```
-npm start      # run dev server
-# or
-go run .       # run dev server without Wrangler (Cloudflare-related features are not available)
-npm run build  # build Go Wasm binary
-npm run deploy # deploy worker
-```
+- [docs/devops.md](docs/devops.md): how the project is built, checked, tested and shipped. This is the authority on tooling and conventions; start here before changing anything.
+- Design rationale (why, not a spec):
+  - [docs/invitations_design.md](docs/invitations_design.md)
+  - [docs/registration_design.md](docs/registration_design.md)
+  - [docs/first_run_design.md](docs/first_run_design.md)
 
-### Testing dev server
+## License
 
-- Just send HTTP request using some tools like curl.
-
-```
-$ curl http://localhost:8787/hello
-Hello!
-```
-
-```
-$ curl -X POST -d "test message" http://localhost:8787/echo
-test message
-```
+[MIT](LICENSE)
