@@ -76,7 +76,7 @@ Rules:
 - **Format:** `gofmt -s`. `make fmt-check` fails on any diff.
 - **Linter:** [golangci-lint](https://golangci-lint.run) v2, driven by a committed `.golangci.yml`, pinned in `tools.env`.
 - **Posture: maximal.** Start from `default: all` and disable linters one by one, each with a comment giving the reason (conflicts with another linter, does not apply to TinyGo, etc.). The disable list is chosen and reviewed in the lint commit.
-- **Linted configurations:** the host build with production tags (no tags) and the host build with every dev flag on. The `js/wasm` target is not linted separately beyond the one compile/vet check of `cmd/worker` under `GOOS=js GOARCH=wasm`, which is the only code that exists solely there. Everything else is exercised by e2e.
+- **Linted configurations:** the host build with production tags (no tags) and the host build with every dev flag on. The `js/wasm` target is not linted wholesale; only `cmd/worker` is vetted and linted under `GOOS=js GOARCH=wasm`, because it is the only code that exists solely there. Everything else is exercised by e2e.
 - `//nolint` directives must name the linter and give a reason (enforced by `nolintlint`).
 
 ### Why not test or lint under `js/wasm`

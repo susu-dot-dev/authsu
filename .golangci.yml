@@ -1,0 +1,53 @@
+# golangci-lint v2 configuration. See docs/devops.md.
+#
+# Posture: maximal. Every linter is enabled and the ones below are disabled one
+# by one, each with the reason. Formatting is `gofmt -s` (make fmt), not a
+# golangci-lint formatter.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: all
+  disable:
+    # Deprecated: replaced by the maintained *_v2/_v5 linters, which
+    # `default: all` enables.
+    - exhaustruct
+    - gomodguard
+    - wsl
+    # Whitespace-placement opinions beyond what gofmt and `whitespace` enforce.
+    - wsl_v5
+    - nlreturn
+    # Forces every struct literal to name every field; painful for Deps,
+    # config structs and table-driven tests where zero values are intended.
+    - exhaustruct_v5
+    # Bans returning interfaces; conflicts with idiomatic constructors such as
+    # NewHandler returning http.Handler.
+    - ireturn
+    # Rejects idiomatic short names (w, r, db, tt) unless tuned per name.
+    - varnamelen
+    # A no-op without a hand-written allow/deny list, which this project does
+    # not have a use for yet. Enable when there is a dependency policy to
+    # encode.
+    - depguard
+  settings:
+    gomoddirectives:
+      # The only permitted replace: the workers-go fork carrying D1 batch
+      # support until it is merged upstream. Any other replace fails the lint.
+      replace-allow-list:
+        - github.com/syumai/workers-go
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    testpackage:
+      # Internal tests must be named *_internal_test.go so that needing
+      # package-private access is a visible, deliberate exception.
+      skip-regexp: (export|internal)_test\.go
+
+formatters:
+  enable: []
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

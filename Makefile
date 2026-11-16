@@ -50,6 +50,12 @@ vet: ## go vet on the host, plus a compile check of the js/wasm entrypoint
 	go vet ./...
 	GOOS=js GOARCH=wasm go vet ./cmd/worker
 
+.PHONY: lint
+lint: ## golangci-lint (host, dev tags if any, and the js/wasm entrypoint)
+	golangci-lint run ./...
+	@if [ -n "$(DEV_TAGS)" ]; then golangci-lint run --build-tags "$(DEV_TAGS)" ./...; fi
+	GOOS=js GOARCH=wasm golangci-lint run ./cmd/worker
+
 # ---- build / local dev ------------------------------------------------------
 
 .PHONY: build
@@ -71,4 +77,4 @@ clean: ## Remove build outputs
 # ---- aggregate --------------------------------------------------------------
 
 .PHONY: check
-check: check-tools fmt-check vet ## Fast pre-commit gate (no wasm build, no e2e)
+check: check-tools fmt-check vet lint ## Fast pre-commit gate (no wasm build, no e2e)
