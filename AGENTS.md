@@ -1,62 +1,44 @@
-# Cloudflare Workers
+# authsu
 
-STOP. Your knowledge of Cloudflare Workers APIs and limits may be outdated. Always retrieve current documentation before any Workers, KV, R2, D1, Durable Objects, Queues, Vectorize, AI, or Agents SDK task.
+A passkey-only authentication service: Go compiled with TinyGo to WebAssembly, running as a Cloudflare Worker, with D1 for storage. There is no TypeScript and no frontend framework; Wrangler (Node) is the only JavaScript tooling.
 
-## Docs
+## Where to look first
 
-- https://developers.cloudflare.com/workers/
+- **[docs/devops.md](docs/devops.md) is the authority** on layout, tooling, testing, CI and conventions. Read the relevant section before changing build, test, lint, CI or flag code, and update it in the same commit as any change to how those work.
+- `docs/*_design.md` explain why invitations, registration and first-run are shaped as they are. They are rationale, not specs: when they disagree with the code about what exists, the code wins.
+
+## Cloudflare: check current docs
+
+Your knowledge of Cloudflare Workers, D1 and Wrangler may be out of date. Retrieve current documentation before any Workers, D1 or Wrangler task, rather than relying on memory.
+
+- https://developers.cloudflare.com/workers/ and https://developers.cloudflare.com/d1/
 - MCP: `https://docs.mcp.cloudflare.com/mcp`
-
-For all limits and quotas, retrieve from the product's `/platform/limits/` page. eg. `/workers/platform/limits`
+- Limits and quotas: the product's `/platform/limits/` page, e.g. `/workers/platform/limits/`
+- Errors (including Error 1102, CPU or memory exceeded): https://developers.cloudflare.com/workers/observability/errors/
 
 ## Commands
 
+The `Makefile` is the only entrypoint; CI runs the same targets. `make help` lists them.
+
 | Command | Purpose |
-|---------|---------|
-| `npx wrangler dev` | Local development |
-| `npx wrangler deploy` | Deploy to Cloudflare |
-| `npx wrangler types` | Generate TypeScript types |
+|---|---|
+| `make check` | Fast pre-commit gate: tool versions, format, tidy, vet, lint, unit tests, 100% coverage |
+| `make ci` | Everything CI runs: `check`, the wasm size budget, and both e2e runs |
+| `make dev` | Run the Worker locally on :8787 with dev flags and a local D1 |
+| `make fmt` | Format Go code |
 
-Run `wrangler types` after changing bindings in wrangler.jsonc.
+Run the Worker with `make dev`. Bare `npx wrangler dev` builds the production configuration (no dev flags, no migrations).
 
-## Local Explorer (Debugging & Inspection)
+## Conventions
 
-When running `npx wrangler dev`, a Local Explorer API is available for inspecting and debugging local Workers, bindings, and storage state. The API base URL is printed in the terminal when the dev server starts.
+The full rules, and the reasons, are in `docs/devops.md`. The ones that are easy to get wrong:
 
-Key endpoints (relative to the dev server URL):
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /cdn-cgi/local/explorer/api/local/workers` | List local Workers and their bindings |
-| `GET /cdn-cgi/local/explorer/api/storage/kv/namespaces` | List KV namespaces |
-| `GET /cdn-cgi/local/explorer/api/d1/database` | List D1 databases |
-| `GET /cdn-cgi/local/explorer/api/r2/buckets` | List R2 buckets |
-| `GET /cdn-cgi/local/explorer/api/workers/durable_objects/namespaces` | List Durable Object namespaces |
-| `GET /cdn-cgi/local/explorer/api/workflows` | List Workflows |
-| `POST /cdn-cgi/local/explorer/api/local/observability/query` | Run a read-only SQL query (SELECT/WITH only) over captured request traces and console logs. Tables: `spans`, `logs` (read attributes via `json(attributes)`). Example: `curl -X POST <base>/cdn-cgi/local/explorer/api/local/observability/query -H 'Content-Type: application/json' -d '{"sql":"SELECT service, name, outcome, duration_ms FROM spans WHERE parent_id IS NULL LIMIT 20"}'` |
-| `POST /cdn-cgi/local/explorer/api/local/observability/clear` | Clear all captured traces and logs |
-
-If the routes above don't cover what you need, fetch the full OpenAPI schema (large - use only as a last resort): `GET /cdn-cgi/local/explorer/api`
-
-Use the Local Explorer to debug issues by inspecting storage state (KV keys, D1 rows, R2 objects, DO storage), viewing Worker bindings, and querying request traces and logs captured during the dev session.
-
-## Node.js Compatibility
-
-https://developers.cloudflare.com/workers/runtime-apis/nodejs/
-
-## Errors
-
-- **Error 1102** (CPU/Memory exceeded): Retrieve limits from `/workers/platform/limits/`
-- **All errors**: https://developers.cloudflare.com/workers/observability/errors/
-
-## Product Docs
-
-Retrieve API references and limits from:
-`/kv/` · `/r2/` · `/d1/` · `/durable-objects/` · `/queues/` · `/vectorize/` · `/workers-ai/` · `/agents/`
-
-## Best Practices (conditional)
-
-If the application uses Durable Objects or Workflows, refer to the relevant best practices:
-
-- Durable Objects: https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/
-- Workflows: https://developers.cloudflare.com/workflows/build/rules-of-workflows/
+- **Test code lives only in `_test.go` files.** Fakes and helpers sit beside the tests that use them. There are no shared test packages. Consumers define small interfaces so each package's tests carry a tiny fake.
+- **100% statement coverage of production code.** Make branches reachable by injecting the clock, entropy, and I/O. Only when that is impossible, mark a statement with `// coverage:ignore: <reason>` on the line directly above it; a missing reason or a misplaced marker fails the gate.
+- **Logic stays out of `cmd/worker`.** It is wasm-only and cannot be unit-tested on the host, so it only wires platform resources into `internal/app`.
+- **Feature flags are build tags with build-time dependency injection.** Behaviour that must be absent from production is an interface with ordinary, tested implementations; tagged files in `cmd/worker` only choose which one to wire (see `docs/devops.md`, "Feature flags"). Production code must never reference a dev-only type. Never read a flag from the environment or a request.
+- **TinyGo's `net/http` differs from Go's.** `http.ServeMux` never matches method-qualified patterns such as `"GET /x"`; register plain paths and dispatch on `r.Method`. Host tests cannot catch this, so e2e tests are how you find out.
+- **The linter is strict (nearly every linter enabled).** Fix the code rather than adding `//nolint`; when a suppression is genuinely needed it must name the linter and give a reason.
+- **Binary size is gated.** Linking a heavy package such as `encoding/json` can add hundreds of KB under TinyGo and will fail `make size`. Raise the budget deliberately, in the PR that justifies it.
+- **Migrations are append-only.** Never edit a migration that has landed on `main`; add a new one. Production migrations are applied by hand (see `docs/devops.md`).
+- **Do not add third-party GitHub Actions** without maintainer approval, and pin any action to a full commit SHA.
