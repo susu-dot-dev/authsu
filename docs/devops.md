@@ -62,6 +62,7 @@ tools.env               Pinned tool versions and checksums (see Tool versions)
 | Tests | `*_test.go` | No (excluded by the toolchain) |
 | Test fakes and helpers | `*_test.go` only, beside the tests that use them (`fake_*_test.go`) | No |
 | Wasm-only glue | `cmd/worker/` | No (explicit exclusion) |
+| Dev tooling | `scripts/` (Go programs such as `scripts/covgate`) | No (explicit exclusion) |
 | End-to-end tests | `e2e/` under build tag `e2e` | No |
 
 Rules:
@@ -88,7 +89,7 @@ Rules:
 - `go test -race ./...` with the host toolchain, run with no tags (the production configuration).
 - **100% statement coverage of all production code.** Not a total over most of it, and not `internal/` only: every non-test, non-excluded line.
 - **Exclusions are explicit and reviewed**, never a path-based hiding place:
-  - `cmd/worker/` (wasm-only glue, covered by e2e) is excluded by the coverage script.
+  - `cmd/worker/` (wasm-only glue, covered by e2e) and `scripts/` (dev tooling) are excluded by the coverage script. Scripts are still linted and formatted, but tests for them are optional.
   - Individual unreachable statements are marked with a comment of the form:
 
     ```go
@@ -97,7 +98,7 @@ Rules:
 
     The marker applies to the statement or block that follows. A reason after the second colon is mandatory. Our coverage script drops marked lines from the profile, fails on a marker with no reason, and prints the full list of ignores in CI output so each one is visible in review.
   - Before reaching for `coverage:ignore`, refactor to make the branch reachable (inject the reader, the clock, the failing dependency).
-- Coverage is computed from `go test -coverprofile` (`-covermode=atomic`) over `./internal/...`.
+- Coverage is computed from `go test -coverprofile` (`-covermode=atomic`) over `./...` and checked by `scripts/covgate` (`make coverage`), which reads the profile, applies the exclusions above, and fails below 100%. It prints every honoured `coverage:ignore` and fails on a marker with no reason or one that is not directly above a statement.
 
 ### Coverage and feature flags (first iteration)
 

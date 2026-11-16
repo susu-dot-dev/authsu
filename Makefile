@@ -50,6 +50,24 @@ vet: ## go vet on the host, plus a compile check of the js/wasm entrypoint
 	go vet ./...
 	GOOS=js GOARCH=wasm go vet ./cmd/worker
 
+# ---- tests ------------------------------------------------------------------
+
+COVER_OUT := coverage.out
+
+.PHONY: test
+test: ## Unit tests (race detector on, production tags)
+	go test -race ./...
+
+.PHONY: coverage
+coverage: ## Unit tests + 100% coverage gate (honours // coverage:ignore: <reason>)
+	go test -covermode=atomic -coverprofile=$(COVER_OUT) ./...
+	go run ./scripts/covgate -profile $(COVER_OUT)
+
+.PHONY: coverage-html
+coverage-html: ## Write coverage.html from the last `make coverage`
+	go tool cover -html=$(COVER_OUT) -o coverage.html
+	@echo "wrote coverage.html"
+
 .PHONY: lint
 lint: ## golangci-lint (host, dev tags if any, and the js/wasm entrypoint)
 	golangci-lint run ./...
@@ -72,9 +90,9 @@ dev: ## Run the Worker locally on :8787 (dev flags)
 
 .PHONY: clean
 clean: ## Remove build outputs
-	rm -rf build
+	rm -rf build $(COVER_OUT) coverage.html
 
 # ---- aggregate --------------------------------------------------------------
 
 .PHONY: check
-check: check-tools fmt-check vet lint ## Fast pre-commit gate (no wasm build, no e2e)
+check: check-tools fmt-check vet lint test coverage ## Fast pre-commit gate (no wasm build, no e2e)
