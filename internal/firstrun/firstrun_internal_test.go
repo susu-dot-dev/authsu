@@ -6,14 +6,18 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/susu-dot-dev/authsu/internal/apierr"
+	"github.com/susu-dot-dev/authsu/internal/httpapi"
 )
 
 var errBoom = errors.New("boom")
@@ -400,16 +404,17 @@ func TestCheckErrors(t *testing.T) {
 	valid := strings.Repeat("a", MinSecretLen)
 
 	tests := map[string]struct {
-		db fakeDB
+		db       fakeDB
+		wantCode string
 	}{
 		"users query fails": {
-			db: fakeDB{failQuery: "FROM users"},
+			db: fakeDB{failQuery: "FROM users"}, wantCode: CodeUsersCheckFailed,
 		},
 		"invitation query fails": {
-			db: fakeDB{failQuery: "FROM invitations WHERE"},
+			db: fakeDB{failQuery: "FROM invitations WHERE"}, wantCode: CodeInvitationCheckFailed,
 		},
 		"insert fails": {
-			db: fakeDB{failQuery: "INSERT"},
+			db: fakeDB{failQuery: "INSERT"}, wantCode: CodeMintFailed,
 		},
 	}
 
@@ -423,6 +428,15 @@ func TestCheckErrors(t *testing.T) {
 			if err == nil {
 				t.Fatalf("Check = %q, want error", status)
 			}
+
+			failure := apierr.As(err)
+			if failure.Kind != apierr.Unavailable || failure.Code != tt.wantCode {
+				t.Errorf("error = (%d, %q), want (Unavailable, %q)", failure.Kind, failure.Code, tt.wantCode)
+			}
+
+			if !errors.Is(err, errBoom) {
+				t.Errorf("error %v does not wrap the driver error", err)
+			}
 		})
 	}
 }
@@ -432,14 +446,26 @@ const (
 	validSecret = "0123456789abcdef0123456789abcdef" // MinSecretLen characters
 )
 
-func serve(t *testing.T, fake *fakeDB, secret, method string) *httptest.ResponseRecorder {
+func serve(t *testing.T, fake *fakeDB, secret string) (int, string, error) {
 	t.Helper()
 
-	rec := httptest.NewRecorder()
-	Handler(fake.open(t), func(string) string { return secret }).ServeHTTP(rec,
-		httptest.NewRequestWithContext(t.Context(), method, "/api/first-run", nil))
+	res := Handler(fake.open(t), func(string) string { return secret })(httpapi.Request{
+		Context: t.Context(),
+		Query:   nil,
+		Body:    nil,
+	})
 
-	return rec
+	resp, err := res.Get()
+	if err != nil {
+		return 0, "", fmt.Errorf("handler: %w", err)
+	}
+
+	body, marshalErr := json.Marshal(resp.Body)
+	if marshalErr != nil {
+		t.Fatalf("marshal body: %v", marshalErr)
+	}
+
+	return resp.Status, string(body), nil
 }
 
 func TestHandlerStatus(t *testing.T) {
@@ -451,19 +477,19 @@ func TestHandlerStatus(t *testing.T) {
 		wantBody string
 	}{
 		"missing secret": {
-			wantBody: `{"status":"missing_secret"}` + "\n",
+			wantBody: `{"status":"missing_secret"}`,
 		},
 		"valid secret mints, so pending": {
 			secret:   validSecret,
-			wantBody: `{"status":"invitation_pending"}` + "\n",
+			wantBody: `{"status":"invitation_pending"}`,
 		},
 		"invitation already pending": {
 			db:       fakeDB{firstRun: true},
-			wantBody: `{"status":"invitation_pending"}` + "\n",
+			wantBody: `{"status":"invitation_pending"}`,
 		},
 		"user exists": {
 			db:       fakeDB{users: true, firstRun: true},
-			wantBody: `{"status":"invitation_accepted"}` + "\n",
+			wantBody: `{"status":"invitation_accepted"}`,
 		},
 	}
 
@@ -472,69 +498,37 @@ func TestHandlerStatus(t *testing.T) {
 			t.Parallel()
 
 			fake := tt.db
-			rec := serve(t, &fake, tt.secret, http.MethodGet)
 
-			if rec.Code != http.StatusOK {
-				t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+			status, body, err := serve(t, &fake, tt.secret)
+			if err != nil {
+				t.Fatalf("handler error: %v", err)
 			}
 
-			if rec.Body.String() != tt.wantBody {
-				t.Errorf("body = %q, want %q", rec.Body.String(), tt.wantBody)
+			if status != http.StatusOK {
+				t.Errorf("status = %d, want %d", status, http.StatusOK)
 			}
 
-			if got := rec.Header().Get("Content-Type"); got != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", got)
-			}
-
-			if got := rec.Header().Get("Cache-Control"); got != noStore {
-				t.Errorf("Cache-Control = %q, want %q", got, noStore)
+			if body != tt.wantBody {
+				t.Errorf("body = %q, want %q", body, tt.wantBody)
 			}
 		})
 	}
 }
 
+// A database failure reaches the boundary as a classified Unavailable error
+// that keeps the driver error as its cause. Hiding the cause from the client is
+// the boundary's job, tested in httpapi and end to end.
 func TestHandlerDatabaseError(t *testing.T) {
 	t.Parallel()
 
-	rec := serve(t, &fakeDB{failQuery: "FROM users"}, validSecret, http.MethodGet)
+	_, _, err := serve(t, &fakeDB{failQuery: "FROM users"}, validSecret)
 
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	failure := apierr.As(err)
+	if failure.Kind != apierr.Unavailable || failure.Code != CodeUsersCheckFailed {
+		t.Errorf("error = (%d, %q), want (Unavailable, %q)", failure.Kind, failure.Code, CodeUsersCheckFailed)
 	}
 
-	if got := rec.Header().Get("Cache-Control"); got != noStore {
-		t.Errorf("Cache-Control = %q, want %q", got, noStore)
-	}
-
-	// The underlying error must not reach the client.
-	if strings.Contains(rec.Body.String(), errBoom.Error()) {
-		t.Errorf("body leaks the error: %q", rec.Body.String())
-	}
-}
-
-func TestHandlerMethods(t *testing.T) {
-	t.Parallel()
-
-	for _, method := range []string{http.MethodPost, http.MethodHead, http.MethodPut, http.MethodDelete} {
-		t.Run(method, func(t *testing.T) {
-			t.Parallel()
-
-			// A valid secret on an empty system would mint if the request
-			// reached the service; a wrong method must not.
-			fake := &fakeDB{}
-			rec := serve(t, fake, validSecret, method)
-
-			if rec.Code != http.StatusMethodNotAllowed {
-				t.Errorf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
-			}
-
-			if got := rec.Header().Get("Allow"); got != http.MethodGet {
-				t.Errorf("Allow = %q, want %q", got, http.MethodGet)
-			}
-
-			if fake.minted != 0 {
-				t.Errorf("insert attempts = %d, want 0", fake.minted)
-			}
-		})
+	if !errors.Is(err, errBoom) {
+		t.Errorf("error = %v, want one wrapping errBoom", err)
 	}
 }

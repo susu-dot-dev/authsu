@@ -44,9 +44,22 @@ func TestHealthz(t *testing.T) {
 		wantStatus int
 		wantBody   string
 	}{
-		"get":          {method: http.MethodGet, path: "/healthz", wantStatus: http.StatusOK, wantBody: "ok\n"},
-		"wrong method": {method: http.MethodPost, path: "/healthz", wantStatus: http.StatusMethodNotAllowed},
-		"unknown path": {method: http.MethodGet, path: "/nope", wantStatus: http.StatusNotFound},
+		"get": {
+			method: http.MethodGet, path: "/healthz",
+			wantStatus: http.StatusOK, wantBody: `{"status":"ok"}` + "\n",
+		},
+		"wrong method": {
+			method: http.MethodPost, path: "/healthz", wantStatus: http.StatusMethodNotAllowed,
+			wantBody: `{"error":{"code":"method_not_allowed","message":"method not allowed"}}` + "\n",
+		},
+		"unknown path": {
+			method: http.MethodGet, path: "/nope", wantStatus: http.StatusNotFound,
+			wantBody: `{"error":{"code":"not_found","message":"no such route"}}` + "\n",
+		},
+		"unknown path any method": {
+			method: http.MethodPost, path: "/nope", wantStatus: http.StatusNotFound,
+			wantBody: `{"error":{"code":"not_found","message":"no such route"}}` + "\n",
+		},
 	}
 
 	for name, tt := range tests {

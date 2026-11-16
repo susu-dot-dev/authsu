@@ -48,13 +48,15 @@ authsu is a Go service compiled with TinyGo to WebAssembly and run as a Cloudfla
 
 ```
 cmd/worker/             Worker entrypoint and build-time wiring (tiny; no logic)
-  main.go               //go:build js && wasm   calls app.Run(deps())
+  main.go               //go:build js && wasm   calls workers.Serve(app.NewHandler(...))
   main_host.go          //go:build !(js && wasm) host stub so `go build ./...` works
   deps_<flag>_on.go     //go:build <flag>   selects the dev implementation
   deps_<flag>_off.go    //go:build !<flag>  selects the safe implementation
 internal/app/           Builds the HTTP handler from a Deps struct; host-testable
 internal/<domain>/      Domain packages (service, store interface, SQL store, ...)
-internal/httpapi/       Routes, handlers, JSON helpers
+internal/httpapi/       Request/Response, Handler, Serve (the net/http boundary), JSON helpers
+internal/apierr/        Structured error: Kind (HTTP status), Code, Description, Data, cause
+internal/result/        Result[T]: chainable fallible steps (Then, Map, Check, MapErr)
 e2e/                    Black-box tests against `wrangler dev` (build tag `e2e`)
 migrations/             D1 migrations, NNNN_name.sql
 scripts/                Shell scripts invoked by the Makefile
@@ -64,7 +66,7 @@ tools.env               Pinned tool versions and checksums (see Tool versions)
 
 ### Thin entrypoint, logic in `internal/app`
 
-`cmd/worker/main.go` imports `workers-go`, which exists only for `js/wasm`, so it can never run in host unit tests. It is therefore kept to a few lines: obtain the D1 binding, call `app.Run(deps())`. Everything else (config, wiring, routing) lives in `internal/app` and is tested on the host against fakes. `cmd/worker` is excluded from coverage and is proven by the e2e tests.
+`cmd/worker/main.go` imports `workers-go`, which exists only for `js/wasm`, so it can never run in host unit tests. It is therefore kept to a few lines: obtain the D1 binding, call `workers.Serve(app.NewHandler(...))`. Everything else (config, wiring, routing) lives in `internal/app` and is tested on the host against fakes. `cmd/worker` is excluded from coverage and is proven by the e2e tests.
 
 ## Code categories
 
@@ -83,6 +85,22 @@ Rules:
 - **Consumers define small interfaces** (`Store`, `Authenticator`, ...) so each package's tests carry a tiny fake of exactly what they need. Cross-package fake duplication is accepted as the cost of this rule.
 - **Tests are table-driven** with named cases and `t.Run`, and use the external test package (`foo_test`) unless internal access is genuinely required.
 - **Time, randomness, and I/O are injected** (a clock, an `io.Reader` for entropy, a `*sql.DB`), so every branch is reachable from a test.
+
+## HTTP handlers and errors
+
+Handlers are pure: `func(httpapi.Request) result.Result[httpapi.Response]`. They never see an `http.ResponseWriter`, never pick a status for a failure and never log. `httpapi.Serve(method, logger, handler)` is the single place that touches HTTP:
+
+- It answers any other method with 405 and `Allow`, so handlers do not check methods. Routes are registered through `app`'s router as plain paths (TinyGo's `ServeMux` ignores method-qualified patterns).
+- It reads the body (capped at 1 MiB; over the cap is 413 `body_too_large`, any other read failure is Internal `body_read_failed`), calls the handler inside a `recover` (a panic becomes Internal `handler_panic`, so a nil step in a chain still gets the JSON error contract and a log line), and writes `Content-Type`, `Cache-Control: no-store` and the status once.
+- It marshals a successful `Response.Body` with `encoding/json`. A body that cannot be marshalled becomes an Internal error.
+- A response `Status` outside 200-599 (including the zero value) is an Internal `invalid_status` error rather than a panic in `net/http`.
+- It converts a failure with `apierr.As`, passes the request (method, path, query, body) and the full error (cause included) to the injected `Logger`, and sends `{"error":{"code","message","data?"}}`. An error that was never classified, or is `Internal`, is sent as `{"code":"internal","message":"internal error"}` with no data, so causes, SQL and table names never reach a client.
+
+`apierr.Error` carries a `Kind` (selects the status; the zero value `Internal` is the fail-closed default), a stable `Code`, a client-visible `Description`, optional `Data`, and a private cause for logs. `apierr.Wrap(err, kind, code, description)` is nil-safe and first-wins: if an `*apierr.Error` is already anywhere in the chain (found with `errors.AsType`, so `%w` and `errors.Join` work) it is kept, so the innermost classification survives. Do not put secrets in `Description` or `Data`. TinyGo's `runtime.Callers` returns no frames on wasm, so errors carry no stack; add context by wrapping with `fmt.Errorf("verb noun: %w", err)`.
+
+Every failure should be a classified `apierr.Error` with its own `Code`; Internal (500) is the fail-closed fallback for the genuinely unknown, not a default to reach for. A database that errors is `Unavailable` (503) with a code naming the step (`first_run_users_check_failed`), a fixed client-safe description, and the driver error as the cause. The `Code` is what a log search or alert keys on, so give each failing step its own. Descriptions are fixed text, never `err.Error()`. Unknown paths are answered by `httpapi.NotFound` registered on `/` (via `ServeAny`), so they get the same JSON envelope as every other failure.
+
+`result.Result[T]` makes a sequence of fallible steps one chain, for example `httpapi.Decode[In](req).Then(load).Check(allowed).Map(respond)`. The first failing step ends the chain and every later step is skipped. `Then` runs a step that may fail and may change the type, `Map` a step that cannot fail, `Check` a guard that passes the value through, and `MapErr` classifies or adds context to a failure. `result.Of(f())` adapts any `(T, error)` function (a failed Result always holds the zero value) and `.Get()` returns to ordinary Go, so a handler that is not a straight line can use plain `if err != nil` for that part and rejoin the chain. The type-changing methods are generic methods, which need Go 1.27.
 
 ## Formatting and linting
 
@@ -141,7 +159,7 @@ A flag is a Go build tag. The default build is production with every flag off.
 
 | Tag | Interface | Dev behaviour | Wiring |
 |---|---|---|---|
-| `debug_routes` | `diag.Diagnostics` | `diag.On` serves `GET /debug/info` | `cmd/worker/deps_debug_routes_{on,off}.go` |
+| `debug_routes` | `diag.Diagnostics` | `diag.On` serves `GET /debug/info` (JSON) | `cmd/worker/deps_debug_routes_{on,off}.go` |
 
 `debug_routes` is a placeholder flag that exists to exercise the mechanism end to end; replace or remove it when a real flag (for example an insecure admin authenticator) lands. A nil `Deps` field always means the safe production behaviour.
 
@@ -154,12 +172,12 @@ A flag is a Go build tag. The default build is production with every flag off.
 
 ## Wasm size budget
 
-The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size limit) is far above what this Worker needs, so the budget is a regression guard rather than a platform-limit guard. Binary size drives parse and startup cost, and a jump is the earliest signal that a heavy package got linked in by accident (for example, using `encoding/json` adds roughly 700 KB under TinyGo).
+The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size limit) is far above what this Worker needs, so the budget is a regression guard rather than a platform-limit guard. Binary size drives parse and startup cost, and a jump is the earliest signal that a heavy package got linked in by accident (`encoding/json` adds roughly 700 KB under TinyGo; it is accepted because every `/api/` endpoint speaks JSON).
 
 `make size` (`scripts/check-size.sh`):
 
 - Builds the production wasm with TinyGo (`-no-debug`, no tags).
-- **Fails if the raw size exceeds `MAX_WASM_BYTES`** (currently 1,400,000 bytes, about 1.5x the initial size of 923 KB). The budget is raised deliberately, in the PR that justifies it, by editing the default in `scripts/check-size.sh`.
+- **Fails if the raw size exceeds `MAX_WASM_BYTES`** (currently 2,200,000 bytes; the initial 923 KB budget was raised when `encoding/json` was adopted for all `/api/` endpoints). The budget is raised deliberately, in the PR that justifies it, by editing the default in `scripts/check-size.sh`.
 - **Fails if a forbidden package is linked in:** `testing` and `net/http/httptest`, matched as whole import paths.
 - Reports, without gating: gzip size, the top packages by flash, and which watched packages are linked, so a reviewer sees a newly linked heavy dependency. The watch list (`encoding/json`, `database/sql`, `crypto/tls`, `log/slog`) holds only heavy packages that are not in the baseline build. Packages already linked through workers-go and `net/http` (`net/http`, `reflect`, `fmt`, `crypto/x509`, `math/big`) are deliberately left off, since they would always print and hide real changes; add a package to `WATCH` when it is worth noticing.
 - Only raw size gates. Wrangler's bundle size (wasm plus JS glue and source map) is not gated.

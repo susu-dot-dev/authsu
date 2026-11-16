@@ -20,7 +20,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MAX_WASM_BYTES="${MAX_WASM_BYTES:-1400000}"
+MAX_WASM_BYTES="${MAX_WASM_BYTES:-2200000}"
 TOP="${TOP:-15}"
 
 # Heavy packages that are NOT in the baseline build, so seeing one linked means
