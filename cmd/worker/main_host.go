@@ -8,9 +8,17 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/susu-dot-dev/authsu/internal/app"
 )
 
 func main() {
+	// Build the same Deps as the Worker so the tag-selected wiring is
+	// type-checked and linted on the host in every flag state.
+	_ = app.NewHandler(app.Deps{
+		Diagnostics: diagnostics(),
+	})
+
 	fmt.Fprintln(os.Stderr, "authsu runs as a Cloudflare Worker; use `make dev`.")
 	os.Exit(1)
 }

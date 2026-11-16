@@ -61,3 +61,42 @@ func TestHealthz(t *testing.T) {
 		})
 	}
 }
+
+type fakeDiagnostics struct{ registered bool }
+
+func (f *fakeDiagnostics) Register(mux *http.ServeMux) {
+	f.registered = true
+
+	mux.HandleFunc("/fake", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+}
+
+func TestDiagnosticsWiring(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeDiagnostics{}
+	handler := app.NewHandler(app.Deps{Diagnostics: fake})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fake", nil))
+
+	if !fake.registered {
+		t.Error("Diagnostics.Register was not called")
+	}
+	if rec.Code != http.StatusTeapot {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusTeapot)
+	}
+}
+
+func TestNilDiagnosticsRegistersNothing(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/info", nil)
+	app.NewHandler(app.Deps{}).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}

@@ -125,7 +125,20 @@ A flag is a Go build tag. The default build is production with every flag off.
 - Production code outside `cmd/worker` must never reference a dev-only type.
 - `make deploy` refuses to run if any flag is set.
 
-**First iteration:** one flag, `insecure_admin`. The `deps_*` file pair is written for one flag so a second flag is a mechanical addition; nothing is generalised until a second flag exists. Per-flag build tags are passed via the `GO_TAGS` environment variable through `package.json` to TinyGo.
+**Current flags:**
+
+| Tag | Interface | Dev behaviour | Wiring |
+|---|---|---|---|
+| `debug_routes` | `diag.Diagnostics` | `diag.On` serves `GET /debug/info` | `cmd/worker/deps_debug_routes_{on,off}.go` |
+
+`debug_routes` is a placeholder flag that exists to exercise the mechanism end to end; replace or remove it when a real flag (for example an insecure admin authenticator) lands. A nil `Deps` field always means the safe production behaviour.
+
+**Mechanics:**
+
+- `DEV_TAGS` in the Makefile lists every flag a dev build turns on. `make dev` and `make build-dev` use it; `make deploy` never does.
+- Tags reach TinyGo through the `GO_TAGS` environment variable, via `package.json`. Running `npx wrangler dev` directly sets no tag, so it serves the production build; use `make dev` for the dev build.
+- `make vet` and `make lint` run with and without `DEV_TAGS`, on the host and for the js/wasm entrypoint, so both wirings are type-checked and linted. `cmd/worker/main_host.go` builds the same `Deps` as the Worker for this reason.
+- Adding a flag: add the interface and its implementations (untagged, tested), a `Deps` field, a `deps_<flag>_{on,off}.go` pair, and add the tag to `DEV_TAGS`. The wiring files are in `cmd/worker`, which is excluded from coverage; e2e proves the prod build does not serve dev behaviour.
 
 ## Wasm size budget
 

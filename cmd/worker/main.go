@@ -12,5 +12,7 @@ import (
 )
 
 func main() {
-	workers.Serve(app.NewHandler(app.Deps{}))
+	workers.Serve(app.NewHandler(app.Deps{
+		Diagnostics: diagnostics(),
+	}))
 }

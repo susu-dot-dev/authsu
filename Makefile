@@ -9,8 +9,7 @@ SHELL := /bin/bash
 include tools.env
 
 # Tags for dev builds and local development. Never used by `deploy`.
-# (Empty until the first flag is added.)
-DEV_TAGS :=
+DEV_TAGS := debug_routes
 
 .PHONY: help
 help: ## Show this help
@@ -50,9 +49,11 @@ fmt-check: ## Fail if Go code is not gofmt-clean
 	@out="$$(gofmt -s -l $(GO_FILES))"; if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 .PHONY: vet
-vet: ## go vet on the host, plus a compile check of the js/wasm entrypoint
+vet: ## go vet on the host (prod and dev tags), plus the js/wasm entrypoint
 	go vet ./...
+	go vet -tags "$(DEV_TAGS)" ./...
 	GOOS=js GOARCH=wasm go vet ./cmd/worker
+	GOOS=js GOARCH=wasm go vet -tags "$(DEV_TAGS)" ./cmd/worker
 
 # ---- tests ------------------------------------------------------------------
 
@@ -77,10 +78,11 @@ tidy-check: ## Fail if go.mod/go.sum are not tidy
 	go mod tidy -diff
 
 .PHONY: lint
-lint: ## golangci-lint (host, dev tags if any, and the js/wasm entrypoint)
+lint: ## golangci-lint (host prod and dev tags, and the js/wasm entrypoint)
 	golangci-lint run ./...
-	@if [ -n "$(DEV_TAGS)" ]; then golangci-lint run --build-tags "$(DEV_TAGS)" ./...; fi
+	golangci-lint run --build-tags "$(DEV_TAGS)" ./...
 	GOOS=js GOARCH=wasm golangci-lint run ./cmd/worker
+	GOOS=js GOARCH=wasm golangci-lint run --build-tags "$(DEV_TAGS)" ./cmd/worker
 
 # ---- build / local dev ------------------------------------------------------
 

@@ -5,19 +5,32 @@
 // a Deps value, and everything else is plain Go tested against fakes.
 package app
 
-import "net/http"
+import (
+	"net/http"
 
-// Deps holds the dependencies supplied by cmd/worker. It is empty until the
-// first feature needs one.
-type Deps struct{}
+	"github.com/susu-dot-dev/authsu/internal/diag"
+)
+
+// Deps holds the dependencies supplied by cmd/worker. Fields that vary between
+// production and dev builds are selected there by build tag; a nil field means
+// the safe production behaviour.
+type Deps struct {
+	// Diagnostics adds developer routes. Nil means none (production).
+	Diagnostics diag.Diagnostics
+}
 
 // NewHandler returns the Worker's root HTTP handler.
 //
 // TinyGo's http.ServeMux never matches method-qualified patterns such as
 // "GET /x", so register plain paths and dispatch on r.Method.
-func NewHandler(Deps) http.Handler {
+func NewHandler(deps Deps) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
+
+	if deps.Diagnostics != nil {
+		deps.Diagnostics.Register(mux)
+	}
+
 	return mux
 }
 
