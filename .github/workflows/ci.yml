@@ -84,3 +84,28 @@ jobs:
           node: "true"
           tinygo: "true"
       - run: make ${{ matrix.target }}
+
+  # The single required status check on `main`. It depends on every other job,
+  # so adding a job above only requires adding it to `needs` here, not changing
+  # branch protection. `always()` makes it run (and fail) even when a needed job
+  # failed or was cancelled; a skipped job also counts as a failure.
+  ci:
+    name: CI
+    if: always()
+    needs: [lint, test, size, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed
+        env:
+          # Space-separated results of every job in `needs`.
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          [ -n "$RESULTS" ] || { echo "::error::no job results"; exit 1; }
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a required job finished with result: $r"
+              exit 1
+            fi
+          done

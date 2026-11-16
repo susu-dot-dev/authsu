@@ -209,7 +209,8 @@ GitHub Actions, Linux only (`ubuntu-24.04`). Triggers: push to `main` and pull r
 - If you add a target to `make ci` or `make check`, add it to the matching job in `ci.yml` too, or CI will silently stop running it.
 - Toolchain setup is the local composite action `.github/actions/setup` (loads `tools.env`, then installs Go and, on request, golangci-lint, Node plus `npm ci`, and TinyGo with the tarball cache described above). Jobs opt in to each tool, so `test` does not pay for TinyGo or Node. It is first-party code in this repository, and every action it uses is SHA-pinned.
 - The two e2e builds run on separate runners, so they cannot collide on `E2E_STATE` or ports.
-- Each job is a status check; the required checks on `main` are `Lint`, `Unit tests`, `Wasm size`, `E2E (dev)` and `E2E (prod)`. Vulnerability scanning and pin upkeep run on a schedule instead, in `.github/workflows/scheduled.yml`.
+- **One required check.** The `CI` job (`needs` every other job, `if: always()`) fails unless every needed job succeeded; cancelled and skipped count as failures. Branch protection on `main` requires only `CI`, so adding a job means adding it to the `needs` list in `ci.yml`, not changing repository settings. A job missing from `needs` is not gated, so keep the list complete.
+- Vulnerability scanning and pin upkeep run on a schedule instead, in `.github/workflows/scheduled.yml`.
 
 ## Cloudflare Workers Builds
 
