@@ -2,13 +2,18 @@
 package app
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"net/http"
+	"time"
+	"uuid"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
+	"github.com/susu-dot-dev/authsu/internal/atomic"
 	"github.com/susu-dot-dev/authsu/internal/diag"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
@@ -25,6 +30,10 @@ type Deps struct {
 type Platform struct {
 	// DB is the D1 database.
 	DB *sql.DB
+	// Batch runs statements as one atomic unit. D1 offers that only inside the
+	// Worker, so the platform supplies it. Nil disables the routes that write
+	// (registration finish answers 503).
+	Batch atomic.Batch
 	// Getenv reads a deploy-time secret or variable. It is called per request,
 	// because the Worker's environment only exists while a request is handled.
 	Getenv func(name string) string
@@ -64,6 +73,16 @@ func NewHandler(deps Deps, platform Platform) http.Handler {
 	routes.Handle(http.MethodGet, "/healthz", healthz)
 	routes.Handle(http.MethodGet, "/api/first-run", firstrun.Handler(platform.DB, platform.Getenv))
 
+	registrar := registration.NewService(registration.Deps{
+		Reader:  sqlReader(platform.DB),
+		Batch:   platform.Batch,
+		Now:     time.Now,
+		Entropy: rand.Reader,
+		NewID:   func() string { return uuid.NewV7().String() },
+	})
+	routes.Handle(http.MethodPost, "/api/register/begin", registrar.BeginHandler(platform.Getenv))
+	routes.Handle(http.MethodPost, "/api/register/finish", registrar.FinishHandler(platform.Getenv))
+
 	if deps.Diagnostics != nil {
 		deps.Diagnostics.Register(routes)
 	}
@@ -78,4 +97,14 @@ type healthBody struct {
 
 func healthz(httpapi.Request) result.Result[httpapi.Response] {
 	return result.Ok(httpapi.JSON(http.StatusOK, healthBody{Status: "ok"}))
+}
+
+// sqlReader returns the registration Reader over db, or nil when there is no
+// database (the host stub), so registration answers 503 rather than panicking.
+func sqlReader(db *sql.DB) registration.Reader {
+	if db == nil {
+		return nil
+	}
+
+	return registration.NewSQLReader(db)
 }

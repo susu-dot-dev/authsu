@@ -43,6 +43,14 @@ const (
 	// one) so tests can compute what the Worker should have stored for it.
 	firstRunSecret = "e2e-first-run-secret-0123456789ABCDEFGHIJKL"
 
+	// authHMACSecret is the AUTH_HMAC_SECRET the Worker under test is started
+	// with: fixed and throwaway, 43 characters like a generated one.
+	authHMACSecret = "e2e-auth-hmac-secret-0123456789ABCDEFGHIJKLMN"
+
+	// rpID is the relying party ID. The origin is built from the port the
+	// Worker is given, so it is set in serve.
+	rpID = "localhost"
+
 	// envFileName is written into the state directory and handed to wrangler
 	// with --env-file. Nothing in the repository root is read or written, so a
 	// developer's own .dev.vars is never used by, or clobbered by, a test run.
@@ -56,6 +64,8 @@ var errNotReady = errors.New("worker not ready")
 // worker is the running Worker under test.
 type worker struct {
 	baseURL string
+	// origin is the relying party origin the Worker accepts.
+	origin string
 
 	// root is the repository root and state the Worker's local D1 state
 	// directory (relative to root), so tests can inspect the database.
@@ -96,17 +106,14 @@ func run(m *testing.M) int {
 		return fail("apply migrations: %v\n%s", err, out)
 	}
 
-	envFile, err := writeEnvFile(filepath.Join(root, state))
-	if err != nil {
-		return fail("write env file: %v", err)
-	}
-
-	return serve(ctx, root, state, envFile, m)
+	return serve(ctx, root, state, m)
 }
 
-// writeEnvFile writes the secrets the Worker under test is configured with to
-// dir, in the dotenv format wrangler's --env-file reads, and returns its path.
-func writeEnvFile(dir string) (string, error) {
+// writeEnvFile writes the secrets and variables the Worker under test is
+// configured with to dir, in the dotenv format wrangler's --env-file reads, and
+// returns its path. The relying party origin depends on the port the Worker
+// listens on, so it is a parameter.
+func writeEnvFile(dir, origin string) (string, error) {
 	err := os.MkdirAll(dir, 0o700)
 	if err != nil {
 		return "", fmt.Errorf("create %s: %w", dir, err)
@@ -114,7 +121,13 @@ func writeEnvFile(dir string) (string, error) {
 
 	path := filepath.Join(dir, envFileName)
 
-	err = os.WriteFile(path, []byte("FIRST_RUN_SECRET="+firstRunSecret+"\n"), envFilePerm)
+	contents := "FIRST_RUN_SECRET=" + firstRunSecret + "\n" +
+		"AUTH_HMAC_SECRET=" + authHMACSecret + "\n" +
+		"RP_ID=" + rpID + "\n" +
+		"RP_ORIGIN=" + origin + "\n" +
+		"RP_NAME=authsu e2e\n"
+
+	err = os.WriteFile(path, []byte(contents), envFilePerm)
 	if err != nil {
 		return "", fmt.Errorf("write %s: %w", path, err)
 	}
@@ -124,10 +137,17 @@ func writeEnvFile(dir string) (string, error) {
 
 // serve starts wrangler, waits for the Worker, runs the tests, and always tears
 // wrangler (and the workerd it spawns) down.
-func serve(ctx context.Context, root, state, envFile string, m *testing.M) int {
+func serve(ctx context.Context, root, state string, m *testing.M) int {
 	port, err := freePort(ctx)
 	if err != nil {
 		return fail("pick port: %v", err)
+	}
+
+	origin := "http://" + rpID + ":" + port
+
+	envFile, err := writeEnvFile(filepath.Join(root, state), origin)
+	if err != nil {
+		return fail("write env file: %v", err)
 	}
 
 	inspector, err := freePort(ctx)
@@ -155,7 +175,10 @@ func serve(ctx context.Context, root, state, envFile string, m *testing.M) int {
 		_ = cmd.Wait()
 	}()
 
-	target = worker{baseURL: "http://127.0.0.1:" + port, root: root, state: state}
+	// Tests connect to 127.0.0.1 (wrangler binds IPv4, and "localhost" may
+	// resolve to ::1 first). The relying party origin is only ever a string
+	// inside clientDataJSON, so it can use the name "localhost".
+	target = worker{baseURL: "http://127.0.0.1:" + port, origin: origin, root: root, state: state}
 
 	err = waitReady(ctx, target.baseURL+"/healthz")
 	if err != nil {

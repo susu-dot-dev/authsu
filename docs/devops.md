@@ -55,6 +55,8 @@ cmd/worker/             Worker entrypoint and build-time wiring (tiny; no logic)
 internal/app/           Builds the HTTP handler from a Deps struct; host-testable
 internal/<domain>/      Domain packages (service, store interface, SQL store, ...)
 internal/httpapi/       Request/Response, Handler, Serve (the net/http boundary), JSON helpers
+internal/atomic/        Statement, Batch and ErrConflict: the host-compilable vocabulary for D1's atomic batch
+internal/webauthn/      Strict verification of a passkey registration response (no I/O, no clock)
 internal/apierr/        Structured error: Kind (HTTP status), Code, Description, Data, cause
 internal/result/        Result[T]: chainable fallible steps (Then, Map, Check, MapErr)
 e2e/                    Black-box tests against `wrangler dev` (build tag `e2e`)
@@ -176,11 +178,31 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 
 `make size` (`scripts/check-size.sh`):
 
-- Measures the production wasm that `make build` produced (`-no-debug`, no tags): the same `build/app.wasm` the e2e tests run, so the binary that is size-checked is the binary that is tested. The script itself builds nothing; the Makefile also produces `build/size-full.txt` (`tinygo -size full`, a second link of the same program) and passes both in.
-- **Fails if the raw size exceeds `MAX_WASM_BYTES`** (currently 2,200,000 bytes; the initial 923 KB budget was raised when `encoding/json` was adopted for all `/api/` endpoints). The budget is raised deliberately, in the PR that justifies it, by editing the default in `scripts/check-size.sh`.
+- Builds the production wasm with TinyGo (`-no-debug`, no tags).
+- **Fails if the raw size exceeds `MAX_WASM_BYTES`** (currently 2,500,000 bytes; the initial 923 KB budget was raised to 2,200,000 when `encoding/json` was adopted for all `/api/` endpoints, and again when passkey registration added `fxamacker/cbor` (about 138 KB) and the P-256 code behind `crypto/ecdh` (about 96 KB), bringing the production build to about 2.41 MB). The budget is raised deliberately, in the PR that justifies it, by editing the default in `scripts/check-size.sh`.
 - **Fails if a forbidden package is linked in:** `testing` and `net/http/httptest`, matched as whole import paths.
 - Reports, without gating: gzip size, the top packages by flash, and which watched packages are linked, so a reviewer sees a newly linked heavy dependency. The watch list (`encoding/json`, `database/sql`, `crypto/tls`, `log/slog`) holds only heavy packages that are not in the baseline build. Packages already linked through workers-go and `net/http` (`net/http`, `reflect`, `fmt`, `crypto/x509`, `math/big`) are deliberately left off, since they would always print and hide real changes; add a package to `WATCH` when it is worth noticing.
 - Only raw size gates. Wrangler's bundle size (wasm plus JS glue and source map) is not gated.
+
+## Secrets and variables
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `FIRST_RUN_SECRET` | secret | Becomes the first-run invitation code (see `first_run_design.md`) |
+| `AUTH_HMAC_SECRET` | secret | Root key material. Registration derives its challenge-signing key from it with a distinct context (`authsu/registration-challenge/v1`). At least 32 characters. Never use it directly, and never derive a key from it for anything where a signature is authorization (such as a session) without its own context |
+| `RP_ID` | var | WebAuthn relying party ID. **Permanent**: a passkey is bound to it, so changing it invalidates every registered passkey |
+| `RP_ORIGIN` | var | The one origin registration ceremonies are accepted from, such as `https://auth.example.com`. Compared as an exact string |
+| `RP_NAME` | var | Relying party name the browser shows |
+
+The `RP_*` defaults in `wrangler.jsonc` are `localhost` values, so a deployment must set them before the first registration. They are configuration and not derived from the request, because a `Host` header is attacker-influenced and a Worker is reachable on several hostnames. Registration answers 503 `registration_not_configured` while any of them is missing or `AUTH_HMAC_SECRET` is too short.
+
+## Atomic writes
+
+D1 has no interactive transactions. Its only atomic primitive is `d1.Batch`, which runs statements as one transaction and rolls the whole batch back if any statement fails. It imports `syscall/js`, so `internal/` cannot import it. `internal/atomic` holds the host-compilable half: `Statement`, the `Batch` function type, and `ErrConflict`. `cmd/worker/main.go` supplies the one closure that converts to `d1.Statement`, calls `d1.Batch` and passes the error through `atomic.Classify`, and `app.Platform.Batch` carries it to the features that need it. A nil `Batch` makes those features answer 503 rather than panic, which is what the host stub gets.
+
+`atomic.Classify` marks an error `ErrConflict` when its text contains `SQLITE_CONSTRAINT`. D1 reports a failed batch as an untyped error whose text is SQLite's, so the text is all there is to match; the e2e tests prove the real text is recognised.
+
+A conditional `INSERT ... SELECT` that matches no rows is not an error, so it does not roll a batch back by itself. Make a later statement in the batch depend on the row existing (a `NOT NULL` foreign key filled from a subselect) so that "nothing was inserted" becomes a failed batch. Registration relies on this; see `internal/registration/sql.go`.
 
 ## D1 migrations
 
@@ -211,8 +233,9 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 - **Production build only.** There is no dev-flag e2e run: the artifact under test is the one that is deployed, which is also what proves dev-only behaviour is absent (a test may assert that a dev-only route is a 404). Unit tests and the lint/vet matrix cover the dev wirings on the host. If a flag ever needs wasm-level verification, add a separate e2e run for it then; it needs its own build output so it cannot be mistaken for the production `build/`.
 - E2E exists for what the host cannot see: TinyGo `net/http` differences (notably `http.ServeMux` never matches method-qualified patterns like `"GET /x"`; use plain paths and dispatch on `r.Method`), the D1 driver, real SQLite behaviour, and Wrangler wiring.
 - Dev and e2e use separate state directories so tests never touch data created while developing.
-- **Secrets.** The harness starts the Worker with `FIRST_RUN_SECRET` set to a fixed, throwaway constant (`firstRunSecret` in `e2e/harness_test.go`), so tests can compute what the Worker should have stored for it. It writes the secret to `e2e.env` inside the state directory and passes it with `wrangler dev --env-file`. The repository root is never read or written, so a developer's own `.dev.vars` is neither used by a test run nor overwritten by one. Wrangler loads `--env-file` values even when a `.dev.vars` exists (checked: the Worker saw the test value, not the `.dev.vars` one). Never put a real secret in the constant. A new secret means a new line in `writeEnvFile`.
+- **Secrets.** The harness starts the Worker with `FIRST_RUN_SECRET` and `AUTH_HMAC_SECRET` set to fixed, throwaway constants (`firstRunSecret` and `authHMACSecret` in `e2e/harness_test.go`), so tests can compute what the Worker should have stored for them. It also sets `RP_ID`, `RP_ORIGIN` and `RP_NAME`; the origin includes the port the harness picked, which is why the file is written after the port is known. It writes them to `e2e.env` inside the state directory and passes it with `wrangler dev --env-file`. The repository root is never read or written, so a developer's own `.dev.vars` is neither used by a test run nor overwritten by one. Wrangler loads `--env-file` values even when a `.dev.vars` exists (checked: the Worker saw the test value, not the `.dev.vars` one). Never put a real secret in the constant. A new secret means a new line in `writeEnvFile`.
 - **Inspecting the database.** Tests reach the Worker's simulated D1 with `wrangler d1 execute DB --local --persist-to <state> --json` (the `query` helper in `e2e/firstrun_test.go`). Use it to assert on what was actually stored, which the HTTP response alone cannot show.
+- **Registration e2e builds a real passkey response.** `e2e/register_test.go` takes the creation options the Worker returned, generates an ES256 key and builds a real `none` attestation over them, so nothing about the Worker is mocked. It is the only thing that proves the registration SQL (the conditional user insert, the credential's required reference to it, and the rollback), because the unit tests fake the database.
 - **The database is shared and tests run in source order.** There is one Worker and one database for the whole run. A test that needs the invitations or users tables to be empty must run before the tests that fill them, and must clean up what it adds. `TestFirstRun` fills them and finishes with a user, so it runs last among the first-run tests.
 - **Linting:** e2e code is linted like everything else, except that `gosec` is excluded under `e2e/` (see `.golangci.yml`): the harness launches `npx` and clears a state directory named by an environment variable by design. The one process-wide fixture (`target`) carries a `//nolint:gochecknoglobals` with its reason.
 

@@ -2,9 +2,14 @@ module github.com/susu-dot-dev/authsu
 
 go 1.27.4
 
-require github.com/syumai/workers-go v0.36.0
+require (
+	github.com/fxamacker/cbor/v2 v2.10.0
+	github.com/syumai/workers-go v0.36.0
+	golang.org/x/text v0.42.0
+)
 
 require (
+	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
