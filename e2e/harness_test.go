@@ -7,8 +7,9 @@
 // cannot see: TinyGo's net/http differences, the D1 driver, and the wrangler
 // wiring itself.
 //
-// Run them with `make test-e2e`, which builds the Worker first. This harness
-// only runs what was built; it never decides which build tags to use.
+// Run them with `make test-e2e`, which builds the production Worker first. This
+// harness only runs what was built: wrangler.e2e.jsonc has no build command, so
+// wrangler never rebuilds it.
 package e2e_test
 
 import (
@@ -31,8 +32,11 @@ const (
 	readyInterval = 500 * time.Millisecond
 	dialTimeout   = time.Second
 	stateDirEnv   = "E2E_STATE"
-	tagsEnv       = "E2E_GO_TAGS"
 	defaultState  = ".wrangler/e2e-state"
+
+	// wranglerConfig is wrangler.jsonc without its build command, so wrangler
+	// serves the build/ that make produced rather than running TinyGo again.
+	wranglerConfig = "wrangler.e2e.jsonc"
 
 	// firstRunSecret is the FIRST_RUN_SECRET the Worker under test is started
 	// with. It is a fixed, throwaway value (43 characters, like a generated
@@ -87,7 +91,7 @@ func run(m *testing.M) int {
 	}
 
 	out, err := command(ctx, root, "npx", "wrangler", "d1", "migrations", "apply", "DB",
-		"--local", "--persist-to", state).CombinedOutput()
+		"--config", wranglerConfig, "--local", "--persist-to", state).CombinedOutput()
 	if err != nil {
 		return fail("apply migrations: %v\n%s", err, out)
 	}
@@ -131,14 +135,9 @@ func serve(ctx context.Context, root, state, envFile string, m *testing.M) int {
 		return fail("pick inspector port: %v", err)
 	}
 
-	cmd := command(ctx, root, "npx", "wrangler", "dev", "--local",
+	cmd := command(ctx, root, "npx", "wrangler", "dev", "--config", wranglerConfig, "--local",
 		"--port", port, "--inspector-port", inspector,
 		"--persist-to", state, "--env-file", envFile, "--show-interactive-dev-session=false")
-
-	// wrangler re-runs build.command on start. Give it the same tags the
-	// Makefile built with so the rebuilt binary is identical to the one built
-	// for this run.
-	cmd.Env = append(os.Environ(), "GO_TAGS="+os.Getenv(tagsEnv))
 
 	var logs bytes.Buffer
 

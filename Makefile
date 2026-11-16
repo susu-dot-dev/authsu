@@ -12,11 +12,22 @@ include tools.env
 # directories so e2e can wipe its own state without touching dev data.
 DEV_STATE := .wrangler/state
 
-# E2E uses its own state and builds, never the dev state.
+# E2E uses its own state, never the dev state.
 E2E_STATE := .wrangler/e2e-state
 
 # Tags for dev builds and local development. Never used by `deploy`.
 DEV_TAGS := debug_routes
+
+# The production wasm is a real file target, so it is built once and shared:
+# `size`, `test-e2e` and CI's downstream jobs all consume the same build/. Make
+# rebuilds it only when a Go source, the module files or the build recipe
+# changed. TinyGo has no incremental compilation, so this is the only way to
+# skip the ~20s compile. Tests, migrations and docs are not inputs.
+WASM        := build/app.wasm
+SIZE_REPORT := build/size-full.txt
+WASM_DEPS   := $(shell git ls-files --cached --others --exclude-standard -- \
+                 'cmd/*.go' 'internal/*.go' go.mod go.sum package.json tools.env \
+                 | grep -v '_test\.go$$')
 
 .PHONY: help
 help: ## Show this help
@@ -86,8 +97,8 @@ tidy-check: ## Fail if go.mod/go.sum are not tidy
 	go mod tidy -diff
 
 .PHONY: size
-size: ## Production wasm size report + budget (fails if over budget or test pkgs linked)
-	./scripts/check-size.sh
+size: $(WASM) $(SIZE_REPORT) ## Production wasm size report + budget (fails if over budget or test pkgs linked)
+	WASM=$(WASM) SIZE_REPORT=$(SIZE_REPORT) ./scripts/check-size.sh
 
 .PHONY: vuln
 vuln: ## Scan dependencies for known vulnerabilities (pinned govulncheck)
@@ -103,13 +114,33 @@ lint: ## golangci-lint (host prod and dev tags, e2e, and the js/wasm entrypoint)
 
 # ---- build / local dev ------------------------------------------------------
 
-.PHONY: build
-build: ## Production build (no flags) -> build/
+# In CI only the `build` job has TinyGo; the jobs that download its artifact set
+# PREBUILT=1 so a stale-looking build/ fails loudly instead of falling through
+# to a TinyGo that is not installed (or silently testing a different binary).
+$(WASM): $(WASM_DEPS)
+	@if [ -n "$(PREBUILT)" ]; then \
+	  echo "PREBUILT is set but $(WASM) is missing or older than its sources"; exit 1; fi
 	GO_TAGS= npm run build
 
+# `-size full` is a second link of the same program, only needed for the size
+# report, so it is a separate target that `size` (and CI's build job) asks for.
+$(SIZE_REPORT): $(WASM_DEPS)
+	@if [ -n "$(PREBUILT)" ]; then \
+	  echo "PREBUILT is set but $(SIZE_REPORT) is missing or older than its sources"; exit 1; fi
+	@mkdir -p $(dir $@)
+	PATH="$$PWD/.tools/tinygo/bin:$$PATH" tinygo build -o /dev/null -target wasm \
+	  -size full ./cmd/worker >$@ 2>&1
+
+.PHONY: build
+build: $(WASM) ## Production build (no flags) -> build/
+
+# A dev build overwrites build/app.wasm, so make would otherwise treat that file
+# as an up-to-date production build. Removing it afterwards keeps `size` and
+# `test-e2e` from ever picking up a dev binary: they rebuild from scratch.
 .PHONY: build-dev
-build-dev: ## Dev build (DEV_TAGS) -> build/
+build-dev: ## Dev build (DEV_TAGS) -> build/ (the next prod build or e2e rebuilds)
 	GO_TAGS="$(DEV_TAGS)" npm run build
+	@touch -d @0 $(WASM)
 
 .PHONY: migrate-local
 migrate-local: ## Apply D1 migrations to the local dev database
@@ -121,23 +152,21 @@ db-reset: ## Delete local dev database state
 
 .PHONY: dev
 dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1)
+	@# wrangler's own rebuild leaves a dev wasm in build/; mark it stale on exit
+	@# (even on Ctrl-C) so size and e2e never mistake it for a production build.
+	trap 'touch -d @0 $(WASM) 2>/dev/null; true' EXIT; \
 	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --persist-to $(DEV_STATE)
 
 # ---- end-to-end tests -------------------------------------------------------
-# Builds the real Worker (TinyGo -> wasm), starts `wrangler dev` (workerd with a
-# simulated D1) on a throwaway state directory and a free port, and drives it
-# over HTTP. The Makefile decides the build tags; the harness only runs what was
-# built and hands the same tags to wrangler's own rebuild.
+# Runs the real production Worker: the prebuilt wasm under `wrangler dev`
+# (workerd with a simulated D1) on a throwaway state directory and a free port,
+# driven over HTTP. wrangler.e2e.jsonc has no build.command, so wrangler serves
+# exactly the build/ that make produced instead of rebuilding it. There is no
+# dev-flag e2e run: the artifact under test is the one that gets deployed.
 
 .PHONY: test-e2e
-test-e2e: ## End-to-end tests against the dev build (DEV_TAGS)
-	GO_TAGS="$(DEV_TAGS)" npm run build
-	E2E_STATE=$(E2E_STATE) E2E_GO_TAGS="$(DEV_TAGS)" go test -tags e2e -count=1 -timeout 5m ./e2e/...
-
-.PHONY: test-e2e-prod
-test-e2e-prod: ## End-to-end tests against the production build (no tags)
-	GO_TAGS= npm run build
-	E2E_STATE=$(E2E_STATE) E2E_GO_TAGS= go test -tags e2e -count=1 -timeout 5m ./e2e/...
+test-e2e: $(WASM) ## End-to-end tests against the production build
+	E2E_STATE=$(E2E_STATE) go test -tags e2e -count=1 -timeout 5m ./e2e/...
 
 .PHONY: clean
 clean: ## Remove build outputs
@@ -148,5 +177,7 @@ clean: ## Remove build outputs
 .PHONY: check
 check: check-tools fmt-check tidy-check vet lint test coverage ## Fast pre-commit gate (no wasm build, no e2e)
 
+# One production build feeds both size and e2e. CI builds it once in a `build`
+# job and hands build/ to the others as an artifact.
 .PHONY: ci
-ci: check size test-e2e test-e2e-prod ## Everything CI runs
+ci: check size test-e2e ## Everything CI runs

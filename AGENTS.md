@@ -23,7 +23,7 @@ The `Makefile` is the only entrypoint; CI runs the same targets. `make help` lis
 | Command | Purpose |
 |---|---|
 | `make check` | Fast pre-commit gate: tool versions, format, tidy, vet, lint, unit tests, 100% coverage |
-| `make ci` | Everything CI runs: `check`, the wasm size budget, and both e2e runs |
+| `make ci` | Everything CI runs: `check`, the wasm size budget, and the e2e run |
 | `make dev` | Run the Worker locally on :8787 with dev flags and a local D1 |
 | `make fmt` | Format Go code |
 

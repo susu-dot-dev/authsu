@@ -1,0 +1,20 @@
+/**
+ * Used only by the e2e harness (`wrangler dev -c wrangler.e2e.jsonc`). It is
+ * wrangler.jsonc without `build`: the Worker is built once by `make build` and
+ * wrangler serves that build/ as is, instead of running the TinyGo build again
+ * on every start. Local-only, so no observability or source-map upload.
+ * See docs/devops.md, "End-to-end tests".
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "authsu",
+	"main": "./build/worker.mjs",
+	"compatibility_date": "2026-11-13",
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_id": "6ae7ad67-1698-45d5-8fc7-df6cff311140",
+			"migrations_dir": "migrations"
+		}
+	]
+}
