@@ -24,25 +24,25 @@ authsu is a Go service compiled with TinyGo to WebAssembly and run as a Cloudfla
 | `make test` | Unit tests |
 | `make coverage` | Unit tests with the 100% coverage gate |
 | `make vuln` | govulncheck (pinned); scheduled in CI, not part of `make ci` |
-| `make size` | Wasm size report and budget gate |
-| `make build` | Production build |
+| `make size` | Wasm size report and budget gate (builds `build/` if stale) |
+| `make build` | Production build into `build/`, skipped when `build/` is up to date |
 | `make build-dev` | Dev build (all dev flags on) |
 | `make dev` | Run the Worker locally with local D1 |
-| `make test-e2e` / `make test-e2e-prod` | End-to-end tests against `wrangler dev` |
+| `make test-e2e` | End-to-end tests against the production build under `wrangler dev` |
 | `make check` | Fast gate for the edit loop (no wasm build, no e2e) |
 | `make ci` | Everything CI runs. Slow: run it once, as the final pass before committing |
 | `make deploy` | Production deploy, only ever with no flags, gated on checks |
 
 ### Which target when
 
-`make ci` is slow because the wasm size check and both e2e runs each build the Worker with TinyGo (the two e2e runs take about 30 seconds each on top of that). Do not use it as a save-and-check loop.
+`make ci` is slow mostly because of one TinyGo build (about 20 seconds, nearly all of it single-threaded; TinyGo has no incremental compilation). `size` and `test-e2e` share that one `build/`, and make skips it when no Go source, `go.mod`, `go.sum`, `package.json` or `tools.env` changed, so a repeat run after editing only tests, migrations or docs does not rebuild. Do not use `make ci` as a save-and-check loop.
 
 - **While working:** run only the narrowest target that covers what you changed, and `make check` once a change is ready for a broader look. It is fast and has no wasm build.
   - Go logic: `go test ./internal/...` for the package you are editing, then `make check`.
   - Formatting or lint: `make fmt`, `make lint`.
   - A migration: apply it to a throwaway local database (`npx wrangler d1 migrations apply DB --local --persist-to <tmp dir>`) and exercise it with `wrangler d1 execute`, rather than a full e2e run.
 - **Before committing:** run `make ci` once, as the last step, after the change is otherwise finished. If it fails, fix the cause with the narrow target that reproduces it, and run `make ci` once more at the end instead of after each fix.
-- **Do not run `make ci` after every edit, after documentation-only changes, or to check that a single target still passes.** `make size` and `make test-e2e` / `make test-e2e-prod` are available on their own for the rare change that needs only one of them (for example, a dependency bump for `size`).
+- **Do not run `make ci` after every edit, after documentation-only changes, or to check that a single target still passes.** `make size` and `make test-e2e` are available on their own for the rare change that needs only one of them (for example, a dependency bump for `size`).
 
 ## Repository layout
 
@@ -176,7 +176,7 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 
 `make size` (`scripts/check-size.sh`):
 
-- Builds the production wasm with TinyGo (`-no-debug`, no tags).
+- Measures the production wasm that `make build` produced (`-no-debug`, no tags): the same `build/app.wasm` the e2e tests run, so the binary that is size-checked is the binary that is tested. The script itself builds nothing; the Makefile also produces `build/size-full.txt` (`tinygo -size full`, a second link of the same program) and passes both in.
 - **Fails if the raw size exceeds `MAX_WASM_BYTES`** (currently 2,200,000 bytes; the initial 923 KB budget was raised when `encoding/json` was adopted for all `/api/` endpoints). The budget is raised deliberately, in the PR that justifies it, by editing the default in `scripts/check-size.sh`.
 - **Fails if a forbidden package is linked in:** `testing` and `net/http/httptest`, matched as whole import paths.
 - Reports, without gating: gzip size, the top packages by flash, and which watched packages are linked, so a reviewer sees a newly linked heavy dependency. The watch list (`encoding/json`, `database/sql`, `crypto/tls`, `log/slog`) holds only heavy packages that are not in the baseline build. Packages already linked through workers-go and `net/http` (`net/http`, `reflect`, `fmt`, `crypto/x509`, `math/big`) are deliberately left off, since they would always print and hide real changes; add a package to `WATCH` when it is worth noticing.
@@ -202,12 +202,13 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 ## End-to-end tests
 
 - Written in Go under `e2e/`, build tag `e2e`, so they are excluded from `go test ./...` (and so from coverage). `make vet` and `make lint` still check them with `-tags e2e`.
-- **The Makefile decides the build, the harness only runs it.** `make test-e2e` builds the Worker (TinyGo to wasm) with `DEV_TAGS` and passes the same tags to the harness as `E2E_GO_TAGS`. Wrangler re-runs `build.command` on every `wrangler dev` start, so the harness exports `GO_TAGS=$E2E_GO_TAGS` to it; otherwise wrangler would silently rebuild a different binary than the one just built. The tag list therefore lives only in the Makefile (`DEV_TAGS`).
+- **The Makefile decides the build, the harness only runs it.** `make test-e2e` depends on `build/app.wasm` (the production build, no tags), so it is built once, or not at all if `build/` is current. The harness runs wrangler with `--config wrangler.e2e.jsonc`, which is `wrangler.jsonc` without `build`, so wrangler serves that `build/` instead of running TinyGo again (that rebuild used to double the cost of every run and start-up was about 18s against about 1s now). Keep the two files in step by hand when a binding changes.
+- `build/app.wasm` is a real file target whose inputs are the non-test Go files under `cmd/` and `internal/`, `go.mod`, `go.sum`, `package.json` and `tools.env`. Test files, `e2e/`, migrations and docs are not inputs. A dev build (`make build-dev`, or the rebuild `make dev` leaves behind) overwrites `build/app.wasm`, so both mark it stale afterwards (mtime reset) and the next `size` or `test-e2e` rebuilds production. If you change the build recipe somewhere other than `package.json`, add that file to `WASM_DEPS` in the Makefile.
 - The harness then:
   1. wipes `E2E_STATE` (default `.wrangler/e2e-state`) and applies every migration to a fresh local D1,
   2. starts `wrangler dev --local` in its own process group on OS-chosen free ports (no collision with `make dev` or a parallel run),
   3. polls `/healthz` until the Worker answers, runs the tests over HTTP, and on exit signals the whole process group so wrangler and workerd never leak. On a failing run it prints wrangler's output.
-- Run twice: `make test-e2e` against the **dev build** (`DEV_TAGS` on) and `make test-e2e-prod` against the **production build** (no tags). Tests that depend on a flag must assert both sides, so the production run proves dev-only behaviour is absent.
+- **Production build only.** There is no dev-flag e2e run: the artifact under test is the one that is deployed, which is also what proves dev-only behaviour is absent (a test may assert that a dev-only route is a 404). Unit tests and the lint/vet matrix cover the dev wirings on the host. If a flag ever needs wasm-level verification, add a separate e2e run for it then; it needs its own build output so it cannot be mistaken for the production `build/`.
 - E2E exists for what the host cannot see: TinyGo `net/http` differences (notably `http.ServeMux` never matches method-qualified patterns like `"GET /x"`; use plain paths and dispatch on `r.Method`), the D1 driver, real SQLite behaviour, and Wrangler wiring.
 - Dev and e2e use separate state directories so tests never touch data created while developing.
 - **Secrets.** The harness starts the Worker with `FIRST_RUN_SECRET` set to a fixed, throwaway constant (`firstRunSecret` in `e2e/harness_test.go`), so tests can compute what the Worker should have stored for it. It writes the secret to `e2e.env` inside the state directory and passes it with `wrangler dev --env-file`. The repository root is never read or written, so a developer's own `.dev.vars` is neither used by a test run nor overwritten by one. Wrangler loads `--env-file` values even when a `.dev.vars` exists (checked: the Worker saw the test value, not the `.dev.vars` one). Never put a real secret in the constant. A new secret means a new line in `writeEnvFile`.
@@ -236,13 +237,18 @@ GitHub Actions, Linux only (`ubuntu-24.04`). Triggers: push to `main` and pull r
 |---|---|---|
 | `lint` | `fmt-check tidy-check vet lint` | Go, golangci-lint |
 | `test` | `test coverage` | Go |
-| `size` | `size` | Go, TinyGo |
-| `e2e` (matrix: `dev`, `prod`) | `test-e2e` / `test-e2e-prod` | Go, Node, TinyGo |
+| `build` | `build build/size-full.txt`, then uploads `build/` as the `worker-build` artifact | Go, Node, TinyGo |
+| `size` | `size PREBUILT=1` | Go; downloads `worker-build` |
+| `e2e` | `test-e2e PREBUILT=1` | Go, Node; downloads `worker-build` |
+
+`build` is the only job that installs or runs TinyGo; `size` and `e2e` start when it finishes and run in parallel. The Worker is built once per run instead of five times, and TinyGo is installed once instead of three times.
 
 - `check-tools` is not run in CI: it only verifies a developer's local installs, and CI installs the pinned versions itself.
 - If you add a target to `make ci` or `make check`, add it to the matching job in `ci.yml` too, or CI will silently stop running it.
-- Toolchain setup is the local composite action `.github/actions/setup` (loads `tools.env`, then installs Go and, on request, golangci-lint, Node plus `npm ci`, and TinyGo with the tarball cache described above). Jobs opt in to each tool, so `test` does not pay for TinyGo or Node. It is first-party code in this repository, and every action it uses is SHA-pinned.
-- The two e2e builds run on separate runners, so they cannot collide on `E2E_STATE` or ports.
+- Toolchain setup is the local composite action `.github/actions/setup` (loads `tools.env`, then installs Go and, on request, golangci-lint, Node plus `npm ci`, and TinyGo with the tarball cache described above). Jobs opt in to each tool, so `test` does not pay for TinyGo or Node, and only `build` pays for TinyGo. It is first-party code in this repository, and every action it uses is SHA-pinned.
+- **The `worker-build` artifact is trusted because of how it is scoped.** The caches above are rejected as untrusted because any pull request can write one that a later run on another ref reads. A workflow artifact is different: it is created and consumed inside one workflow run, by jobs that all check out the same commit, and it expires after a day, so a pull request cannot hand a binary to someone else's run. Keep it that way: never download an artifact from another run or workflow (no `run-id`, no `github-token` input), never publish it, and never add a cross-run cache of `build/`. Upload and download use the first-party `actions/upload-artifact` and `actions/download-artifact`, SHA-pinned like the rest.
+- **`PREBUILT=1`.** The `size` and `e2e` jobs have no TinyGo, so they pass `PREBUILT=1`: if `build/` is missing or older than its sources, make fails with a message instead of trying to rebuild or quietly testing something else. Downloaded files are newer than the checkout, so this does not normally trigger. Locally, leave it unset.
+- The e2e job runs on its own runner, so it cannot collide on `E2E_STATE` or ports.
 - **One required check.** The `CI` job (`needs` every other job, `if: always()`) fails unless every needed job succeeded; cancelled and skipped count as failures. Branch protection on `main` requires only `CI`, so adding a job means adding it to the `needs` list in `ci.yml`, not changing repository settings. A job missing from `needs` is not gated, so keep the list complete.
 - Vulnerability scanning and pin upkeep run on a schedule instead, in `.github/workflows/scheduled.yml`.
 

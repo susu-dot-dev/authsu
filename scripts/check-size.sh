@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Builds the production Worker wasm with TinyGo, reports where the bytes go, and
-# fails if it is over budget or links a forbidden package. See docs/devops.md
-# ("Wasm size budget").
+# Reports where the bytes of the production Worker wasm go, and fails if it is
+# over budget or links a forbidden package. See docs/devops.md ("Wasm size
+# budget").
+#
+# It does not build anything: `make size` builds build/app.wasm and the
+# `tinygo -size full` report once (the same build e2e uses; CI builds them in
+# its `build` job and passes them along as an artifact) and hands them in.
 #
 # Gates (fail the check):
 #   - raw wasm size above MAX_WASM_BYTES
@@ -14,9 +18,11 @@
 #   MAX_WASM_BYTES  raw budget in bytes (default below); raise it deliberately
 #                   in a PR when a feature justifies it
 #   TOP             how many packages to list (default 15)
-#   SIZE_REPORT     if set, read this `tinygo -size full` table instead of
-#                   building (used to test the parser); also needs WASM_BYTES
-#   WASM_BYTES      raw size to use with SIZE_REPORT
+#   WASM            path to the built production wasm (required, unless
+#                   WASM_BYTES is given)
+#   SIZE_REPORT     path to the `tinygo -size full` table (required)
+#   WASM_BYTES      raw size to use instead of measuring WASM (used to test the
+#                   parser against a canned report)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,18 +41,16 @@ FORBID=(testing net/http/httptest)
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-if [ -n "${SIZE_REPORT:-}" ]; then
-  cp "$SIZE_REPORT" "$tmp/size.txt"
-  raw="${WASM_BYTES:?WASM_BYTES is required with SIZE_REPORT}"
+: "${SIZE_REPORT:?SIZE_REPORT is required (make size builds it)}"
+cp "$SIZE_REPORT" "$tmp/size.txt"
+
+if [ -n "${WASM_BYTES:-}" ]; then
+  raw="$WASM_BYTES"
   gz="n/a"
 else
-  # Production configuration: no build tags. Put the repo-local TinyGo (from
-  # `npm run setup:ci`) first on PATH when present, as `npm run build` does.
-  PATH="$PWD/.tools/tinygo/bin:$PATH"
-  tinygo build -o "$tmp/app.wasm" -target wasm -no-debug ./cmd/worker
-  tinygo build -o "$tmp/full.wasm" -target wasm -size full ./cmd/worker >"$tmp/size.txt" 2>&1
-  raw=$(stat -c %s "$tmp/app.wasm")
-  gz=$(gzip -9 -c "$tmp/app.wasm" | wc -c)
+  : "${WASM:?WASM is required (make size builds it)}"
+  raw=$(stat -c %s "$WASM")
+  gz=$(gzip -9 -c "$WASM" | wc -c)
 fi
 
 # One row per package from the `-size full` table: "<flash> <import path>".
