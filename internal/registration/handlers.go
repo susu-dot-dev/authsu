@@ -31,6 +31,9 @@ const (
 	CodeInvalidCredential  = "invalid_credential" //nolint:gosec // an error code, not a credential
 	CodeRegistrationFailed = "registration_failed"
 	CodeAcceptFailed       = "registration_accept_failed"
+	// CodeAcceptRejected is a write the schema's own rules refused (a CHECK or
+	// FOREIGN KEY): the code let through something the database would not.
+	CodeAcceptRejected = "registration_accept_rejected"
 )
 
 const (
@@ -458,16 +461,25 @@ func (s *Service) accept(ctx context.Context, in accepted) (FinishResponse, erro
 	return FinishResponse{UserID: userID, Role: in.role}, nil
 }
 
-// acceptError classifies a failed batch. A refused write is the client's to
-// resolve (the invitation was used up, or this attempt was a replay), and
-// anything else is the database being unavailable.
+// acceptError classifies a failed batch by why the database refused it:
+//
+//   - a conflict (a unique value already taken, or the required user row not
+//     there) is the client's to resolve: the invitation was used up, or this
+//     attempt was a replay, so 409;
+//   - a rejection (a CHECK or FOREIGN KEY, the schema's backstop for input the
+//     code should have refused) is a defect on our side, so 500 under its own
+//     code, which a log line or an alert can single out;
+//   - anything else is the database being unavailable, so 503.
 func acceptError(err error) error {
-	if errors.Is(err, atomic.ErrConflict) {
+	switch {
+	case errors.Is(err, atomic.ErrConflict):
 		return fail(err, apierr.Conflict, CodeAcceptFailed,
 			"registration could not be completed: the invitation was already used or this registration was already submitted")
+	case errors.Is(err, atomic.ErrRejected):
+		return fail(err, apierr.Internal, CodeAcceptRejected, "internal error")
+	default:
+		return fail(err, apierr.Unavailable, CodeAcceptFailed, "registration is temporarily unavailable")
 	}
-
-	return fail(err, apierr.Unavailable, CodeAcceptFailed, "registration is temporarily unavailable")
 }
 
 // fail builds a classified error. It goes through apierr.Wrap, which keeps the

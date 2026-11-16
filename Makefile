@@ -11,6 +11,10 @@ include tools.env
 # Local D1 state (git-ignored via .wrangler). Dev and e2e use different
 # directories so e2e can wipe its own state without touching dev data.
 DEV_STATE := .wrangler/state
+# Relying party values for `make dev`, passed as --var so they override the
+# deployment's RP_* in wrangler.jsonc. The origin must match DEV_PORT.
+DEV_PORT := 8787
+DEV_RP_VARS := --var RP_ID:localhost --var RP_ORIGIN:http://localhost:$(DEV_PORT) --var 'RP_NAME:authsu dev'
 
 # E2E uses its own state, never the dev state.
 E2E_STATE := .wrangler/e2e-state
@@ -151,11 +155,11 @@ db-reset: ## Delete local dev database state
 	rm -rf $(DEV_STATE)
 
 .PHONY: dev
-dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1)
+dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1, localhost RP)
 	@# wrangler's own rebuild leaves a dev wasm in build/; mark it stale on exit
 	@# (even on Ctrl-C) so size and e2e never mistake it for a production build.
 	trap 'touch -d @0 $(WASM) 2>/dev/null; true' EXIT; \
-	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --persist-to $(DEV_STATE)
+	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_RP_VARS)
 
 # ---- configuration ----------------------------------------------------------
 # Registration's AUTH_HMAC_SECRET (secret) and RP_ID, RP_ORIGIN, RP_NAME (vars).

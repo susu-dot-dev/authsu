@@ -21,8 +21,9 @@
 	/**
 	 * Relying party configuration for passkeys. RP_ID is permanent: a passkey
 	 * is bound to it, so changing it invalidates every registered passkey.
-	 * Set them to your deployment's real domain before the first registration.
-	 * `make dev` and the e2e tests override them with localhost values.
+	 * Set them to your deployment's real domain before the first registration
+	 * (make config-set-vars). `make dev` and the e2e tests override them with
+	 * localhost values, so the values here never apply to local runs.
 	 * AUTH_HMAC_SECRET is a Worker secret (npx wrangler secret put), never a var.
 	 */
 	"vars": {

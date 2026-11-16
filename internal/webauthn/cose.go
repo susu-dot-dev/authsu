@@ -67,6 +67,7 @@ func parseCOSEKey(dec decoder, data []byte) ([]byte, error) {
 	}
 
 	canonical, err := encodeCanonical(cbor.CTAP2EncOptions(), key)
+	// coverage:ignore: a coseKey always encodes under the fixed CTAP2 options
 	if err != nil {
 		return nil, err
 	}

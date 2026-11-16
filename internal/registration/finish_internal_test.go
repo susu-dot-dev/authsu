@@ -378,9 +378,15 @@ func TestFinishClassifiesBatchFailures(t *testing.T) {
 	tests := map[string]struct {
 		err      error
 		wantKind apierr.Kind
+		wantCode string
 	}{
-		"refused by a constraint": {err: errors.Join(atomic.ErrConflict, errDB), wantKind: apierr.Conflict},
-		"database unavailable":    {err: errDB, wantKind: apierr.Unavailable},
+		"conflict with existing data": {
+			err: errors.Join(atomic.ErrConflict, errDB), wantKind: apierr.Conflict, wantCode: CodeAcceptFailed,
+		},
+		"schema rule violated": {
+			err: errors.Join(atomic.ErrRejected, errDB), wantKind: apierr.Internal, wantCode: CodeAcceptRejected,
+		},
+		"database unavailable": {err: errDB, wantKind: apierr.Unavailable, wantCode: CodeAcceptFailed},
 	}
 
 	for name, tt := range tests {
@@ -393,7 +399,7 @@ func TestFinishClassifiesBatchFailures(t *testing.T) {
 
 			_, _, err := finish(t, fix, getenv(nil), req)
 
-			wantFailure(t, err, tt.wantKind, CodeAcceptFailed)
+			wantFailure(t, err, tt.wantKind, tt.wantCode)
 
 			if !errors.Is(err, errDB) {
 				t.Errorf("error %v does not keep the cause for the log", err)

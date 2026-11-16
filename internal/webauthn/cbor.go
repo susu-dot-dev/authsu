@@ -99,8 +99,8 @@ func (d decoder) requireCanonical(data []byte) error {
 	}
 
 	again, err := d.canonical.Marshal(value)
+	// coverage:ignore: every value the decoder produces (maps, strings, integers, simple values) encodes
 	if err != nil {
-		// coverage:ignore: every value the decoder produces (maps, strings, integers, simple values) encodes
 		return fmt.Errorf("re-encode: %w", err)
 	}
 
