@@ -168,15 +168,17 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 
 ## End-to-end tests
 
-- Written in Go under `e2e/`, build tag `e2e`, so they are excluded from `go test ./...`.
-- The Makefile builds the real Worker (TinyGo to wasm) first. The harness then:
-  1. wipes a throwaway state directory,
-  2. applies migrations,
-  3. starts `wrangler dev --local` in its own process group on a fixed port,
-  4. waits for readiness, drives the Worker over HTTP, and kills the process group on exit.
-- Run twice: `make test-e2e` against the **dev build** (all flags on) and `make test-e2e-prod` against the **production build**, where dev-only behaviour must be provably unreachable.
+- Written in Go under `e2e/`, build tag `e2e`, so they are excluded from `go test ./...` (and so from coverage). `make vet` and `make lint` still check them with `-tags e2e`.
+- **The Makefile decides the build, the harness only runs it.** `make test-e2e` builds the Worker (TinyGo to wasm) with `DEV_TAGS` and passes the same tags to the harness as `E2E_GO_TAGS`. Wrangler re-runs `build.command` on every `wrangler dev` start, so the harness exports `GO_TAGS=$E2E_GO_TAGS` to it; otherwise wrangler would silently rebuild a different binary than the one just built. The tag list therefore lives only in the Makefile (`DEV_TAGS`).
+- The harness then:
+  1. wipes `E2E_STATE` (default `.wrangler/e2e-state`) and applies every migration to a fresh local D1,
+  2. starts `wrangler dev --local` in its own process group on OS-chosen free ports (no collision with `make dev` or a parallel run),
+  3. polls `/healthz` until the Worker answers, runs the tests over HTTP, and on exit signals the whole process group so wrangler and workerd never leak. On a failing run it prints wrangler's output.
+- Run twice: `make test-e2e` against the **dev build** (`DEV_TAGS` on) and `make test-e2e-prod` against the **production build** (no tags). Tests that depend on a flag must assert both sides, so the production run proves dev-only behaviour is absent.
 - E2E exists for what the host cannot see: TinyGo `net/http` differences (notably `http.ServeMux` never matches method-qualified patterns like `"GET /x"`; use plain paths and dispatch on `r.Method`), the D1 driver, real SQLite behaviour, and Wrangler wiring.
 - Dev and e2e use separate state directories so tests never touch data created while developing.
+- **Linting:** e2e code is linted like everything else, except that `gosec` is excluded under `e2e/` (see `.golangci.yml`): the harness launches `npx` and clears a state directory named by an environment variable by design. The one process-wide fixture (`target`) carries a `//nolint:gochecknoglobals` with its reason.
+- **Current coverage of behaviour:** `/healthz` only (status, body, wrong method, unknown path). Flag assertions (`/debug/info` present in dev, absent in prod) are not tested yet, so nothing automatically proves the production build omits dev routes until a test asserts it.
 
 ## Continuous integration
 
@@ -191,7 +193,7 @@ GitHub Actions, Linux only (`ubuntu-24.04`). Triggers: push to `main` and pull r
 - `golangci-lint` is installed by `golangci/golangci-lint-action` in `install-only` mode, with the version taken from `tools.env`; `make lint` does the actual run, so CI and local use the same command. The action downloads the binary without a checksum pin, which is an accepted trade-off for this one third-party action.
 - CI loads `tools.env` into the job environment (`cat tools.env >> "$GITHUB_ENV"`), so versions and checksums are never duplicated in the workflow.
 
-**Jobs:** a `check` job that runs `make ci` (`make check`, which is tool versions, format, tidy check, vet, lint, unit tests and the coverage gate, plus the wasm size budget; later also govulncheck) and an `e2e` job (dev and prod builds) once the e2e harness exists. Both are required status checks on `main` via branch protection.
+**Jobs:** a `check` job that runs `make ci` (`make check`, which is tool versions, format, tidy check, vet, lint, unit tests and the coverage gate, plus the wasm size budget and both e2e runs; later also govulncheck). A separate `e2e` job is a later optimisation if CI time warrants it. The job is a required status check on `main` via branch protection.
 
 ## Cloudflare Workers Builds
 

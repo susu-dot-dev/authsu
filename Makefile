@@ -12,6 +12,9 @@ include tools.env
 # directories so e2e can wipe its own state without touching dev data.
 DEV_STATE := .wrangler/state
 
+# E2E uses its own state and builds, never the dev state.
+E2E_STATE := .wrangler/e2e-state
+
 # Tags for dev builds and local development. Never used by `deploy`.
 DEV_TAGS := debug_routes
 
@@ -53,9 +56,10 @@ fmt-check: ## Fail if Go code is not gofmt-clean
 	@out="$$(gofmt -s -l $(GO_FILES))"; if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 .PHONY: vet
-vet: ## go vet on the host (prod and dev tags), plus the js/wasm entrypoint
+vet: ## go vet on the host (prod and dev tags, e2e), plus the js/wasm entrypoint
 	go vet ./...
 	go vet -tags "$(DEV_TAGS)" ./...
+	go vet -tags e2e ./e2e/...
 	GOOS=js GOARCH=wasm go vet ./cmd/worker
 	GOOS=js GOARCH=wasm go vet -tags "$(DEV_TAGS)" ./cmd/worker
 
@@ -86,9 +90,10 @@ size: ## Production wasm size report + budget (fails if over budget or test pkgs
 	./scripts/check-size.sh
 
 .PHONY: lint
-lint: ## golangci-lint (host prod and dev tags, and the js/wasm entrypoint)
+lint: ## golangci-lint (host prod and dev tags, e2e, and the js/wasm entrypoint)
 	golangci-lint run ./...
 	golangci-lint run --build-tags "$(DEV_TAGS)" ./...
+	golangci-lint run --build-tags e2e ./e2e/...
 	GOOS=js GOARCH=wasm golangci-lint run ./cmd/worker
 	GOOS=js GOARCH=wasm golangci-lint run --build-tags "$(DEV_TAGS)" ./cmd/worker
 
@@ -114,9 +119,25 @@ db-reset: ## Delete local dev database state
 dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1)
 	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --persist-to $(DEV_STATE)
 
+# ---- end-to-end tests -------------------------------------------------------
+# Builds the real Worker (TinyGo -> wasm), starts `wrangler dev` (workerd with a
+# simulated D1) on a throwaway state directory and a free port, and drives it
+# over HTTP. The Makefile decides the build tags; the harness only runs what was
+# built and hands the same tags to wrangler's own rebuild.
+
+.PHONY: test-e2e
+test-e2e: ## End-to-end tests against the dev build (DEV_TAGS)
+	GO_TAGS="$(DEV_TAGS)" npm run build
+	E2E_STATE=$(E2E_STATE) E2E_GO_TAGS="$(DEV_TAGS)" go test -tags e2e -count=1 -timeout 5m ./e2e/...
+
+.PHONY: test-e2e-prod
+test-e2e-prod: ## End-to-end tests against the production build (no tags)
+	GO_TAGS= npm run build
+	E2E_STATE=$(E2E_STATE) E2E_GO_TAGS= go test -tags e2e -count=1 -timeout 5m ./e2e/...
+
 .PHONY: clean
 clean: ## Remove build outputs
-	rm -rf build $(COVER_OUT) coverage.html
+	rm -rf build $(COVER_OUT) coverage.html $(E2E_STATE)
 
 # ---- aggregate --------------------------------------------------------------
 
@@ -124,4 +145,4 @@ clean: ## Remove build outputs
 check: check-tools fmt-check tidy-check vet lint test coverage ## Fast pre-commit gate (no wasm build, no e2e)
 
 .PHONY: ci
-ci: check size ## Everything CI runs
+ci: check size test-e2e test-e2e-prod ## Everything CI runs

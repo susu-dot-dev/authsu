@@ -45,6 +45,16 @@ linters:
       # package-private access is a visible, deliberate exception.
       skip-regexp: (export|internal)_test\.go
 
+  exclusions:
+    rules:
+      # The e2e harness is test tooling that, by design, launches `npx`
+      # (G204) and clears a state directory named by an env var (G703). Its
+      # inputs come from the Makefile and the developer's environment, never
+      # from a request.
+      - path: ^e2e/
+        linters:
+          - gosec
+
 formatters:
   enable: []
 
