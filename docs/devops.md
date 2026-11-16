@@ -165,11 +165,23 @@ GitHub Actions, Linux only (`ubuntu-24.04`). Triggers: push to `main` and pull r
 
 - `permissions: contents: read`, `persist-credentials: false`, no secrets, no deploy step.
 - Only first-party `actions/*` plus [`golangci/golangci-lint-action`](https://github.com/golangci/golangci-lint-action) are allowed. All are pinned to full commit SHAs with the version in a trailing comment. Other third-party actions need explicit maintainer approval. TinyGo is **not** installed via a third-party action.
-- TinyGo is downloaded from the official release URL and verified against a SHA-256 pinned in `tools.env`.
+- TinyGo is installed by `scripts/install-tinygo.sh` (`npm run setup:ci`): it downloads the official release into `.tools/tinygo` (git-ignored), verifies it against the SHA-256 pinned in `tools.env`, and is idempotent. `npm run build` puts `.tools/tinygo/bin` on `PATH` when present, so `npm run setup:ci && npm run build` works without any PATH plumbing. CI and Cloudflare Workers Builds use the same script.
 - Go comes from `go.mod` via `actions/setup-go`. Node is 22, and dependencies install with `npm ci --ignore-scripts`.
-- The `golangci-lint` version comes from `tools.env`.
+- `golangci-lint` is installed by `golangci/golangci-lint-action` in `install-only` mode, with the version taken from `tools.env`; `make lint` does the actual run, so CI and local use the same command. The action downloads the binary without a checksum pin, which is an accepted trade-off for this one third-party action.
+- CI loads `tools.env` into the job environment (`cat tools.env >> "$GITHUB_ENV"`), so versions and checksums are never duplicated in the workflow.
 
-**Jobs:** a `check` job (format, lint, unit tests, coverage gate, tidy check, size budget, govulncheck) and an `e2e` job (dev and prod builds). Both are required status checks on `main` via branch protection.
+**Jobs:** a `check` job that runs `make check` (tool versions, format, tidy check, vet, lint, unit tests, coverage gate; later also the size budget and govulncheck) and an `e2e` job (dev and prod builds) once the e2e harness exists. Both are required status checks on `main` via branch protection.
+
+## Cloudflare Workers Builds
+
+Workers Builds clones the repository and runs the dashboard build and deploy commands. Its image has Go (fetched per `go.mod`) and Node but no TinyGo, and it ignores the `build` section of `wrangler.jsonc`. Configure the project (Settings > Build) with:
+
+| Setting | Value |
+|---|---|
+| Build command | `npm run setup:ci && npm run build` |
+| Deploy command | `npx wrangler deploy` |
+
+TinyGo's version and checksum come from `tools.env`, so bumping it there updates CI and Cloudflare together.
 
 ## Tool versions
 

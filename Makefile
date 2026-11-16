@@ -37,13 +37,17 @@ check-tools: ## Verify local tool versions match tools.env
 
 # ---- quality ----------------------------------------------------------------
 
+# Go files to format: tracked plus untracked-but-not-ignored, so .gitignore
+# keeps .tools/, node_modules/ and build/ out, and new files are still checked.
+GO_FILES = $$(git ls-files --cached --others --exclude-standard -- '*.go')
+
 .PHONY: fmt
 fmt: ## Format Go code
-	gofmt -s -w .
+	gofmt -s -w $(GO_FILES)
 
 .PHONY: fmt-check
 fmt-check: ## Fail if Go code is not gofmt-clean
-	@out="$$(gofmt -s -l .)"; if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
+	@out="$$(gofmt -s -l $(GO_FILES))"; if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 .PHONY: vet
 vet: ## go vet on the host, plus a compile check of the js/wasm entrypoint
@@ -67,6 +71,10 @@ coverage: ## Unit tests + 100% coverage gate (honours // coverage:ignore: <reaso
 coverage-html: ## Write coverage.html from the last `make coverage`
 	go tool cover -html=$(COVER_OUT) -o coverage.html
 	@echo "wrote coverage.html"
+
+.PHONY: tidy-check
+tidy-check: ## Fail if go.mod/go.sum are not tidy
+	go mod tidy -diff
 
 .PHONY: lint
 lint: ## golangci-lint (host, dev tags if any, and the js/wasm entrypoint)
@@ -95,4 +103,4 @@ clean: ## Remove build outputs
 # ---- aggregate --------------------------------------------------------------
 
 .PHONY: check
-check: check-tools fmt-check vet lint test coverage ## Fast pre-commit gate (no wasm build, no e2e)
+check: check-tools fmt-check tidy-check vet lint test coverage ## Fast pre-commit gate (no wasm build, no e2e)
