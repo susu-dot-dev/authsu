@@ -45,6 +45,14 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
+      # Cache only the downloaded tarball (not the extracted tree): a cache is
+      # unsigned, and install-tinygo.sh re-verifies the tarball against the
+      # SHA-256 in tools.env on every run, so a bad cache entry is discarded.
+      - name: Cache TinyGo download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/cache
+          key: tinygo-${{ runner.os }}-${{ env.TINYGO_VERSION }}-${{ env.TINYGO_LINUX_AMD64_SHA256 }}
       - name: Install TinyGo (checksum-verified, pinned in tools.env)
         run: npm run setup:ci
       - run: echo "$PWD/.tools/tinygo/bin" >> "$GITHUB_PATH"
