@@ -48,4 +48,4 @@ jobs:
       - name: Install TinyGo (checksum-verified, pinned in tools.env)
         run: npm run setup:ci
       - run: echo "$PWD/.tools/tinygo/bin" >> "$GITHUB_PATH"
-      - run: make check
+      - run: make ci

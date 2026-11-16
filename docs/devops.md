@@ -142,13 +142,15 @@ A flag is a Go build tag. The default build is production with every flag off.
 
 ## Wasm size budget
 
-Cloudflare limits compressed Worker size, and binary size also drives cold-start cost. `make size`:
+The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size limit) is far above what this Worker needs, so the budget is a regression guard rather than a platform-limit guard. Binary size drives parse and startup cost, and a jump is the earliest signal that a heavy package got linked in by accident (for example, using `encoding/json` adds roughly 700 KB under TinyGo).
 
-- Builds the production wasm with TinyGo (`-no-debug`, no tags) and reports raw and gzip sizes.
-- **Fails on absolute budgets** for raw and gzip size, set with headroom below the platform limit.
-- **Fails if forbidden packages are linked in:** `testing` and `net/http/httptest`.
-- Reports the top packages by flash (`tinygo -size full`) and which watched packages are linked (`net/http`, `encoding/json`, `reflect`, `fmt`, `database/sql`, `crypto/x509`, `crypto/tls`, `log/slog`).
-- Prints the delta against a committed baseline file as information. The baseline does not gate; `make size-update` rewrites it.
+`make size` (`scripts/check-size.sh`):
+
+- Builds the production wasm with TinyGo (`-no-debug`, no tags).
+- **Fails if the raw size exceeds `MAX_WASM_BYTES`** (currently 1,400,000 bytes, about 1.5x the initial size of 923 KB). The budget is raised deliberately, in the PR that justifies it, by editing the default in `scripts/check-size.sh`.
+- **Fails if a forbidden package is linked in:** `testing` and `net/http/httptest`, matched as whole import paths.
+- Reports, without gating: gzip size, the top packages by flash, and which watched packages are linked, so a reviewer sees a newly linked heavy dependency. The watch list (`encoding/json`, `database/sql`, `crypto/tls`, `log/slog`) holds only heavy packages that are not in the baseline build. Packages already linked through workers-go and `net/http` (`net/http`, `reflect`, `fmt`, `crypto/x509`, `math/big`) are deliberately left off, since they would always print and hide real changes; add a package to `WATCH` when it is worth noticing.
+- Only raw size gates. Wrangler's bundle size (wasm plus JS glue and source map) is not gated.
 
 ## D1 migrations
 
@@ -183,7 +185,7 @@ GitHub Actions, Linux only (`ubuntu-24.04`). Triggers: push to `main` and pull r
 - `golangci-lint` is installed by `golangci/golangci-lint-action` in `install-only` mode, with the version taken from `tools.env`; `make lint` does the actual run, so CI and local use the same command. The action downloads the binary without a checksum pin, which is an accepted trade-off for this one third-party action.
 - CI loads `tools.env` into the job environment (`cat tools.env >> "$GITHUB_ENV"`), so versions and checksums are never duplicated in the workflow.
 
-**Jobs:** a `check` job that runs `make check` (tool versions, format, tidy check, vet, lint, unit tests, coverage gate; later also the size budget and govulncheck) and an `e2e` job (dev and prod builds) once the e2e harness exists. Both are required status checks on `main` via branch protection.
+**Jobs:** a `check` job that runs `make ci` (`make check`, which is tool versions, format, tidy check, vet, lint, unit tests and the coverage gate, plus the wasm size budget; later also govulncheck) and an `e2e` job (dev and prod builds) once the e2e harness exists. Both are required status checks on `main` via branch protection.
 
 ## Cloudflare Workers Builds
 

@@ -77,6 +77,10 @@ coverage-html: ## Write coverage.html from the last `make coverage`
 tidy-check: ## Fail if go.mod/go.sum are not tidy
 	go mod tidy -diff
 
+.PHONY: size
+size: ## Production wasm size report + budget (fails if over budget or test pkgs linked)
+	./scripts/check-size.sh
+
 .PHONY: lint
 lint: ## golangci-lint (host prod and dev tags, and the js/wasm entrypoint)
 	golangci-lint run ./...
@@ -106,3 +110,6 @@ clean: ## Remove build outputs
 
 .PHONY: check
 check: check-tools fmt-check tidy-check vet lint test coverage ## Fast pre-commit gate (no wasm build, no e2e)
+
+.PHONY: ci
+ci: check size ## Everything CI runs
