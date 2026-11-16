@@ -13,6 +13,10 @@ import (
 	"net/http"
 	"time"
 	"uuid"
+
+	"github.com/susu-dot-dev/authsu/internal/apierr"
+	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
 // InvitationType is the invitations.type of the first-run invitation.
@@ -44,41 +48,42 @@ const (
 	StatusInvitationAccepted Status = "invitation_accepted"
 )
 
-// Handler returns the handler for Path. getenv reads deploy-time secrets; it is
-// called per request, because the Worker's environment only exists while a
-// request is handled.
-//
-// The response never contains the code or the secret. The body is written by
-// hand rather than with encoding/json, which would add hundreds of KB to the
-// TinyGo binary; the status values are fixed ASCII constants, so no escaping
-// is needed.
-func Handler(db *sql.DB, getenv func(string) string) http.Handler {
+// Handler returns the GET /api/first-run handler. getenv reads deploy-time
+// secrets; it is called per request, because the Worker's environment only
+// exists while a request is handled. The response never contains the code or
+// the secret.
+func Handler(db *sql.DB, getenv func(string) string) httpapi.Handler {
 	return newService(db, time.Now).handler(getenv)
 }
 
-func (s *service) handler(getenv func(string) string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+// Error codes. Each failing step has its own, so a log line or an alert names
+// the step. They are stable: clients and dashboards may match on them.
+const (
+	CodeUsersCheckFailed      = "first_run_users_check_failed"
+	CodeInvitationCheckFailed = "first_run_invitation_check_failed"
+	CodeMintFailed            = "first_run_mint_failed"
+)
 
-			return
-		}
+// unavailable classifies a database failure in the step named by code. The
+// database erroring is the service being unavailable, not a fault in the
+// request, and the client can only retry. The description is fixed text; the
+// SQL error stays in the cause, which only the log sees.
+func unavailable(code string, err error) error {
+	return apierr.Wrap(err, apierr.Unavailable, code, "first-run status is temporarily unavailable")
+}
 
-		status, err := s.check(r.Context(), getenv)
+// statusBody is the JSON response body.
+type statusBody struct {
+	Status Status `json:"status"`
+}
 
-		w.Header().Set("Cache-Control", "no-store")
-
-		if err != nil {
-			// The error can name tables and SQL; keep it out of the response.
-			http.Error(w, "internal error", http.StatusInternalServerError)
-
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"` + string(status) + `"}` + "\n"))
-	})
+func (s *service) handler(getenv func(string) string) httpapi.Handler {
+	return func(req httpapi.Request) result.Result[httpapi.Response] {
+		return result.Of(s.check(req.Context, getenv)).
+			Map(func(status Status) httpapi.Response {
+				return httpapi.JSON(http.StatusOK, statusBody{Status: status})
+			})
+	}
 }
 
 type service struct {
@@ -91,18 +96,6 @@ func newService(db *sql.DB, now func() time.Time) *service {
 	return &service{db: db, now: now}
 }
 
-// check reports the first-run status. getenv reads deploy-time secrets; it is
-// not called once a user exists, so a leftover FIRST_RUN_SECRET is inert.
-//
-// Every value, including the invitation type and label, is bound as a
-// parameter. SQL text is never built by concatenation, even from constants.
-//
-// When the secret is valid and no first-run invitation exists yet, check tries
-// to mint it. That write is derived only from configuration and conditional on
-// the system still being empty. The status reflects what that statement did:
-// if it inserted, the invitation is pending; if the condition refused it (a
-// racing request minted first, or an invitation of another type exists), no
-// invitation was minted from this secret, so the owner is not told it is.
 func (s *service) check(ctx context.Context, getenv func(string) string) (Status, error) {
 	var users bool
 
@@ -110,7 +103,7 @@ func (s *service) check(ctx context.Context, getenv func(string) string) (Status
 		`SELECT EXISTS (SELECT 1 FROM users)`,
 	).Scan(&users)
 	if err != nil {
-		return "", fmt.Errorf("check for users: %w", err)
+		return "", unavailable(CodeUsersCheckFailed, fmt.Errorf("check for users: %w", err))
 	}
 
 	if users {
@@ -124,7 +117,7 @@ func (s *service) check(ctx context.Context, getenv func(string) string) (Status
 		InvitationType,
 	).Scan(&pending)
 	if err != nil {
-		return "", fmt.Errorf("check for first-run invitation: %w", err)
+		return "", unavailable(CodeInvitationCheckFailed, fmt.Errorf("check for first-run invitation: %w", err))
 	}
 
 	if pending {
@@ -179,7 +172,7 @@ func (s *service) mint(ctx context.Context, code string) (bool, error) {
 	}
 
 	if err != nil {
-		return false, fmt.Errorf("mint first-run invitation: %w", err)
+		return false, unavailable(CodeMintFailed, fmt.Errorf("mint first-run invitation: %w", err))
 	}
 
 	return true, nil

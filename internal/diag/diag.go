@@ -7,42 +7,52 @@
 package diag
 
 import (
-	"fmt"
 	"net/http"
 	"runtime"
+
+	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
-// Diagnostics registers diagnostic routes on a mux.
+// Router registers a handler for a path and the one method it accepts. It is
+// implemented by the app, so diagnostics go through the same request and error
+// handling as every other route.
+type Router interface {
+	Handle(method, path string, handler httpapi.Handler)
+}
+
+// Diagnostics registers diagnostic routes on a Router.
 type Diagnostics interface {
-	// Register adds this implementation's routes to mux. It may add none.
-	Register(mux *http.ServeMux)
+	// Register adds this implementation's routes to router. It may add none.
+	Register(router Router)
 }
 
 // Off registers nothing. It is the production implementation.
 type Off struct{}
 
 // Register implements Diagnostics.
-func (Off) Register(*http.ServeMux) {}
+func (Off) Register(Router) {}
 
 // On registers developer-only routes. It must never be wired into a
 // production build.
 type On struct{}
 
 // Register implements Diagnostics.
-func (On) Register(mux *http.ServeMux) {
-	mux.HandleFunc("/debug/info", info)
+func (On) Register(router Router) {
+	router.Handle(http.MethodGet, "/debug/info", info)
 }
 
-func info(writer http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet && req.Method != http.MethodHead {
-		writer.Header().Set("Allow", "GET, HEAD")
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+// infoBody is the JSON response body of /debug/info.
+type infoBody struct {
+	DebugRoutes string `json:"debugRoutes"`
+	Go          string `json:"go"`
+	Platform    string `json:"platform"`
+}
 
-		return
-	}
-
-	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	writer.Header().Set("Cache-Control", "no-store")
-	_, _ = fmt.Fprintf(writer, "debug_routes=on\ngo=%s\nplatform=%s/%s\n",
-		runtime.Version(), runtime.GOOS, runtime.GOARCH)
+func info(httpapi.Request) result.Result[httpapi.Response] {
+	return result.Ok(httpapi.JSON(http.StatusOK, infoBody{
+		DebugRoutes: "on",
+		Go:          runtime.Version(),
+		Platform:    runtime.GOOS + "/" + runtime.GOARCH,
+	}))
 }

@@ -13,7 +13,9 @@ import (
 	"github.com/syumai/workers-go/cloudflare"
 	_ "github.com/syumai/workers-go/cloudflare/d1" // registers the "d1" database/sql driver
 
+	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/app"
+	"github.com/susu-dot-dev/authsu/internal/httpapi"
 )
 
 func main() {
@@ -26,6 +28,14 @@ func main() {
 
 	workers.Serve(app.NewHandler(
 		app.Deps{Diagnostics: diagnostics()},
-		app.Platform{DB: db, Getenv: cloudflare.Getenv},
+		app.Platform{DB: db, Getenv: cloudflare.Getenv, Log: logError},
 	))
+}
+
+// logError writes the full detail of a failed request, including the cause the
+// client never sees, to the Worker's log. The code comes first so a log search
+// or alert can key on it.
+func logError(req httpapi.Request, failure *apierr.Error) {
+	log.Printf("request failed: code=%s status=%d method=%s path=%s err=%v",
+		failure.Code, failure.Kind.Status(), req.Method, req.Path, failure)
 }
