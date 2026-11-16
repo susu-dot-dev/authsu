@@ -157,6 +157,24 @@ dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1)
 	trap 'touch -d @0 $(WASM) 2>/dev/null; true' EXIT; \
 	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --persist-to $(DEV_STATE)
 
+# ---- configuration ----------------------------------------------------------
+# Registration's AUTH_HMAC_SECRET (secret) and RP_ID, RP_ORIGIN, RP_NAME (vars).
+# See docs/devops.md, "Secrets and variables". scripts/config.sh does the work.
+
+.PHONY: config-get
+config-get: ## Show the RP_* vars, whether AUTH_HMAC_SECRET is set (never its value)
+	@./scripts/config.sh get
+
+.PHONY: config-set-vars
+config-set-vars: ## Write the RP_* vars into wrangler.jsonc: RP_ID=... RP_ORIGIN=... RP_NAME=...
+	@[ -n "$(RP_ID)" ] && [ -n "$(RP_ORIGIN)" ] && [ -n "$(RP_NAME)" ] || { \
+	  echo 'usage: make config-set-vars RP_ID=auth.example.com RP_ORIGIN=https://auth.example.com RP_NAME="My Auth"'; exit 2; }
+	@./scripts/config.sh set-vars "$(RP_ID)" "$(RP_ORIGIN)" "$(RP_NAME)"
+
+.PHONY: config-set-secret
+config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for .dev.vars, ARGS=--stdin to supply one)
+	@./scripts/config.sh set-secret $(ARGS)
+
 # ---- end-to-end tests -------------------------------------------------------
 # Runs the real production Worker: the prebuilt wasm under `wrangler dev`
 # (workerd with a simulated D1) on a throwaway state directory and a free port,

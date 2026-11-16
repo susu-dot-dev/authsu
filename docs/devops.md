@@ -28,6 +28,7 @@ authsu is a Go service compiled with TinyGo to WebAssembly and run as a Cloudfla
 | `make build` | Production build into `build/`, skipped when `build/` is up to date |
 | `make build-dev` | Dev build (all dev flags on) |
 | `make dev` | Run the Worker locally with local D1 |
+| `make config-get` / `config-set-vars` / `config-set-secret` | Read and set `AUTH_HMAC_SECRET` and `RP_ID`, `RP_ORIGIN`, `RP_NAME` (see Secrets and variables) |
 | `make test-e2e` | End-to-end tests against the production build under `wrangler dev` |
 | `make check` | Fast gate for the edit loop (no wasm build, no e2e) |
 | `make ci` | Everything CI runs. Slow: run it once, as the final pass before committing |
@@ -193,6 +194,31 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 | `RP_ID` | var | WebAuthn relying party ID. **Permanent**: a passkey is bound to it, so changing it invalidates every registered passkey |
 | `RP_ORIGIN` | var | The one origin registration ceremonies are accepted from, such as `https://auth.example.com`. Compared as an exact string |
 | `RP_NAME` | var | Relying party name the browser shows |
+
+**How Cloudflare stores them.** To the Worker there is no difference: both arrive as string properties on `env`, and `workers-go` reads them the same way. The difference is in storage and visibility.
+
+| | var | secret |
+|---|---|---|
+| Declared in | `vars` in `wrangler.jsonc`, so it is in git and ships with every deploy | Not in any file. Set on the deployed Worker with `wrangler secret put`, `wrangler secret bulk`, or the dashboard |
+| Stored | Plaintext, as part of the Worker's configuration | Encrypted at rest on Cloudflare |
+| Readable afterwards | Yes: dashboard, `wrangler.jsonc`, deploy logs | No. The dashboard and Wrangler show the name only, and `wrangler secret list` returns names, never values |
+| Changing it | Edit the file and deploy | `wrangler secret put` creates a new Worker version and deploys it at once (`wrangler versions secret put` only creates the version, for gradual rollouts) |
+| Survives `wrangler deploy` | Replaced by whatever `wrangler.jsonc` says, so a dashboard edit to a var is overwritten | Kept. A deploy never touches secrets |
+| Local development | `vars` in `wrangler.jsonc` | `.dev.vars` (git-ignored), or `--env-file` as the e2e harness does |
+
+So `RP_*` belong in `wrangler.jsonc` (non-sensitive, and reviewable in git), and `AUTH_HMAC_SECRET` must never be a var. Cloudflare also has account-wide Secrets Store bindings; this project does not use them.
+
+**Helper commands.** `scripts/config.sh`, through `make`:
+
+| Command | What it does |
+|---|---|
+| `make config-get` | Prints the `RP_*` values from `wrangler.jsonc`, whether the Worker has `AUTH_HMAC_SECRET` (name only: its value cannot be read back), and whether `.dev.vars` has one |
+| `make config-set-vars RP_ID=auth.example.com RP_ORIGIN=https://auth.example.com RP_NAME="My Auth"` | Validates and writes the three vars into `wrangler.jsonc`, keeping its comments. Takes effect on the next `npx wrangler deploy` |
+| `make config-set-secret` | Generates 32 random bytes (43 base64url characters), and uploads them with `wrangler secret put`, which deploys a new version |
+| `make config-set-secret ARGS=--local` | The same, but writes `AUTH_HMAC_SECRET` into `.dev.vars` (mode 0600) for `make dev` |
+| `make config-set-secret ARGS=--stdin` | Uploads a secret you supply on stdin instead of generating one |
+
+The secret is passed to Wrangler on stdin, so it is never on a command line, never printed and never written to disk (except by `--local`, which is the point). The helpers refuse the two changes that cannot be undone, unless you opt in: replacing an existing `AUTH_HMAC_SECRET` (`CONFIRM_SECRET_ROTATE=1`; this invalidates every registration begun but not finished) and changing a non-`localhost` `RP_ID` (`CONFIRM_RP_ID_CHANGE=1`; this invalidates every registered passkey). `set-vars` also checks that `RP_ORIGIN` is an `https://` origin with no path (`http` only for localhost) and that `RP_ID` equals the origin's host or a parent domain of it.
 
 The `RP_*` defaults in `wrangler.jsonc` are `localhost` values, so a deployment must set them before the first registration. They are configuration and not derived from the request, because a `Host` header is attacker-influenced and a Worker is reachable on several hostnames. Registration answers 503 `registration_not_configured` while any of them is missing or `AUTH_HMAC_SECRET` is too short.
 

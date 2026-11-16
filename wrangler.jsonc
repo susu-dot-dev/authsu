@@ -26,9 +26,9 @@
 	 * AUTH_HMAC_SECRET is a Worker secret (npx wrangler secret put), never a var.
 	 */
 	"vars": {
-		"RP_ID": "localhost",
-		"RP_ORIGIN": "http://localhost:8787",
-		"RP_NAME": "authsu"
+		"RP_ID": "susu.dev",
+		"RP_ORIGIN": "https://auth.susu.dev",
+		"RP_NAME": "susu.dev"
 	},
 	"d1_databases": [
 		{
