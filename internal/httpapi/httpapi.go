@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
+	"reflect"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/result"
@@ -60,15 +60,26 @@ func JSON(status int, body any) Response {
 }
 
 // Decode parses the request body as a T. Malformed input is a BadRequest with
-// a code that says what was wrong. Unknown fields are rejected so a typo in a
+// a code that says what was wrong. Member names must match exactly and appear
+// once, and text must be valid UTF-8 (see checkStrict), so the body means the
+// same thing to every parser. Unknown members are rejected so a typo in a
 // client is not silently ignored.
 func Decode[T any](req Request) result.Result[T] {
 	var out T
 
+	strict := json.NewDecoder(bytes.NewReader(req.Body))
+	strict.UseNumber() // a number is checked, not converted, so none can overflow here
+
+	err := checkStrict(strict, reflect.TypeFor[T]())
+	if err != nil {
+		return result.Fail[T](decodeError(err))
+	}
+
 	decoder := json.NewDecoder(bytes.NewReader(req.Body))
+	// checkStrict has already refused unknown members; this is a backstop.
 	decoder.DisallowUnknownFields()
 
-	err := decoder.Decode(&out)
+	err = decoder.Decode(&out)
 	if err != nil {
 		return result.Fail[T](decodeError(err))
 	}
@@ -92,8 +103,13 @@ func decodeError(err error) *apierr.Error {
 		return apierr.New(apierr.BadRequest, "invalid_field_type", "a field has the wrong type").WithCause(err)
 	}
 
-	if strings.HasPrefix(err.Error(), "json: unknown field") {
+	switch {
+	case errors.Is(err, errUnknownMember):
 		return apierr.New(apierr.BadRequest, "unknown_field", "request body has an unknown field").WithCause(err)
+	case errors.Is(err, errDuplicateMember):
+		return apierr.New(apierr.BadRequest, "duplicate_field", "request body repeats a field").WithCause(err)
+	case errors.Is(err, errInvalidText):
+		return apierr.New(apierr.BadRequest, "invalid_text", "request body has text that is not valid UTF-8").WithCause(err)
 	}
 
 	return apierr.New(apierr.BadRequest, "invalid_json", "request body is not valid JSON").WithCause(err)

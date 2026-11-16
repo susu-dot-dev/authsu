@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -93,6 +94,9 @@ const (
 	helloBody    = "hello"
 	internalBody = `{"error":{"code":"internal","message":"internal error"}}` + "\n"
 	invalidJSON  = "invalid_json"
+	unknownField = "unknown_field"
+	invalidType  = "invalid_field_type"
+	invalidText  = "invalid_text"
 	notFoundBody = `{"error":{"code":"not_found","message":"no such route"}}` + "\n"
 )
 
@@ -385,8 +389,8 @@ func TestDecode(t *testing.T) {
 		"valid with nl":   {body: `{"code":"abc"}` + "\n", want: input{Code: queryValue}},
 		"malformed":       {body: `{`, wantCode: invalidJSON},
 		"empty":           {body: ``, wantCode: "empty_body"},
-		"unknown field":   {body: `{"code":"a","extra":1}`, wantCode: "unknown_field"},
-		"wrong type":      {body: `{"code":1}`, wantCode: "invalid_field_type"},
+		"unknown field":   {body: `{"code":"a","extra":1}`, wantCode: unknownField},
+		"wrong type":      {body: `{"code":1}`, wantCode: invalidType},
 		"trailing object": {body: `{"code":"a"}{"code":"b"}`, wantCode: "trailing_data"},
 	}
 
@@ -401,6 +405,124 @@ func TestDecode(t *testing.T) {
 			if tt.wantCode == "" {
 				if err != nil || got != tt.want {
 					t.Errorf("Decode = (%+v, %v), want (%+v, nil)", got, err, tt.want)
+				}
+
+				return
+			}
+
+			failure := apierr.As(err)
+			if failure.Kind != apierr.BadRequest || failure.Code != tt.wantCode {
+				t.Errorf("Decode error = (%d, %q), want (BadRequest, %q)", failure.Kind, failure.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+type nested struct {
+	Inner input `json:"inner"`
+}
+
+// TestDecodeIsStrict covers request bodies that encoding/json reads leniently:
+// it matches member names case-insensitively, keeps the last of a repeated
+// name, and replaces invalid UTF-8 with U+FFFD. Each means a body can say one
+// thing to another parser (a proxy, a log pipeline, a WAF) and another to us,
+// so each is refused. Member names are matched exactly.
+func TestDecodeIsStrict(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"name in another case":         `{"inner":{"CODE":"abc"}}`,
+		"name in mixed case":           `{"inner":{"Code":"abc"}}`,
+		"outer name in another case":   `{"INNER":{"code":"abc"}}`,
+		"repeated name":                `{"inner":{"code":"abc","code":"def"}}`,
+		"repeated name, same value":    `{"inner":{"code":"abc","code":"abc"}}`,
+		"repeated outer name":          `{"inner":{"code":"abc"},"inner":{"code":"def"}}`,
+		"repeated name through escape": `{"inner":{"code":"abc","\u0063ode":"def"}}`,
+		"invalid UTF-8 in a value":     "{\"inner\":{\"code\":\"ab\xffc\"}}",
+		"invalid UTF-8 in a name":      "{\"inner\":{\"code\xff\":\"abc\"}}",
+		"lone surrogate in a value":    `{"inner":{"code":"ab\ud800c"}}`,
+	}
+
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := httpapi.Decode[nested](httpapi.Request{
+				Context: t.Context(), Query: nil, Body: []byte(body),
+			}).Get()
+			if err == nil {
+				t.Fatalf("Decode accepted %q as %+v", body, got)
+			}
+
+			if kind := apierr.As(err).Kind; kind != apierr.BadRequest {
+				t.Errorf("kind = %d, want BadRequest", kind)
+			}
+		})
+	}
+}
+
+// shapes has a member of every kind checkStrict walks into.
+type shapes struct {
+	List  []input            `json:"list"`
+	Map   map[string]input   `json:"map"`
+	Ptr   *input             `json:"ptr"`
+	Any   json.RawMessage    `json:"any"`
+	Plain string             // untagged, so matched by its Go name
+	Words map[string][]input `json:"words"`
+}
+
+// TestDecodeChecksEveryValue covers checkStrict's walk: the exact-name and
+// repeat rules hold inside arrays, maps and pointers, and inside values whose
+// Go type gives no structure.
+func TestDecodeChecksEveryValue(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		body     string
+		wantCode string
+	}{
+		"every kind": {
+			body: `{"list":[{"code":"a"}],"map":{"k":{"code":"b"}},"ptr":{"code":"c"},` +
+				`"any":{"X":[1,{"y":true}],"z":null},"Plain":"p","words":{"w":[{"code":"d"}]}}`,
+		},
+		"a number too large for float64": {body: `{"any":1e999999}`},
+		"name in another case in an array": {
+			body: `{"list":[{"CODE":"a"}]}`, wantCode: unknownField,
+		},
+		"name in another case in a map": {
+			body: `{"map":{"k":{"CODE":"a"}}}`, wantCode: unknownField,
+		},
+		"name in another case behind a pointer": {
+			body: `{"ptr":{"CODE":"a"}}`, wantCode: unknownField,
+		},
+		"untagged field in another case": {body: `{"plain":"p"}`, wantCode: unknownField},
+		"repeat inside an unstructured value": {
+			body: `{"any":{"x":{"y":1,"y":2}}}`, wantCode: "duplicate_field",
+		},
+		"repeat inside an array in an unstructured value": {
+			body: `{"any":[{"y":1,"y":2}]}`, wantCode: "duplicate_field",
+		},
+		"invalid UTF-8 in a name":          {body: "{\"map\":{\"k\xff\":{}}}", wantCode: invalidText},
+		"an escaped replacement character": {body: `{"Plain":"\ufffd"}`, wantCode: invalidText},
+		"a lone surrogate":                 {body: `{"Plain":"\udc00"}`, wantCode: invalidText},
+		"non-string key":                   {body: `{1:2}`, wantCode: invalidJSON},
+		"unclosed array":                   {body: `{"list":[`, wantCode: invalidJSON},
+		"value missing at the end":         {body: `{"Plain":`, wantCode: invalidJSON},
+		"object for a string":              {body: `{"Plain":{"x":1}}`, wantCode: invalidType},
+		"array for a string":               {body: `{"Plain":[1]}`, wantCode: invalidType},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := httpapi.Decode[shapes](httpapi.Request{
+				Context: t.Context(), Query: nil, Body: []byte(tt.body),
+			}).Get()
+
+			if tt.wantCode == "" {
+				if err != nil {
+					t.Errorf("Decode error = %v, want success", err)
 				}
 
 				return

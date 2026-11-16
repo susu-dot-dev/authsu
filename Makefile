@@ -11,6 +11,10 @@ include tools.env
 # Local D1 state (git-ignored via .wrangler). Dev and e2e use different
 # directories so e2e can wipe its own state without touching dev data.
 DEV_STATE := .wrangler/state
+# Relying party values for `make dev`, passed as --var so they override the
+# deployment's RP_* in wrangler.jsonc. The origin must match DEV_PORT.
+DEV_PORT := 8787
+DEV_RP_VARS := --var RP_ID:localhost --var RP_ORIGIN:http://localhost:$(DEV_PORT) --var 'RP_NAME:authsu dev'
 
 # E2E uses its own state, never the dev state.
 E2E_STATE := .wrangler/e2e-state
@@ -151,11 +155,29 @@ db-reset: ## Delete local dev database state
 	rm -rf $(DEV_STATE)
 
 .PHONY: dev
-dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1)
+dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1, localhost RP)
 	@# wrangler's own rebuild leaves a dev wasm in build/; mark it stale on exit
 	@# (even on Ctrl-C) so size and e2e never mistake it for a production build.
 	trap 'touch -d @0 $(WASM) 2>/dev/null; true' EXIT; \
-	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --persist-to $(DEV_STATE)
+	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_RP_VARS)
+
+# ---- configuration ----------------------------------------------------------
+# Registration's AUTH_HMAC_SECRET (secret) and RP_ID, RP_ORIGIN, RP_NAME (vars).
+# See docs/devops.md, "Secrets and variables". scripts/config.sh does the work.
+
+.PHONY: config-get
+config-get: ## Show the RP_* vars, whether AUTH_HMAC_SECRET is set (never its value)
+	@./scripts/config.sh get
+
+.PHONY: config-set-vars
+config-set-vars: ## Write the RP_* vars into wrangler.jsonc: RP_ID=... RP_ORIGIN=... RP_NAME=...
+	@[ -n "$(RP_ID)" ] && [ -n "$(RP_ORIGIN)" ] && [ -n "$(RP_NAME)" ] || { \
+	  echo 'usage: make config-set-vars RP_ID=auth.example.com RP_ORIGIN=https://auth.example.com RP_NAME="My Auth"'; exit 2; }
+	@./scripts/config.sh set-vars "$(RP_ID)" "$(RP_ORIGIN)" "$(RP_NAME)"
+
+.PHONY: config-set-secret
+config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for .dev.vars, ARGS=--stdin to supply one)
+	@./scripts/config.sh set-secret $(ARGS)
 
 # ---- end-to-end tests -------------------------------------------------------
 # Runs the real production Worker: the prebuilt wasm under `wrangler dev`

@@ -63,7 +63,7 @@ To understand where the state travels, it helps to know what the browser sends b
 Several properties of this document matter here:
 
 - **The browser writes it, not us and not the page script.** The `challenge` field is our challenge, copied byte for byte and base64url-encoded. The `origin` field is filled in by the browser, which is what makes passkeys resistant to phishing.
-- **It is effectively signed by the passkey.** The authenticator never sees the JSON itself. It receives only the SHA-256 hash of it and signs over that hash. So once real attestation verification exists, the challenge inside `clientDataJSON` is covered by the passkey's own signature as well as ours.
+- **At registration it is not signed by anything we can check.** The authenticator never sees the JSON itself; it receives only its SHA-256 hash. With attestation `none`, which is what we request, no signature over that hash reaches us, so nothing cryptographically ties the new public key to this client data. (Self attestation would not change that: it is signed by the new key itself, which whoever registers chooses.) The client data, the flags (UP, UV, BE, BS), the AAGUID, the credential id and the transports are all the registering client's claims. What makes registration trustworthy is the invitation code, our signed challenge, and TLS. At login it is different: the assertion signature covers the hash of the client data and the authenticator data, so login must take user verification from the signed flags, never from what was stored here, and must check that the returned user handle is the account's.
 - **Other fields may appear.** The spec allows extra and reordered fields (such as `topOrigin` for cross-origin iframes), so we parse it as JSON and don't match it as a fixed string.
 
 The challenge is the only field we control, so any state that `begin` wants back at `finish` has to fit inside it.
@@ -73,22 +73,24 @@ The challenge is the only field we control, so any state that `begin` wants back
 The challenge is a single opaque byte string made of two parts concatenated together:
 
 ```
-challenge = state || tag
-
-state = version || expires_at || user_handle        -- illustrative layout
-tag   = HMAC(K, state || SHA-256(invitation_code))
+state     = version || expires_at || user_handle        -- illustrative layout
+signature = HMAC(K, state || SHA-256(invitation_code) || SHA-256(name))
+challenge = state || signature
 ```
 
 So it really is "`{blob, sig}`", flattened into bytes. There is no second payload and no separate token. The browser hands the whole thing back unchanged, inside `clientDataJSON`.
 
-The invitation code is the subtle part. It is **an input to the signature, but it is not part of the blob.** Its hash is mixed into the HMAC computation and is never transmitted. This is the same idea as "associated data" in authenticated encryption: the signature commits to it, and the verifier has to supply it independently in order to verify. At `finish`, the client sends the code again in the request body. The server recomputes the tag from the `state` it got back plus the hash of the code it just received, and compares the result in constant time. A mismatch means one of four things:
+The invitation code is the subtle part. It is **an input to the signature, but it is not part of the blob.** Its hash is mixed into the HMAC computation and is never transmitted. The account name is treated the same way, for the same reason: `begin` puts the name in the creation options, so without binding it a client could begin with one name and finish with another. This is the same idea as "associated data" in authenticated encryption: the signature commits to it, and the verifier has to supply it independently in order to verify. At `finish`, the client sends the code and the name again in the request body. The server recomputes the signature from the `state` it got back plus the hashes of what it just received, and compares the result in constant time. A mismatch means one of five things:
 
 - the challenge was forged;
 - the challenge was altered;
 - the challenge was minted for a different code;
+- the challenge was minted for a different name;
 - the request is just malformed.
 
-If the tag matches, the server checks that `expires_at` hasn't passed, and then trusts `user_handle`.
+If the signature matches, the server checks that `expires_at` hasn't passed, and then trusts `user_handle`. The order matters: the expiry is read only after the signature has verified, so a client-chosen expiry is never acted on, and a challenge that is both forged and expired is reported as forged.
+
+Hashing the code and the name to fixed width before mixing them in also means two different pairs can never produce the same bytes. Plain concatenation would let `("ab", "c")` and `("a", "bc")` collide.
 
 Some consequences of this shape:
 
@@ -97,6 +99,14 @@ Some consequences of this shape:
 - **The version byte** lets us change the layout later (for example, to bind more data) without ambiguity about how to parse old challenges still in flight.
 - **The expiry is inside the signed state**, so a client can't extend it. The spec suggests challenges stay valid for about the upper end of the ceremony timeout range, which is 5 to 10 minutes. Our expiry should match the timeout we send in the creation options.
 - **A fixed binary layout, not a JWT or JSON.** A compact layout keeps the challenge small (see the size budget below) and avoids parsing a general-purpose token format in a security-critical place.
+
+### Where the challenge's entropy comes from
+
+WebAuthn asks for at least 16 random bytes per challenge. Nothing in our challenge is random except the user handle: the version is a constant, the expiry is a time, and the signature is deterministic. The handle is 32 random bytes, so every `begin` produces a unique challenge, and that is the property the spec's requirement exists to provide. This is easy to break by accident (a deterministic handle would silently make challenges repeat), so a test asserts that two begins never produce the same challenge.
+
+### The challenge is read from `clientDataJSON`
+
+`finish` takes the challenge from the `clientDataJSON` the browser produced, never from a separate field in the request. That is the only copy of the challenge that the authenticator's response is bound to. A separate field would let a client present one challenge to our check and another to the authenticator.
 
 ### Size budget
 
@@ -166,9 +176,34 @@ The account and its first passkey must be created together. An account with no c
 
 The role of the new account is copied from the invitation as part of the same write. The client has no say in it, and this is how the first-run invitation produces the first admin with no admin-specific logic in registration.
 
+## Verification
+
+What `finish` verifies is deliberately narrow, and everything outside it fails closed:
+
+- **Attestation format `none` only**, with an empty statement. We request no attestation, so there is no signature or certificate chain to parse. Registration with `none` verifies no signature at all: there is none to check. What it verifies is that the ceremony was for this relying party and origin, answers our challenge, and that the credential public key is a well-formed point on the curve. Signatures matter at login, which is a separate feature. Accepting more formats later is a deliberate change, because certificate-chain parsing is where most of WebAuthn's parser bugs live.
+- **One algorithm, ES256** (COSE -7) over P-256, advertised as the only `pubKeyCredParams` entry. The key must be an EC2 key with 32-byte coordinates that form a point on the curve (this is the invalid-curve defence), carry no parameters we do not understand (so no private key `d` and no `key_ops`), and be the last thing in the authenticator data. The stored key is our own canonical re-encoding of the validated parts, which must equal the client's bytes. Because the registrant chooses the key, the curve check protects no server secret; it keeps a malformed key from reaching the login code.
+- **Strict CBOR.** The attestation object and key must be in CTAP2 canonical form (section 2.4), checked by re-encoding: keys out of order and integers or lengths not in their shortest form are errors. Repeated map keys, indefinite lengths, tags, unknown members (including a member spelled in another case, such as `FMT`) and trailing bytes are errors, and nesting and collection sizes are bounded. A missing or null `attStmt` is read as the empty statement.
+- **Strict base64url.** Every binary value (the challenge inside `clientDataJSON`, `clientDataJSON`, `attestationObject`, `id`, `rawId`) must be in its one base64url spelling (section 3): no padding, no line breaks, unused bits zero. Go's decoder would otherwise skip CR and LF and ignore unused bits, so one challenge would have several spellings while section 7.1 compares it with "the base64url encoding".
+- **Strict `clientDataJSON`.** Member names are matched exactly and a repeated name is an error, because `encoding/json` alone would match case-insensitively and keep the last duplicate, so a document could mean one thing to the browser and another to us. Unknown members are ignored, as the spec requires, except `crossOrigin: true` and `topOrigin`, which are refused. A present `crossOrigin` must be a boolean (null is refused, where `encoding/json` would read it as false), and `type`, `challenge` and `origin` must be strings. JSON escapes are decoded before comparison. The origin is compared exactly as a whole string. One deliberate deviation: section 7.1 step 5 strips a leading byte order mark, but no conforming client writes one, so it is refused.
+- **Authenticator data.** The RP ID hash must match, user presence and user verification must both be set (we request both), attested credential data must be present, extension data must be absent (we send none), reserved bits must be clear, and backup state without backup eligibility is invalid. Reserved bits are refused even though section 7.1 does not check them, failing closed on flags we do not understand. The credential id must be 1 to 1023 bytes and equal both the `id` and the `rawId` the client reported. The signature counter is deliberately not stored: synced passkeys always report zero.
+- **Transports** are stored as the client reports them, unknown values included (section 5.2.1 says relying parties SHOULD accept and store them), but must be at most 8 unique entries of 1 to 32 printable-ASCII bytes in sorted order, which is the shape section 5.2.1 says clients produce.
+- **The request body** is what `PublicKeyCredential.toJSON()` returns (`RegistrationResponseJSON`), unmodified. `authenticatorData`, `publicKey` and `publicKeyAlgorithm` are copies of what `attestationObject` holds; everything is read from `attestationObject`, so they are ignored. `clientExtensionResults` must be empty, because we request no extensions. The body is decoded strictly: member names must match exactly, may not repeat, and text must be valid UTF-8.
+- **The account name** must be valid UTF-8 in Unicode Normalization Form C, with no control (Cc) or format (Cf) code points: no NUL, bidirectional overrides, or zero-width characters. This is the core of the PRECIS Nickname profile section 5.4.3 asks for.
+
+Both the relying party ID and the origin come from configuration (`RP_ID`, `RP_ORIGIN`), never from the request, because a `Host` header is attacker-influenced and a Worker is reachable on several hostnames. The ID is permanent: a passkey is bound to it.
+
+The parsers are fuzzed (`go test -fuzz=FuzzVerify ./internal/webauthn`), with the property that anything accepted is a bounded credential id and a key that round-trips byte for byte.
+
+## Decisions that were open
+
+- **The routes** are `POST /api/register/begin` and `POST /api/register/finish`, under `/api/` like `/api/first-run`. The bare `/register` path is the browser page.
+- **The account name** is supplied by the user at `begin`, because `begin` has to return it in the creation options, and it is bound into the challenge as described above. It is one field used as both `name` and `displayName`, and is stored in `users.profile`.
+- **Role.** `RoleFor` maps an invitation type to a role in Go (`first_run` is `admin`) and fails closed on an unknown type. The user insert also requires the invitation to still have the type the role was chosen for, so a type that changed between the read and the write cannot receive another type's role.
+- **`finish` issues no session.** Registering the passkey is the whole job here; sessions need their own key derivation (see the key-separation constraint above), a cookie or bearer decision and a login ceremony, which is the next feature.
+- **Failure of the atomic write.** A batch the database refused on a constraint (the invitation was used up, or the handle or credential id is a replay) is a 409. Any other failure is a 503. `finish` reads the invitation before the write, so a request that is already stale gets a clean 403 without reaching it, and the 409 is for the race that read cannot close.
+
 ## Open questions
 
-- How to verify attestations under TinyGo's constraints, and which attestation formats to accept.
-- How the relying-party ID and origin are configured.
-- What session is issued after `finish`, and its key derivation (see the key-separation constraint above).
 - Whether `begin` needs rate limiting. This is driven by whether low-entropy invitation codes are ever allowed.
+- Which further attestation formats, if any, to accept, and whether that changes the verifier or only its policy.
+- What session is issued after login, and its key derivation (see the key-separation constraint above).
