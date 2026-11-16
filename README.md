@@ -4,7 +4,7 @@ A self-hosted, passkey-only authentication service that runs as a Cloudflare Wor
 
 It is written in Go, compiled to WebAssembly with [TinyGo](https://tinygo.org), and run on Cloudflare Workers through [`workers-go`](https://github.com/syumai/workers-go). Data lives in D1 (SQLite).
 
-> **Status:** early. The tooling and project structure are in place; the invitation, registration and first-run flows described in the design docs are not built yet. Today the Worker serves only `/healthz`.
+> **Status:** early. The tooling and project structure are in place; the invitation, registration and first-run flows described in the design docs are mostly not built yet. Today the Worker serves `/healthz` and `GET /api/first-run`, the first-run status check.
 
 ## Requirements
 
@@ -24,7 +24,8 @@ It is written in Go, compiled to WebAssembly with [TinyGo](https://tinygo.org), 
 make setup   # npm ci, go mod download, verify tool versions
 make dev     # migrate the local database and serve the Worker on :8787
 curl http://localhost:8787/healthz
-make check   # the pre-commit gate: format, tidy, vet, lint, tests, coverage
+make check   # fast gate: format, tidy, vet, lint, tests, coverage
+make ci      # everything CI runs, including e2e; slow, run once before committing
 make help    # every target
 ```
 

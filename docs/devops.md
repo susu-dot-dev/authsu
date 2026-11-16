@@ -29,9 +29,20 @@ authsu is a Go service compiled with TinyGo to WebAssembly and run as a Cloudfla
 | `make build-dev` | Dev build (all dev flags on) |
 | `make dev` | Run the Worker locally with local D1 |
 | `make test-e2e` / `make test-e2e-prod` | End-to-end tests against `wrangler dev` |
-| `make check` | Fast pre-commit gate (no wasm build, no e2e) |
-| `make ci` | Everything CI runs |
+| `make check` | Fast gate for the edit loop (no wasm build, no e2e) |
+| `make ci` | Everything CI runs. Slow: run it once, as the final pass before committing |
 | `make deploy` | Production deploy, only ever with no flags, gated on checks |
+
+### Which target when
+
+`make ci` is slow because the wasm size check and both e2e runs each build the Worker with TinyGo (the two e2e runs take about 30 seconds each on top of that). Do not use it as a save-and-check loop.
+
+- **While working:** run only the narrowest target that covers what you changed, and `make check` once a change is ready for a broader look. It is fast and has no wasm build.
+  - Go logic: `go test ./internal/...` for the package you are editing, then `make check`.
+  - Formatting or lint: `make fmt`, `make lint`.
+  - A migration: apply it to a throwaway local database (`npx wrangler d1 migrations apply DB --local --persist-to <tmp dir>`) and exercise it with `wrangler d1 execute`, rather than a full e2e run.
+- **Before committing:** run `make ci` once, as the last step, after the change is otherwise finished. If it fails, fix the cause with the narrow target that reproduces it, and run `make ci` once more at the end instead of after each fix.
+- **Do not run `make ci` after every edit, after documentation-only changes, or to check that a single target still passes.** `make size` and `make test-e2e` / `make test-e2e-prod` are available on their own for the rare change that needs only one of them (for example, a dependency bump for `size`).
 
 ## Repository layout
 
@@ -156,16 +167,19 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 ## D1 migrations
 
 - Migrations are plain SQL files in `migrations/`, named `NNNN_description.sql`, applied in order by Wrangler (`wrangler d1 migrations apply`), which records applied files in the `d1_migrations` table.
-- `migrations/` holds only a `.gitkeep` until the first feature needs a table. An empty directory is a no-op for Wrangler; a missing directory is an error, which is why the placeholder file exists.
+- `migrations/` keeps a `.gitkeep` so the directory always exists: Wrangler treats an empty directory as a no-op but a missing one as an error.
+- **No `CHECK` on open-ended values.** Columns whose set of values grows with the code (invitation `type`, user `role`) are validated in Go and carry no `CHECK`, because changing a `CHECK` in SQLite means rebuilding the table. `CHECK` is for invariants that will not change, such as `json_valid(...)` and `num_invites > 0`.
+- **JSON columns are `TEXT`**, not `BLOB`: SQLite's binary JSONB is its own internal format that Go cannot write, and the legacy path that reads JSON text from a `BLOB` is documented as bug compatibility. We read these columns whole and decode them in Go, so there is no query-side speedup to chase.
 - Migrations are append-only. A migration that has landed on `main` is never edited; changes are new migrations.
 - The Worker is bound to D1 as `DB` in both environments (`wrangler.jsonc`), so Go code never knows which one it is talking to. The top-level `d1_databases` entry is the production database; `previews.d1_databases` rebinds `DB` to a separate preview database for Cloudflare Previews. Go code does not open the binding until a feature needs it, at which point `cmd/worker` opens it and passes a `*sql.DB` in through `Deps`.
 - **Local development:** `make dev` applies migrations to a local persisted database in `.wrangler/state` (git-ignored) and then runs the Worker against it. `make migrate-local` applies them on their own; `make db-reset` deletes the state.
 - **Dev and e2e state are separate.** E2E uses its own state directory (`.wrangler/e2e-state`) and wipes it on every run, so it never touches data created while developing.
-- **CI verification:** the e2e harness applies every migration to a fresh local D1 on every run, so a broken migration fails CI. Until the first migration exists, the harness only proves that applying an empty set works.
+- **CI verification:** the e2e harness applies every migration to a fresh local D1 on every run, so a broken migration fails CI.
 - The `database_id` values in `wrangler.jsonc` are identifiers, not secrets. Local dev and e2e use the same `DB` binding name but are simulated locally (`--local`, with `--persist-to`), so they never reach the production or preview databases. Always pass `--local` for anything but a deliberate remote migration.
 - **Remote migrations are applied by hand.** Neither CI nor Workers Builds applies them, so apply a new migration to the target database before deploying code that needs it.
   - **Production:** `npx wrangler d1 migrations apply DB --remote`.
-  - **Preview database:** Wrangler resolves a migration target from the top-level `d1_databases`, so migrating the preview database needs a second config file, `wrangler.preview-migrations.jsonc`, with a top-level `d1_databases` entry (binding `PREVIEW_DB`, the preview `database_id`, `migrations_dir: "migrations"`), applied with `npx wrangler d1 migrations apply PREVIEW_DB --remote --config wrangler.preview-migrations.jsonc`. Create that file with the first migration. Its `database_id` must match `previews.d1_databases`.
+  - **Preview database:** Wrangler resolves a migration target from the top-level `d1_databases`, so migrating the preview database needs a second config file, `wrangler.preview-migrations.jsonc`, with a top-level `d1_databases` entry (binding `PREVIEW_DB`, the preview `database_id`, `migrations_dir: "migrations"`), applied with `npx wrangler d1 migrations apply PREVIEW_DB --remote --config wrangler.preview-migrations.jsonc`. Its `database_id` must match `previews.d1_databases` in `wrangler.jsonc`; change both together.
+  - **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that has already been applied to the preview database is silently ignored there. While a migration is unmerged, the preview database is disposable: drop its tables and the `d1_migrations` rows (or recreate the database) and apply again. All Previews share that one database by default, so it reflects one branch's schema at a time; a branch that needs its own can point both config files at a separate database. Once a migration is on `main`, the append-only rule applies and the fix is a new migration.
 
 ## End-to-end tests
 
@@ -178,8 +192,10 @@ The Cloudflare Workers size limit (64 MiB uncompressed, with no compressed-size 
 - Run twice: `make test-e2e` against the **dev build** (`DEV_TAGS` on) and `make test-e2e-prod` against the **production build** (no tags). Tests that depend on a flag must assert both sides, so the production run proves dev-only behaviour is absent.
 - E2E exists for what the host cannot see: TinyGo `net/http` differences (notably `http.ServeMux` never matches method-qualified patterns like `"GET /x"`; use plain paths and dispatch on `r.Method`), the D1 driver, real SQLite behaviour, and Wrangler wiring.
 - Dev and e2e use separate state directories so tests never touch data created while developing.
+- **Secrets.** The harness starts the Worker with `FIRST_RUN_SECRET` set to a fixed, throwaway constant (`firstRunSecret` in `e2e/harness_test.go`), so tests can compute what the Worker should have stored for it. It writes the secret to `e2e.env` inside the state directory and passes it with `wrangler dev --env-file`. The repository root is never read or written, so a developer's own `.dev.vars` is neither used by a test run nor overwritten by one. Wrangler loads `--env-file` values even when a `.dev.vars` exists (checked: the Worker saw the test value, not the `.dev.vars` one). Never put a real secret in the constant. A new secret means a new line in `writeEnvFile`.
+- **Inspecting the database.** Tests reach the Worker's simulated D1 with `wrangler d1 execute DB --local --persist-to <state> --json` (the `query` helper in `e2e/firstrun_test.go`). Use it to assert on what was actually stored, which the HTTP response alone cannot show.
+- **The database is shared and tests run in source order.** There is one Worker and one database for the whole run. A test that needs the invitations or users tables to be empty must run before the tests that fill them, and must clean up what it adds. `TestFirstRun` fills them and finishes with a user, so it runs last among the first-run tests.
 - **Linting:** e2e code is linted like everything else, except that `gosec` is excluded under `e2e/` (see `.golangci.yml`): the harness launches `npx` and clears a state directory named by an environment variable by design. The one process-wide fixture (`target`) carries a `//nolint:gochecknoglobals` with its reason.
-- **Current coverage of behaviour:** `/healthz` only (status, body, wrong method, unknown path). Flag assertions (`/debug/info` present in dev, absent in prod) are not tested yet, so nothing automatically proves the production build omits dev routes until a test asserts it.
 
 ## Continuous integration
 
@@ -244,4 +260,3 @@ Bumping a tool means editing `tools.env` only. Checksums for downloaded tools ar
   - the `replace` of `workers-go` with the fork carrying D1 batch support, which should be dropped once upstream releases it.
 
   The job fails when a pin is behind (exit 1) or when a lookup itself failed (exit 2), so a broken check is never mistaken for "all current". The token stays read-only, so there is no issue or comment: a failed scheduled run, and GitHub's notification for it, is the reminder.
-

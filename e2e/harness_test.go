@@ -33,6 +33,18 @@ const (
 	stateDirEnv   = "E2E_STATE"
 	tagsEnv       = "E2E_GO_TAGS"
 	defaultState  = ".wrangler/e2e-state"
+
+	// firstRunSecret is the FIRST_RUN_SECRET the Worker under test is started
+	// with. It is a fixed, throwaway value (43 characters, like a generated
+	// one) so tests can compute what the Worker should have stored for it.
+	firstRunSecret = "e2e-first-run-secret-0123456789ABCDEFGHIJKL"
+
+	// envFileName is written into the state directory and handed to wrangler
+	// with --env-file. Nothing in the repository root is read or written, so a
+	// developer's own .dev.vars is never used by, or clobbered by, a test run.
+	envFileName = "e2e.env"
+
+	envFilePerm = 0o600
 )
 
 var errNotReady = errors.New("worker not ready")
@@ -40,6 +52,11 @@ var errNotReady = errors.New("worker not ready")
 // worker is the running Worker under test.
 type worker struct {
 	baseURL string
+
+	// root is the repository root and state the Worker's local D1 state
+	// directory (relative to root), so tests can inspect the database.
+	root  string
+	state string
 }
 
 // target is set by TestMain before any test runs.
@@ -75,12 +92,35 @@ func run(m *testing.M) int {
 		return fail("apply migrations: %v\n%s", err, out)
 	}
 
-	return serve(ctx, root, state, m)
+	envFile, err := writeEnvFile(filepath.Join(root, state))
+	if err != nil {
+		return fail("write env file: %v", err)
+	}
+
+	return serve(ctx, root, state, envFile, m)
+}
+
+// writeEnvFile writes the secrets the Worker under test is configured with to
+// dir, in the dotenv format wrangler's --env-file reads, and returns its path.
+func writeEnvFile(dir string) (string, error) {
+	err := os.MkdirAll(dir, 0o700)
+	if err != nil {
+		return "", fmt.Errorf("create %s: %w", dir, err)
+	}
+
+	path := filepath.Join(dir, envFileName)
+
+	err = os.WriteFile(path, []byte("FIRST_RUN_SECRET="+firstRunSecret+"\n"), envFilePerm)
+	if err != nil {
+		return "", fmt.Errorf("write %s: %w", path, err)
+	}
+
+	return path, nil
 }
 
 // serve starts wrangler, waits for the Worker, runs the tests, and always tears
 // wrangler (and the workerd it spawns) down.
-func serve(ctx context.Context, root, state string, m *testing.M) int {
+func serve(ctx context.Context, root, state, envFile string, m *testing.M) int {
 	port, err := freePort(ctx)
 	if err != nil {
 		return fail("pick port: %v", err)
@@ -93,7 +133,7 @@ func serve(ctx context.Context, root, state string, m *testing.M) int {
 
 	cmd := command(ctx, root, "npx", "wrangler", "dev", "--local",
 		"--port", port, "--inspector-port", inspector,
-		"--persist-to", state, "--show-interactive-dev-session=false")
+		"--persist-to", state, "--env-file", envFile, "--show-interactive-dev-session=false")
 
 	// wrangler re-runs build.command on start. Give it the same tags the
 	// Makefile built with so the rebuilt binary is identical to the one built
@@ -116,7 +156,7 @@ func serve(ctx context.Context, root, state string, m *testing.M) int {
 		_ = cmd.Wait()
 	}()
 
-	target = worker{baseURL: "http://127.0.0.1:" + port}
+	target = worker{baseURL: "http://127.0.0.1:" + port, root: root, state: state}
 
 	err = waitReady(ctx, target.baseURL+"/healthz")
 	if err != nil {

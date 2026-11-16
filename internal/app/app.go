@@ -1,31 +1,44 @@
 // Package app builds the Worker's HTTP handler from its dependencies.
-//
-// It is the composition root that can be exercised on the host: cmd/worker
-// supplies platform-specific dependencies (which only exist under js/wasm) in
-// a Deps value, and everything else is plain Go tested against fakes.
 package app
 
 import (
+	"database/sql"
 	"net/http"
 
 	"github.com/susu-dot-dev/authsu/internal/diag"
+	"github.com/susu-dot-dev/authsu/internal/firstrun"
 )
 
-// Deps holds the dependencies supplied by cmd/worker. Fields that vary between
-// production and dev builds are selected there by build tag; a nil field means
-// the safe production behaviour.
+// Deps holds the behaviour that cmd/worker selects at build time with build
+// tags (see docs/devops.md, "Feature flags"). A nil field means the safe
+// production behaviour.
+//
+// Deps is not a service registry. Features that are always on do not belong
+// here: they are built inside this package from the Platform resources.
 type Deps struct {
 	// Diagnostics adds developer routes. Nil means none (production).
 	Diagnostics diag.Diagnostics
+}
+
+// Platform holds the resources that exist only inside the Worker runtime, so
+// cmd/worker has to supply them. It carries resources, never services.
+type Platform struct {
+	// DB is the D1 database.
+	DB *sql.DB
+
+	// Getenv reads a deploy-time secret or variable. It is called per request,
+	// because the Worker's environment only exists while a request is handled.
+	Getenv func(name string) string
 }
 
 // NewHandler returns the Worker's root HTTP handler.
 //
 // TinyGo's http.ServeMux never matches method-qualified patterns such as
 // "GET /x", so register plain paths and dispatch on r.Method.
-func NewHandler(deps Deps) http.Handler {
+func NewHandler(deps Deps, platform Platform) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
+	mux.Handle("/api/first-run", firstrun.Handler(platform.DB, platform.Getenv))
 
 	if deps.Diagnostics != nil {
 		deps.Diagnostics.Register(mux)
