@@ -1,0 +1,35 @@
+# Dependency updates. See docs/devops.md ("Dependency automation").
+#
+# Weekly and grouped to limit noise: one PR per ecosystem per week. Security
+# updates are separate and immediate, and are not delayed by grouping.
+#
+# Not covered here (bumped by hand, see docs/devops.md): TinyGo and
+# golangci-lint versions and checksums in tools.env, and the workers-go fork
+# `replace` in go.mod.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      npm-dependencies:
+        patterns: ["*"]
+
+  # Keeps the full-SHA pins in .github/workflows current. Dependabot rewrites
+  # the SHA and the trailing "# vX.Y.Z" comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

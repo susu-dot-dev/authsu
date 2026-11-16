@@ -89,6 +89,10 @@ tidy-check: ## Fail if go.mod/go.sum are not tidy
 size: ## Production wasm size report + budget (fails if over budget or test pkgs linked)
 	./scripts/check-size.sh
 
+.PHONY: vuln
+vuln: ## Scan dependencies for known vulnerabilities (pinned govulncheck)
+	go tool govulncheck ./...
+
 .PHONY: lint
 lint: ## golangci-lint (host prod and dev tags, e2e, and the js/wasm entrypoint)
 	golangci-lint run ./...

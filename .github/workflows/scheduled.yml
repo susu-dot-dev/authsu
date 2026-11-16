@@ -1,0 +1,51 @@
+# Weekly checks that must run without any code change. See docs/devops.md
+# ("Dependency automation and vulnerability scanning").
+#   vuln:   new advisories are published against existing dependencies.
+#   upkeep: pins that Dependabot cannot update (tools.env, the workers-go fork).
+# Each job fails independently, and a failed scheduled run is the reminder.
+# Same supply-chain rules as ci.yml: pinned first-party actions, read-only
+# token, no secrets beyond the automatic read-only GITHUB_TOKEN.
+name: Scheduled checks
+
+on:
+  schedule:
+    # Mondays 06:17 UTC; an off-the-hour minute avoids the scheduler rush.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # govulncheck is pinned by the `tool` directive in go.mod, never @latest.
+      - run: make vuln
+
+  upkeep:
+    name: Hand-maintained pins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check pins
+        env:
+          # Read-only token, only used to avoid anonymous API rate limits.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          scripts/check-upkeep.sh | tee -a "$GITHUB_STEP_SUMMARY"
+          status="${PIPESTATUS[0]}"
+          # 1 = something is stale, 2 = a lookup failed. Both fail the run.
+          exit "$status"

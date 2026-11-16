@@ -23,6 +23,7 @@ authsu is a Go service compiled with TinyGo to WebAssembly and run as a Cloudfla
 | `make lint` | golangci-lint |
 | `make test` | Unit tests |
 | `make coverage` | Unit tests with the 100% coverage gate |
+| `make vuln` | govulncheck (pinned); scheduled in CI, not part of `make ci` |
 | `make size` | Wasm size report and budget gate |
 | `make build` | Production build |
 | `make build-dev` | Dev build (all dev flags on) |
@@ -194,7 +195,7 @@ GitHub Actions, Linux only (`ubuntu-24.04`). Triggers: push to `main` and pull r
 - CI loads `tools.env` into the job environment, so versions and checksums are never duplicated in the workflow. `$GITHUB_ENV` accepts only `NAME=value` lines, so the step filters out comments and blank lines with `grep`; keep `tools.env` to plain `KEY=value` assignments.
 - `npm ci --ignore-scripts` is safe for e2e: the `workerd` binary ships as a platform optional dependency (`@cloudflare/workerd-linux-64`) and runs without its postinstall script. This was verified by installing with `--ignore-scripts` in a clean clone and running `make test-e2e`.
 
-**Jobs:** a `check` job that runs `make ci` (`make check`, which is tool versions, format, tidy check, vet, lint, unit tests and the coverage gate, plus the wasm size budget and both e2e runs; later also govulncheck). A separate `e2e` job is a later optimisation if CI time warrants it. The job is a required status check on `main` via branch protection.
+**Jobs:** a `check` job that runs `make ci` (`make check`, which is tool versions, format, tidy check, vet, lint, unit tests and the coverage gate, plus the wasm size budget and both e2e runs). Vulnerability scanning and pin upkeep run on a schedule instead, in `.github/workflows/scheduled.yml`. A separate `e2e` job is a later optimisation if CI time warrants it. The job is a required status check on `main` via branch protection.
 
 ## Cloudflare Workers Builds
 
@@ -218,7 +219,14 @@ Bumping a tool means editing `tools.env` only. Checksums for downloaded tools ar
 
 ## Dependency automation and vulnerability scanning
 
-- **Dependabot** for the `gomod`, `npm`, and `github-actions` ecosystems, grouped, weekly. It also keeps the pinned action SHAs current.
-- **govulncheck** is pinned through a `tool` directive in `go.mod` (so it is version-locked by `go.sum` and never `@latest`) and runs on pull requests and on a weekly schedule.
+- **Dependabot** (`.github/dependabot.yml`) covers the `gomod`, `npm`, and `github-actions` ecosystems, weekly, with one grouped pull request per ecosystem to limit noise. Security updates are separate and immediate, and Dependabot's default 3-day cooldown on new releases applies to version updates (not security updates). It also keeps the pinned action SHAs current, rewriting the SHA and the trailing version comment together.
+- **govulncheck** is pinned through a `tool` directive in `go.mod` (version-locked by `go.sum`, never `@latest`), so Dependabot's `gomod` ecosystem keeps it current. `make vuln` runs `go tool govulncheck ./...`.
+  - It runs only on a schedule (the `vuln` job in `.github/workflows/scheduled.yml`, Mondays plus manual dispatch), not on pull requests: advisories arrive without any code change, so a timer is what catches them. Run `make vuln` locally when adding a dependency.
+  - The tool version matters: an old govulncheck panics inside its bundled `x/tools` when analysing code built by a newer Go. Dependabot bumping it is therefore load-bearing, and a panic in the scheduled run means the pin is stale, not that the code is vulnerable.
 - `go mod tidy -diff` runs in CI; `go.mod` and `go.sum` must be tidy.
-- Tool checksums in `tools.env` are not covered by Dependabot and are bumped manually.
+- **Manual upkeep.** Dependabot cannot update these, so the `upkeep` job in the same scheduled workflow runs `scripts/check-upkeep.sh` weekly and reports in the job summary:
+  - the TinyGo and golangci-lint versions in `tools.env` (bump the version and checksum together, saying in the commit where the checksum came from), and
+  - the `replace` of `workers-go` with the fork carrying D1 batch support, which should be dropped once upstream releases it.
+
+  The job fails when a pin is behind (exit 1) or when a lookup itself failed (exit 2), so a broken check is never mistaken for "all current". The token stays read-only, so there is no issue or comment: a failed scheduled run, and GitHub's notification for it, is the reminder.
+
