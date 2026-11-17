@@ -29,7 +29,7 @@ make ci      # everything CI runs, including e2e; slow, run once before committi
 make help    # every target
 ```
 
-Run the Worker through `make dev`, not `npx wrangler dev`: the Makefile builds with the dev flags and applies migrations, while Wrangler on its own builds the production configuration.
+Run the Worker through `make dev`, not `npx wrangler dev`: the Makefile applies migrations and overrides the relying party with `localhost` values, which Wrangler on its own does not.
 
 ## Documentation
 

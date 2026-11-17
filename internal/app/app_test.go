@@ -13,10 +13,8 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/app"
-	"github.com/susu-dot-dev/authsu/internal/diag"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
-	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
 func TestHealthz(t *testing.T) {
@@ -58,7 +56,7 @@ func TestHealthz(t *testing.T) {
 
 			req := newRequest(t, tt.method, tt.path, nil)
 			rec := httptest.NewRecorder()
-			app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
+			app.NewHandler(app.Platform{}).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -72,46 +70,6 @@ func TestHealthz(t *testing.T) {
 				t.Errorf("Allow = %q, want %q", got, tt.wantAllow)
 			}
 		})
-	}
-}
-
-type fakeDiagnostics struct{ registered bool }
-
-func (f *fakeDiagnostics) Register(router diag.Router) {
-	f.registered = true
-
-	router.Handle(http.MethodGet, "/fake", func(httpapi.Request) result.Result[httpapi.Response] {
-		return result.Ok(httpapi.Response{Status: http.StatusTeapot, Body: nil})
-	})
-}
-
-func TestDiagnosticsWiring(t *testing.T) {
-	t.Parallel()
-
-	fake := &fakeDiagnostics{}
-	handler := app.NewHandler(app.Deps{Diagnostics: fake}, app.Platform{})
-
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, newRequest(t, http.MethodGet, "/fake", nil))
-
-	if !fake.registered {
-		t.Error("Diagnostics.Register was not called")
-	}
-
-	if rec.Code != http.StatusTeapot {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusTeapot)
-	}
-}
-
-func TestNilDiagnosticsRegistersNothing(t *testing.T) {
-	t.Parallel()
-
-	rec := httptest.NewRecorder()
-	req := newRequest(t, http.MethodGet, "/debug/info", nil)
-	app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
 
@@ -151,7 +109,7 @@ func TestFailureIsLoggedAndHidden(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := newRequest(t, http.MethodGet, "/api/first-run", nil)
-	app.NewHandler(app.Deps{}, platform).ServeHTTP(rec, req)
+	app.NewHandler(platform).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
@@ -181,7 +139,7 @@ func TestNilLogDiscards(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := newRequest(t, http.MethodGet, "/api/first-run", nil)
-	app.NewHandler(app.Deps{}, platform).ServeHTTP(rec, req)
+	app.NewHandler(platform).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
@@ -221,7 +179,7 @@ func TestUnsafeRoutesRequireJSON(t *testing.T) {
 					req.Header.Set("Content-Type", contentType)
 				}
 
-				app.NewHandler(app.Deps{}, app.Platform{Getenv: loginEnv}).ServeHTTP(rec, req)
+				app.NewHandler(app.Platform{Getenv: loginEnv}).ServeHTTP(rec, req)
 
 				if rec.Code != http.StatusUnsupportedMediaType ||
 					!strings.Contains(rec.Body.String(), `"unsupported_media_type"`) {

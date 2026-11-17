@@ -55,7 +55,7 @@ Conventions for writing migrations are in [devops.md](devops.md). Applying them:
 
 ## Deploying
 
-Two paths, both running the same `npx wrangler deploy` on a build made without dev flags. `make deploy` refuses to run with any flag set.
+Two paths, both running the same `npx wrangler deploy`.
 
 **Cloudflare Workers Builds** clones the repository and runs the dashboard commands. Its image has Go (fetched per `go.mod`) and Node but no TinyGo, and it ignores the `build` section of `wrangler.jsonc`. Configure the project (Settings > Build) with:
 

@@ -5,7 +5,7 @@ This is the generic scaffolding: how code is built, tested, gated and shipped. I
 ## Principles
 
 - **One entrypoint.** The `Makefile` is the only interface to dev tooling. CI runs the same `make` targets a developer runs, so nothing in workflow YAML is unrunnable locally.
-- **Production is the default build.** Anything insecure or dev-only is opt-in via a build tag and is not wired into the production binary.
+- **One build.** There are no dev and production variants of the binary: what runs locally, in e2e and in production is the same wasm, so what is tested is what is deployed.
 - **Fail closed, fail loudly.** Gates are strict from the start. Loosening one needs a written reason in the commit.
 - **Minimal supply chain.** Prefer the standard library and first-party tooling, pin everything, verify what is downloaded.
 - **Reproducible locally.** Tool versions are pinned in one file, `tools.env`, read by both the Makefile and CI.
@@ -21,12 +21,12 @@ Go compiled with TinyGo to WebAssembly, run as a Cloudflare Worker through [`wor
 - **While working,** run the narrowest thing that covers the change (`go test ./internal/<pkg>`, `make fmt`, `make lint`), then `make check` once the change is ready for a broader look. `make check` is fast and does no wasm build.
 - **Before committing,** run `make ci` once, as the last step. It is everything CI runs. It is slow, mostly because of one TinyGo build (no incremental compilation, nearly all single-threaded); make skips that build when no Go source or build input changed.
 - **Do not** run `make ci` after every edit, after documentation-only changes, or to re-check one target. If it fails, fix the cause with the narrow target that reproduces it, then run `make ci` once more.
-- Run the Worker with `make dev`, not bare `npx wrangler dev`, which builds the production configuration (no dev flags, no migrations).
+- Run the Worker with `make dev`, not bare `npx wrangler dev`, which skips the migrations and the localhost relying party overrides.
 
 ## Code structure
 
 - **`cmd/worker` is thin, wasm-only wiring.** It imports `workers-go`, which exists only for `js/wasm`, so it cannot run in host unit tests. It obtains platform resources and hands them to `internal/app`; it holds no logic and is excluded from coverage.
-- **Logic lives in host-testable `internal/` packages**, tested against fakes. `internal/app` builds the handler from a `Deps` struct and a `Platform`.
+- **Logic lives in host-testable `internal/` packages**, tested against fakes. `internal/app` builds the handler from a `Platform`.
 - **Handlers are pure** (`Request` to `Result[Response]`). One boundary, `internal/httpapi`, does everything that touches HTTP, and `internal/apierr` classifies failures so no cause or internal detail reaches a client. Their package docs are the contract.
 - **TinyGo's `net/http` differs from Go's** (for example, `ServeMux` never matches method-qualified patterns). Host tests cannot catch this, which is a large part of why e2e tests exist.
 - **Why not test or lint under `js/wasm`.** The toolchain can compile and vet for it but cannot practically run tests there, and `workerd` would not be the runner. So logic stays out of wasm-only files, only `cmd/worker` is vetted and linted for `js/wasm`, and the real TinyGo build is exercised by e2e.
@@ -38,24 +38,13 @@ Go compiled with TinyGo to WebAssembly, run as a Cloudflare Worker through [`wor
 - **Tests are table-driven**, with named cases and `t.Run`, in the external test package unless internal access is genuinely needed.
 - **Time, randomness and I/O are injected**, so every branch is reachable from a test.
 - **100% statement coverage of production code**, enforced by `scripts/covgate` (`make coverage`). Exclusions are explicit: `cmd/worker` and `scripts/` are excluded by the gate, and an individual unreachable statement is marked `// coverage:ignore: <reason>` on the line directly above it. A missing reason or misplaced marker fails the gate, and every honoured ignore is printed in CI. Before using one, refactor to make the branch reachable.
-- **End-to-end tests** (`e2e/`, build tag `e2e`) drive the real Worker under `wrangler dev` with a simulated D1. They exist for what the host cannot see: TinyGo differences, the D1 driver, real SQLite behaviour and Wrangler wiring. They run against the production build only, the artifact that is deployed, which is also what shows dev-only behaviour is absent. The `Makefile` decides the build and the harness only runs it. Dev and e2e use separate state directories. Details are in the harness and test file comments.
+- **End-to-end tests** (`e2e/`, build tag `e2e`) drive the real Worker under `wrangler dev` with a simulated D1. They exist for what the host cannot see: TinyGo differences, the D1 driver, real SQLite behaviour and Wrangler wiring. The `Makefile` decides the build and the harness only runs it. Dev and e2e use separate state directories. Details are in the harness and test file comments.
 
 ## Lint, size and dependencies
 
-- **Format** is `gofmt -s`. **Lint** is golangci-lint v2 with a posture of maximal: every linter on, disabled one by one with a stated reason in `.golangci.yml`. Fix the code rather than adding `//nolint`; a needed suppression must name the linter and give a reason. Both the production and the all-dev-flags configurations are linted.
+- **Format** is `gofmt -s`. **Lint** is golangci-lint v2 with a posture of maximal: every linter on, disabled one by one with a stated reason in `.golangci.yml`. Fix the code rather than adding `//nolint`; a needed suppression must name the linter and give a reason.
 - **Wasm size is budgeted** by `make size` as a regression guard, not a platform-limit guard: a jump is the earliest sign a heavy package was linked by accident (`encoding/json` is the usual suspect under TinyGo). The budget is raised deliberately, in the PR that justifies it, by editing the default in `scripts/check-size.sh`. Packages that must never be linked (`testing`, `net/http/httptest`) fail the check.
 - **`go.mod` and `go.sum` must be tidy.** Dependabot keeps `gomod`, `npm` and `github-actions` current, and a scheduled workflow runs `govulncheck` and reports pins Dependabot cannot update (see [runbook.md](runbook.md)).
-
-## Feature flags
-
-A flag is a Go build tag, and the default build has every flag off. The pattern is an interface with build-time dependency injection:
-
-1. Behaviour that varies is an interface with ordinary, fully tested implementations, including the dev-only ones, in untagged files.
-2. `internal/app` takes a `Deps` struct holding one implementation per interface. A nil field always means the safe production behaviour.
-3. `cmd/worker` picks implementations with a pair of tiny tagged files per flag, `deps_<flag>_off.go` (`!<flag>`) and `deps_<flag>_on.go` (`<flag>`), each setting exactly one `Deps` field so flags compose independently.
-4. The linker drops code that `main` cannot reach, so a dev-only implementation that production wiring never references is absent from the production binary. That is a linker property, not a language guarantee, which is why the rules below matter.
-
-Rules: flags are compile-time only and are never read from the environment, a binding or a request; production code must never reference a dev-only type; `make deploy` refuses to run with any flag set. `DEV_TAGS` in the Makefile lists the flags a dev build turns on, and `make vet` and `make lint` check both wirings. To add a flag, add the interface and its implementations, a `Deps` field and the tagged pair, and add the tag to `DEV_TAGS`. The `cmd/worker/deps_*` files are the list of current flags.
 
 ## Database
 

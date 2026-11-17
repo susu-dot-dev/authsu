@@ -1,7 +1,4 @@
 # authsu developer commands. Run `make help`. See docs/devops.md.
-#
-# Production is the default build. Compile-time feature flags are Go build tags
-# passed to TinyGo via GO_TAGS; dev targets set DEV_TAGS, `deploy` never does.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -19,10 +16,7 @@ DEV_RP_VARS := --var RP_ID:localhost --var RP_ORIGIN:http://localhost:$(DEV_PORT
 # E2E uses its own state, never the dev state.
 E2E_STATE := .wrangler/e2e-state
 
-# Tags for dev builds and local development. Never used by `deploy`.
-DEV_TAGS := debug_routes
-
-# The production wasm is a real file target, so it is built once and shared:
+# The wasm is a real file target, so it is built once and shared:
 # `size`, `test-e2e` and CI's downstream jobs all consume the same build/. Make
 # rebuilds it only when a Go source, the module files or the build recipe
 # changed. TinyGo has no incremental compilation, so this is the only way to
@@ -71,19 +65,17 @@ fmt-check: ## Fail if Go code is not gofmt-clean
 	@out="$$(gofmt -s -l $(GO_FILES))"; if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 .PHONY: vet
-vet: ## go vet on the host (prod and dev tags, e2e), plus the js/wasm entrypoint
+vet: ## go vet on the host (and e2e), plus the js/wasm entrypoint
 	go vet ./...
-	go vet -tags "$(DEV_TAGS)" ./...
 	go vet -tags e2e ./e2e/...
 	GOOS=js GOARCH=wasm go vet ./cmd/worker
-	GOOS=js GOARCH=wasm go vet -tags "$(DEV_TAGS)" ./cmd/worker
 
 # ---- tests ------------------------------------------------------------------
 
 COVER_OUT := coverage.out
 
 .PHONY: test
-test: ## Unit tests (race detector on, production tags)
+test: ## Unit tests (race detector on)
 	go test -race ./...
 
 .PHONY: coverage
@@ -101,7 +93,7 @@ tidy-check: ## Fail if go.mod/go.sum are not tidy
 	go mod tidy -diff
 
 .PHONY: size
-size: $(WASM) $(SIZE_REPORT) ## Production wasm size report + budget (fails if over budget or test pkgs linked)
+size: $(WASM) $(SIZE_REPORT) ## Wasm size report + budget (fails if over budget or test pkgs linked)
 	WASM=$(WASM) SIZE_REPORT=$(SIZE_REPORT) ./scripts/check-size.sh
 
 .PHONY: vuln
@@ -109,12 +101,10 @@ vuln: ## Scan dependencies for known vulnerabilities (pinned govulncheck)
 	go tool govulncheck ./...
 
 .PHONY: lint
-lint: ## golangci-lint (host prod and dev tags, e2e, and the js/wasm entrypoint)
+lint: ## golangci-lint (host, e2e, and the js/wasm entrypoint)
 	golangci-lint run ./...
-	golangci-lint run --build-tags "$(DEV_TAGS)" ./...
 	golangci-lint run --build-tags e2e ./e2e/...
 	GOOS=js GOARCH=wasm golangci-lint run ./cmd/worker
-	GOOS=js GOARCH=wasm golangci-lint run --build-tags "$(DEV_TAGS)" ./cmd/worker
 
 # ---- build / local dev ------------------------------------------------------
 
@@ -124,7 +114,7 @@ lint: ## golangci-lint (host prod and dev tags, e2e, and the js/wasm entrypoint)
 $(WASM): $(WASM_DEPS)
 	@if [ -n "$(PREBUILT)" ]; then \
 	  echo "PREBUILT is set but $(WASM) is missing or older than its sources"; exit 1; fi
-	GO_TAGS= npm run build
+	npm run build
 
 # `-size full` is a second link of the same program, only needed for the size
 # report, so it is a separate target that `size` (and CI's build job) asks for.
@@ -136,15 +126,7 @@ $(SIZE_REPORT): $(WASM_DEPS)
 	  -size full ./cmd/worker >$@ 2>&1
 
 .PHONY: build
-build: $(WASM) ## Production build (no flags) -> build/
-
-# A dev build overwrites build/app.wasm, so make would otherwise treat that file
-# as an up-to-date production build. Removing it afterwards keeps `size` and
-# `test-e2e` from ever picking up a dev binary: they rebuild from scratch.
-.PHONY: build-dev
-build-dev: ## Dev build (DEV_TAGS) -> build/ (the next prod build or e2e rebuilds)
-	GO_TAGS="$(DEV_TAGS)" npm run build
-	@touch -d @0 $(WASM)
+build: $(WASM) ## Build the Worker -> build/
 
 .PHONY: migrate-local
 migrate-local: ## Apply D1 migrations to the local dev database
@@ -155,11 +137,8 @@ db-reset: ## Delete local dev database state
 	rm -rf $(DEV_STATE)
 
 .PHONY: dev
-dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1, localhost RP)
-	@# wrangler's own rebuild leaves a dev wasm in build/; mark it stale on exit
-	@# (even on Ctrl-C) so size and e2e never mistake it for a production build.
-	trap 'touch -d @0 $(WASM) 2>/dev/null; true' EXIT; \
-	GO_TAGS="$(DEV_TAGS)" npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_RP_VARS)
+dev: migrate-local ## Run the Worker locally on :8787 (local D1, localhost RP)
+	npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_RP_VARS)
 
 # ---- configuration ----------------------------------------------------------
 # Registration's AUTH_HMAC_SECRET (secret) and RP_ID, RP_ORIGIN, RP_NAME (vars).
@@ -180,14 +159,13 @@ config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for 
 	@./scripts/config.sh set-secret $(ARGS)
 
 # ---- end-to-end tests -------------------------------------------------------
-# Runs the real production Worker: the prebuilt wasm under `wrangler dev`
-# (workerd with a simulated D1) on a throwaway state directory and a free port,
-# driven over HTTP. wrangler.e2e.jsonc has no build.command, so wrangler serves
-# exactly the build/ that make produced instead of rebuilding it. There is no
-# dev-flag e2e run: the artifact under test is the one that gets deployed.
+# Runs the real Worker: the prebuilt wasm under `wrangler dev` (workerd with a
+# simulated D1) on a throwaway state directory and a free port, driven over
+# HTTP. wrangler.e2e.jsonc has no build.command, so wrangler serves exactly the
+# build/ that make produced instead of rebuilding it.
 
 .PHONY: test-e2e
-test-e2e: $(WASM) ## End-to-end tests against the production build
+test-e2e: $(WASM) ## End-to-end tests against the built Worker
 	E2E_STATE=$(E2E_STATE) go test -tags e2e -count=1 -timeout 10m ./e2e/...
 
 .PHONY: clean
@@ -199,7 +177,7 @@ clean: ## Remove build outputs
 .PHONY: check
 check: check-tools fmt-check tidy-check vet lint test coverage ## Fast pre-commit gate (no wasm build, no e2e)
 
-# One production build feeds both size and e2e. CI builds it once in a `build`
+# One build feeds both size and e2e. CI builds it once in a `build`
 # job and hands build/ to the others as an artifact.
 .PHONY: ci
 ci: check size test-e2e ## Everything CI runs
