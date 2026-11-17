@@ -93,7 +93,7 @@ type publicKeyOptions struct {
 type Config struct {
 	// Deploy is the root secret and relying party.
 	Deploy deploy.Config
-	// Issuer is the session issuer, derived from the origin.
+	// Issuer is the session issuer, derived from the API origin.
 	Issuer session.Issuer
 }
 
@@ -106,12 +106,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, notConfigured(err)
 	}
 
-	issuer, err := session.IssuerFor(cfg.RP.Origin)
-	if err != nil {
-		return Config{}, notConfigured(err)
-	}
-
-	return Config{Deploy: cfg, Issuer: issuer}, nil
+	return Config{Deploy: cfg, Issuer: session.IssuerFor(cfg.API)}, nil
 }
 
 func notConfigured(cause error) error {

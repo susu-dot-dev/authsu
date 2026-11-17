@@ -47,9 +47,15 @@ const (
 	// with: fixed and throwaway, 43 characters like a generated one.
 	authHMACSecret = "e2e-auth-hmac-secret-0123456789ABCDEFGHIJKLMN"
 
-	// rpID is the relying party ID. The origin is built from the port the
-	// Worker is given, so it is set in serve.
+	// rpID is the relying party ID: the host of the UI origin, which the Worker
+	// derives from UI_ORIGIN.
 	rpID = "localhost"
+
+	// uiPort is the port of the UI origin. No UI runs there; the origin is only
+	// ever a string in clientDataJSON and an Origin header. It differs from the
+	// Worker's own port, as it does in production (susu.dev and auth.susu.dev),
+	// so the tests exercise a cross-origin UI.
+	uiPort = "3000"
 
 	// envFileName is written into the state directory and handed to wrangler
 	// with --env-file. Nothing in the repository root is read or written, so a
@@ -64,8 +70,11 @@ var errNotReady = errors.New("worker not ready")
 // worker is the running Worker under test.
 type worker struct {
 	baseURL string
-	// origin is the relying party origin the Worker accepts.
+	// origin is the UI origin: the relying party origin the Worker accepts
+	// ceremonies from, and the one origin it allows cross-origin.
 	origin string
+	// apiOrigin is the origin the Worker is served from: its session issuer.
+	apiOrigin string
 
 	// root is the repository root and state the Worker's local D1 state
 	// directory (relative to root), so tests can inspect the database.
@@ -111,9 +120,9 @@ func run(m *testing.M) int {
 
 // writeEnvFile writes the secrets and variables the Worker under test is
 // configured with to dir, in the dotenv format wrangler's --env-file reads, and
-// returns its path. The relying party origin depends on the port the Worker
-// listens on, so it is a parameter.
-func writeEnvFile(dir, origin string) (string, error) {
+// returns its path. The API origin depends on the port the Worker listens on,
+// so both origins are parameters.
+func writeEnvFile(dir, apiOrigin, uiOrigin string) (string, error) {
 	err := os.MkdirAll(dir, 0o700)
 	if err != nil {
 		return "", fmt.Errorf("create %s: %w", dir, err)
@@ -123,9 +132,8 @@ func writeEnvFile(dir, origin string) (string, error) {
 
 	contents := "FIRST_RUN_SECRET=" + firstRunSecret + "\n" +
 		"AUTH_HMAC_SECRET=" + authHMACSecret + "\n" +
-		"RP_ID=" + rpID + "\n" +
-		"RP_ORIGIN=" + origin + "\n" +
-		"RP_NAME=authsu e2e\n"
+		"API_ORIGIN=" + apiOrigin + "\n" +
+		"UI_ORIGIN=" + uiOrigin + "\n"
 
 	err = os.WriteFile(path, []byte(contents), envFilePerm)
 	if err != nil {
@@ -143,9 +151,10 @@ func serve(ctx context.Context, root, state string, m *testing.M) int {
 		return fail("pick port: %v", err)
 	}
 
-	origin := "http://" + rpID + ":" + port
+	apiOrigin := "http://" + rpID + ":" + port
+	uiOrigin := "http://" + rpID + ":" + uiPort
 
-	envFile, err := writeEnvFile(filepath.Join(root, state), origin)
+	envFile, err := writeEnvFile(filepath.Join(root, state), apiOrigin, uiOrigin)
 	if err != nil {
 		return fail("write env file: %v", err)
 	}
@@ -176,9 +185,12 @@ func serve(ctx context.Context, root, state string, m *testing.M) int {
 	}()
 
 	// Tests connect to 127.0.0.1 (wrangler binds IPv4, and "localhost" may
-	// resolve to ::1 first). The relying party origin is only ever a string
-	// inside clientDataJSON, so it can use the name "localhost".
-	target = worker{baseURL: "http://127.0.0.1:" + port, origin: origin, root: root, state: state}
+	// resolve to ::1 first). The origins are only ever strings (inside
+	// clientDataJSON, in an Origin header, in an issuer), so they can use the
+	// name "localhost".
+	target = worker{
+		baseURL: "http://127.0.0.1:" + port, origin: uiOrigin, apiOrigin: apiOrigin, root: root, state: state,
+	}
 
 	err = waitReady(ctx, target.baseURL+"/healthz")
 	if err != nil {

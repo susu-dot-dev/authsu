@@ -8,10 +8,14 @@ include tools.env
 # Local D1 state (git-ignored via .wrangler). Dev and e2e use different
 # directories so e2e can wipe its own state without touching dev data.
 DEV_STATE := .wrangler/state
-# Relying party values for `make dev`, passed as --var so they override the
-# deployment's RP_* in wrangler.jsonc. The origin must match DEV_PORT.
+# Origins for `make dev`, passed as --var so they override the deployment's
+# API_ORIGIN and UI_ORIGIN in wrangler.jsonc. The API listens on DEV_PORT; the UI
+# is a separate dev server on DEV_UI_PORT, and UI_ORIGIN is its origin because
+# that is where passkey ceremonies run and what CORS allows (docs/runbook.md,
+# "Frontend on another origin"). The relying party ID is derived from it.
 DEV_PORT := 8787
-DEV_RP_VARS := --var RP_ID:localhost --var RP_ORIGIN:http://localhost:$(DEV_PORT) --var 'RP_NAME:authsu dev'
+DEV_UI_PORT := 3000
+DEV_ORIGIN_VARS := --var API_ORIGIN:http://localhost:$(DEV_PORT) --var UI_ORIGIN:http://localhost:$(DEV_UI_PORT)
 
 # E2E uses its own state, never the dev state.
 E2E_STATE := .wrangler/e2e-state
@@ -137,22 +141,22 @@ db-reset: ## Delete local dev database state
 	rm -rf $(DEV_STATE)
 
 .PHONY: dev
-dev: migrate-local ## Run the Worker locally on :8787 (local D1, localhost RP)
-	npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_RP_VARS)
+dev: migrate-local ## Run the Worker locally on :8787 (local D1, UI origin on :3000)
+	npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_ORIGIN_VARS)
 
 # ---- configuration ----------------------------------------------------------
-# Registration's AUTH_HMAC_SECRET (secret) and RP_ID, RP_ORIGIN, RP_NAME (vars).
+# AUTH_HMAC_SECRET (secret) and API_ORIGIN, UI_ORIGIN (vars).
 # See docs/runbook.md, "Secrets and variables". scripts/config.sh does the work.
 
 .PHONY: config-get
-config-get: ## Show the RP_* vars, whether AUTH_HMAC_SECRET is set (never its value)
+config-get: ## Show API_ORIGIN and UI_ORIGIN, whether AUTH_HMAC_SECRET is set (never its value)
 	@./scripts/config.sh get
 
 .PHONY: config-set-vars
-config-set-vars: ## Write the RP_* vars into wrangler.jsonc: RP_ID=... RP_ORIGIN=... RP_NAME=...
-	@[ -n "$(RP_ID)" ] && [ -n "$(RP_ORIGIN)" ] && [ -n "$(RP_NAME)" ] || { \
-	  echo 'usage: make config-set-vars RP_ID=auth.example.com RP_ORIGIN=https://auth.example.com RP_NAME="My Auth"'; exit 2; }
-	@./scripts/config.sh set-vars "$(RP_ID)" "$(RP_ORIGIN)" "$(RP_NAME)"
+config-set-vars: ## Write the origins into wrangler.jsonc: API_ORIGIN=... UI_ORIGIN=...
+	@[ -n "$(API_ORIGIN)" ] && [ -n "$(UI_ORIGIN)" ] || { \
+	  echo 'usage: make config-set-vars API_ORIGIN=https://auth.example.com UI_ORIGIN=https://example.com'; exit 2; }
+	@./scripts/config.sh set-vars "$(API_ORIGIN)" "$(UI_ORIGIN)"
 
 .PHONY: config-set-secret
 config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for .dev.vars, ARGS=--stdin to supply one)

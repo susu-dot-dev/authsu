@@ -29,9 +29,9 @@ var errDB = errors.New("database is on fire")
 
 const (
 	testSecret = "login-secret-0123456789ABCDEFGHIJKLMNOP"
-	testRPID   = "auth.example.com"
-	testOrigin = "https://auth.example.com"
-	testRPName = "Example Auth"
+	testRPID   = "example.com"
+	testOrigin = "https://example.com"
+	testAPI    = "https://auth.example.com"
 
 	testCredRowID = "00000000-0000-7000-8000-000000000001"
 	testUserID    = "00000000-0000-7000-8000-000000000002"
@@ -80,10 +80,9 @@ func (f *fakeBatch) run(_ context.Context, statements ...atomic.Statement) error
 
 func getenv(overrides map[string]string) func(string) string {
 	values := map[string]string{
-		deploy.SecretHMAC:  testSecret,
-		deploy.VarRPID:     testRPID,
-		deploy.VarRPOrigin: testOrigin,
-		deploy.VarRPName:   testRPName,
+		deploy.SecretHMAC:   testSecret,
+		deploy.VarAPIOrigin: testAPI,
+		deploy.VarUIOrigin:  testOrigin,
 	}
 
 	maps.Copy(values, overrides)

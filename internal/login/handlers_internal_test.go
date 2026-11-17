@@ -117,12 +117,12 @@ func TestBeginRefusesWithoutConfiguration(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]map[string]string{
-		"secret missing":   {deploy.SecretHMAC: ""},
-		"secret too short": {deploy.SecretHMAC: strings.Repeat("a", deploy.MinSecretLen-1)},
-		"rp id missing":    {deploy.VarRPID: ""},
-		"rp origin":        {deploy.VarRPOrigin: ""},
-		"rp name missing":  {deploy.VarRPName: ""},
-		"origin not http":  {deploy.VarRPOrigin: "ftp://auth.example.com"},
+		"secret missing":      {deploy.SecretHMAC: ""},
+		"secret too short":    {deploy.SecretHMAC: strings.Repeat("a", deploy.MinSecretLen-1)},
+		"api origin missing":  {deploy.VarAPIOrigin: ""},
+		"ui origin missing":   {deploy.VarUIOrigin: ""},
+		"ui origin not http":  {deploy.VarUIOrigin: "ftp://example.com"},
+		"api origin not http": {deploy.VarAPIOrigin: "ftp://auth.example.com"},
 	}
 
 	for name, overrides := range tests {

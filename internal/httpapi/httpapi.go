@@ -11,9 +11,10 @@
 //   - A route whose method is not GET or HEAD requires the request's
 //     Content-Type to be application/json, even when the body is empty (415
 //     unsupported_media_type, checked after the method and before the body is
-//     read). That type forces a CORS preflight, which fails because no route
-//     sends CORS headers, so another site cannot make a browser deliver such a
-//     request: this is the CSRF defence for every unsafe route (see isJSON).
+//     read). That type forces a CORS preflight, which fails for every origin
+//     but the one CORS allows, so another site cannot make a browser deliver
+//     such a request: this is the CSRF defence for every unsafe route (see
+//     isJSON and CORS).
 //   - A request body is capped at 1 MiB (413 body_too_large).
 //   - A handler runs inside a recover, so a panic still gets the JSON error
 //     contract and a log line, as Internal handler_panic.
@@ -357,7 +358,8 @@ const jsonMediaType = "application/json"
 //
 // This is the CSRF defence. application/json is not a CORS-safelisted type, so
 // a browser cannot send it cross-origin without a preflight, and the
-// preflight fails because nothing here answers it with CORS headers. HTML forms
+// preflight fails because CORS answers it only for the one allowed origin
+// (the UI), never for another site. HTML forms
 // cannot send it at all. Requiring it on every unsafe request, even one with
 // an empty body, means no other site can make a browser deliver a request this
 // boundary will hand to a handler, whatever the handler does with the body.

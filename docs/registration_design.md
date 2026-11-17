@@ -158,18 +158,27 @@ The key needs its own secret rather than being derived from `FIRST_RUN_SECRET`, 
 
 ### Deployment configuration
 
-Registration, login and sessions share four settings, read by `internal/deploy`:
+Registration, login and sessions share three settings, read by `internal/deploy`:
 
 | Name | Kind | Purpose |
 |---|---|---|
 | `AUTH_HMAC_SECRET` | secret | Root key material, at least 32 characters (a generated one is 43). Each purpose derives its own key from it with a distinct context (`internal/deploy.DeriveKey`; registration uses `authsu/registration-challenge/v1`). Never used directly, and never for anything where a signature is authorization |
-| `RP_ID` | var | WebAuthn relying party ID. **Permanent**: a passkey is bound to it, so changing it invalidates every registered passkey |
-| `RP_ORIGIN` | var | The one origin ceremonies are accepted from, such as `https://auth.example.com`, compared as an exact string |
-| `RP_NAME` | var | The relying party name the browser shows |
+| `API_ORIGIN` | var | The origin this Worker is served from, such as `https://auth.example.com`. It is the identity of the service: the session issuer is derived from it |
+| `UI_ORIGIN` | var | The origin the UI is served from, such as `https://example.com`. Passkey ceremonies run on the UI's pages, so it is the one origin ceremonies are accepted from (compared as an exact string), and it is the one origin allowed to call the API cross-origin (see [login_design.md](login_design.md#the-ui-on-another-origin)) |
 
-`RP_*` are non-sensitive and live in `wrangler.jsonc`; `AUTH_HMAC_SECRET` must be a secret, never a var. [runbook.md](runbook.md) covers setting them. They are configuration, not derived from the request, for the reason given under Verification below.
+Both origins must be bare: a scheme and a host with an optional numeric port, lower case, with no path, query, fragment or user info. `https` is accepted for any host and plain `http` for `localhost` only.
 
-While any of them is missing or the secret is too short, registration answers 503 `registration_not_configured`. Login (`login_not_configured`) and the session routes (`session_not_configured`) fail the same way, and also when `RP_ORIGIN` is not `https://` (or `http://localhost`). Sessions need no variable of their own: their issuer is derived from `RP_ORIGIN`.
+The WebAuthn relying party is derived from `UI_ORIGIN`, not configured separately, so it cannot disagree with it:
+
+- The **relying party ID** is its host, with no scheme and no port (`https://susu.dev` gives `susu.dev`; `http://localhost:3000` gives `localhost`). **Permanent**: a passkey is bound to it, so changing the host of `UI_ORIGIN` invalidates every registered passkey.
+- The **relying party name** the browser shows is the same host.
+- The **origin** ceremonies are accepted from is `UI_ORIGIN` itself.
+
+The ID is therefore always the UI's host exactly. A deployment cannot choose a parent domain of the UI's host as the ID.
+
+The variables are non-sensitive and live in `wrangler.jsonc`; `AUTH_HMAC_SECRET` must be a secret, never a var. [runbook.md](runbook.md) covers setting them. They are configuration, not derived from the request, for the reason given under Verification below.
+
+While either origin is missing or invalid, or the secret is too short, registration answers 503 `registration_not_configured`. Login (`login_not_configured`) and the session routes (`session_not_configured`) fail the same way. Sessions need no variable of their own: their issuer is derived from `API_ORIGIN`.
 
 ## The point of acceptance
 
@@ -205,7 +214,7 @@ What `finish` verifies is deliberately narrow, and everything outside it fails c
 - **The request body** is what `PublicKeyCredential.toJSON()` returns (`RegistrationResponseJSON`), unmodified. `authenticatorData`, `publicKey` and `publicKeyAlgorithm` are copies of what `attestationObject` holds; everything is read from `attestationObject`, so they are ignored. `clientExtensionResults` must be empty, because we request no extensions. The body is decoded strictly: member names must match exactly, may not repeat, and text must be valid UTF-8.
 - **The account name** must be valid UTF-8 in Unicode Normalization Form C, with no control (Cc) or format (Cf) code points: no NUL, bidirectional overrides, or zero-width characters. This is the core of the PRECIS Nickname profile section 5.4.3 asks for.
 
-Both the relying party ID and the origin come from configuration (`RP_ID`, `RP_ORIGIN`), never from the request, because a `Host` header is attacker-influenced and a Worker is reachable on several hostnames. The ID is permanent: a passkey is bound to it.
+Both the relying party ID and the origin come from configuration (`UI_ORIGIN`), never from the request, because a `Host` header is attacker-influenced and a Worker is reachable on several hostnames. The ID is permanent: a passkey is bound to it.
 
 The parsers are fuzzed (`go test -fuzz=FuzzVerify ./internal/webauthn`), with the property that anything accepted is a bounded credential id and a key that round-trips byte for byte.
 

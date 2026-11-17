@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Helpers to read and write the registration configuration: the AUTH_HMAC_SECRET
-# secret and the RP_ID, RP_ORIGIN and RP_NAME vars. See docs/runbook.md
+# Helpers to read and write the deployment configuration: the AUTH_HMAC_SECRET
+# secret and the API_ORIGIN and UI_ORIGIN vars. See docs/runbook.md
 # ("Secrets and variables") for how they are stored and why. Run through
 # `make config-*`; see `make help`.
 #
 #   config.sh get                      show every value and where it is stored
-#   config.sh set-vars ID ORIGIN NAME  write the RP_* vars into wrangler.jsonc
+#   config.sh set-vars API UI          write API_ORIGIN and UI_ORIGIN into wrangler.jsonc
 #   config.sh set-secret               generate AUTH_HMAC_SECRET and upload it
 #   config.sh set-secret --stdin       upload the secret read from stdin instead
 #   config.sh set-secret --local       write it to .dev.vars instead of Cloudflare
@@ -26,7 +26,7 @@ DEV_VARS="${DEV_VARS:-.dev.vars}"
 WRANGLER="${WRANGLER:-npx wrangler}"
 
 SECRET=AUTH_HMAC_SECRET
-VARS=(RP_ID RP_ORIGIN RP_NAME)
+VARS=(API_ORIGIN UI_ORIGIN)
 
 # Registration refuses a secret shorter than this (registration.MinSecretLen).
 MIN_SECRET_LEN=32
@@ -79,42 +79,37 @@ var_set() {
   rm -f "$tmp"
 }
 
+# validate_origin NAME VALUE: the same rule as deploy.ParseOrigin: a scheme and a
+# host with an optional numeric port and nothing else, lower case, https for any
+# host and plain http for localhost only.
 validate_origin() {
-  case $1 in
+  local name=$1 value=$2
+  case $value in
     https://*) ;;
-    http://localhost | http://localhost:* | http://127.0.0.1 | http://127.0.0.1:*) ;;
-    *) die "RP_ORIGIN must be an https:// origin (http only for localhost): $1" ;;
+    http://localhost | http://localhost:*) ;;
+    *) die "$name must be an https:// origin (http only for localhost): $value" ;;
   esac
-  case ${1#*://} in
-    */* | *\?* | *#*) die "RP_ORIGIN must be an origin only, with no path, query or fragment: $1" ;;
+  case ${value#*://} in
+    */* | *\?* | *#* | *@*) die "$name must be an origin only, with no path, query, fragment or user info: $value" ;;
   esac
-  case $1 in
-    *[[:space:]]*) die "RP_ORIGIN must not contain whitespace: $1" ;;
+  case $value in
+    *[[:space:]]*) die "$name must not contain whitespace: $value" ;;
+    *[A-Z]*) die "$name must be lower case, as a browser sends it: $value" ;;
   esac
+  # After the scheme, a colon introduces the port, which must be digits.
+  local authority=${value#*://}
+  if [[ $authority == *:* ]]; then
+    case ${authority#*:} in
+      '' | *[!0-9]*) die "$name has an invalid port: $value" ;;
+    esac
+  fi
 }
 
-validate_rp_id() {
-  case $1 in
-    '') die "RP_ID must not be empty" ;;
-    *://* | */* | *:* | *[[:space:]]*) die "RP_ID must be a bare domain such as auth.example.com, not a URL or host:port: $1" ;;
-  esac
-}
-
-# host_of ORIGIN -> the hostname of an origin, without scheme or port.
+# host_of ORIGIN -> the hostname of an origin, without scheme or port. This is
+# the relying party ID the Worker derives from UI_ORIGIN.
 host_of() {
   local h=${1#*://}
   printf '%s' "${h%%:*}"
-}
-
-# An RP ID must equal the origin's host or be a registrable suffix of it, or the
-# browser rejects every ceremony. A suffix check cannot know the public suffix
-# list, so this only catches the clear mismatches.
-validate_rp_id_matches_origin() {
-  local id=$1 host
-  host="$(host_of "$2")"
-  if [ "$host" != "$id" ] && [[ $host != *".$id" ]]; then
-    die "RP_ID '$id' must equal the origin's host '$host' or be a parent domain of it"
-  fi
 }
 
 secret_present() { # -> 0 when the Worker has the secret
@@ -129,7 +124,7 @@ cmd_get() {
   echo "Vars (plaintext, in $CONFIG, deployed with the Worker):"
   for name in "${VARS[@]}"; do
     value="$(var_get "$name")"
-    printf '  %-10s %s\n' "$name" "${value:-<unset>}"
+    printf '  %-12s %s\n' "$name" "${value:-<unset>}"
   done
 
   echo
@@ -156,25 +151,27 @@ cmd_get() {
 }
 
 cmd_set_vars() {
-  [ $# -eq 3 ] || { echo "usage: config.sh set-vars RP_ID RP_ORIGIN RP_NAME" >&2; exit 2; }
-  local id=$1 origin=$2 name=$3
+  [ $# -eq 2 ] || { echo "usage: config.sh set-vars API_ORIGIN UI_ORIGIN" >&2; exit 2; }
+  local api=$1 ui=$2
 
-  validate_rp_id "$id"
-  validate_origin "$origin"
-  validate_rp_id_matches_origin "$id" "$origin"
-  [ -n "$name" ] || die "RP_NAME must not be empty"
+  validate_origin API_ORIGIN "$api"
+  validate_origin UI_ORIGIN "$ui"
 
-  local current
-  current="$(var_get RP_ID)"
-  if [ -n "$current" ] && [ "$current" != "$id" ] && [ "$current" != localhost ] && [ -z "${CONFIRM_RP_ID_CHANGE:-}" ]; then
-    die "RP_ID is already '$current'. Changing it invalidates every registered passkey. Re-run with CONFIRM_RP_ID_CHANGE=1 if that is intended."
+  # The relying party ID is the UI origin's host, and a passkey is bound to it.
+  local current current_id id
+  current="$(var_get UI_ORIGIN)"
+  id="$(host_of "$ui")"
+  if [ -n "$current" ]; then
+    current_id="$(host_of "$current")"
+    if [ "$current_id" != "$id" ] && [ "$current_id" != localhost ] && [ -z "${CONFIRM_RP_ID_CHANGE:-}" ]; then
+      die "UI_ORIGIN's host is already '$current_id', which is the relying party ID. Changing it to '$id' invalidates every registered passkey. Re-run with CONFIRM_RP_ID_CHANGE=1 if that is intended."
+    fi
   fi
 
-  var_set RP_ID "$id"
-  var_set RP_ORIGIN "$origin"
-  var_set RP_NAME "$name"
+  var_set API_ORIGIN "$api"
+  var_set UI_ORIGIN "$ui"
 
-  echo "Wrote RP_ID, RP_ORIGIN and RP_NAME to $CONFIG."
+  echo "Wrote API_ORIGIN and UI_ORIGIN to $CONFIG (relying party ID: $id)."
   echo "Vars ship with the code: they take effect on the next deploy (npx wrangler deploy)."
 }
 

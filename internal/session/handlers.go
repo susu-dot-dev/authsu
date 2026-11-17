@@ -24,7 +24,7 @@ const (
 )
 
 // Config is what the handlers need from the deployment: the issuer, derived from
-// the relying party origin.
+// the API origin.
 type Config struct {
 	Issuer Issuer
 }
@@ -33,17 +33,12 @@ type Config struct {
 // configuration is the deployment being broken, not the request being wrong, so
 // it is Unavailable, with a code that names it for the log.
 func LoadConfig(getenv func(string) string) (Config, error) {
-	origin := getenv(deploy.VarRPOrigin)
-	if origin == "" {
-		return Config{}, notConfigured(deploy.ErrRelyingParty)
-	}
-
-	issuer, err := IssuerFor(origin)
+	api, _, err := deploy.Origins(getenv)
 	if err != nil {
 		return Config{}, notConfigured(err)
 	}
 
-	return Config{Issuer: issuer}, nil
+	return Config{Issuer: IssuerFor(api)}, nil
 }
 
 // Service handles the requests that act on an existing session.
@@ -76,7 +71,11 @@ func NewService(deps Deps) *Service {
 // __Host- prefix requires, and which keeps it to this host), and SameSite=Lax:
 // a session survives a user following a link to the site, and is withheld from
 // cross-site subrequests and POSTs, which is also what stops another site from
-// triggering a logout.
+// triggering a logout. The UI may be on another origin than this API, but it
+// must be on the same site (susu.dev and auth.susu.dev; localhost on two
+// ports), so the UI's credentialed fetches still carry the cookie. SameSite
+// compares registrable domains, not origins, which is why Lax suffices and
+// None is not needed.
 func Cookie(key Key) *http.Cookie {
 	return &http.Cookie{
 		Name:     CookieName,

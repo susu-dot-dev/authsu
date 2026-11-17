@@ -9,7 +9,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "authsu",
 	"main": "./build/worker.mjs",
-	"compatibility_date": "2026-11-13",
+	"compatibility_date": "2026-10-18",
 	"d1_databases": [
 		{
 			"binding": "DB",

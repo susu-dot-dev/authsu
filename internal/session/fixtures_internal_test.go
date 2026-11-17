@@ -24,10 +24,11 @@ const (
 )
 
 const (
-	testOrigin = "https://auth.example.com"
-	testUserID = "00000000-0000-7000-8000-000000000002"
-	testCredID = "00000000-0000-7000-8000-000000000001"
-	testRole   = "admin"
+	testOrigin   = "https://auth.example.com"
+	testUIOrigin = "https://example.com"
+	testUserID   = "00000000-0000-7000-8000-000000000002"
+	testCredID   = "00000000-0000-7000-8000-000000000001"
+	testRole     = "admin"
 )
 
 // testNow is the fixed time the tests run at. It is real time, not a fixed
@@ -36,7 +37,7 @@ const (
 func testNow() time.Time { return time.Now() }
 
 func getenv(overrides map[string]string) func(string) string {
-	values := map[string]string{deploy.VarRPOrigin: testOrigin}
+	values := map[string]string{deploy.VarAPIOrigin: testOrigin, deploy.VarUIOrigin: testUIOrigin}
 
 	maps.Copy(values, overrides)
 
@@ -90,10 +91,12 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 
-	issuer, err := IssuerFor(testOrigin)
+	api, err := deploy.ParseOrigin(testOrigin)
 	if err != nil {
-		t.Fatalf("issuer: %v", err)
+		t.Fatalf("origin: %v", err)
 	}
+
+	issuer := IssuerFor(api)
 
 	fix := &fixture{
 		reader:  &fakeReader{keys: map[string]ActiveKey{}, err: nil, asked: nil, at: nil},

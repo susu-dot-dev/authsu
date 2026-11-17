@@ -29,12 +29,11 @@ import (
 const (
 	// SecretHMAC is the Worker secret that is the root key material.
 	SecretHMAC = deploy.SecretHMAC
-	// VarRPID is the relying party ID, such as "auth.example.com".
-	VarRPID = deploy.VarRPID
-	// VarRPOrigin is the one origin ceremonies are accepted from.
-	VarRPOrigin = deploy.VarRPOrigin
-	// VarRPName is the relying party name shown by the browser.
-	VarRPName = deploy.VarRPName
+	// VarAPIOrigin is the origin this Worker is served from.
+	VarAPIOrigin = deploy.VarAPIOrigin
+	// VarUIOrigin is the origin the UI is served from: the one origin
+	// ceremonies are accepted from, whose host is the relying party ID.
+	VarUIOrigin = deploy.VarUIOrigin
 )
 
 // MinSecretLen is the shortest AUTH_HMAC_SECRET accepted.

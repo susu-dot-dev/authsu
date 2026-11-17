@@ -25,7 +25,7 @@ Which names exist, what each is for and what happens when one is missing is part
 
 | Command | What it does |
 |---|---|
-| `make config-set-vars RP_ID=auth.example.com RP_ORIGIN=https://auth.example.com RP_NAME="My Auth"` | Validates and writes the relying party vars into `wrangler.jsonc`, keeping its comments. Takes effect on the next `npx wrangler deploy` |
+| `make config-set-vars API_ORIGIN=https://auth.example.com UI_ORIGIN=https://example.com` | Validates and writes the two origins into `wrangler.jsonc`, keeping its comments. Takes effect on the next `npx wrangler deploy` |
 | `make config-set-secret` | Generates 32 random bytes (43 base64url characters) and uploads them as `AUTH_HMAC_SECRET` with `wrangler secret put`, which deploys a new version |
 | `make config-set-secret ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev` |
 | `make config-set-secret ARGS=--stdin` | Uploads a secret you supply on stdin instead of generating one |
@@ -35,11 +35,21 @@ The secret is passed to Wrangler on stdin, so it is never on a command line, nev
 Two changes cannot be undone, so the helpers refuse them unless you opt in:
 
 - Replacing an existing `AUTH_HMAC_SECRET` (`CONFIRM_SECRET_ROTATE=1`). Ceremonies begun but not finished are invalidated.
-- Changing a non-`localhost` `RP_ID` (`CONFIRM_RP_ID_CHANGE=1`). A passkey is bound to the relying party ID, so this invalidates every registered passkey.
+- Changing the host of a non-`localhost` `UI_ORIGIN` (`CONFIRM_RP_ID_CHANGE=1`). The relying party ID is that host and a passkey is bound to it, so this invalidates every registered passkey. Changing `API_ORIGIN` does not, but it changes the session issuer and so ends every live session.
 
-`set-vars` also checks that `RP_ORIGIN` is an `https://` origin with no path (`http` only for localhost) and that `RP_ID` is the origin's host or a parent domain of it. Set the relying party vars before the first registration, and never leave a value in `wrangler.jsonc` that you do not control.
+`set-vars` also checks that both values are bare origins (an `https://` origin with no path, query or user info, lower case; `http` only for localhost). Set them before the first registration, and never leave a value in `wrangler.jsonc` that you do not control.
 
-Local runs never use the committed values: `make dev` overrides them with `localhost` values (`DEV_RP_VARS` in the Makefile) and the e2e harness writes its own, so a local run cannot register passkeys against the real domain.
+Local runs never use the committed values: `make dev` overrides them with `localhost` values (`DEV_ORIGIN_VARS` in the Makefile) and the e2e harness writes its own, so a local run cannot register passkeys against the real domain.
+
+### Frontend on another origin
+
+The UI may be served from a different origin than the API (`https://susu.dev` calling `https://auth.susu.dev`). The Worker allows exactly one origin to call it from a browser, and it is `UI_ORIGIN`: there is no separate CORS setting. Why, and what that does and does not allow, is in [login_design.md](login_design.md#the-ui-on-another-origin).
+
+- **`UI_ORIGIN` is the UI's origin**, not the Worker's, and **`API_ORIGIN` is the Worker's**. Passkey ceremonies run on the UI's page, so a `UI_ORIGIN` that is the API's host makes every registration and login fail with a wrong-origin error. The relying party ID and name are the host of `UI_ORIGIN`; there is nothing else to set.
+- **The UI and API must share a registrable domain** (`susu.dev` and `auth.susu.dev`), or the session cookie, which is `SameSite=Lax`, will not be sent. Nothing checks this: a login that succeeds followed by an unauthenticated request is the symptom.
+- **The UI must send credentials**: `fetch(url, { credentials: "include" })`, and `Content-Type: application/json` on every POST.
+- **Locally**, `make dev` serves the API on :8787 and sets `API_ORIGIN` to `http://localhost:8787` and `UI_ORIGIN` to `http://localhost:3000` (`DEV_UI_PORT` in the Makefile), so run the UI dev server on that port, or override it: `make dev DEV_UI_PORT=5173`. A browser will not let a page on another origin read a response the Worker did not mark readable, so a UI on any other port fails with a CORS error.
+- **Symptoms:** a CORS error in the browser console with no `Access-Control-Allow-Origin` on the response means the page's origin is not exactly `UI_ORIGIN` (scheme, host and port all count; no trailing slash), or `UI_ORIGIN` is not a valid bare origin and so allows nothing.
 
 ## Database migrations
 
@@ -49,9 +59,8 @@ Conventions for writing migrations are in [devops.md](devops.md). Applying them:
 - **Always pass `--local`** for anything that is not a deliberate remote migration. Local and e2e use the same `DB` binding name as production but are simulated.
 - **Remote migrations are applied by hand.** Neither CI nor Workers Builds applies them, so apply a new migration to the target database before deploying code that needs it.
   - **Production:** `npx wrangler d1 migrations apply DB --remote`.
-  - **Preview database:** Wrangler resolves a migration target from the top-level `d1_databases`, so the preview database needs a second config file, `wrangler.preview-migrations.jsonc`, with a top-level `d1_databases` entry (binding `PREVIEW_DB`, the preview `database_id`, `migrations_dir: "migrations"`). Apply with `npx wrangler d1 migrations apply PREVIEW_DB --remote --config wrangler.preview-migrations.jsonc`. Its `database_id` must match `previews.d1_databases` in `wrangler.jsonc`; change both together.
-- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to the preview database is silently ignored there. While a migration is unmerged, the preview database is disposable: drop its tables and the `d1_migrations` rows (or recreate the database) and apply again. All Previews share that one database by default, so it reflects one branch's schema at a time. Once a migration is on `main`, the append-only rule applies and the fix is a new migration.
-- The `database_id` values in `wrangler.jsonc` are identifiers, not secrets.
+- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. Once a migration is on `main`, the append-only rule applies and the fix is a new migration.
+- The `database_id` in `wrangler.jsonc` is an identifier, not a secret.
 
 ## Deploying
 
@@ -83,4 +92,6 @@ Dependabot and the scheduled workflow (`.github/workflows/scheduled.yml`) do mos
 
 - **TinyGo and golangci-lint** pins in `tools.env`: bump the version and checksum together, and say in the commit where the checksum came from.
 - **The `workers-go` fork:** `go.mod` replaces `workers-go` with a fork carrying D1 batch support. Drop the `replace` once upstream releases it.
+- **The Workers `compatibility_date`** in `wrangler.jsonc` and `wrangler.e2e.jsonc` (keep the two equal: e2e must test the date that is deployed). It is a deliberate pin, not "the newest": it is the runtime behaviour this code was tested against, and it may be any date the locked workerd supports. A date newer than the workerd bundled with the installed wrangler makes `wrangler dev` refuse to start (`newest date supported by this server binary`), so the date, not the wrangler minimum in `package.json`, is what decides how old a wrangler is acceptable: `package.json` allows the oldest wrangler whose workerd supports the date. The weekly check reports a date that is newer than the locked workerd supports, one that is more than 90 days behind it, and the two configs disagreeing. To bump it, read the [compatibility flag changes](https://developers.cloudflare.com/workers/configuration/compatibility-flags/) since the old date, raise both configs together, and raise the wrangler range in `package.json` to the oldest version whose workerd supports the new date (`npm view wrangler@<version> dependencies.workerd` gives its `1.YYYYMMDD.N`).
+- **A wrangler that is not the project's.** `npx wrangler` uses `node_modules` when it exists and otherwise falls back to any globally installed wrangler, which can be older than `package-lock.json` pins. Run `make setup` (`npm ci`) first; `workerd` refusing the compatibility date is the usual symptom.
 - **govulncheck** is pinned through a `tool` directive in `go.mod`, so Dependabot keeps it current. An old govulncheck panics inside its bundled `x/tools` when analysing code built by a newer Go: a panic in the scheduled run means the pin is stale, not that the code is vulnerable. Run `make vuln` locally when adding a dependency.

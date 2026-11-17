@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/susu-dot-dev/japikey_go"
+
+	"github.com/susu-dot-dev/authsu/internal/deploy"
 )
 
 func TestAudienceIsDerivedFromTheKind(t *testing.T) {
@@ -54,6 +56,8 @@ func TestLoginGrantIsTheHashOfTheChallenge(t *testing.T) {
 	}
 }
 
+// TestIssuerFor: the issuer is the API's origin plus /keys, and plain http is
+// carried through only for the localhost origin deploy.ParseOrigin allowed.
 func TestIssuerFor(t *testing.T) {
 	t.Parallel()
 
@@ -61,38 +65,24 @@ func TestIssuerFor(t *testing.T) {
 		origin       string
 		wantBase     string
 		wantInsecure bool
-		wantErr      bool
 	}{
 		"https":           {origin: "https://auth.example.com", wantBase: "https://auth.example.com/keys"},
 		"https with port": {origin: "https://auth.example.com:8443", wantBase: "https://auth.example.com:8443/keys"},
-		"localhost http":  {origin: "http://localhost:8787", wantBase: "http://localhost:8787/keys", wantInsecure: true},
-		"localhost bare":  {origin: "http://localhost", wantBase: "http://localhost/keys", wantInsecure: true},
-		// Only the host "localhost" may be insecure. A prefix match would let a
-		// lookalike host through, with an http issuer and so an http cookie.
-		"localhost subdomain lookalike": {origin: "http://localhost.evil.com", wantErr: true},
-		"localhost suffix lookalike":    {origin: "http://localhostx", wantErr: true},
-		"localhost lookalike with port": {origin: "http://localhost.evil.com:8787", wantErr: true},
-		"localhost userinfo":            {origin: "http://localhost@evil.com", wantErr: true},
-		"localhost with path":           {origin: "http://localhost/path", wantErr: true},
-		"localhost bad port":            {origin: "http://localhost:abc", wantErr: true},
-		"localhost empty port":          {origin: "http://localhost:", wantErr: true},
-		"https lookalike userinfo":      {origin: "https://auth.example.com@evil.com", wantErr: true},
-		// Plain http is for localhost only: anywhere else it would put the
-		// session cookie on a network.
-		"http elsewhere": {origin: "http://auth.example.com", wantErr: true},
-		"other scheme":   {origin: "ftp://auth.example.com", wantErr: true},
-		"empty":          {origin: "", wantErr: true},
+		"localhost http": {
+			origin: "http://localhost:8787", wantBase: "http://localhost:8787/keys", wantInsecure: true,
+		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := IssuerFor(tt.origin)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			api, err := deploy.ParseOrigin(tt.origin)
+			if err != nil {
+				t.Fatalf("ParseOrigin: %v", err)
 			}
 
+			got := IssuerFor(api)
 			if got.Base != tt.wantBase || got.Insecure != tt.wantInsecure {
 				t.Errorf("issuer = %+v, want base %q insecure %v", got, tt.wantBase, tt.wantInsecure)
 			}
@@ -271,10 +261,12 @@ func TestVerifyRefusesAnotherIssuer(t *testing.T) {
 	fix := newFixture(t)
 	key := fix.issue(t, fix.now.Add(Lifetime))
 
-	elsewhere, err := IssuerFor("https://other.example.com")
+	other, err := deploy.ParseOrigin("https://other.example.com")
 	if err != nil {
-		t.Fatalf("issuer: %v", err)
+		t.Fatalf("origin: %v", err)
 	}
+
+	elsewhere := IssuerFor(other)
 
 	_, err = NewVerifier(fix.reader, elsewhere, func() time.Time { return fix.now }).Verify(t.Context(), key.JWT)
 	if !errors.Is(err, ErrUnauthorized) {
