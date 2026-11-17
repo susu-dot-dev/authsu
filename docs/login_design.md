@@ -207,7 +207,7 @@ An unknown credential, a mismatched handle, a bad signature, and a replay are al
 - **Reading the session** is `GET /api/session`. It reports who the cookie speaks for and when the session ends, which is also when the user has to sign in again. It never writes.
 - **The issuer** of every token is derived from `API_ORIGIN`: the service that mints a token is the one that identifies it, wherever the UI is served. japikey requires `https`, so plain `http` is accepted for `localhost` only.
 - **Configuration** is the deployment's, shared with registration (see [registration_design.md](registration_design.md#deployment-configuration)). Login derives its challenge key from `AUTH_HMAC_SECRET` with its own context. Sessions need no signing key at all: each is a japikey whose private half is discarded as soon as it signs its one token, so there is no key whose leak would be account takeover. When configuration is missing, login answers 503 `login_not_configured` and the session routes 503 `session_not_configured`.
-- **The account's role is read when a request is verified**, not copied into the token. A role change takes effect on the next request, at the cost of joining `users` on the one primary-key read.
+- **The account's role is read when a request is verified**, not copied into the token. A role change takes effect on the next request, at the cost of joining `users` on the one primary-key read. The same join checks that the account is not revoked (see [users_design.md](users_design.md)).
 - **Every response about an unusable session is one answer** (401, `unauthenticated`), whether the cookie is missing, malformed, unknown, expired, revoked or for another audience. The cause goes to the log. A failure to read the store is a 503, never a 401, so an outage cannot look like a verdict on someone's session.
 
 ## The UI on another origin
@@ -233,5 +233,5 @@ The ceremonies run on the UI's page, so the browser writes the UI's origin into 
 
 ## Open questions
 
-- How an administrator revokes someone else's sessions, and how a user lists and ends their own other sessions. The index for it exists; the endpoints do not.
+- How a user lists and ends their own other sessions, and how an administrator ends someone's sessions without revoking the account. The index for it exists; the endpoints do not. Revoking the account (`DELETE /api/user/{id}`, [users_design.md](users_design.md)) does end all of its sessions.
 - Removing expired rows. The design says rows are deleted on expiry and never on revocation, and nothing yet deletes them. The table grows by one row per login, so this can wait, but it should not be forgotten.

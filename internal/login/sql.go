@@ -5,6 +5,10 @@ package login
 // backup eligibility is checked against, and the user handle the response must
 // echo. credential_id is unique, so this is one primary-key-like read.
 //
+// A credential of a revoked account is not found: login refuses it exactly as
+// it refuses an unknown credential, so the response does not say the account
+// exists or was revoked.
+//
 // Arguments: credential_id.
 //
 //nolint:gosec // SQL naming the credentials table, not a credential
@@ -12,7 +16,8 @@ const credentialQuery = `
 SELECT c.id, c.user_id, c.public_key, c.flags, u.user_handle, u.role
 FROM credentials c
 JOIN users u ON u.id = c.user_id
-WHERE c.credential_id = ?`
+WHERE c.credential_id = ?
+  AND u.revoked_at IS NULL`
 
 // updateFlagsQuery stores the flags an accepted assertion reported. Backup
 // state and the verified bit legitimately change over a credential's life, and

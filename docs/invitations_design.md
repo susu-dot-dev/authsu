@@ -63,7 +63,7 @@ This keeps the admin-creates-admin and bootstrap cases from needing special code
 
 ## Managing invitations
 
-Admins manage invitations through `/api/invitation`: `GET` lists every invitation (revoked ones included), `POST` creates one, `PATCH /api/invitation/{id}` changes how many accounts it may create, and `DELETE /api/invitation/{id}` revokes it. Every route requires a session whose account is an admin; the role is read from the account on each request, so demoting an admin takes effect at once. The code is the one thing never returned by a read: it is in the response to the `POST` that created the invitation and nowhere else.
+Admins manage invitations through `/api/invitation`: `GET` lists every invitation (revoked ones included), `POST` creates one, `PATCH /api/invitation/{id}` changes how many accounts it may create, and `DELETE /api/invitation/{id}` revokes it. Every route requires a session whose account is an admin; the role is read from the account on each request, so demoting an admin takes effect at once (why the role is not a claim in the token is in [users_design.md](users_design.md)). The code is the one thing never returned by a read: it is in the response to the `POST` that created the invitation and nowhere else.
 
 A few choices worth keeping in mind:
 

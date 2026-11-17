@@ -20,9 +20,25 @@ func TestActiveKeyChecksRevocationAndExpiry(t *testing.T) {
 		"AND (k.revoked_at IS NULL OR k.revoked_at > ?)",
 		"AND k.expires_at > ?",
 		"AND k.kind = 'session'",
+		"AND u.revoked_at IS NULL",
 	} {
 		if !strings.Contains(query, want) {
 			t.Errorf("active key query lacks %q:\n%s", want, query)
+		}
+	}
+}
+
+// TestInsertSessionRefusesARevokedAccount: the account is read from the
+// credential in the write, and only an account that is not revoked yields one,
+// so the NOT NULL user_id fails the batch otherwise.
+func TestInsertSessionRefusesARevokedAccount(t *testing.T) {
+	t.Parallel()
+
+	query := squash(InsertSessionQuery)
+
+	for _, want := range []string{"WHERE c.id = ? AND u.revoked_at IS NULL", "JOIN users u ON u.id = c.user_id"} {
+		if !strings.Contains(query, want) {
+			t.Errorf("session insert lacks %q:\n%s", want, query)
 		}
 	}
 }
