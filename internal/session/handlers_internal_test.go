@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
+	"github.com/susu-dot-dev/authsu/internal/atomic"
 	"github.com/susu-dot-dev/authsu/internal/deploy"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 )
@@ -281,6 +282,31 @@ func TestLogoutReportsAFailingWriteAsUnavailable(t *testing.T) {
 	if !errors.Is(err, errDB) {
 		t.Errorf("err = %v, want it to wrap the cause for the log", err)
 	}
+}
+
+// TestLogoutOfASessionRevokedMeanwhileIsUnauthenticated: the write matches no
+// row when another request revoked the session after this one authenticated, so
+// logout answers as it does for any request without a session.
+func TestLogoutOfASessionRevokedMeanwhileIsUnauthenticated(t *testing.T) {
+	t.Parallel()
+
+	fix := newFixture(t)
+	key := fix.issue(t, fix.now.Add(Lifetime))
+	fix.batcher.unchanged = true
+
+	_, err := fix.svc.LogoutHandler(getenv(nil))(requestWith(t, key)).Get()
+	wantFailure(t, err, apierr.Unauthorized, CodeUnauthenticated)
+}
+
+func TestLogoutRefusesABatchThatMisreports(t *testing.T) {
+	t.Parallel()
+
+	fix := newFixture(t)
+	key := fix.issue(t, fix.now.Add(Lifetime))
+	fix.batcher.results = []atomic.Result{}
+
+	_, err := fix.svc.LogoutHandler(getenv(nil))(requestWith(t, key)).Get()
+	wantFailure(t, err, apierr.Internal, CodeLogoutFailed)
 }
 
 func TestTheSessionRoutesAreOnlyMethodChecked(t *testing.T) {

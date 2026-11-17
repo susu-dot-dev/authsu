@@ -219,10 +219,10 @@ func TestRegistrationOnTheHost(t *testing.T) {
 	handler := app.NewHandler(app.Platform{
 		DB:     sql.OpenDB(invitationDB{}),
 		Getenv: registrationEnv,
-		Batch: func(_ context.Context, statements ...atomic.Statement) error {
+		Batch: func(_ context.Context, statements ...atomic.Statement) ([]atomic.Result, error) {
 			batches = append(batches, statements)
 
-			return nil
+			return make([]atomic.Result, len(statements)), nil
 		},
 	})
 

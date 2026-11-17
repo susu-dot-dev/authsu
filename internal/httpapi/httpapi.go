@@ -29,8 +29,10 @@
 //   - Unknown paths are answered by NotFound registered on "/", so they too use
 //     the JSON envelope.
 //
-// Routes are registered as plain paths: TinyGo's http.ServeMux ignores
-// method-qualified patterns, so Serve does the method check instead.
+// Routes are registered as plain paths, optionally with {name} wildcards
+// (see Request.PathValues): TinyGo's http.ServeMux ignores method-qualified
+// patterns, so Serve does the method check instead, and ServeMethods lets one
+// path answer several methods.
 package httpapi
 
 import (
@@ -40,8 +42,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
@@ -64,6 +68,10 @@ type Request struct {
 	Context context.Context //nolint:containedctx // a request value is the unit that carries its context
 	// Query holds the URL query parameters.
 	Query map[string][]string
+	// PathValues holds the values of the route's path wildcards, by name: for
+	// a route registered as "/x/{id}", PathValues["id"]. It is empty for a route
+	// with none.
+	PathValues map[string]string
 	// Body is the raw request body, read up to a fixed limit.
 	Body []byte
 	// Cookies are the request's cookies.
@@ -165,7 +173,7 @@ func decodeError(err error) *apierr.Error {
 // and answers every other method with 405 and an Allow header. A panic in the
 // handler is recovered and reported as an Internal error.
 func Serve(method string, logger Logger, handler Handler) http.Handler {
-	return serve(method, maxBodyBytes, logger, handler)
+	return serve([]string{method}, maxBodyBytes, logger, handler)
 }
 
 // ServeLimited is Serve for a route whose legitimate bodies are small: a body
@@ -174,37 +182,63 @@ func Serve(method string, logger Logger, handler Handler) http.Handler {
 // never use. maxBody is clamped to DefaultMaxBody, so a route can only tighten
 // the cap, never raise it.
 func ServeLimited(method string, maxBody int64, logger Logger, handler Handler) http.Handler {
-	return serve(method, min(maxBody, maxBodyBytes), logger, handler)
+	return serve([]string{method}, min(maxBody, maxBodyBytes), logger, handler)
+}
+
+// ServeMethods is Serve for one path that answers several methods, each with
+// its own handler. The routes map is keyed by method; any other method gets 405
+// with an Allow header listing the keys, sorted. Every rule in the package doc
+// applies per method, so a method that is not GET or HEAD still requires
+// Content-Type: application/json.
+//
+// wildcards names the {name} wildcards in the path the handler is registered
+// for. net/http can only look a wildcard up by name, not list them, so the
+// caller says which to copy into Request.PathValues.
+//
+// It exists because TinyGo's http.ServeMux cannot route by method: a path is
+// registered once, and the method is chosen here.
+func ServeMethods(logger Logger, wildcards []string, routes map[string]Handler) http.Handler {
+	methods := slices.Sorted(maps.Keys(routes))
+
+	return serveWith(methods, wildcards, maxBodyBytes, logger, func(req Request) result.Result[Response] {
+		return routes[req.Method](req)
+	})
 }
 
 // ServeAny is Serve for a handler that accepts every method.
 func ServeAny(logger Logger, handler Handler) http.Handler {
-	return serve("", maxBodyBytes, logger, handler)
+	return serve(nil, maxBodyBytes, logger, handler)
 }
 
-// serve implements Serve. An empty method accepts every method.
-func serve(method string, maxBody int64, logger Logger, handler Handler) http.Handler {
+// serve implements Serve. No methods accepts every method.
+func serve(methods []string, maxBody int64, logger Logger, handler Handler) http.Handler {
+	return serveWith(methods, nil, maxBody, logger, handler)
+}
+
+// serveWith is serve for a route whose path has the named wildcards.
+func serveWith(methods, wildcards []string, maxBody int64, logger Logger, handler Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
 
 		request := Request{
-			Method:  req.Method,
-			Path:    req.URL.Path,
-			Context: req.Context(),
-			Query:   req.URL.Query(),
-			Body:    nil,
-			Cookies: req.Cookies(),
+			Method:     req.Method,
+			Path:       req.URL.Path,
+			Context:    req.Context(),
+			Query:      req.URL.Query(),
+			PathValues: pathValues(req, wildcards),
+			Body:       nil,
+			Cookies:    req.Cookies(),
 		}
 
-		if method != "" && req.Method != method {
-			writer.Header().Set("Allow", method)
+		if len(methods) > 0 && !slices.Contains(methods, req.Method) {
+			writer.Header().Set("Allow", strings.Join(methods, ", "))
 			write(writer, logger, request, result.Fail[Response](
 				apierr.New(apierr.MethodNotAllowed, "method_not_allowed", "method not allowed")))
 
 			return
 		}
 
-		if method != "" && !safeMethod(method) && !isJSON(req.Header.Values("Content-Type")) {
+		if len(methods) > 0 && !safeMethod(req.Method) && !isJSON(req.Header.Values("Content-Type")) {
 			write(writer, logger, request, result.Fail[Response](
 				apierr.New(apierr.UnsupportedMediaType, "unsupported_media_type",
 					"request Content-Type must be application/json")))
@@ -223,6 +257,20 @@ func serve(method string, maxBody int64, logger Logger, handler Handler) http.Ha
 
 		write(writer, logger, request, safely(handler, request))
 	})
+}
+
+// pathValues returns the value the mux matched for each named wildcard.
+// A wildcard that matched nothing is absent; the map itself is never nil.
+func pathValues(req *http.Request, wildcards []string) map[string]string {
+	values := make(map[string]string, len(wildcards))
+
+	for _, name := range wildcards {
+		if value := req.PathValue(name); value != "" {
+			values[name] = value
+		}
+	}
+
+	return values
 }
 
 // bodyReadError classifies a failure to read the request body. Only the size

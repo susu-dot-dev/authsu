@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -862,6 +863,142 @@ func TestServeLimited(t *testing.T) {
 
 			if tt.wantStatus == http.StatusRequestEntityTooLarge && !strings.Contains(rec.Body.String(), "body_too_large") {
 				t.Errorf("body = %q, want code body_too_large", rec.Body.String())
+			}
+		})
+	}
+}
+
+// echoMethod answers with the method the handler saw, so a test can tell which
+// of several handlers ran.
+func echoMethod(req httpapi.Request) result.Result[httpapi.Response] {
+	return result.Ok(httpapi.JSON(http.StatusOK, req.Method))
+}
+
+func methodsHandler(logger httpapi.Logger, wildcards []string) http.Handler {
+	return httpapi.ServeMethods(logger, wildcards, map[string]httpapi.Handler{
+		http.MethodGet:    echoMethod,
+		http.MethodPatch:  echoMethod,
+		http.MethodDelete: echoMethod,
+	})
+}
+
+func TestServeMethodsDispatchesByMethod(t *testing.T) {
+	t.Parallel()
+
+	for _, method := range []string{http.MethodGet, http.MethodPatch, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), method, "/x", nil)
+			req.Header.Set("Content-Type", jsonType)
+
+			methodsHandler(func(httpapi.Request, *apierr.Error) {}, nil).ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK || rec.Body.String() != `"`+method+`"`+"\n" {
+				t.Errorf("%s = %d %q, want 200 and the method echoed", method, rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+func TestServeMethodsRefusesOtherMethods(t *testing.T) {
+	t.Parallel()
+
+	var logged []*apierr.Error
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/x", nil)
+	req.Header.Set("Content-Type", jsonType)
+
+	methodsHandler(func(_ httpapi.Request, e *apierr.Error) { logged = append(logged, e) }, nil).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+
+	if got := rec.Header().Get("Allow"); got != "DELETE, GET, PATCH" {
+		t.Errorf("Allow = %q, want the methods, sorted", got)
+	}
+
+	if len(logged) != 1 {
+		t.Errorf("logged %d errors, want 1", len(logged))
+	}
+}
+
+// TestServeMethodsRequiresJSONForUnsafeMethods holds the CSRF rule per method:
+// GET needs no Content-Type, PATCH and DELETE need application/json, and the
+// refusal comes before the handler.
+func TestServeMethodsRequiresJSONForUnsafeMethods(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		method, contentType string
+		want                int
+	}{
+		"get without a type":     {method: http.MethodGet, contentType: "", want: http.StatusOK},
+		"patch without a type":   {method: http.MethodPatch, contentType: "", want: http.StatusUnsupportedMediaType},
+		"patch as text":          {method: http.MethodPatch, contentType: plainType, want: http.StatusUnsupportedMediaType},
+		"delete without a type":  {method: http.MethodDelete, contentType: "", want: http.StatusUnsupportedMediaType},
+		"delete as json":         {method: http.MethodDelete, contentType: jsonType, want: http.StatusOK},
+		"delete as json+charset": {method: http.MethodDelete, contentType: jsonType + "; charset=utf-8", want: http.StatusOK},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), tt.method, "/x", nil)
+
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+
+			methodsHandler(func(httpapi.Request, *apierr.Error) {}, nil).ServeHTTP(rec, req)
+
+			if rec.Code != tt.want {
+				t.Errorf("%s = %d %q, want %d", name, rec.Code, rec.Body, tt.want)
+			}
+		})
+	}
+}
+
+// TestPathValues checks that the wildcards a route names reach the handler, and
+// that one the route does not name, or that matched nothing, does not.
+func TestPathValues(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		wildcards []string
+		want      map[string]string
+	}{
+		"named":     {wildcards: []string{"id"}, want: map[string]string{"id": "abc"}},
+		"not named": {wildcards: nil, want: map[string]string{}},
+		"unknown":   {wildcards: []string{"other"}, want: map[string]string{}},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var got map[string]string
+
+			handler := httpapi.ServeMethods(func(httpapi.Request, *apierr.Error) {}, tt.wildcards,
+				map[string]httpapi.Handler{http.MethodGet: func(req httpapi.Request) result.Result[httpapi.Response] {
+					got = req.PathValues
+
+					return result.Ok(httpapi.JSON(http.StatusOK, nil))
+				}})
+
+			mux := http.NewServeMux()
+			mux.Handle("/x/{id}", handler)
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x/abc", nil))
+
+			if rec.Code != http.StatusOK || !maps.Equal(got, tt.want) {
+				t.Errorf("PathValues = %v (status %d), want %v", got, rec.Code, tt.want)
 			}
 		})
 	}

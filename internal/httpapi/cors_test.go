@@ -92,9 +92,16 @@ func TestCORSPreflightRefusesWhatTheAPIDoesNotUse(t *testing.T) {
 		wantMethods     string
 		wantHeader      string
 	}{
-		"get":    {method: http.MethodGet, headers: "", wantMethods: http.MethodGet, wantHeader: contentType},
-		"delete": {method: http.MethodDelete, headers: "content-type", wantMethods: "", wantHeader: contentType},
-		"put":    {method: http.MethodPut, headers: "", wantMethods: "", wantHeader: contentType},
+		"get": {method: http.MethodGet, headers: "", wantMethods: http.MethodGet, wantHeader: contentType},
+		"delete": {
+			method: http.MethodDelete, headers: "content-type",
+			wantMethods: http.MethodDelete, wantHeader: contentType,
+		},
+		"patch": {
+			method: http.MethodPatch, headers: "content-type",
+			wantMethods: http.MethodPatch, wantHeader: contentType,
+		},
+		"put": {method: http.MethodPut, headers: "", wantMethods: "", wantHeader: contentType},
 		"authorization header": {
 			method: http.MethodPost, headers: "content-type, authorization",
 			wantMethods: http.MethodPost, wantHeader: "",

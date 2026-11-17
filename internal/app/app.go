@@ -13,6 +13,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/deploy"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/invitations"
 	"github.com/susu-dot-dev/authsu/internal/login"
 	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/result"
@@ -55,6 +56,12 @@ func (r router) HandleLimited(method, path string, maxBody int64, handler httpap
 	r.mux.Handle(path, httpapi.ServeLimited(method, maxBody, r.log, handler))
 }
 
+// HandleMethods registers one handler per method for path. wildcards names the
+// {name} wildcards in path, which Serve copies into Request.PathValues.
+func (r router) HandleMethods(path string, wildcards []string, handlers map[string]httpapi.Handler) {
+	r.mux.Handle(path, httpapi.ServeMethods(r.log, wildcards, handlers))
+}
+
 // NewHandler returns the Worker's HTTP handler. Every feature is built here
 // from platform.
 func NewHandler(platform Platform) http.Handler {
@@ -78,7 +85,7 @@ func NewHandler(platform Platform) http.Handler {
 		Batch:   platform.Batch,
 		Now:     time.Now,
 		Entropy: rand.Reader,
-		NewID:   func() string { return uuid.NewV7().String() },
+		NewID:   newID,
 	})
 	routes.HandleLimited(http.MethodPost, "/api/register/begin", registration.MaxBeginBody,
 		registrar.BeginHandler(platform.Getenv))
@@ -102,10 +109,26 @@ func NewHandler(platform Platform) http.Handler {
 	routes.Handle(http.MethodGet, "/api/session", sessions.WhoAmIHandler(platform.Getenv))
 	routes.Handle(http.MethodPost, "/api/logout", sessions.LogoutHandler(platform.Getenv))
 
+	invitationRoutes := invitations.NewService(invitations.Deps{
+		Sessions: sessions,
+		Reader:   invitationReader(platform.DB),
+		Batch:    platform.Batch,
+		Now:      time.Now,
+		Entropy:  rand.Reader,
+		NewID:    newID,
+		Types:    invitations.CreatableTypes(),
+	}).Handlers(platform.Getenv)
+	routes.HandleMethods(invitations.CollectionPath, nil, invitationRoutes.Collection)
+	routes.HandleMethods(invitations.ItemPath, invitations.PathWildcards(), invitationRoutes.Item)
+
 	// CORS is outermost so a preflight is answered before routing, which would
 	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's.
 	return httpapi.CORS(func() string { return allowedOrigin(platform.Getenv) }, routes.mux)
 }
+
+// newID returns a fresh UUIDv7 in canonical text form, the id of every row the
+// services create.
+func newID() string { return uuid.NewV7().String() }
 
 // allowedOrigin returns the one origin allowed to call the API from a browser:
 // UI_ORIGIN, the origin the UI is served from and the only one a passkey
@@ -162,4 +185,14 @@ func sessionReader(db *sql.DB) session.Reader {
 	}
 
 	return session.NewSQLReader(db)
+}
+
+// invitationReader returns the invitations Reader over db, or nil when there is
+// no database, so the invitation routes answer 503 rather than panicking.
+func invitationReader(db *sql.DB) invitations.Reader {
+	if db == nil {
+		return nil
+	}
+
+	return invitations.NewSQLReader(db)
 }

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -16,6 +17,14 @@ const (
 	headerMaxAge      = "Access-Control-Max-Age"
 	headerReqMethod   = "Access-Control-Request-Method"
 )
+
+// corsMethods are the methods a preflight may be answered for: the ones the API
+// has routes for. PATCH and DELETE are not CORS-safelisted, so they always
+// need a preflight, and so are as protected as POST; every unsafe method also
+// requires Content-Type: application/json (see Serve).
+func corsMethods() []string {
+	return []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete}
+}
 
 // preflightMaxAge is how long, in seconds, a browser may cache a preflight
 // answer. Browsers cap it themselves (Chromium at two hours).
@@ -94,16 +103,17 @@ func isPreflight(req *http.Request) bool {
 // enforced when the real request arrives, so the preflight only has to say that
 // the browser may try.
 //
-// The requested method is echoed only when it is one this API uses, and the
-// only request header allowed is Content-Type, which is all the frontend sends.
-// A request for anything else gets no Allow-Methods and the browser refuses.
+// The requested method is echoed only when it is one this API uses (GET, POST,
+// PATCH and DELETE), and the only request header allowed is Content-Type, which
+// is all the frontend sends. A request for anything else gets no Allow-Methods
+// and the browser refuses.
 func answerPreflight(writer http.ResponseWriter, req *http.Request) {
 	header := writer.Header()
 	header.Add(headerVary, headerReqMethod)
 	header.Add(headerVary, "Access-Control-Request-Headers")
 
 	method := req.Header.Get(headerReqMethod)
-	if method == http.MethodGet || method == http.MethodPost {
+	if slices.Contains(corsMethods(), method) {
 		header.Set(headerAllowMeths, method)
 	}
 

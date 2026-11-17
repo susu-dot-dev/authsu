@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"log"
 
 	"github.com/syumai/workers-go"
@@ -42,17 +43,44 @@ func logError(req httpapi.Request, failure *apierr.Error) {
 }
 
 // batch returns the atomic write function: D1's batch call, which rolls the
-// whole batch back if any statement fails. It only converts the statement type
-// and classifies the failure; the SQL lives with the feature that issues it.
+// whole batch back if any statement fails. It only converts the statement and
+// result types and classifies the failure; the SQL lives with the feature that
+// issues it.
 func batch(db *sql.DB) atomic.Batch {
-	return func(ctx context.Context, statements ...atomic.Statement) error {
+	return func(ctx context.Context, statements ...atomic.Statement) ([]atomic.Result, error) {
 		converted := make([]d1.Statement, len(statements))
 		for i, statement := range statements {
 			converted[i] = d1.Statement{Query: statement.Query, Args: statement.Args}
 		}
 
-		_, err := d1.Batch(ctx, db, converted...)
+		raw, err := d1.Batch(ctx, db, converted...)
+		if err != nil {
+			return nil, atomic.Classify(err)
+		}
 
-		return atomic.Classify(err)
+		results := make([]atomic.Result, len(raw))
+		for i, one := range raw {
+			results[i] = atomic.Result{Changes: one.Meta.Changes, Rows: rowsOf(one.Rows)}
+		}
+
+		return results, nil
 	}
+}
+
+// rowsOf converts the driver's row values to plain values. It returns nil for
+// a statement that returned no rows.
+func rowsOf(raw [][]driver.Value) [][]any {
+	if raw == nil {
+		return nil
+	}
+
+	rows := make([][]any, len(raw))
+	for i, row := range raw {
+		rows[i] = make([]any, len(row))
+		for j, value := range row {
+			rows[i][j] = value
+		}
+	}
+
+	return rows
 }

@@ -61,6 +61,17 @@ An invitation describes the code and also what the resulting account should be, 
 
 This keeps the admin-creates-admin and bootstrap cases from needing special code in registration. The first-run invitation is just an invitation whose grant is "admin". A future "invite a co-admin" feature would be the same thing, minted by an existing admin. Registration does not need to know why an invitation grants admin, only that it does.
 
+## Managing invitations
+
+Admins manage invitations through `/api/invitation`: `GET` lists every invitation (revoked ones included), `POST` creates one, `PATCH /api/invitation/{id}` changes how many accounts it may create, and `DELETE /api/invitation/{id}` revokes it. Every route requires a session whose account is an admin; the role is read from the account on each request, so demoting an admin takes effect at once. The code is the one thing never returned by a read: it is in the response to the `POST` that created the invitation and nowhere else.
+
+A few choices worth keeping in mind:
+
+- **Revoke, never delete.** Accounts reference the invitation, and "who came from this code?" must stay answerable, so `DELETE` sets `revoked_at` and the row stays. Revoking twice succeeds and keeps the first time, so a retry is safe and cannot move a revocation later.
+- **Status is derived, not stored.** `revoked`, `expired`, `exhausted` or `active`, decided in that order from the row and the clock. There is no status column to fall out of step with the facts it summarises.
+- **The cap cannot go below the accounts already made.** That condition is part of the write, not a check before it, because a registration can finish between a read and a write. A revoked invitation cannot be changed: revocation is final, and editing one would suggest it could be revived.
+- **No invitation type can be created yet.** `POST` takes a `type`, and every value is refused. First run is bound to there being no account at all, so only `GET /api/first-run` mints it. A new type is one entry in the invitations package plus its role in `registration.RoleFor`; registration refuses a type that has no role.
+
 ## Where invitations are stored
 
 Invitations, users, and credentials all live in D1 rather than a Durable Object. The data is relational and globally shared: admins list invitations, cap checks count users per invitation, and logins look up credentials. D1 fits that shape. The one place that needs strong consistency is the single moment of acceptance, a "check and create" that must not race. A single conditional write inside a D1 transaction provides that. A global Durable Object would also provide it, but it would make every auth operation go through one serialized instance for a guarantee we only need at one point. If narrow strongly-consistent needs appear later, such as rate limiting or per-user counters, they can be handled by Durable Objects scoped to those needs, without moving this data.

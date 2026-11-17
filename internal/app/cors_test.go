@@ -9,14 +9,19 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/app"
 )
 
-// corsRoutes are the API routes and the method each takes.
-func corsRoutes() map[string]string {
-	return map[string]string{
-		"/healthz":       http.MethodGet,
-		"/api/first-run": http.MethodGet,
-		beginPath:        http.MethodPost, finishPath: http.MethodPost,
-		loginBeginPath: http.MethodPost, loginFinishPath: http.MethodPost,
-		sessionPath: http.MethodGet, logoutPath: http.MethodPost,
+// corsRoute is a path and one method it takes.
+type corsRoute struct{ path, method string }
+
+// corsRoutes are the API routes, one entry per method each takes.
+func corsRoutes() []corsRoute {
+	return []corsRoute{
+		{"/healthz", http.MethodGet},
+		{"/api/first-run", http.MethodGet},
+		{beginPath, http.MethodPost}, {finishPath, http.MethodPost},
+		{loginBeginPath, http.MethodPost}, {loginFinishPath, http.MethodPost},
+		{sessionPath, http.MethodGet}, {logoutPath, http.MethodPost},
+		{invitationPath, http.MethodGet}, {invitationPath, http.MethodPost},
+		{invitationItem, http.MethodPatch}, {invitationItem, http.MethodDelete},
 	}
 }
 
@@ -27,8 +32,10 @@ func corsRoutes() map[string]string {
 func TestCORSAllowsOnlyTheRelyingPartyOrigin(t *testing.T) {
 	t.Parallel()
 
-	for path, method := range corsRoutes() {
-		t.Run(path, func(t *testing.T) {
+	for _, route := range corsRoutes() {
+		path, method := route.path, route.method
+
+		t.Run(method+" "+path, func(t *testing.T) {
 			t.Parallel()
 
 			handler := app.NewHandler(app.Platform{Getenv: registrationEnv})

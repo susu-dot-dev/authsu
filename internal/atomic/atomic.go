@@ -11,6 +11,16 @@
 // does not roll a batch back by itself. To turn "nothing was inserted" into a
 // failed batch, make a later statement depend on the row existing, such as a
 // NOT NULL foreign key filled from a subselect. See internal/registration/sql.go.
+//
+// Which tool answers "did it take effect?" depends on the batch:
+//
+//   - A batch of several statements that must stand or fall together needs the
+//     constraint above. Result.Changes is only readable once the batch has
+//     committed, so a zero there cannot undo an earlier statement that did.
+//   - A single conditional write, where "matched nothing" is an outcome to
+//     report and not a failure, uses the result. Return the row with RETURNING
+//     (Result.Rows) so the outcome and the row are the same instant, and do not
+//     read the row again afterwards, which could see a different state.
 package atomic
 
 import (
@@ -25,12 +35,30 @@ type Statement struct {
 	Args  []any
 }
 
+// Result is the outcome of one statement in a batch.
+type Result struct {
+	// Changes is the number of rows the statement inserted, updated or deleted
+	// (D1's meta.changes). A conditional write that matched nothing is not an
+	// error, so this is how a caller learns whether it took effect.
+	Changes int64
+
+	// Rows are the rows the statement returned, such as from a RETURNING
+	// clause, each in the order of the columns the statement named. Values
+	// are nil, int64, float64, string or []byte. It is nil when the statement
+	// returned no rows.
+	//
+	// A statement that returns rows can report its own outcome in them, which
+	// is the one way to learn why a conditional write did nothing without a
+	// second, separate read: see internal/invitations/sql.go.
+	Rows [][]any
+}
+
 // Batch runs statements as one atomic unit: either every statement takes effect
-// or none does. A write the database refused because a constraint failed is
-// reported as an error wrapping ErrConflict or ErrRejected (see Classify), and
-// errors.Is says which kind of constraint it was; any other failure is returned
-// as is.
-type Batch func(ctx context.Context, statements ...Statement) error
+// or none does. It returns one Result per statement, in order. A write the
+// database refused because a constraint failed is reported as an error wrapping
+// ErrConflict or ErrRejected (see Classify), and errors.Is says which kind of
+// constraint it was; any other failure is returned as is.
+type Batch func(ctx context.Context, statements ...Statement) ([]Result, error)
 
 // The constraint failures Classify recognises. A write refused for one of these
 // reasons is the database saying "no" rather than being unavailable, but the

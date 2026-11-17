@@ -155,7 +155,7 @@ type WhoAmIResponse struct {
 // reads and never writes.
 func (s *Service) WhoAmIHandler(getenv func(string) string) httpapi.Handler {
 	return func(req httpapi.Request) result.Result[httpapi.Response] {
-		principal, err := s.authenticate(req.Context, getenv, req)
+		principal, err := s.Authenticate(req.Context, getenv, req)
 		if err != nil {
 			return result.Fail[httpapi.Response](err)
 		}
@@ -183,29 +183,12 @@ func (s *Service) LogoutHandler(getenv func(string) string) httpapi.Handler {
 	}
 }
 
-func (s *Service) logout(ctx context.Context, getenv func(string) string, req httpapi.Request) error {
-	principal, err := s.authenticate(ctx, getenv, req)
-	if err != nil {
-		return err
-	}
-
-	if s.batch == nil {
-		return notConfigured(errNoStore)
-	}
-
-	at := s.now().Unix()
-
-	err = s.batch(ctx, atomic.Statement{Query: logoutQuery, Args: []any{at, principal.KeyID}})
-	if err != nil {
-		return fail(fmt.Errorf("revoke session: %w", err), apierr.Unavailable, CodeLogoutFailed,
-			"sessions are temporarily unavailable")
-	}
-
-	return nil
-}
-
-// authenticate verifies the request's session cookie.
-func (s *Service) authenticate(
+// Authenticate verifies the request's session cookie and returns who it speaks
+// for. It is what every authenticated route starts with. A request without a
+// valid session is 401 unauthenticated (whatever was wrong with the token), and
+// a deployment that cannot verify sessions is 503; the error is already
+// classified, so a handler returns it as is.
+func (s *Service) Authenticate(
 	ctx context.Context, getenv func(string) string, req httpapi.Request,
 ) (Principal, error) {
 	cfg, err := LoadConfig(getenv)
@@ -229,3 +212,44 @@ func (s *Service) authenticate(
 
 	return principal, nil
 }
+
+func (s *Service) logout(ctx context.Context, getenv func(string) string, req httpapi.Request) error {
+	principal, err := s.Authenticate(ctx, getenv, req)
+	if err != nil {
+		return err
+	}
+
+	if s.batch == nil {
+		return notConfigured(errNoStore)
+	}
+
+	at := s.now().Unix()
+
+	results, err := s.batch(ctx, atomic.Statement{Query: logoutQuery, Args: []any{at, principal.KeyID}})
+	if err != nil {
+		return fail(fmt.Errorf("revoke session: %w", err), apierr.Unavailable, CodeLogoutFailed,
+			"sessions are temporarily unavailable")
+	}
+
+	// The write is conditional on the key not being revoked already, and a
+	// write that matches nothing is not an error. Authenticate saw an active
+	// key, so no change means another request revoked it in between: the
+	// session is gone, which is what a request without one is told.
+	if len(results) != 1 {
+		return fail(errBatchResults, apierr.Internal, CodeLogoutFailed, "internal error")
+	}
+
+	if results[0].Changes == 0 {
+		return unauthenticated(errRevokedFirst)
+	}
+
+	return nil
+}
+
+// errBatchResults is the cause of a batch that did not return one result for
+// its one statement, which the platform's Batch promises it does.
+var errBatchResults = errors.New("batch returned the wrong number of results")
+
+// errRevokedFirst is the cause of a logout that found its session already
+// revoked by a concurrent request.
+var errRevokedFirst = errors.New("session was revoked by another request")

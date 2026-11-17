@@ -72,10 +72,10 @@ type fakeBatch struct {
 	batches [][]atomic.Statement
 }
 
-func (f *fakeBatch) run(_ context.Context, statements ...atomic.Statement) error {
+func (f *fakeBatch) run(_ context.Context, statements ...atomic.Statement) ([]atomic.Result, error) {
 	f.batches = append(f.batches, statements)
 
-	return f.err
+	return make([]atomic.Result, len(statements)), f.err
 }
 
 func getenv(overrides map[string]string) func(string) string {
