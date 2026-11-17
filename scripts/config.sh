@@ -9,6 +9,7 @@
 #   config.sh set-secret               generate AUTH_HMAC_SECRET and upload it
 #   config.sh set-secret --stdin       upload the secret read from stdin instead
 #   config.sh set-secret --local       write it to .dev.vars instead of Cloudflare
+#   config.sh dev-vars                 write AUTH_HMAC_SECRET and FIRST_RUN_SECRET to .dev.vars
 #
 # A secret is never printed, never put on a command line (where `ps` shows it)
 # and never written to disk unless --local says so. Cloudflare cannot return a
@@ -26,6 +27,9 @@ DEV_VARS="${DEV_VARS:-.dev.vars}"
 WRANGLER="${WRANGLER:-npx wrangler}"
 
 SECRET=AUTH_HMAC_SECRET
+# The first-run code (internal/firstrun.SecretName), needed only to bootstrap
+# the first administrator on a fresh database.
+FIRST_RUN_SECRET=FIRST_RUN_SECRET
 VARS=(API_ORIGIN UI_ORIGIN)
 
 # Registration refuses a secret shorter than this (registration.MinSecretLen).
@@ -229,6 +233,37 @@ set_local() {
   echo "$SECRET written to $DEV_VARS (git-ignored)."
 }
 
+# dev_vars_set NAME VALUE -> sets NAME in $DEV_VARS unless it is already there,
+# leaving every other line alone. Prints whether it wrote or kept the entry.
+# The file is created 0600. Existing values are never replaced: rotating a
+# secret under a running local database would orphan its first-run invitation.
+dev_vars_set() {
+  local name=$1 value=$2 tmp
+  if [ -f "$DEV_VARS" ] && grep -q -E "^$name=.{$MIN_SECRET_LEN,}" "$DEV_VARS"; then
+    echo "  $name: already set, kept"
+    return
+  fi
+  umask 077
+  touch "$DEV_VARS"
+  tmp="$(mktemp "$DEV_VARS.XXXXXX")"
+  { grep -v -E "^$name=" "$DEV_VARS" || true; printf '%s=%s\n' "$name" "$value"; } >"$tmp"
+  cat "$tmp" >"$DEV_VARS"
+  rm -f "$tmp"
+  echo "  $name: generated"
+}
+
+# cmd_dev_vars generates every secret `make dev` needs into $DEV_VARS. It is
+# idempotent: values already present are kept, so it is safe to re-run.
+cmd_dev_vars() {
+  [ $# -eq 0 ] || usage
+  echo "Writing $DEV_VARS (git-ignored, mode 0600):"
+  dev_vars_set "$SECRET" "$(generate_secret)"
+  dev_vars_set "$FIRST_RUN_SECRET" "$(generate_secret)"
+  echo
+  echo "Next: make dev. To change a value, edit $DEV_VARS or delete it and re-run."
+  echo "The first-run invitation code is the $FIRST_RUN_SECRET value in $DEV_VARS."
+}
+
 main() {
   local cmd=${1:-}
   [ $# -gt 0 ] && shift
@@ -236,6 +271,7 @@ main() {
     get) cmd_get "$@" ;;
     set-vars) cmd_set_vars "$@" ;;
     set-secret) cmd_set_secret "$@" ;;
+    dev-vars) cmd_dev_vars "$@" ;;
     -h | --help | help) usage 0 ;;
     *) usage ;;
   esac

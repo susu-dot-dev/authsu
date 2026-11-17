@@ -42,6 +42,10 @@ setup: check-tools ## Install JS deps and download Go modules
 	npm ci
 	go mod download
 
+.PHONY: setup-dev
+setup-dev: ## Generate .dev.vars (AUTH_HMAC_SECRET, FIRST_RUN_SECRET) for `make dev`; keeps existing values
+	@./scripts/config.sh dev-vars
+
 .PHONY: check-tools
 check-tools: ## Verify local tool versions match tools.env
 	@fail=0; \
@@ -133,16 +137,24 @@ $(SIZE_REPORT): $(WASM_DEPS)
 build: $(WASM) ## Build the Worker -> build/
 
 .PHONY: migrate-local
-migrate-local: ## Apply D1 migrations to the local dev database
-	npx wrangler d1 migrations apply DB --local --persist-to $(DEV_STATE)
+migrate-local: ## Apply D1 migrations to the local dev database (no prompt)
+	@# CI=true makes wrangler skip its confirmation prompt. That is only safe
+	@# because --local confines it to the simulated database in $(DEV_STATE):
+	@# never drop --local here, and never apply remote migrations this way
+	@# (they are applied by hand; see docs/runbook.md).
+	CI=true npx wrangler d1 migrations apply DB --local --persist-to $(DEV_STATE)
 
 .PHONY: db-reset
 db-reset: ## Delete local dev database state
 	rm -rf $(DEV_STATE)
 
 .PHONY: dev
-dev: migrate-local ## Run the Worker locally on :8787 (local D1, UI origin on :3000)
-	npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_ORIGIN_VARS)
+dev: $(WASM) migrate-local ## Run the Worker locally on :8787 (local D1, UI origin on :3000)
+	@# -c wrangler.e2e.jsonc has no build.command, so wrangler serves the build/
+	@# that $(WASM) just (re)built, only when a Go source changed, instead of
+	@# running the ~20s TinyGo build on every start. It has no vars: the origins
+	@# come from DEV_ORIGIN_VARS. Editing Go code needs a restart of `make dev`.
+	npx wrangler dev -c wrangler.e2e.jsonc --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_ORIGIN_VARS)
 
 # ---- configuration ----------------------------------------------------------
 # AUTH_HMAC_SECRET (secret) and API_ORIGIN, UI_ORIGIN (vars).
