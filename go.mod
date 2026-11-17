@@ -20,6 +20,6 @@ require (
 	golang.org/x/vuln v1.9.0 // indirect
 )
 
-replace github.com/syumai/workers-go => github.com/intentionally-left-nil/workers-go v0.0.0-20261115184608-88d456e75a13
+replace github.com/syumai/workers-go => github.com/intentionally-left-nil/workers-go v0.0.0-20261117154858-da5af392ad53
 
 tool golang.org/x/vuln/cmd/govulncheck

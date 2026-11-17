@@ -282,7 +282,7 @@ func (s *Service) accept(
 		return finished{}, apierr.Wrap(err, apierr.Internal, CodeMintFailed, "internal error")
 	}
 
-	err = s.batch(ctx,
+	_, err = s.batch(ctx,
 		atomic.Statement{Query: updateFlagsQuery, Args: []any{int64(asserted.Flags.Stored()), stored.ID}},
 		atomic.Statement{Query: session.InsertSessionQuery, Args: []any{
 			key.ID.String(), stored.ID, string(key.JWK), key.ExpiresAt.Unix(),

@@ -455,7 +455,7 @@ func (s *Service) accept(ctx context.Context, in accepted) (FinishResponse, erro
 	now := s.now().Unix()
 	userID := s.newID()
 
-	err = s.batch(ctx,
+	_, err = s.batch(ctx,
 		atomic.Statement{Query: insertUserQuery, Args: []any{
 			userID, in.handle, in.role, string(profileJSON), now,
 			codeHash(in.code), in.invType, now,

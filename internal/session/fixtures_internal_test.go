@@ -67,16 +67,37 @@ func (f *fakeReader) ActiveKey(_ context.Context, kid string, now time.Time) (Ac
 	return key, ok, nil
 }
 
-// fakeBatch records the batches it receives and returns a configured error.
+// fakeBatch records the batches it receives and returns a configured error. Each
+// statement reports that it changed one row, as a write that took effect does,
+// unless unchanged says it matched nothing. results, when set, replaces what the
+// batch returns, for a platform that misreports.
 type fakeBatch struct {
-	err     error
-	batches [][]atomic.Statement
+	err       error
+	batches   [][]atomic.Statement
+	unchanged bool
+	results   []atomic.Result
 }
 
-func (f *fakeBatch) run(_ context.Context, statements ...atomic.Statement) error {
+func (f *fakeBatch) run(_ context.Context, statements ...atomic.Statement) ([]atomic.Result, error) {
 	f.batches = append(f.batches, statements)
 
-	return f.err
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	if f.results != nil {
+		return f.results, nil
+	}
+
+	results := make([]atomic.Result, len(statements))
+
+	if !f.unchanged {
+		for i := range results {
+			results[i].Changes = 1
+		}
+	}
+
+	return results, nil
 }
 
 // fixture is a service wired to fakes, with a clock we control.
@@ -100,7 +121,7 @@ func newFixture(t *testing.T) *fixture {
 
 	fix := &fixture{
 		reader:  &fakeReader{keys: map[string]ActiveKey{}, err: nil, asked: nil, at: nil},
-		batcher: &fakeBatch{err: nil, batches: nil},
+		batcher: &fakeBatch{err: nil, batches: nil, unchanged: false, results: nil},
 		issuer:  issuer,
 		now:     testNow(),
 		svc:     nil,

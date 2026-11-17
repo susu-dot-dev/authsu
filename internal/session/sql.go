@@ -44,6 +44,10 @@ VALUES (?, (SELECT user_id FROM credentials WHERE id = ?), 'session', ?, ?, ?, ?
 // logoutQuery revokes a session key now. A key that is already revoked keeps its
 // earlier time, so logging out twice cannot move a revocation later.
 //
+// The number of rows it changes is the outcome: one means this request ended the
+// session, none means it was already revoked (another request got there first),
+// and the handler answers that as any request without a session.
+//
 // Arguments: revoke_at (unix seconds), kid.
 const logoutQuery = `
 UPDATE japikeys

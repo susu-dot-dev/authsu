@@ -239,10 +239,10 @@ func loginHandler(pk passkey) (http.Handler, *[][]atomic.Statement) {
 			pk.cose, int64(0x05), loginHandle(), "admin",
 		}}),
 		Getenv: loginEnv,
-		Batch: func(_ context.Context, statements ...atomic.Statement) error {
+		Batch: func(_ context.Context, statements ...atomic.Statement) ([]atomic.Result, error) {
 			batches = append(batches, statements)
 
-			return nil
+			return make([]atomic.Result, len(statements)), nil
 		},
 	})
 

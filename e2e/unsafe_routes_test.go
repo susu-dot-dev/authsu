@@ -21,6 +21,11 @@ const (
 	originHeader      = "Origin"
 	evilOrigin        = "https://evil.example"
 	contentTypeHeader = "Content-Type"
+	// The headers of a CORS preflight, and a Content-Type a form can send.
+	requestMethodHeader  = "Access-Control-Request-Method"
+	requestHeadersHeader = "Access-Control-Request-Headers"
+	contentTypeOnly      = "content-type"
+	plainText            = "text/plain"
 )
 
 // unsafeRoutes are the routes that change something. Login begin and logout read
@@ -37,13 +42,13 @@ func unsafeRoutes() []string {
 func rawPost(t *testing.T, path string, headers map[string]string) reply {
 	t.Helper()
 
-	return rawRequest(t, http.MethodPost, path, "", headers)
+	return rawRequest(t, http.MethodPost, path, headers)
 }
 
-func rawRequest(t *testing.T, method, path, body string, headers map[string]string) reply {
+func rawRequest(t *testing.T, method, path string, headers map[string]string) reply {
 	t.Helper()
 
-	req, err := http.NewRequestWithContext(context.Background(), method, target.baseURL+path, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), method, target.baseURL+path, http.NoBody)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -77,7 +82,7 @@ func rawRequest(t *testing.T, method, path, body string, headers map[string]stri
 //
 //nolint:paralleltest // shares one database with the other tests
 func TestUnsafeRoutesRequireJSON(t *testing.T) {
-	contentTypes := []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"}
+	contentTypes := []string{"", plainText, "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"}
 
 	for _, path := range unsafeRoutes() {
 		for _, contentType := range contentTypes {
@@ -111,10 +116,10 @@ func TestUnsafeRoutesRequireJSON(t *testing.T) {
 func TestForeignOriginGetsNoCORS(t *testing.T) {
 	for _, path := range unsafeRoutes() {
 		t.Run(path, func(t *testing.T) {
-			preflight := rawRequest(t, http.MethodOptions, path, "", map[string]string{
-				originHeader:                     evilOrigin,
-				"Access-Control-Request-Method":  http.MethodPost,
-				"Access-Control-Request-Headers": "content-type",
+			preflight := rawRequest(t, http.MethodOptions, path, map[string]string{
+				originHeader:         evilOrigin,
+				requestMethodHeader:  http.MethodPost,
+				requestHeadersHeader: contentTypeOnly,
 			})
 
 			if preflight.status >= 200 && preflight.status < 300 {
@@ -144,10 +149,10 @@ func TestForeignOriginGetsNoCORS(t *testing.T) {
 func TestRelyingPartyOriginMayCallCrossOrigin(t *testing.T) {
 	for _, path := range unsafeRoutes() {
 		t.Run(path, func(t *testing.T) {
-			preflight := rawRequest(t, http.MethodOptions, path, "", map[string]string{
-				originHeader:                     target.origin,
-				"Access-Control-Request-Method":  http.MethodPost,
-				"Access-Control-Request-Headers": "content-type",
+			preflight := rawRequest(t, http.MethodOptions, path, map[string]string{
+				originHeader:         target.origin,
+				requestMethodHeader:  http.MethodPost,
+				requestHeadersHeader: contentTypeOnly,
 			})
 
 			if preflight.status != http.StatusNoContent {
@@ -187,7 +192,7 @@ func TestRelyingPartyOriginMayCallCrossOrigin(t *testing.T) {
 func TestCookieRoutesRequireJSON(t *testing.T) {
 	token := login(t, registerPasskey(t))
 
-	got := rawPost(t, logoutPath, map[string]string{"Cookie": cookieName + "=" + token, contentTypeHeader: "text/plain"})
+	got := rawPost(t, logoutPath, map[string]string{"Cookie": cookieName + "=" + token, contentTypeHeader: plainText})
 	if got.status != http.StatusUnsupportedMediaType {
 		t.Errorf("POST %s with the cookie as text/plain = %d %s, want 415", logoutPath, got.status, got.body)
 	}
