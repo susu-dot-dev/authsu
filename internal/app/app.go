@@ -49,6 +49,12 @@ func (r router) Handle(method, path string, handler httpapi.Handler) {
 	r.mux.Handle(path, httpapi.Serve(method, r.log, handler))
 }
 
+// HandleLimited is Handle for a route whose bodies are small, refused with 413
+// above maxBody bytes.
+func (r router) HandleLimited(method, path string, maxBody int64, handler httpapi.Handler) {
+	r.mux.Handle(path, httpapi.ServeLimited(method, maxBody, r.log, handler))
+}
+
 // NewHandler returns the Worker's HTTP handler. Every feature is built here
 // from platform.
 func NewHandler(platform Platform) http.Handler {
@@ -74,8 +80,10 @@ func NewHandler(platform Platform) http.Handler {
 		Entropy: rand.Reader,
 		NewID:   func() string { return uuid.NewV7().String() },
 	})
-	routes.Handle(http.MethodPost, "/api/register/begin", registrar.BeginHandler(platform.Getenv))
-	routes.Handle(http.MethodPost, "/api/register/finish", registrar.FinishHandler(platform.Getenv))
+	routes.HandleLimited(http.MethodPost, "/api/register/begin", registration.MaxBeginBody,
+		registrar.BeginHandler(platform.Getenv))
+	routes.HandleLimited(http.MethodPost, "/api/register/finish", registration.MaxFinishBody,
+		registrar.FinishHandler(platform.Getenv))
 
 	authenticator := login.NewService(login.Deps{
 		Reader:  loginReader(platform.DB),

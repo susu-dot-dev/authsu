@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,7 +45,7 @@ func TestVerifyAccepts(t *testing.T) {
 		t.Errorf("stored flags = %08b, want UP|UV only", cred.Flags.Stored())
 	}
 
-	if strings.Join(cred.Transports, ",") != "hybrid,internal" {
+	if strings.Join(cred.Transports, ",") != transportHybrid+","+transportInternal {
 		t.Errorf("transports = %v", cred.Transports)
 	}
 
@@ -434,50 +436,156 @@ func TestNewDecoderRejectsBadEncodingOptions(t *testing.T) {
 	}
 }
 
-// TestVerifyChecksTransports covers the transport hints, which are stored as
-// sent: a short, sorted list of unique printable-ASCII strings (section
-// 5.2.1), unknown values included.
-// transportNFC is a transport value the tests use more than once.
-const transportNFC = "nfc"
+// Transport values (section 5.8.4) the transport tests use more than once.
+const (
+	transportNFC      = "nfc"
+	transportUSB      = "usb"
+	transportHybrid   = "hybrid"
+	transportInternal = "internal"
+)
 
-func TestVerifyChecksTransports(t *testing.T) {
+// verifyTransports runs Verify on a valid registration that reports
+// transports, and fails the test if the caller's slice is modified.
+func verifyTransports(t *testing.T, transports []string) (Verified, error) {
+	t.Helper()
+
+	reg := validResponse(t).build(t)
+	reg.Transports = transports
+	original := slices.Clone(transports)
+
+	got, err := Verify(reg, testRP())
+
+	if !slices.Equal(reg.Transports, original) {
+		t.Errorf("Verify modified the caller's transports: %v, was %v", reg.Transports, original)
+	}
+
+	return got, err
+}
+
+// distinct returns n distinct printable-ASCII transports, in descending order
+// so a list of them is never already sorted.
+func distinct(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("t%03d", n-i)
+	}
+
+	return out
+}
+
+// repeated returns n copies of transport.
+func repeated(transport string, n int) []string {
+	return slices.Repeat([]string{transport}, n)
+}
+
+// TestVerifyCanonicalizesTransports covers the transport hints. Section 5.2.1
+// says clients report them sorted and unique, but real providers do not (one
+// sent "hybrid" after "internal"), and the hints are not security-relevant, so
+// Verify accepts any order and repeats and stores a canonical list: sorted,
+// duplicates removed. Unknown values are kept, and nothing is truncated.
+func TestVerifyCanonicalizesTransports(t *testing.T) {
 	t.Parallel()
 
+	maxLen := strings.Repeat("z", maxTransportLen)
+
 	tests := map[string]struct {
-		transports []string
-		ok         bool
+		sent []string
+		want []string
 	}{
-		"none":             {transports: nil, ok: true},
-		"empty list":       {transports: []string{}, ok: true},
-		"an unknown value": {transports: []string{"carrier-pigeon", "internal"}, ok: true},
-		"at the bounds":    {transports: []string{"a", "b", "c", "d", "e", "f", "g", strings.Repeat("z", 32)}, ok: true},
-		"too many":         {transports: []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}},
-		"too long":         {transports: []string{strings.Repeat("z", 33)}},
-		"an empty entry":   {transports: []string{""}},
-		"a control":        {transports: []string{"usb\t"}},
-		"non-ASCII":        {transports: []string{"us\u00e9"}},
-		"a duplicate":      {transports: []string{transportNFC, transportNFC}},
-		"not sorted":       {transports: []string{"usb", transportNFC}},
+		"none":       {sent: nil, want: nil},
+		"empty list": {sent: []string{}, want: []string{}},
+		"already canonical": {
+			sent: []string{transportHybrid, transportInternal},
+			want: []string{transportHybrid, transportInternal},
+		},
+		"an unknown value": {
+			sent: []string{"carrier-pigeon", transportInternal},
+			want: []string{"carrier-pigeon", transportInternal},
+		},
+		"out of order, as providers send": {
+			sent: []string{transportInternal, transportHybrid},
+			want: []string{transportHybrid, transportInternal},
+		},
+		"reverse sorted": {sent: []string{transportUSB, transportNFC}, want: []string{transportNFC, transportUSB}},
+		"a duplicate":    {sent: []string{transportNFC, transportNFC}, want: []string{transportNFC}},
+		"unsorted with scattered duplicates": {
+			sent: []string{transportUSB, transportNFC, transportUSB, transportInternal, transportNFC},
+			want: []string{transportInternal, transportNFC, transportUSB},
+		},
+		"an entry of the maximum length, out of order": {
+			sent: []string{maxLen, "a"},
+			want: []string{"a", maxLen},
+		},
+		"the most entries allowed": {
+			sent: distinct(MaxTransports),
+			want: slices.Sorted(slices.Values(distinct(MaxTransports))),
+		},
+		"the most entries allowed, all repeats": {
+			sent: repeated("a", MaxTransports),
+			want: []string{"a"},
+		},
+		"the most entries allowed, half repeats": {
+			sent: slices.Concat(distinct(MaxTransports/2), distinct(MaxTransports/2)),
+			want: slices.Sorted(slices.Values(distinct(MaxTransports / 2))),
+		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			reg := validResponse(t).build(t)
-			reg.Transports = tt.transports
-
-			got, err := Verify(reg, testRP())
-			if tt.ok {
-				if err != nil || strings.Join(got.Credential.Transports, ",") != strings.Join(tt.transports, ",") {
-					t.Errorf("Verify = (%v, %v), want the transports stored as sent", got.Credential.Transports, err)
-				}
-
-				return
+			got, err := verifyTransports(t, tt.sent)
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
 			}
 
+			if !slices.Equal(got.Credential.Transports, tt.want) || (got.Credential.Transports == nil) != (tt.want == nil) {
+				t.Errorf("transports = %#v, want %#v", got.Credential.Transports, tt.want)
+			}
+		})
+	}
+}
+
+// TestVerifyRefusesBadTransports covers what is still refused, whole and not
+// truncated: a list over the count limit (counted as sent, so repeats do not
+// hide a flood and the list is refused before it is sorted), or an entry that
+// is empty, over the length limit or not printable ASCII, wherever it sits in
+// the list.
+func TestVerifyRefusesBadTransports(t *testing.T) {
+	t.Parallel()
+
+	overLen := strings.Repeat("z", maxTransportLen+1)
+
+	tests := map[string][]string{
+		"one over the count limit":                 distinct(MaxTransports + 1),
+		"one over, though every entry is a repeat": repeated("a", MaxTransports+1),
+		"one over, though they merge below the limit": slices.Concat(
+			distinct(MaxTransports/2), distinct(MaxTransports/2), []string{"x"}),
+		"far over the count limit":               repeated("a", 100000),
+		"one entry one byte too long":            {overLen},
+		"too long, among valid unsorted entries": {transportUSB, overLen, transportNFC},
+		"far too long":                           {strings.Repeat("z", 20000)},
+		"an empty entry":                         {""},
+		"an empty entry, last":                   {transportUSB, transportNFC, ""},
+		"a control":                              {transportUSB + "\t"},
+		"a NUL":                                  {transportUSB + "\x00"},
+		"DEL":                                    {transportUSB + "\x7f"},
+		"non-ASCII":                              {"us\u00e9"},
+		"a bad entry after a good one":           {transportUSB, "us\u00e9"},
+		"a bad entry at the count limit":         append(distinct(MaxTransports-1), ""),
+	}
+
+	for name, sent := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := verifyTransports(t, sent)
 			if !errors.Is(err, ErrTransports) {
 				t.Errorf("Verify error = %v, want ErrTransports", err)
+			}
+
+			if got.Credential.Transports != nil || got.Challenge != nil {
+				t.Errorf("a refused registration returned a partial result: %+v", got)
 			}
 		})
 	}

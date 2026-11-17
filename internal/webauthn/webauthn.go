@@ -43,8 +43,8 @@ var (
 	// ErrPublicKey means the credential public key was malformed, not ES256,
 	// or not a point on the curve.
 	ErrPublicKey = errors.New("invalid credential public key")
-	// ErrTransports means the reported transports were not a short, sorted
-	// list of unique printable-ASCII strings.
+	// ErrTransports means the reported transports were not a short list of
+	// printable-ASCII strings. Order and repeats are not errors.
 	ErrTransports = errors.New("invalid transports")
 )
 
@@ -71,8 +71,8 @@ type Credential struct {
 	// AAGUID identifies the authenticator model. All zero when the
 	// authenticator does not reveal it.
 	AAGUID [16]byte
-	// Transports are the transport hints the client reported, as sent. They
-	// are unverified and informational only.
+	// Transports are the transport hints the client reported, sorted and
+	// without duplicates. They are unverified and informational only.
 	Transports []string
 }
 

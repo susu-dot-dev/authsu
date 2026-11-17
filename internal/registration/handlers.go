@@ -43,6 +43,20 @@ const (
 	maxNameBytes = 128
 	// maxCodeBytes bounds the invitation code. Real codes are 43 characters.
 	maxCodeBytes = 256
+
+	// MaxBeginBody caps the begin request, which is two short strings (a real
+	// one is about 100 bytes). A name is escaped in JSON, at worst six bytes
+	// per byte, so this leaves room for the longest valid one.
+	MaxBeginBody = 4 << 10
+
+	// MaxFinishBody caps the finish request, so the server never parses more
+	// than a legitimate one could hold (a real one is under 1 KiB). It is the
+	// sum of what the members may legally be, with room for JSON syntax and
+	// escaping: id and rawId (1023 bytes each, base64url), clientDataJSON
+	// (2048) and attestationObject (4096) as base64url, the name and code, and
+	// maxTransports transports. Anything larger fails a member's own bound
+	// anyway, so refusing it here costs no honest client.
+	MaxFinishBody = 32 << 10
 )
 
 // BeginRequest is the body of POST /api/register/begin.
@@ -84,9 +98,12 @@ type credential struct {
 // verified or stored.
 type credentialResult struct {
 	// The member name is fixed by the WebAuthn specification.
-	ClientDataJSON     string   `json:"clientDataJSON"` //nolint:tagliatelle // WebAuthn names this member clientDataJSON
-	AttestationObject  string   `json:"attestationObject"`
-	Transports         []string `json:"transports"`
+	ClientDataJSON    string `json:"clientDataJSON"` //nolint:tagliatelle // WebAuthn names this member clientDataJSON
+	AttestationObject string `json:"attestationObject"`
+	// Transports is bounded while the body is still being checked, so an
+	// oversized list is refused before it is allocated. The bound is the same
+	// as the one webauthn.Verify enforces (webauthn.MaxTransports).
+	Transports         []string `json:"transports"         maxitems:"100"`
 	AuthenticatorData  string   `json:"authenticatorData"`
 	PublicKey          string   `json:"publicKey"`
 	PublicKeyAlgorithm int64    `json:"publicKeyAlgorithm"`

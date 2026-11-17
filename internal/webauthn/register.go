@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/fxamacker/cbor/v2"
@@ -50,7 +51,8 @@ type Registration struct {
 	// ClientDataJSON and AttestationObject are the response members.
 	ClientDataJSON    string
 	AttestationObject string
-	// Transports are the client's transport hints, stored as given.
+	// Transports are the client's transport hints, in any order and possibly
+	// with repeats; Verify stores them sorted and unique.
 	Transports []string
 }
 
@@ -113,12 +115,10 @@ func verifyWith(opts cbor.DecOptions, reg Registration, rp RelyingParty) (Verifi
 		return Verified{}, err
 	}
 
-	err = checkTransports(reg.Transports)
+	credential.Transports, err = canonicalTransports(reg.Transports)
 	if err != nil {
 		return Verified{}, err
 	}
-
-	credential.Transports = reg.Transports
 
 	return Verified{Challenge: challenge, Credential: credential}, nil
 }
@@ -282,38 +282,52 @@ func checkCredentialID(id []byte, reg Registration) error {
 }
 
 // Transport bounds. Real lists are one or two of the six values section 5.8.4
-// defines, each at most 10 bytes; these leave room for values defined later.
+// defines, each at most 10 bytes; these leave room for values defined later and
+// are far more than any client sends. Over a bound is refused, never truncated.
 const (
-	maxTransports   = 8
+	// MaxTransports is the most transports a registration may report. The
+	// request decoder enforces the same number with a maxitems tag on the
+	// field, so an oversized list is refused before it is allocated; a test
+	// keeps the two equal.
+	MaxTransports   = 100
 	maxTransportLen = 32
 	minPrintable    = 0x20
 	maxPrintable    = 0x7e
 )
 
-var errTransports = errors.New("transports are not a short sorted list of unique printable-ASCII strings")
+var errTransports = errors.New("transports are not a short list of printable-ASCII strings")
 
-// checkTransports bounds the client's transport hints, which are stored as
-// sent. Section 5.2.1 describes them as "zero or more unique DOMStrings in
+// canonicalTransports bounds and normalises the client's transport hints.
+// Section 5.2.1 describes them as "zero or more unique DOMStrings in
 // lexicographical order" and says relying parties SHOULD accept and store
-// unknown values, so unknown values pass; what is refused is a list a
-// conforming client could not have produced, or one too large to be a hint.
-func checkTransports(transports []string) error {
-	if len(transports) > maxTransports {
-		return fmt.Errorf("%w: %w: %d entries", ErrTransports, errTransports, len(transports))
+// unknown values, so unknown values pass. Real providers do not always send
+// them sorted or unique, and the hints are not security-relevant, so a harmless
+// ordering difference or repeat is not an error: the list is returned sorted
+// with duplicates removed, as a conforming client would have sent it.
+//
+// What is refused is a list too large to be a hint (counted as sent, so a
+// flood of repeats is refused too) or an entry that is empty, too long or not
+// printable ASCII. The input is not modified. A nil or empty list is returned
+// as is.
+func canonicalTransports(transports []string) ([]string, error) {
+	if len(transports) > MaxTransports {
+		return nil, fmt.Errorf("%w: %w: %d entries", ErrTransports, errTransports, len(transports))
 	}
 
-	for i, transport := range transports {
+	for _, transport := range transports {
 		if len(transport) == 0 || len(transport) > maxTransportLen || !printableASCII(transport) {
-			return fmt.Errorf("%w: %w: %q", ErrTransports, errTransports, transport)
-		}
-
-		// Strictly increasing is both sorted and unique.
-		if i > 0 && transports[i-1] >= transport {
-			return fmt.Errorf("%w: %w: %q after %q", ErrTransports, errTransports, transport, transports[i-1])
+			return nil, fmt.Errorf("%w: %w: %q", ErrTransports, errTransports, transport)
 		}
 	}
 
-	return nil
+	if len(transports) == 0 {
+		return transports, nil
+	}
+
+	canonical := slices.Clone(transports)
+	slices.Sort(canonical)
+
+	return slices.Compact(canonical), nil
 }
 
 // printableASCII reports whether s holds only printable ASCII (0x20 to 0x7e).

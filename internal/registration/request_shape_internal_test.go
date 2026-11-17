@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/webauthn"
 )
 
 // These tests state what the request handlers must accept and refuse at the
@@ -93,28 +96,40 @@ func storedTransports(t *testing.T, fix *fixture) []string {
 // Transport values (section 5.8.4) the tests use more than once.
 const (
 	transportUSB      = "usb"
+	transportNFC      = "nfc"
+	transportHybrid   = "hybrid"
 	transportInternal = "internal"
 )
+
+// finishWithTransports registers with the given response.transports.
+func finishWithTransports(t *testing.T, transports []string) (*fixture, error) {
+	t.Helper()
+
+	fix := newFixture(t)
+	req := beginThenRespond(t, fix, newAuthenticator())
+	req.Credential.Response.Transports = transports
+
+	_, err := postFinish(t, fix, mustJSON(t, req))
+
+	return fix, err
+}
 
 // TestFinishBoundsTransports covers response.transports. Section 5.2.1 says the
 // client reports "zero or more unique DOMStrings in lexicographical order",
 // which SHOULD be AuthenticatorTransport values, and that relying parties
 // "SHOULD accept and store unknown values". So unknown values are kept, but the
-// list is bounded (at most 8 entries of 1 to 32 printable-ASCII bytes) and must
-// be unique and sorted, and anything else is the client's error, refused before
-// the database.
+// list is bounded (at most 100 entries of 1 to 32 printable-ASCII bytes) and
+// anything else is the client's error, refused before the database. A list over
+// the bound is refused whole, never truncated.
 func TestFinishBoundsTransports(t *testing.T) {
 	t.Parallel()
 
 	refused := map[string][]string{
-		"too many entries":    {"a", "b", "c", "d", "e", "f", "g", "h", "i"},
 		"an entry too long":   {strings.Repeat("x", 33)},
 		"an empty entry":      {""},
 		"a NUL":               {transportUSB + "\x00"},
 		"a control character": {transportUSB + "\t"},
 		"non-ASCII":           {"us\u00e9"},
-		"a duplicate":         {transportUSB, transportUSB},
-		"not sorted":          {transportUSB, "nfc"},
 		"far too long":        {strings.Repeat("x", 20000)},
 	}
 
@@ -122,11 +137,7 @@ func TestFinishBoundsTransports(t *testing.T) {
 		t.Run("refuses "+name, func(t *testing.T) {
 			t.Parallel()
 
-			fix := newFixture(t)
-			req := beginThenRespond(t, fix, newAuthenticator())
-			req.Credential.Response.Transports = transports
-
-			_, err := postFinish(t, fix, mustJSON(t, req))
+			fix, err := finishWithTransports(t, transports)
 			wantFailure(t, err, apierr.BadRequest, CodeInvalidCredential)
 
 			if len(fix.batcher.batches) != 0 {
@@ -137,29 +148,170 @@ func TestFinishBoundsTransports(t *testing.T) {
 
 	accepted := map[string][]string{
 		"none reported":      {},
-		"a platform passkey": {"hybrid", transportInternal},
-		"a security key":     {"nfc", transportUSB},
+		"a platform passkey": {transportHybrid, transportInternal},
+		"a security key":     {transportNFC, transportUSB},
 		"an unknown value":   {"carrier-pigeon", transportInternal},
-		"the most allowed": {
-			"a", "b", "c", "d", "e", "f", "g", strings.Repeat("z", 32),
-		},
+		"the longest entry":  {"a", strings.Repeat("z", 32)},
 	}
 
 	for name, transports := range accepted {
 		t.Run("stores "+name, func(t *testing.T) {
 			t.Parallel()
 
-			fix := newFixture(t)
-			req := beginThenRespond(t, fix, newAuthenticator())
-			req.Credential.Response.Transports = transports
-
-			_, err := postFinish(t, fix, mustJSON(t, req))
+			fix, err := finishWithTransports(t, transports)
 			if err != nil {
 				t.Fatalf("finish: %v", err)
 			}
 
 			if got := storedTransports(t, fix); !slices.Equal(got, transports) {
 				t.Errorf("stored transports = %q, want %q", got, transports)
+			}
+		})
+	}
+}
+
+// manyTransports returns n distinct transports in descending order.
+func manyTransports(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("t%03d", n-i)
+	}
+
+	return out
+}
+
+// TestFinishBoundsTheTransportCount: the count limit is exact. The most
+// allowed is stored (sorted); one more is refused as too_many_items while the
+// body is being checked, before any of it is verified or any database work, and
+// is not truncated to the limit. Repeats count as sent, so a list that would
+// merge below the limit is still refused.
+func TestFinishBoundsTheTransportCount(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the most allowed is stored", func(t *testing.T) {
+		t.Parallel()
+
+		fix, err := finishWithTransports(t, manyTransports(webauthn.MaxTransports))
+		if err != nil {
+			t.Fatalf("finish: %v", err)
+		}
+
+		want := slices.Sorted(slices.Values(manyTransports(webauthn.MaxTransports)))
+		if got := storedTransports(t, fix); !slices.Equal(got, want) {
+			t.Errorf("stored %d transports, want all %d sorted", len(got), len(want))
+		}
+	})
+
+	refused := map[string][]string{
+		"one over the limit":            manyTransports(webauthn.MaxTransports + 1),
+		"one over, all repeats":         slices.Repeat([]string{transportUSB}, webauthn.MaxTransports+1),
+		"far over the limit":            slices.Repeat([]string{"a"}, 100000),
+		"far over, would merge to one":  slices.Repeat([]string{transportInternal}, 20000),
+		"one over, repeats merge below": slices.Concat(manyTransports(50), manyTransports(50), []string{"x"}),
+	}
+
+	for name, transports := range refused {
+		t.Run("refuses "+name, func(t *testing.T) {
+			t.Parallel()
+
+			fix, err := finishWithTransports(t, transports)
+			wantFailure(t, err, apierr.BadRequest, "too_many_items")
+
+			if len(fix.batcher.batches) != 0 {
+				t.Error("a refused registration reached the database")
+			}
+		})
+	}
+}
+
+// TestTransportLimitsAgree: the request's maxitems tag must be a literal, so
+// nothing but this test keeps it equal to the limit Verify enforces. If they
+// drifted, either the decoder would refuse lists Verify allows, or the tag
+// would stop protecting the decoder.
+func TestTransportLimitsAgree(t *testing.T) {
+	t.Parallel()
+
+	field, ok := reflect.TypeFor[credentialResult]().FieldByName("Transports")
+	if !ok {
+		t.Fatal("credentialResult has no Transports field")
+	}
+
+	got, err := strconv.Atoi(field.Tag.Get("maxitems"))
+	if err != nil || got != webauthn.MaxTransports {
+		t.Errorf("maxitems tag = %q, want %d (webauthn.MaxTransports)", field.Tag.Get("maxitems"), webauthn.MaxTransports)
+	}
+}
+
+// TestFinishBodyCapFitsEveryLegitimateRequest: MaxFinishBody must be larger
+// than a request whose every member is at its own limit, or the cap would
+// refuse a request the members would accept; and it must be far below the
+// default cap, which is what bounds the parsing work.
+func TestFinishBodyCapFitsEveryLegitimateRequest(t *testing.T) {
+	t.Parallel()
+
+	b64Len := func(n int) int { return base64.RawURLEncoding.EncodedLen(n) }
+
+	// Worst case JSON: every member at its limit, each byte of the name
+	// escaped as \u00XX (six bytes), and a full list of full-length transports.
+	biggest := b64Len(1023)*2 + // id, rawId
+		b64Len(webauthn.MaxClientDataJSON) +
+		b64Len(webauthn.MaxAttestationObject) +
+		b64Len(webauthn.MaxAttestationObject) + // authenticatorData, publicKey copies
+		maxNameBytes*6 + maxCodeBytes*6 +
+		webauthn.MaxTransports*(32+3) +
+		1024 // member names, braces, quotes, commas
+
+	if biggest > MaxFinishBody {
+		t.Errorf("a maximal finish request is about %d bytes, over MaxFinishBody = %d", biggest, MaxFinishBody)
+	}
+
+	if MaxFinishBody >= httpapi.DefaultMaxBody/8 {
+		t.Errorf("MaxFinishBody = %d is not far below the default cap %d", MaxFinishBody, httpapi.DefaultMaxBody)
+	}
+
+	if MaxBeginBody <= maxNameBytes*6+maxCodeBytes*6 {
+		t.Errorf("MaxBeginBody = %d cannot hold a maximal begin request", MaxBeginBody)
+	}
+}
+
+// TestFinishCanonicalizesTransports: real providers do not report transports
+// sorted and unique as section 5.2.1 says (one sent "hybrid" after "internal",
+// which used to fail the whole registration). The hints are not
+// security-relevant, so an unsorted or repeating list registers fine and is
+// stored sorted with duplicates removed.
+func TestFinishCanonicalizesTransports(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct{ sent, stored []string }{
+		"out of order, as providers send": {
+			sent:   []string{transportInternal, transportHybrid},
+			stored: []string{transportHybrid, transportInternal},
+		},
+		"reverse sorted": {
+			sent:   []string{transportUSB, transportNFC},
+			stored: []string{transportNFC, transportUSB},
+		},
+		"a duplicate": {
+			sent:   []string{transportUSB, transportUSB},
+			stored: []string{transportUSB},
+		},
+		"unsorted with duplicates": {
+			sent:   []string{transportUSB, transportNFC, transportUSB, transportInternal, transportNFC},
+			stored: []string{transportInternal, transportNFC, transportUSB},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fix, err := finishWithTransports(t, tt.sent)
+			if err != nil {
+				t.Fatalf("finish: %v", err)
+			}
+
+			if got := storedTransports(t, fix); !slices.Equal(got, tt.stored) {
+				t.Errorf("stored transports = %q, want %q", got, tt.stored)
 			}
 		})
 	}

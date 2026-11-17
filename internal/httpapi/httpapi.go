@@ -15,7 +15,8 @@
 //     but the one CORS allows, so another site cannot make a browser deliver
 //     such a request: this is the CSRF defence for every unsafe route (see
 //     isJSON and CORS).
-//   - A request body is capped at 1 MiB (413 body_too_large).
+//   - A request body is capped at 1 MiB (413 body_too_large), or at a smaller
+//     limit a route asks for with ServeLimited.
 //   - A handler runs inside a recover, so a panic still gets the JSON error
 //     contract and a log line, as Internal handler_panic.
 //   - Responses carry Content-Type and Cache-Control: no-store, and the status
@@ -49,6 +50,10 @@ import (
 
 // maxBodyBytes caps how much of a request body is read.
 const maxBodyBytes = 1 << 20
+
+// DefaultMaxBody is the cap on a request body for a route that does not ask for
+// a smaller one.
+const DefaultMaxBody = maxBodyBytes
 
 // Request is the part of an HTTP request a handler may use.
 type Request struct {
@@ -145,6 +150,8 @@ func decodeError(err error) *apierr.Error {
 	switch {
 	case errors.Is(err, errUnknownMember):
 		return apierr.New(apierr.BadRequest, "unknown_field", "request body has an unknown field").WithCause(err)
+	case errors.Is(err, errTooManyItems):
+		return apierr.New(apierr.BadRequest, "too_many_items", "request body has an array with too many items").WithCause(err)
 	case errors.Is(err, errDuplicateMember):
 		return apierr.New(apierr.BadRequest, "duplicate_field", "request body repeats a field").WithCause(err)
 	case errors.Is(err, errInvalidText):
@@ -158,16 +165,25 @@ func decodeError(err error) *apierr.Error {
 // and answers every other method with 405 and an Allow header. A panic in the
 // handler is recovered and reported as an Internal error.
 func Serve(method string, logger Logger, handler Handler) http.Handler {
-	return serve(method, logger, handler)
+	return serve(method, maxBodyBytes, logger, handler)
+}
+
+// ServeLimited is Serve for a route whose legitimate bodies are small: a body
+// over maxBody bytes is refused with 413 body_too_large, and never read past
+// that, so a client cannot make the route spend time on a megabyte it could
+// never use. maxBody is clamped to DefaultMaxBody, so a route can only tighten
+// the cap, never raise it.
+func ServeLimited(method string, maxBody int64, logger Logger, handler Handler) http.Handler {
+	return serve(method, min(maxBody, maxBodyBytes), logger, handler)
 }
 
 // ServeAny is Serve for a handler that accepts every method.
 func ServeAny(logger Logger, handler Handler) http.Handler {
-	return serve("", logger, handler)
+	return serve("", maxBodyBytes, logger, handler)
 }
 
 // serve implements Serve. An empty method accepts every method.
-func serve(method string, logger Logger, handler Handler) http.Handler {
+func serve(method string, maxBody int64, logger Logger, handler Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
 
@@ -196,7 +212,7 @@ func serve(method string, logger Logger, handler Handler) http.Handler {
 			return
 		}
 
-		body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, maxBodyBytes))
+		body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, maxBody))
 		if err != nil {
 			write(writer, logger, request, result.Fail[Response](bodyReadError(err)))
 
