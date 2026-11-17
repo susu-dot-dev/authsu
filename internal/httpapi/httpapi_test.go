@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -114,6 +115,7 @@ const (
 	unknownField = "unknown_field"
 	invalidType  = "invalid_field_type"
 	invalidText  = "invalid_text"
+	tooManyItems = "too_many_items"
 	notFoundBody = `{"error":{"code":"not_found","message":"no such route"}}` + "\n"
 )
 
@@ -487,6 +489,10 @@ type shapes struct {
 	Any   json.RawMessage    `json:"any"`
 	Plain string             // untagged, so matched by its Go name
 	Words map[string][]input `json:"words"`
+	// Few is an array bounded to three items.
+	Few []string `json:"few" maxitems:"3"`
+	// None is bounded to zero items: always empty.
+	None []string `json:"none" maxitems:"0"`
 }
 
 // TestDecodeChecksEveryValue covers checkStrict's walk: the exact-name and
@@ -712,5 +718,151 @@ func TestServeSafeMethodsNeedNoContentType(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s with no Content-Type = %d, want 200", method, rec.Code)
 		}
+	}
+}
+
+// TestDecodeBoundsArrays covers the maxitems tag: an array over its limit is
+// refused (never truncated), at the first item past the limit.
+func TestDecodeBoundsArrays(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		body     string
+		wantFew  []string
+		wantCode string
+	}{
+		"empty":                  {body: `{"few":[]}`, wantFew: []string{}},
+		"under the limit":        {body: `{"few":["a","b"]}`, wantFew: []string{"a", "b"}},
+		"at the limit":           {body: `{"few":["a","b","c"]}`, wantFew: []string{"a", "b", "c"}},
+		"one over the limit":     {body: `{"few":["a","b","c","d"]}`, wantCode: tooManyItems},
+		"far over the limit":     {body: `{"few":[` + strings.Repeat(`"a",`, 5000) + `"a"]}`, wantCode: tooManyItems},
+		"repeats count as items": {body: `{"few":["a","a","a","a"]}`, wantCode: tooManyItems},
+		"zero limit, empty":      {body: `{"none":[]}`},
+		"zero limit, one item":   {body: `{"none":["a"]}`, wantCode: tooManyItems},
+		"null is no array":       {body: `{"few":null}`},
+		"unbounded array":        {body: `{"list":[` + strings.Repeat(`{},`, 50) + `{}]}`},
+		"limit is per array":     {body: `{"few":["a"],"words":{"w":[{},{},{},{},{}]}}`, wantFew: []string{"a"}},
+		"too many then bad json": {body: `{"few":["a","b","c","d"`, wantCode: tooManyItems},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := httpapi.Decode[shapes](httpapi.Request{
+				Context: t.Context(), Query: nil, Body: []byte(tt.body),
+			}).Get()
+
+			if tt.wantCode != "" {
+				failure := apierr.As(err)
+				if failure.Kind != apierr.BadRequest || failure.Code != tt.wantCode {
+					t.Errorf("Decode error = (%d, %q), want (BadRequest, %q)", failure.Kind, failure.Code, tt.wantCode)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Decode error = %v, want success", err)
+			}
+
+			if tt.wantFew != nil && !slices.Equal(got.Few, tt.wantFew) {
+				t.Errorf("Few = %q, want %q (an array is never truncated)", got.Few, tt.wantFew)
+			}
+		})
+	}
+}
+
+// badLimit has a maxitems tag that is not a non-negative integer.
+type badLimit struct {
+	Items []string `json:"items" maxitems:"many"`
+}
+
+type negativeLimit struct {
+	Items []string `json:"items" maxitems:"-1"`
+}
+
+// TestDecodeRefusesAMalformedLimit: a bad tag is a bug in the code, not in the
+// request, so it must not silently leave the array unbounded. Decode panics,
+// which Serve turns into an Internal error.
+func TestDecodeRefusesAMalformedLimit(t *testing.T) {
+	t.Parallel()
+
+	body := httpapi.Request{Context: t.Context(), Query: nil, Body: []byte(`{"items":["a"]}`)}
+
+	tests := map[string]func() any{
+		"not a number": func() any { return httpapi.Decode[badLimit](body) },
+		"negative":     func() any { return httpapi.Decode[negativeLimit](body) },
+	}
+
+	for name, decode := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			defer func() {
+				if recover() == nil {
+					t.Error("Decode did not panic on a malformed maxitems tag")
+				}
+			}()
+
+			decode()
+		})
+	}
+}
+
+// TestServeLimited covers the per-route body cap: a body over the route's cap
+// is refused with 413 without reaching the handler, a body at the cap is
+// delivered whole, and a route cannot raise the cap above the default.
+func TestServeLimited(t *testing.T) {
+	t.Parallel()
+
+	const limit = 64
+
+	tests := map[string]struct {
+		maxBody    int64
+		bodyLen    int
+		wantStatus int
+		wantCalled bool
+	}{
+		"under the cap":              {maxBody: limit, bodyLen: limit - 1, wantStatus: http.StatusOK, wantCalled: true},
+		"at the cap":                 {maxBody: limit, bodyLen: limit, wantStatus: http.StatusOK, wantCalled: true},
+		"one byte over the cap":      {maxBody: limit, bodyLen: limit + 1, wantStatus: http.StatusRequestEntityTooLarge},
+		"far over the cap":           {maxBody: limit, bodyLen: 512 << 10, wantStatus: http.StatusRequestEntityTooLarge},
+		"cannot raise above default": {maxBody: 1 << 30, bodyLen: 2 << 20, wantStatus: http.StatusRequestEntityTooLarge},
+		"default cap still allows":   {maxBody: 1 << 30, bodyLen: 1 << 20, wantStatus: http.StatusOK, wantCalled: true},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			called := false
+			handler := func(req httpapi.Request) result.Result[httpapi.Response] {
+				called = true
+
+				if len(req.Body) != tt.bodyLen {
+					t.Errorf("handler got %d bytes, want %d", len(req.Body), tt.bodyLen)
+				}
+
+				return result.Ok(httpapi.JSON(http.StatusOK, 1))
+			}
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x",
+				strings.NewReader(strings.Repeat("a", tt.bodyLen)))
+			setContentType(req, nil)
+
+			logger := func(httpapi.Request, *apierr.Error) {}
+
+			httpapi.ServeLimited(http.MethodPost, tt.maxBody, logger, handler).ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus || called != tt.wantCalled {
+				t.Errorf("status = %d, handler called = %v; want %d, %v", rec.Code, called, tt.wantStatus, tt.wantCalled)
+			}
+
+			if tt.wantStatus == http.StatusRequestEntityTooLarge && !strings.Contains(rec.Body.String(), "body_too_large") {
+				t.Errorf("body = %q, want code body_too_large", rec.Body.String())
+			}
+		})
 	}
 }

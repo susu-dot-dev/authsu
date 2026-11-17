@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -15,6 +16,7 @@ var (
 	errUnknownMember   = errors.New("unknown member")
 	errDuplicateMember = errors.New("repeated member")
 	errInvalidText     = errors.New("text is not valid UTF-8")
+	errTooManyItems    = errors.New("array has too many items")
 )
 
 // checkStrict reads one JSON value from dec and checks it against t, the Go
@@ -27,7 +29,10 @@ var (
 //     name) says;
 //   - a name may appear once per object;
 //   - no name or string may contain U+FFFD. Invalid UTF-8 and lone surrogate
-//     escapes both decode to it, and no honest client sends it.
+//     escapes both decode to it, and no honest client sends it;
+//   - an array member whose field has a `maxitems:"N"` tag may hold at most N
+//     items. The walk stops at item N+1, so an oversized array is refused
+//     (never truncated) before the decoder allocates it.
 //
 // Where t gives no structure (an interface, json.RawMessage, a scalar given an
 // object) only the last two rules apply, and decoding reports any type error.
@@ -40,7 +45,7 @@ func checkStrict(dec *json.Decoder, t reflect.Type) error {
 		return err //nolint:wrapcheck // decodeError classifies the decoder's errors
 	}
 
-	return truncated(checkToken(dec, token, t))
+	return truncated(checkToken(dec, token, t, noLimit))
 }
 
 // truncated reports input that ends after the first token as a truncated
@@ -54,17 +59,24 @@ func truncated(err error) error {
 }
 
 // checkValue reads and checks the next value.
-func checkValue(dec *json.Decoder, t reflect.Type) error {
+//
+// limit is the most items an array value may hold, or noLimit.
+func checkValue(dec *json.Decoder, t reflect.Type, limit int) error {
 	token, err := dec.Token()
 	if err != nil {
 		return err //nolint:wrapcheck // decodeError classifies the decoder's errors
 	}
 
-	return checkToken(dec, token, t)
+	return checkToken(dec, token, t, limit)
 }
 
-// checkToken checks the value that starts with token.
-func checkToken(dec *json.Decoder, token json.Token, t reflect.Type) error {
+// noLimit means an array may hold any number of items (the body cap still
+// bounds it).
+const noLimit = -1
+
+// checkToken checks the value that starts with token. limit applies only if
+// the value is an array.
+func checkToken(dec *json.Decoder, token json.Token, t reflect.Type, limit int) error {
 	t = indirect(t)
 
 	switch value := token.(type) {
@@ -74,7 +86,7 @@ func checkToken(dec *json.Decoder, token json.Token, t reflect.Type) error {
 		var err error
 
 		if value == '[' {
-			err = checkArray(dec, elemType(t))
+			err = checkArray(dec, elemType(t), limit)
 		} else {
 			err = checkObject(dec, t)
 		}
@@ -92,9 +104,13 @@ func checkToken(dec *json.Decoder, token json.Token, t reflect.Type) error {
 	}
 }
 
-func checkArray(dec *json.Decoder, elem reflect.Type) error {
-	for dec.More() {
-		err := checkValue(dec, elem)
+func checkArray(dec *json.Decoder, elem reflect.Type, limit int) error {
+	for count := 0; dec.More(); count++ {
+		if limit != noLimit && count >= limit {
+			return fmt.Errorf("%w: more than %d", errTooManyItems, limit)
+		}
+
+		err := checkValue(dec, elem, noLimit)
 		if err != nil {
 			return err
 		}
@@ -127,12 +143,12 @@ func checkObject(dec *json.Decoder, t reflect.Type) error {
 
 		seen[name] = struct{}{}
 
-		member, known := memberType(t, name)
+		member, limit, known := memberType(t, name)
 		if !known {
 			return fmt.Errorf("%w: %q", errUnknownMember, name)
 		}
 
-		err = checkValue(dec, member)
+		err = checkValue(dec, member, limit)
 		if err != nil {
 			return err
 		}
@@ -149,27 +165,46 @@ func checkText(s string) error {
 	return nil
 }
 
-// memberType is the type of member name of an object decoded into t, and
-// whether t has such a member. A nil type means no structure is known.
-func memberType(t reflect.Type, name string) (reflect.Type, bool) {
+// memberType is the type of member name of an object decoded into t, the most
+// items it may hold if it is an array (noLimit if none is set), and whether t
+// has such a member. A nil type means no structure is known.
+func memberType(t reflect.Type, name string) (reflect.Type, int, bool) {
 	if t == nil {
-		return nil, true
+		return nil, noLimit, true
 	}
 
 	switch t.Kind() { //nolint:exhaustive // only structs and maps give members a type
 	case reflect.Struct:
 		for field := range t.Fields() {
 			if jsonName(field) == name {
-				return field.Type, true
+				return field.Type, maxItems(field), true
 			}
 		}
 
-		return nil, false
+		return nil, noLimit, false
 	case reflect.Map:
-		return t.Elem(), true
+		return t.Elem(), noLimit, true
 	default:
-		return nil, true
+		return nil, noLimit, true
 	}
+}
+
+// maxItems is the limit a field's `maxitems:"N"` tag sets, or noLimit. A tag
+// that is not a non-negative integer is a programming error, so it panics: the
+// handler's recover turns that into an Internal error rather than silently
+// leaving the array unbounded.
+func maxItems(field reflect.StructField) int {
+	tag, ok := field.Tag.Lookup("maxitems")
+	if !ok {
+		return noLimit
+	}
+
+	limit, err := strconv.Atoi(tag)
+	if err != nil || limit < 0 {
+		panic(fmt.Sprintf("httpapi: field %s has an invalid maxitems tag %q", field.Name, tag))
+	}
+
+	return limit
 }
 
 // elemType is the element type of an array decoded into t, or nil.

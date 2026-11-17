@@ -24,6 +24,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/atomic"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/registration"
+	"github.com/susu-dot-dev/authsu/internal/webauthn"
 )
 
 const (
@@ -96,6 +97,62 @@ func TestRegistrationRejectsBadJSON(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want %d", path, rec.Code, http.StatusBadRequest)
 		}
+	}
+}
+
+// The registration routes cap their bodies far below the default 1 MiB, because
+// a legitimate request is a few KiB: a body over the cap is refused with 413
+// before any JSON is parsed, and a body exactly at it is still read (and then
+// fails as the malformed JSON it is, not as too large).
+func TestRegistrationBodyCaps(t *testing.T) {
+	t.Parallel()
+
+	caps := map[string]int{
+		beginPath:  registration.MaxBeginBody,
+		finishPath: registration.MaxFinishBody,
+	}
+
+	for path, limit := range caps {
+		for name, tt := range map[string]struct {
+			size int
+			want int
+		}{
+			"at the cap":     {size: limit, want: http.StatusBadRequest},
+			"one over":       {size: limit + 1, want: http.StatusRequestEntityTooLarge},
+			"far over":       {size: limit * 10, want: http.StatusRequestEntityTooLarge},
+			"near the 1 MiB": {size: 1 << 20, want: http.StatusRequestEntityTooLarge},
+			"over the 1 MiB": {size: 2 << 20, want: http.StatusRequestEntityTooLarge},
+		} {
+			t.Run(path+" "+name, func(t *testing.T) {
+				t.Parallel()
+
+				rec := httptest.NewRecorder()
+				app.NewHandler(app.Platform{Getenv: registrationEnv}).ServeHTTP(rec,
+					newRequest(t, http.MethodPost, path, strings.NewReader(strings.Repeat("a", tt.size))))
+
+				if rec.Code != tt.want {
+					t.Errorf("status = %d, want %d", rec.Code, tt.want)
+				}
+			})
+		}
+	}
+}
+
+// A finish request with more transports than allowed is refused at the route
+// with the code that names the problem, and never reaches the database (the
+// host stub has none, so reaching it would be a 503).
+func TestRegistrationFinishRefusesTooManyTransports(t *testing.T) {
+	t.Parallel()
+
+	body := `{"invitationCode":"c","name":"n","credential":{"response":{"transports":[` +
+		strings.Repeat(`"a",`, webauthn.MaxTransports) + `"a"]}}}`
+
+	rec := httptest.NewRecorder()
+	app.NewHandler(app.Platform{Getenv: registrationEnv}).ServeHTTP(rec,
+		newRequest(t, http.MethodPost, finishPath, strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "too_many_items") {
+		t.Errorf("status = %d, body = %q, want 400 too_many_items", rec.Code, rec.Body.String())
 	}
 }
 
