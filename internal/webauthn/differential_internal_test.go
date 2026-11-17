@@ -61,6 +61,12 @@ func TestVerifyRejectsAmbiguousClientData(t *testing.T) {
 		"origin name in upper case": {
 			mutate: raw(typeMember, challengeMember(), `"ORIGIN":"`+testOrigin+`"`), wantErr: ErrClientData,
 		},
+		// encoding/json folds case and keeps the last match, so it would read
+		// the evil origin here; a strict reader alone would read ours.
+		"ORIGIN beside origin": {
+			mutate:  raw(typeMember, challengeMember(), originMember, `"ORIGIN":"https://evil.example"`),
+			wantErr: ErrClientData,
+		},
 		// The decoder unescapes names before the duplicate check, so an escaped
 		// spelling of a name is still the same name.
 		"type repeated through an escape": {

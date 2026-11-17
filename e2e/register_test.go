@@ -66,6 +66,9 @@ type authenticator struct {
 	flags  byte
 
 	// The overrides below let a test send what no honest authenticator would.
+	// priv is the credential's private key. It is generated when nil, so a
+	// test that later signs assertions can supply the key it will sign with.
+	priv *ecdsa.PrivateKey
 	// cose replaces the generated credential public key.
 	cose []byte
 	// object builds the attestation object from authData instead of the
@@ -140,9 +143,15 @@ func (a authenticator) finishBody(t *testing.T, options creationOptions, code, n
 func (a authenticator) attestationObject(t *testing.T) []byte {
 	t.Helper()
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("key: %v", err)
+	key := a.priv
+
+	if key == nil {
+		var err error
+
+		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatalf("key: %v", err)
+		}
 	}
 
 	encoder, err := cbor.CTAP2EncOptions().EncMode()
@@ -198,6 +207,8 @@ func postJSON(t *testing.T, path string, body []byte) (int, string) {
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
+
+	req.Header.Set("Content-Type", jsonContentType)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -466,4 +477,47 @@ func base64ToHex(t *testing.T, encoded string) string {
 	}
 
 	return strings.ToUpper(hex.EncodeToString(raw))
+}
+
+// TestCredentialPublicKeysAreUnique checks the UNIQUE constraint on
+// credentials.public_key against the real SQLite. Registration with attestation
+// "none" carries no proof that the registrant holds the private key, and public
+// keys are not secret, so without the constraint another account could register
+// this account's public key under a credential id of its own; the login
+// signature covers neither the credential id nor the user handle, so a response
+// for the real key would then verify against both rows.
+//
+// The Worker cannot be asked to do this today (the only invitation type with a
+// role is redeemable while no account exists), so the statement registration's
+// batch ends with is run against the database directly, for a second account.
+//
+//nolint:paralleltest // shares one database with the other tests
+func TestCredentialPublicKeysAreUnique(t *testing.T) {
+	registerPasskey(t)
+
+	query(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+		"SELECT '00000000-0000-7000-8000-0000000e2e93', X'0A0B0C', 'admin', invitation_id, '{}', 0 FROM users")
+
+	insert := func(id, credentialID, key string) string {
+		return "INSERT INTO credentials (id, credential_id, user_id, public_key, flags, metadata, created_at) " +
+			"VALUES ('" + id + "', X'" + credentialID + "', '00000000-0000-7000-8000-0000000e2e93', " + key + ", 5, '{}', 0)"
+	}
+
+	t.Run("another account cannot store the same key under another credential id", func(t *testing.T) {
+		duplicate := insert("00000000-0000-7000-8000-0000000e2e94", "0102030405",
+			"(SELECT public_key FROM credentials WHERE user_id <> '00000000-0000-7000-8000-0000000e2e93')")
+		if !queryFails(t, duplicate) {
+			t.Error("a second credential with the same public key was accepted")
+		}
+
+		expectCount(t, "credentials", "1")
+	})
+
+	t.Run("a different key is accepted", func(t *testing.T) {
+		if queryFails(t, insert("00000000-0000-7000-8000-0000000e2e95", "0102030406", "X'0102'")) {
+			t.Error("a credential with a distinct public key was refused")
+		}
+
+		expectCount(t, "credentials", "2")
+	})
 }

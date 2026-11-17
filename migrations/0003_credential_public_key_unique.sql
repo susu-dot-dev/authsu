@@ -1,0 +1,23 @@
+-- One public key belongs to one credential.
+--
+-- Rationale: docs/login_design.md. Conventions are those of 0001.
+--
+-- Registration asks for attestation "none", so the response carries no proof
+-- that the registrant holds the private key, and public keys are not secret.
+-- Without this index anyone with an invitation could register another
+-- account's public key under a credential id of their own. The login
+-- signature covers neither the credential id nor the user handle, so a
+-- response for the real key would then verify against both rows. With it, a
+-- signature can only verify against the one row that stores its key, and the
+-- user handle check is a consistency check on that row.
+--
+-- Uniqueness is on the stored bytes. Registration only stores the one
+-- canonical COSE encoding of an ES256 key, so a key has exactly one spelling.
+-- A format that allowed several would have to be canonicalised before this
+-- index means "one key".
+--
+-- This fails if a database already holds two credentials with the same key.
+-- Check first with:
+--   SELECT public_key, count(*) FROM credentials GROUP BY public_key HAVING count(*) > 1;
+
+CREATE UNIQUE INDEX credentials_public_key ON credentials (public_key);

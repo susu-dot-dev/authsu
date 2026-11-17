@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Helpers to read and write the registration configuration: the AUTH_HMAC_SECRET
-# secret and the RP_ID, RP_ORIGIN and RP_NAME vars. See docs/devops.md
-# ("Secrets and variables") for what each one is and why they are stored as they
-# are. Run through `make config-*`; see `make help`.
+# secret and the RP_ID, RP_ORIGIN and RP_NAME vars. See docs/runbook.md
+# ("Secrets and variables") for how they are stored and why. Run through
+# `make config-*`; see `make help`.
 #
 #   config.sh get                      show every value and where it is stored
 #   config.sh set-vars ID ORIGIN NAME  write the RP_* vars into wrangler.jsonc

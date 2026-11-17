@@ -8,14 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // MaxClientDataJSON caps clientDataJSON before it is parsed. A real one is
 // about 150 bytes plus the challenge; it is client-supplied, so it is bounded.
 const MaxClientDataJSON = 2048
 
-// createType is the clientData type of a registration ceremony.
-const createType = "webauthn.create"
+// The clientData types of the two ceremonies (section 5.8.1).
+const (
+	createType = "webauthn.create"
+	getType    = "webauthn.get"
+)
 
 var (
 	errNotObject    = errors.New("not a JSON object")
@@ -24,6 +28,7 @@ var (
 	errNotString    = errors.New("not a string")
 	errMissing      = errors.New("missing member")
 	errNotBool      = errors.New("not a boolean")
+	errCaseVariant  = errors.New("member name differs from a checked member only in case")
 )
 
 // ParseClientData verifies clientDataJSON for a registration at rp and returns
@@ -38,8 +43,21 @@ var (
 // The document is read strictly. encoding/json would match member names
 // case-insensitively and keep the last of a repeated name, so a document could
 // mean one thing to the browser and another to us. Instead names are matched
-// exactly and a repeated name is an error.
+// exactly, a repeated name is an error, and so is a name that differs from a
+// member we read only in case (see rejectCaseVariants).
 func ParseClientData(raw []byte, rp RelyingParty) ([]byte, [sha256.Size]byte, error) {
+	return parseClientData(raw, rp, createType)
+}
+
+// ParseAssertionClientData is ParseClientData for a login: the same strict
+// reading and the same checks, with the ceremony type webauthn.get. The hash it
+// returns is the one the assertion signature covers.
+func ParseAssertionClientData(raw []byte, rp RelyingParty) ([]byte, [sha256.Size]byte, error) {
+	return parseClientData(raw, rp, getType)
+}
+
+// parseClientData implements both, for the ceremony type want.
+func parseClientData(raw []byte, rp RelyingParty, want string) ([]byte, [sha256.Size]byte, error) {
 	var zero [sha256.Size]byte
 
 	if len(raw) == 0 || len(raw) > MaxClientDataJSON {
@@ -51,7 +69,12 @@ func ParseClientData(raw []byte, rp RelyingParty) ([]byte, [sha256.Size]byte, er
 		return nil, zero, fmt.Errorf("%w: %w", ErrClientData, err)
 	}
 
-	err = checkCeremony(members, rp)
+	err = rejectCaseVariants(members)
+	if err != nil {
+		return nil, zero, fmt.Errorf("%w: %w", ErrClientData, err)
+	}
+
+	err = checkCeremony(members, rp, want)
 	if err != nil {
 		return nil, zero, fmt.Errorf("%w: %w", ErrClientData, err)
 	}
@@ -64,21 +87,50 @@ func ParseClientData(raw []byte, rp RelyingParty) ([]byte, [sha256.Size]byte, er
 	return challenge, sha256.Sum256(raw), nil
 }
 
+// checkedMembers are the clientDataJSON members this package reads.
+func checkedMembers() [5]string {
+	return [...]string{"type", "challenge", "origin", "crossOrigin", "topOrigin"}
+}
+
+// rejectCaseVariants refuses a member whose name is not one we read but
+// case-folds to one, such as "ORIGIN" or "Type". JSON names are case sensitive,
+// so to us such a member is unknown, and unknown members are otherwise ignored
+// (section 5.8.1 lets clients add members). But encoding/json, which
+// go-webauthn and most Go code read client data with, folds case and keeps the
+// last match, so it would take its value for the real member: a document whose
+// origin, type or cross-origin state two parsers disagree about. No browser
+// writes one, so it is refused rather than interpreted.
+//
+// strings.EqualFold applies Unicode simple folding, which includes the Kelvin
+// sign (folds to "k") and the long s (folds to "s") that encoding/json also
+// folds, so it refuses at least everything encoding/json would match.
+func rejectCaseVariants(members map[string]json.RawMessage) error {
+	for name := range members {
+		for _, checked := range checkedMembers() {
+			if name != checked && strings.EqualFold(name, checked) {
+				return fmt.Errorf("%w: %q", errCaseVariant, name)
+			}
+		}
+	}
+
+	return nil
+}
+
 var (
 	errWrongType   = errors.New("wrong ceremony type")
 	errWrongOrigin = errors.New("origin is not the relying party's")
 	errEmptyChal   = errors.New("empty challenge")
 )
 
-// checkCeremony requires a registration ceremony from exactly our origin, made
+// checkCeremony requires a ceremony of type want from exactly our origin, made
 // outside any cross-origin context.
-func checkCeremony(members map[string]json.RawMessage, rp RelyingParty) error {
+func checkCeremony(members map[string]json.RawMessage, rp RelyingParty, want string) error {
 	typ, err := requiredString(members, "type")
 	if err != nil {
 		return err
 	}
 
-	if typ != createType {
+	if typ != want {
 		return fmt.Errorf("%w: %q", errWrongType, typ)
 	}
 
@@ -191,7 +243,7 @@ func requiredString(members map[string]json.RawMessage, name string) (string, er
 	return *out, nil
 }
 
-// rejectCrossOrigin refuses a registration made from a cross-origin context.
+// rejectCrossOrigin refuses a ceremony made from a cross-origin context.
 // crossOrigin is optional, and false means same-origin, so only true is
 // refused; but when present it must be a boolean, and null is not one
 // (encoding/json would read it as false). topOrigin only accompanies a
@@ -217,4 +269,4 @@ func rejectCrossOrigin(members map[string]json.RawMessage) error {
 	return nil
 }
 
-var errCrossOrigin = errors.New("cross-origin registration is not accepted")
+var errCrossOrigin = errors.New("cross-origin ceremony is not accepted")

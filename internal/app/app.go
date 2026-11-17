@@ -13,8 +13,10 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/diag"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/login"
 	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/session"
 )
 
 // Deps are the build-time feature flags: pluggable behaviour that must differ
@@ -32,7 +34,7 @@ type Platform struct {
 	DB *sql.DB
 	// Batch runs statements as one atomic unit. D1 offers that only inside the
 	// Worker, so the platform supplies it. Nil disables the routes that write
-	// (registration finish answers 503).
+	// (registration finish, login finish and logout answer 503).
 	Batch atomic.Batch
 	// Getenv reads a deploy-time secret or variable. It is called per request,
 	// because the Worker's environment only exists while a request is handled.
@@ -83,6 +85,23 @@ func NewHandler(deps Deps, platform Platform) http.Handler {
 	routes.Handle(http.MethodPost, "/api/register/begin", registrar.BeginHandler(platform.Getenv))
 	routes.Handle(http.MethodPost, "/api/register/finish", registrar.FinishHandler(platform.Getenv))
 
+	authenticator := login.NewService(login.Deps{
+		Reader:  loginReader(platform.DB),
+		Batch:   platform.Batch,
+		Now:     time.Now,
+		Entropy: rand.Reader,
+	})
+	routes.Handle(http.MethodPost, "/api/login/begin", authenticator.BeginHandler(platform.Getenv))
+	routes.Handle(http.MethodPost, "/api/login/finish", authenticator.FinishHandler(platform.Getenv))
+
+	sessions := session.NewService(session.Deps{
+		Reader: sessionReader(platform.DB),
+		Batch:  platform.Batch,
+		Now:    time.Now,
+	})
+	routes.Handle(http.MethodGet, "/api/session", sessions.WhoAmIHandler(platform.Getenv))
+	routes.Handle(http.MethodPost, "/api/logout", sessions.LogoutHandler(platform.Getenv))
+
 	if deps.Diagnostics != nil {
 		deps.Diagnostics.Register(routes)
 	}
@@ -107,4 +126,24 @@ func sqlReader(db *sql.DB) registration.Reader {
 	}
 
 	return registration.NewSQLReader(db)
+}
+
+// loginReader returns the login Reader over db, or nil when there is no database
+// (the host stub), so login answers 503 rather than panicking.
+func loginReader(db *sql.DB) login.Reader {
+	if db == nil {
+		return nil
+	}
+
+	return login.NewSQLReader(db)
+}
+
+// sessionReader returns the session Reader over db, or nil when there is no
+// database, so the session routes answer 503 rather than panicking.
+func sessionReader(db *sql.DB) session.Reader {
+	if db == nil {
+		return nil
+	}
+
+	return session.NewSQLReader(db)
 }

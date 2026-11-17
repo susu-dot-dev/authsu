@@ -5,6 +5,30 @@
 // wraps a handler as an http.Handler and does everything that touches HTTP,
 // once: method check, reading the request, converting a failure into a status
 // and JSON body, logging it, and writing headers.
+//
+// Serve is the only place that does this, so the contract holds for every route:
+//
+//   - A route whose method is not GET or HEAD requires the request's
+//     Content-Type to be application/json, even when the body is empty (415
+//     unsupported_media_type, checked after the method and before the body is
+//     read). That type forces a CORS preflight, which fails because no route
+//     sends CORS headers, so another site cannot make a browser deliver such a
+//     request: this is the CSRF defence for every unsafe route (see isJSON).
+//   - A request body is capped at 1 MiB (413 body_too_large).
+//   - A handler runs inside a recover, so a panic still gets the JSON error
+//     contract and a log line, as Internal handler_panic.
+//   - Responses carry Content-Type and Cache-Control: no-store, and the status
+//     is written once. A Status outside 200-599 is an Internal invalid_status
+//     error rather than a panic in net/http.
+//   - A failure is sent as {"error":{"code","message","data?"}}. The logger gets
+//     the request and the full error, cause included. An error that was never
+//     classified, or is Internal, is sent as a bare "internal" with no data, so
+//     causes, SQL and table names never reach a client.
+//   - Unknown paths are answered by NotFound registered on "/", so they too use
+//     the JSON envelope.
+//
+// Routes are registered as plain paths: TinyGo's http.ServeMux ignores
+// method-qualified patterns, so Serve does the method check instead.
 package httpapi
 
 import (
@@ -16,6 +40,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"strings"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/result"
@@ -35,6 +60,8 @@ type Request struct {
 	Query map[string][]string
 	// Body is the raw request body, read up to a fixed limit.
 	Body []byte
+	// Cookies are the request's cookies.
+	Cookies []*http.Cookie
 }
 
 // Response is what a successful handler returns.
@@ -43,6 +70,10 @@ type Response struct {
 	Status int
 	// Body is marshalled to JSON. Nil means no body.
 	Body any
+	// Cookies are sent as Set-Cookie headers. A handler builds each one in
+	// full (name, attributes, expiry), so what a cookie allows is decided in
+	// one place, beside the code that issues it.
+	Cookies []*http.Cookie
 }
 
 // Handler is a pure request handler.
@@ -56,7 +87,14 @@ type Logger func(Request, *apierr.Error)
 
 // JSON returns a successful Response carrying body.
 func JSON(status int, body any) Response {
-	return Response{Status: status, Body: body}
+	return Response{Status: status, Body: body, Cookies: nil}
+}
+
+// WithCookies returns r that also sets cookies.
+func (r Response) WithCookies(cookies ...*http.Cookie) Response {
+	r.Cookies = cookies
+
+	return r
 }
 
 // Decode parses the request body as a T. Malformed input is a BadRequest with
@@ -138,12 +176,21 @@ func serve(method string, logger Logger, handler Handler) http.Handler {
 			Context: req.Context(),
 			Query:   req.URL.Query(),
 			Body:    nil,
+			Cookies: req.Cookies(),
 		}
 
 		if method != "" && req.Method != method {
 			writer.Header().Set("Allow", method)
 			write(writer, logger, request, result.Fail[Response](
 				apierr.New(apierr.MethodNotAllowed, "method_not_allowed", "method not allowed")))
+
+			return
+		}
+
+		if method != "" && !safeMethod(method) && !isJSON(req.Header.Values("Content-Type")) {
+			write(writer, logger, request, result.Fail[Response](
+				apierr.New(apierr.UnsupportedMediaType, "unsupported_media_type",
+					"request Content-Type must be application/json")))
 
 			return
 		}
@@ -250,6 +297,10 @@ func send(writer http.ResponseWriter, resp Response) error {
 		writer.Header().Set("Content-Type", "application/json")
 	}
 
+	for _, cookie := range resp.Cookies {
+		http.SetCookie(writer, cookie)
+	}
+
 	writer.WriteHeader(resp.Status)
 	_, _ = writer.Write(data)
 
@@ -288,4 +339,47 @@ func marshalError(failure *apierr.Error) ([]byte, error) {
 // failure.
 func NotFound(Request) result.Result[Response] {
 	return result.Fail[Response](apierr.New(apierr.NotFound, "not_found", "no such route"))
+}
+
+// safeMethod reports whether method is GET or HEAD, which change nothing and
+// so need no Content-Type.
+func safeMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+// jsonMediaType is the only Content-Type an unsafe request may carry.
+const jsonMediaType = "application/json"
+
+// isJSON reports whether values, a request's Content-Type header lines, are
+// exactly one application/json, optionally with charset=utf-8 (JSON is UTF-8,
+// RFC 8259). Anything else is refused: a missing header, a second line, any
+// other type, any other parameter.
+//
+// This is the CSRF defence. application/json is not a CORS-safelisted type, so
+// a browser cannot send it cross-origin without a preflight, and the
+// preflight fails because nothing here answers it with CORS headers. HTML forms
+// cannot send it at all. Requiring it on every unsafe request, even one with
+// an empty body, means no other site can make a browser deliver a request this
+// boundary will hand to a handler, whatever the handler does with the body.
+func isJSON(values []string) bool {
+	if len(values) != 1 {
+		return false
+	}
+
+	media, params, hasParams := strings.Cut(values[0], ";")
+	if !strings.EqualFold(strings.TrimSpace(media), jsonMediaType) {
+		return false
+	}
+
+	if !hasParams {
+		return true
+	}
+
+	for param := range strings.SplitSeq(params, ";") {
+		if !strings.EqualFold(strings.TrimSpace(param), "charset=utf-8") {
+			return false
+		}
+	}
+
+	return true
 }

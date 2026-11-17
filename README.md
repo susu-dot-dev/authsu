@@ -33,10 +33,12 @@ Run the Worker through `make dev`, not `npx wrangler dev`: the Makefile builds w
 
 ## Documentation
 
-- [docs/devops.md](docs/devops.md): how the project is built, checked, tested and shipped. This is the authority on tooling and conventions; start here before changing anything.
+- [docs/devops.md](docs/devops.md): the scaffolding: how the project is built, checked, tested and shipped. This is the authority on tooling and conventions; start here before changing anything.
+- [docs/runbook.md](docs/runbook.md): operating a deployment: configuration, migrations, deploying and upkeep.
 - Design rationale (why, not a spec):
   - [docs/invitations_design.md](docs/invitations_design.md)
   - [docs/registration_design.md](docs/registration_design.md)
+  - [docs/login_design.md](docs/login_design.md)
   - [docs/first_run_design.md](docs/first_run_design.md)
 
 ## License

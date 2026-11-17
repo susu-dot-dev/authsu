@@ -22,6 +22,9 @@ type call struct {
 	method string
 	target string
 	body   string
+	// contentType are the Content-Type header lines sent. Nil sends
+	// application/json; an empty, non-nil slice sends none.
+	contentType []string
 }
 
 type outcome struct {
@@ -42,9 +45,22 @@ func run(t *testing.T, in call, handler httpapi.Handler) outcome {
 	}
 
 	req := httptest.NewRequestWithContext(t.Context(), in.method, in.target, strings.NewReader(in.body))
+	setContentType(req, in.contentType)
 	httpapi.Serve(http.MethodPost, logger, handler).ServeHTTP(out.rec, req)
 
 	return out
+}
+
+// setContentType sets the Content-Type lines of req: application/json when
+// lines is nil, none when it is empty.
+func setContentType(req *http.Request, lines []string) {
+	if lines == nil {
+		lines = []string{jsonType}
+	}
+
+	for _, line := range lines {
+		req.Header.Add("Content-Type", line)
+	}
 }
 
 func respond(resp httpapi.Response) httpapi.Handler {
@@ -91,6 +107,7 @@ func check(t *testing.T, in call, handler httpapi.Handler, want want) {
 const (
 	queryValue   = "abc"
 	jsonType     = "application/json"
+	plainType    = "text/plain"
 	helloBody    = "hello"
 	internalBody = `{"error":{"code":"internal","message":"internal error"}}` + "\n"
 	invalidJSON  = "invalid_json"
@@ -101,7 +118,7 @@ const (
 )
 
 func post() call {
-	return call{method: http.MethodPost, target: "/x", body: ""}
+	return call{method: http.MethodPost, target: "/x", body: "", contentType: nil}
 }
 
 func TestServeSuccess(t *testing.T) {
@@ -210,7 +227,7 @@ func TestServeWrongMethod(t *testing.T) {
 
 	handled := false
 
-	check(t, call{method: http.MethodGet, target: "/x", body: ""},
+	check(t, call{method: http.MethodGet, target: "/x", body: "", contentType: nil},
 		func(httpapi.Request) result.Result[httpapi.Response] {
 			handled = true
 
@@ -264,7 +281,7 @@ func TestServePassesRequestToHandler(t *testing.T) {
 
 	var got httpapi.Request
 
-	run(t, call{method: http.MethodPost, target: "/x?code=" + queryValue + "&code=def", body: helloBody},
+	run(t, call{method: http.MethodPost, target: "/x?code=" + queryValue + "&code=def", body: helloBody, contentType: nil},
 		func(req httpapi.Request) result.Result[httpapi.Response] {
 			got = req
 
@@ -319,6 +336,7 @@ func TestServeBodyReadErrors(t *testing.T) {
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", tt.body)
+			setContentType(req, nil)
 			httpapi.Serve(http.MethodPost, logger, handler).ServeHTTP(rec, req)
 
 			if handled {
@@ -343,7 +361,7 @@ func TestServeBodyReadErrors(t *testing.T) {
 func TestServeLogsRequest(t *testing.T) {
 	t.Parallel()
 
-	out := run(t, call{method: http.MethodPost, target: "/x?a=b", body: helloBody}, failWith(errCause))
+	out := run(t, call{method: http.MethodPost, target: "/x?a=b", body: helloBody, contentType: nil}, failWith(errCause))
 
 	if len(out.loggedReq) != 1 {
 		t.Fatalf("logged %d requests, want 1", len(out.loggedReq))
@@ -533,5 +551,203 @@ func TestDecodeChecksEveryValue(t *testing.T) {
 				t.Errorf("Decode error = (%d, %q), want (BadRequest, %q)", failure.Kind, failure.Code, tt.wantCode)
 			}
 		})
+	}
+}
+
+func TestServeReadsRequestCookies(t *testing.T) {
+	t.Parallel()
+
+	var got []*http.Cookie
+
+	handler := func(req httpapi.Request) result.Result[httpapi.Response] {
+		got = req.Cookies
+
+		return result.Ok(httpapi.JSON(http.StatusOK, 1))
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(""))
+	setContentType(req, nil)
+	// A browser returns only a cookie's name and value, so that is all a test
+	// request carries; the attributes belong to Set-Cookie.
+	req.Header.Add("Cookie", "a=1; b=2")
+
+	httpapi.Serve(http.MethodPost, nil, handler).ServeHTTP(rec, req)
+
+	if len(got) != 2 || got[0].Name != "a" || got[1].Value != "2" {
+		t.Errorf("cookies = %v, want a=1 and b=2", got)
+	}
+}
+
+func TestServeSetsResponseCookies(t *testing.T) {
+	t.Parallel()
+
+	cookie := &http.Cookie{
+		Name: "session", Value: "token", Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	}
+
+	out := run(t, post(), respond(httpapi.JSON(http.StatusOK, 1).WithCookies(cookie)))
+
+	set := out.rec.Result().Cookies()
+	if len(set) != 1 || set[0].Name != "session" || set[0].Value != "token" || !set[0].HttpOnly || !set[0].Secure {
+		t.Errorf("Set-Cookie = %v, want one HttpOnly Secure session cookie", set)
+	}
+}
+
+func TestServeSetsNoCookiesOnFailure(t *testing.T) {
+	t.Parallel()
+
+	// A handler that failed must not have its cookies sent, whatever it
+	// built before failing: the cookies are part of a Response, and a failure
+	// has none.
+	out := run(t, post(), failWith(errCause))
+
+	if got := out.rec.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Errorf("Set-Cookie = %v, want none", got)
+	}
+}
+
+const unsupportedBody = `{"error":{"code":"unsupported_media_type",` +
+	`"message":"request Content-Type must be application/json"}}` + "\n"
+
+// TestServeRefusesAnUnsafeRequestThatIsNotJSON is the CSRF defence. A request
+// another site can make a browser send without a CORS preflight (a form post,
+// or fetch with a CORS-safelisted Content-Type: text/plain,
+// application/x-www-form-urlencoded, multipart/form-data, or none) must never
+// reach a handler. Every case sends an empty body: the check is on the
+// request, not on what the body holds, so routes that read no body (login
+// begin, logout) are covered the same as those that do.
+func TestServeRefusesAnUnsafeRequestThatIsNotJSON(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string][]string{
+		// The CORS-safelisted types, and no header at all: what a cross-site
+		// form or a no-cors fetch sends.
+		"no Content-Type":       {},
+		"text/plain":            {plainType},
+		"text/plain with UTF-8": {"text/plain;charset=UTF-8"},
+		"form-urlencoded":       {"application/x-www-form-urlencoded"},
+		"multipart":             {"multipart/form-data; boundary=x"},
+		// Near misses, which must not be read as JSON.
+		"empty value":            {""},
+		"json as a suffix":       {"text/plain; application/json"},
+		"two types in one line":  {"application/json, text/plain"},
+		"two lines":              {jsonType, plainType},
+		"json twice":             {jsonType, jsonType},
+		"another subtype":        {"application/jsonx"},
+		"structured suffix":      {"application/merge-patch+json"},
+		"another charset":        {"application/json; charset=latin1"},
+		"another parameter":      {"application/json; boundary=x"},
+		"empty parameter":        {"application/json;"},
+		"charset then junk":      {"application/json; charset=utf-8; x=y"},
+		"type with no subtype":   {"application"},
+		"wildcard":               {"*/*"},
+		"padded with a NUL byte": {"application/json\x00"},
+	}
+
+	for name, lines := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			handled := false
+			handler := func(httpapi.Request) result.Result[httpapi.Response] {
+				handled = true
+
+				return result.Ok(httpapi.JSON(http.StatusOK, 1))
+			}
+
+			check(t, call{method: http.MethodPost, target: "/x", body: "", contentType: lines}, handler,
+				want{status: http.StatusUnsupportedMediaType, body: unsupportedBody, nLogged: 1})
+
+			if handled {
+				t.Error("the handler ran for a request that is not application/json")
+			}
+		})
+	}
+}
+
+// TestServeAcceptsJSON pins the spellings of application/json that pass:
+// media types are case-insensitive, and charset=utf-8 is the one parameter
+// JSON allows.
+func TestServeAcceptsJSON(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range []string{
+		jsonType, "Application/JSON", " application/json ",
+		"application/json; charset=utf-8", "application/json;charset=UTF-8",
+	} {
+		t.Run(line, func(t *testing.T) {
+			t.Parallel()
+
+			check(t, call{method: http.MethodPost, target: "/x", body: "", contentType: []string{line}},
+				respond(httpapi.JSON(http.StatusOK, 1)), want{status: http.StatusOK, body: "1\n"})
+		})
+	}
+}
+
+// TestServeReadsNoBodyBeforeTheContentTypeCheck requires the refusal before
+// the body is read, so an oversized non-JSON body is answered 415, not 413.
+func TestServeReadsNoBodyBeforeTheContentTypeCheck(t *testing.T) {
+	t.Parallel()
+
+	in := call{
+		method: http.MethodPost, target: "/x", body: strings.Repeat("a", 2<<20), contentType: []string{plainType},
+	}
+
+	if got := run(t, in, respond(httpapi.JSON(http.StatusOK, 1))).rec.Code; got != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415", got)
+	}
+}
+
+// TestServeSafeMethodsNeedNoContentType: a GET or HEAD changes nothing and has
+// no body, so it is not held to the JSON rule. A browser sends none on a GET.
+func TestServeSafeMethodsNeedNoContentType(t *testing.T) {
+	t.Parallel()
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(t.Context(), method, "/x", nil)
+		httpapi.Serve(method, nil, respond(httpapi.JSON(http.StatusOK, 1))).ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s with no Content-Type = %d, want 200", method, rec.Code)
+		}
+	}
+}
+
+// TestServeAnswersNoCORSPreflight is the other half of the defence. Because
+// application/json is required, a cross-origin browser request must be
+// preflighted, and the browser sends it only if the preflight answer allows
+// it. The answer here is a 405 that carries no Access-Control-Allow-* header,
+// so every browser refuses to send the real request. Nor does any response
+// carry Access-Control-Allow-Origin, so even a request that was sent could not
+// be read cross-origin. Adding CORS headers anywhere reopens CSRF, and this
+// test is what notices.
+func TestServeAnswersNoCORSPreflight(t *testing.T) {
+	t.Parallel()
+
+	preflight := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/x", nil)
+	preflight.Header.Set("Origin", "https://evil.example")
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	preflight.Header.Set("Access-Control-Request-Headers", "content-type")
+
+	post := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(""))
+	post.Header.Set("Origin", "https://evil.example")
+	setContentType(post, nil)
+
+	for name, req := range map[string]*http.Request{"preflight": preflight, "request": post} {
+		rec := httptest.NewRecorder()
+		httpapi.Serve(http.MethodPost, func(httpapi.Request, *apierr.Error) {}, respond(httpapi.JSON(http.StatusOK, 1))).
+			ServeHTTP(rec, req)
+
+		if name == "preflight" && rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("preflight = %d, want 405", rec.Code)
+		}
+
+		for header := range rec.Header() {
+			if strings.HasPrefix(http.CanonicalHeaderKey(header), "Access-Control-") {
+				t.Errorf("%s: response carries CORS header %s: %q", name, header, rec.Header().Get(header))
+			}
+		}
 	}
 }

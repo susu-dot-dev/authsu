@@ -6,6 +6,11 @@
 // holds the host-compilable vocabulary for it: the statement type, the
 // sentinels for a write the database refused, and the recognition of why. The
 // platform supplies the function that actually calls D1.
+//
+// A conditional INSERT ... SELECT that matches no rows is not an error, so it
+// does not roll a batch back by itself. To turn "nothing was inserted" into a
+// failed batch, make a later statement depend on the row existing, such as a
+// NOT NULL foreign key filled from a subselect. See internal/registration/sql.go.
 package atomic
 
 import (

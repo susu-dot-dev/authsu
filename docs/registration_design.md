@@ -2,7 +2,7 @@
 
 > This document explains *why* registration is shaped the way it is. It is not a spec. Request shapes, byte layouts, and SQL fragments below illustrate an idea; the code is authoritative for what actually exists.
 
-Related: [invitations_design.md](invitations_design.md), [first_run_design.md](first_run_design.md)
+Related: [invitations_design.md](invitations_design.md), [first_run_design.md](first_run_design.md), [login_design.md](login_design.md)
 
 ## The problem
 
@@ -156,6 +156,21 @@ It is worth being precise about what a leaked signing key would allow, because t
 
 The key needs its own secret rather than being derived from `FIRST_RUN_SECRET`, because registration has to keep working long after the bootstrap secret is retired ([first_run_design.md](first_run_design.md)).
 
+### Deployment configuration
+
+Registration, login and sessions share four settings, read by `internal/deploy`:
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `AUTH_HMAC_SECRET` | secret | Root key material, at least 32 characters (a generated one is 43). Each purpose derives its own key from it with a distinct context (`internal/deploy.DeriveKey`; registration uses `authsu/registration-challenge/v1`). Never used directly, and never for anything where a signature is authorization |
+| `RP_ID` | var | WebAuthn relying party ID. **Permanent**: a passkey is bound to it, so changing it invalidates every registered passkey |
+| `RP_ORIGIN` | var | The one origin ceremonies are accepted from, such as `https://auth.example.com`, compared as an exact string |
+| `RP_NAME` | var | The relying party name the browser shows |
+
+`RP_*` are non-sensitive and live in `wrangler.jsonc`; `AUTH_HMAC_SECRET` must be a secret, never a var. [runbook.md](runbook.md) covers setting them. They are configuration, not derived from the request, for the reason given under Verification below.
+
+While any of them is missing or the secret is too short, registration answers 503 `registration_not_configured`. Login (`login_not_configured`) and the session routes (`session_not_configured`) fail the same way, and also when `RP_ORIGIN` is not `https://` (or `http://localhost`). Sessions need no variable of their own: their issuer is derived from `RP_ORIGIN`.
+
 ## The point of acceptance
 
 At `finish`, after the challenge and passkey are verified, account creation happens as one indivisible database operation. Its essential property is that **the authorization checks are conditions of the insert itself**, not reads that happen before it. Roughly:
@@ -206,4 +221,4 @@ The parsers are fuzzed (`go test -fuzz=FuzzVerify ./internal/webauthn`), with th
 
 - Whether `begin` needs rate limiting. This is driven by whether low-entropy invitation codes are ever allowed.
 - Which further attestation formats, if any, to accept, and whether that changes the verifier or only its policy.
-- What session is issued after login, and its key derivation (see the key-separation constraint above).
+- What session is issued after login, and its key derivation (see the key-separation constraint above). Answered in [login_design.md](login_design.md): sessions are japikeys, which have no long-lived signing key.

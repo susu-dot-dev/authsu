@@ -18,17 +18,18 @@ func TestKindStatus(t *testing.T) {
 	t.Parallel()
 
 	tests := map[apierr.Kind]int{
-		apierr.Internal:         http.StatusInternalServerError,
-		apierr.BadRequest:       http.StatusBadRequest,
-		apierr.Unauthorized:     http.StatusUnauthorized,
-		apierr.Forbidden:        http.StatusForbidden,
-		apierr.NotFound:         http.StatusNotFound,
-		apierr.MethodNotAllowed: http.StatusMethodNotAllowed,
-		apierr.Conflict:         http.StatusConflict,
-		apierr.PayloadTooLarge:  http.StatusRequestEntityTooLarge,
-		apierr.RateLimited:      http.StatusTooManyRequests,
-		apierr.Unavailable:      http.StatusServiceUnavailable,
-		apierr.Kind(200):        http.StatusInternalServerError, // unknown kinds fail closed
+		apierr.Internal:             http.StatusInternalServerError,
+		apierr.BadRequest:           http.StatusBadRequest,
+		apierr.Unauthorized:         http.StatusUnauthorized,
+		apierr.Forbidden:            http.StatusForbidden,
+		apierr.NotFound:             http.StatusNotFound,
+		apierr.MethodNotAllowed:     http.StatusMethodNotAllowed,
+		apierr.Conflict:             http.StatusConflict,
+		apierr.PayloadTooLarge:      http.StatusRequestEntityTooLarge,
+		apierr.RateLimited:          http.StatusTooManyRequests,
+		apierr.Unavailable:          http.StatusServiceUnavailable,
+		apierr.UnsupportedMediaType: http.StatusUnsupportedMediaType,
+		apierr.Kind(200):            http.StatusInternalServerError, // unknown kinds fail closed
 	}
 
 	for kind, want := range tests {

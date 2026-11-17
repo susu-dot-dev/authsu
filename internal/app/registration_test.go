@@ -56,7 +56,7 @@ func TestRegistrationRoutesOnlyAcceptPost(t *testing.T) {
 				t.Parallel()
 
 				rec := httptest.NewRecorder()
-				req := httptest.NewRequestWithContext(t.Context(), method, path, nil)
+				req := newRequest(t, method, path, nil)
 				app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
 
 				if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPost {
@@ -76,7 +76,7 @@ func TestRegistrationWithoutADatabaseIsUnavailable(t *testing.T) {
 		rec := httptest.NewRecorder()
 		body := strings.NewReader(`{"invitationCode":"c","name":"n"}`)
 		app.NewHandler(app.Deps{}, app.Platform{Getenv: registrationEnv}).ServeHTTP(rec,
-			httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, body))
+			newRequest(t, http.MethodPost, path, body))
 
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Errorf("%s: status = %d, want %d", path, rec.Code, http.StatusServiceUnavailable)
@@ -91,7 +91,7 @@ func TestRegistrationRejectsBadJSON(t *testing.T) {
 	for _, path := range registrationRoutes() {
 		rec := httptest.NewRecorder()
 		app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec,
-			httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(`nope`)))
+			newRequest(t, http.MethodPost, path, strings.NewReader(`nope`)))
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want %d", path, rec.Code, http.StatusBadRequest)
@@ -171,7 +171,7 @@ func TestRegistrationOnTheHost(t *testing.T) {
 
 	post := func(path, body string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body)))
+		handler.ServeHTTP(rec, newRequest(t, http.MethodPost, path, strings.NewReader(body)))
 
 		return rec
 	}

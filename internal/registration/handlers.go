@@ -14,6 +14,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/atomic"
+	"github.com/susu-dot-dev/authsu/internal/deploy"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/webauthn"
@@ -185,19 +186,12 @@ type config struct {
 // deployment being broken, not the request being wrong, so it is Unavailable,
 // with a code that names it for the log.
 func loadConfig(getenv func(string) string) (config, error) {
-	secret := getenv(SecretHMAC)
-	if len(secret) < MinSecretLen {
-		return config{}, notConfigured(errSecretMissing)
+	cfg, err := deploy.Load(getenv)
+	if err != nil {
+		return config{}, notConfigured(err)
 	}
 
-	rp := webauthn.RelyingParty{ID: getenv(VarRPID), Origin: getenv(VarRPOrigin)}
-	name := getenv(VarRPName)
-
-	if rp.ID == "" || rp.Origin == "" || name == "" {
-		return config{}, notConfigured(errConfigMissing)
-	}
-
-	return config{key: deriveKey(secret), rp: rp, rpName: name}, nil
+	return config{key: deriveKey(cfg.Root), rp: cfg.RP, rpName: cfg.RPName}, nil
 }
 
 func notConfigured(cause error) error {

@@ -131,7 +131,7 @@ func TestVerifyRejectsClientData(t *testing.T) {
 			edit:    func(reg *Registration) { reg.ClientDataJSON = b64Of(MaxClientDataJSON + 1) },
 			wantErr: ErrClientData,
 		},
-		"empty":               {edit: func(reg *Registration) { reg.ClientDataJSON = "" }, wantErr: ErrClientData},
+		emptyCase:             {edit: func(reg *Registration) { reg.ClientDataJSON = "" }, wantErr: ErrClientData},
 		"wrong ceremony type": {mutate: setClient("type", "webauthn.get"), wantErr: ErrClientData},
 		"wrong origin":        {mutate: setClient("origin", "https://evil.example.com"), wantErr: ErrClientData},
 		"origin plus a slash": {mutate: setClient("origin", testOrigin+"/"), wantErr: ErrClientData},
@@ -141,7 +141,7 @@ func TestVerifyRejectsClientData(t *testing.T) {
 		"cross origin":                  {mutate: setClient("crossOrigin", true), wantErr: ErrClientData},
 		"top origin present":            {mutate: setClient("topOrigin", testOrigin), wantErr: ErrClientData},
 		"cross origin is not a boolean": {mutate: setClient("crossOrigin", "false"), wantErr: ErrClientData},
-		"challenge is not base64url":    {mutate: setClient("challenge", "***"), wantErr: ErrClientData},
+		"challenge is not base64url":    {mutate: setClient("challenge", notBase64), wantErr: ErrClientData},
 		"challenge is empty":            {mutate: setClient("challenge", ""), wantErr: ErrClientData},
 		"challenge is missing":          {mutate: dropMember("challenge"), wantErr: ErrClientData},
 		"origin is not a string":        {mutate: setClient("origin", 7), wantErr: ErrClientData},
@@ -282,7 +282,7 @@ func TestVerifyRejectsMismatchedCredentialID(t *testing.T) {
 	runRejections(t, map[string]rejection{
 		"reported id differs":          {edit: func(reg *Registration) { reg.ID = other }, wantErr: ErrAuthData},
 		"reported raw id differs":      {edit: func(reg *Registration) { reg.RawID = other }, wantErr: ErrAuthData},
-		"reported id is not base64url": {edit: func(reg *Registration) { reg.ID = "***" }, wantErr: ErrAuthData},
+		"reported id is not base64url": {edit: func(reg *Registration) { reg.ID = notBase64 }, wantErr: ErrAuthData},
 	})
 }
 
@@ -402,7 +402,7 @@ func TestPublicKeyRejects(t *testing.T) {
 		"unknown parameter":   {mutate: withKey(put(4, []byte{1})), wantErr: ErrPublicKey},
 		"not a map":           {mutate: withRaw([]byte{1, 2, 3}), wantErr: ErrPublicKey},
 		"duplicate label":     {mutate: withRaw(duplicateLabel), wantErr: ErrPublicKey},
-		"empty":               {mutate: withRaw([]byte{}), wantErr: ErrPublicKey},
+		emptyCase:             {mutate: withRaw([]byte{}), wantErr: ErrPublicKey},
 		"tagged":              {mutate: withRaw(append([]byte{0xc1}, canonical...)), wantErr: ErrPublicKey},
 	})
 }
