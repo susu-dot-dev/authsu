@@ -163,7 +163,7 @@ dev: migrate-local ## Run the Worker locally on :8787 (dev flags, local D1, loca
 
 # ---- configuration ----------------------------------------------------------
 # Registration's AUTH_HMAC_SECRET (secret) and RP_ID, RP_ORIGIN, RP_NAME (vars).
-# See docs/devops.md, "Secrets and variables". scripts/config.sh does the work.
+# See docs/runbook.md, "Secrets and variables". scripts/config.sh does the work.
 
 .PHONY: config-get
 config-get: ## Show the RP_* vars, whether AUTH_HMAC_SECRET is set (never its value)
@@ -188,7 +188,7 @@ config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for 
 
 .PHONY: test-e2e
 test-e2e: $(WASM) ## End-to-end tests against the production build
-	E2E_STATE=$(E2E_STATE) go test -tags e2e -count=1 -timeout 5m ./e2e/...
+	E2E_STATE=$(E2E_STATE) go test -tags e2e -count=1 -timeout 10m ./e2e/...
 
 .PHONY: clean
 clean: ## Remove build outputs

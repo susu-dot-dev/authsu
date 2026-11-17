@@ -13,7 +13,6 @@ package registration
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -21,27 +20,25 @@ import (
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/atomic"
+	"github.com/susu-dot-dev/authsu/internal/deploy"
 )
 
-// Environment names read by the handlers.
+// Environment names read by the handlers. They are defined in internal/deploy,
+// which registration and login share; they are repeated here so callers that
+// configure registration keep a name for what they set.
 const (
-	// SecretHMAC is the Worker secret that is the root key material for
-	// signing registration challenges. Each purpose derives its own key from
-	// it; it must never be used directly, and never for anything where a
-	// signature is authorization (such as a session).
-	SecretHMAC = "AUTH_HMAC_SECRET" //nolint:gosec // the name of a secret, not its value
+	// SecretHMAC is the Worker secret that is the root key material.
+	SecretHMAC = deploy.SecretHMAC
 	// VarRPID is the relying party ID, such as "auth.example.com".
-	VarRPID = "RP_ID"
-	// VarRPOrigin is the one origin ceremonies are accepted from, such as
-	// "https://auth.example.com".
-	VarRPOrigin = "RP_ORIGIN"
+	VarRPID = deploy.VarRPID
+	// VarRPOrigin is the one origin ceremonies are accepted from.
+	VarRPOrigin = deploy.VarRPOrigin
 	// VarRPName is the relying party name shown by the browser.
-	VarRPName = "RP_NAME"
+	VarRPName = deploy.VarRPName
 )
 
-// MinSecretLen is the shortest AUTH_HMAC_SECRET accepted: 32 random bytes is
-// 43 base64url characters, so anything shorter is not a generated value.
-const MinSecretLen = 32
+// MinSecretLen is the shortest AUTH_HMAC_SECRET accepted.
+const MinSecretLen = deploy.MinSecretLen
 
 // ChallengeTTL is how long a begin response stays valid. It is also the
 // timeout sent in the creation options. WebAuthn recommends 5 to 10 minutes.
@@ -52,7 +49,7 @@ const ChallengeTTL = 5 * time.Minute
 const derivationContext = "authsu/registration-challenge/v1"
 
 // Roles. An invitation type maps to a role here, in Go, because the schema
-// deliberately has no CHECK on either (see docs/devops.md).
+// deliberately has no CHECK on either (see "Database" in docs/devops.md).
 const (
 	// RoleAdmin may administer the deployment.
 	RoleAdmin = "admin"
@@ -125,20 +122,11 @@ func NewService(deps Deps) *Service {
 	}
 }
 
-var (
-	errSecretMissing = errors.New("signing secret is missing or too short")
-	errNoDatabase    = errors.New("no database is configured")
-	errConfigMissing = errors.New("relying party configuration is missing")
-)
+var errNoDatabase = errors.New("no database is configured")
 
-// deriveKey derives the challenge-signing key from the root secret. Distinct
-// contexts give independent keys, so a key made for one purpose reveals
-// nothing about another.
+// deriveKey derives the challenge-signing key from the root secret.
 func deriveKey(root string) []byte {
-	mac := hmac.New(sha256.New, []byte(root))
-	mac.Write([]byte(derivationContext))
-
-	return mac.Sum(nil)
+	return deploy.DeriveKey(root, derivationContext)
 }
 
 // codeHash is how invitation codes are looked up: the SHA-256 of the code,

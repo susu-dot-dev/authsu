@@ -1,5 +1,5 @@
 # Security-sensitive project: keep the third-party supply chain minimal. See
-# docs/devops.md ("Continuous integration").
+# docs/devops.md ("Continuous integration and supply chain").
 #   - Only actions/* and golangci/golangci-lint-action, each pinned to a full
 #     commit SHA (version in the trailing comment).
 #   - The Worker is built once, in the `build` job, and handed to `size` and

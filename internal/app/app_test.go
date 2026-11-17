@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -55,7 +56,7 @@ func TestHealthz(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			req := httptest.NewRequestWithContext(t.Context(), tt.method, tt.path, nil)
+			req := newRequest(t, tt.method, tt.path, nil)
 			rec := httptest.NewRecorder()
 			app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
 
@@ -91,7 +92,7 @@ func TestDiagnosticsWiring(t *testing.T) {
 	handler := app.NewHandler(app.Deps{Diagnostics: fake}, app.Platform{})
 
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fake", nil))
+	handler.ServeHTTP(rec, newRequest(t, http.MethodGet, "/fake", nil))
 
 	if !fake.registered {
 		t.Error("Diagnostics.Register was not called")
@@ -106,7 +107,7 @@ func TestNilDiagnosticsRegistersNothing(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/info", nil)
+	req := newRequest(t, http.MethodGet, "/debug/info", nil)
 	app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
@@ -149,7 +150,7 @@ func TestFailureIsLoggedAndHidden(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/first-run", nil)
+	req := newRequest(t, http.MethodGet, "/api/first-run", nil)
 	app.NewHandler(app.Deps{}, platform).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
@@ -179,10 +180,55 @@ func TestNilLogDiscards(t *testing.T) {
 	platform := app.Platform{DB: failingDB(t), Getenv: func(string) string { return "" }}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/first-run", nil)
+	req := newRequest(t, http.MethodGet, "/api/first-run", nil)
 	app.NewHandler(app.Deps{}, platform).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// newRequest builds a request as the same-origin frontend sends it: with
+// Content-Type: application/json, which every unsafe route requires.
+func newRequest(t *testing.T, method, path string, body io.Reader) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(t.Context(), method, path, body)
+	req.Header.Set("Content-Type", "application/json")
+
+	return req
+}
+
+// TestUnsafeRoutesRequireJSON checks the CSRF defence is wired to every route
+// that changes something: a POST another site could make a browser send (no
+// Content-Type, or a CORS-safelisted one) is refused with 415 before any
+// handler runs, even with an empty body and with the deployment fully
+// configured. See httpapi's package doc.
+func TestUnsafeRoutesRequireJSON(t *testing.T) {
+	t.Parallel()
+
+	paths := []string{beginPath, finishPath, loginBeginPath, loginFinishPath, logoutPath}
+
+	for _, path := range paths {
+		for _, contentType := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"} {
+			t.Run(path+" "+contentType, func(t *testing.T) {
+				t.Parallel()
+
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
+
+				if contentType != "" {
+					req.Header.Set("Content-Type", contentType)
+				}
+
+				app.NewHandler(app.Deps{}, app.Platform{Getenv: loginEnv}).ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusUnsupportedMediaType ||
+					!strings.Contains(rec.Body.String(), `"unsupported_media_type"`) {
+					t.Errorf("POST %s (%q) = %d %s, want 415 unsupported_media_type",
+						path, contentType, rec.Code, rec.Body)
+				}
+			})
+		}
 	}
 }

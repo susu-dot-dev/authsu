@@ -4,11 +4,13 @@ go 1.27.4
 
 require (
 	github.com/fxamacker/cbor/v2 v2.10.0
+	github.com/susu-dot-dev/japikey_go v0.0.0-20261116153038-f042c31f9150
 	github.com/syumai/workers-go v0.36.0
 	golang.org/x/text v0.42.0
 )
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect

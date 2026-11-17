@@ -1,5 +1,5 @@
-# Weekly checks that must run without any code change. See docs/devops.md
-# ("Dependency automation and vulnerability scanning").
+# Weekly checks that must run without any code change. See docs/runbook.md
+# ("Upkeep").
 #   vuln:   new advisories are published against existing dependencies.
 #   upkeep: pins that Dependabot cannot update (tools.env, the workers-go fork).
 # Each job fails independently, and a failed scheduled run is the reminder.

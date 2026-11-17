@@ -159,3 +159,18 @@ func query(t *testing.T, sql string) string {
 
 	return fmt.Sprint(parsed[0].Results[0]["v"])
 }
+
+// queryFails runs one SQL statement against the Worker's local D1 database and
+// reports whether the database refused it. A refusal is an outcome here, not a
+// test failure: the caller is asserting that a constraint held.
+func queryFails(t *testing.T, sql string) bool {
+	t.Helper()
+
+	cmd := exec.CommandContext(context.Background(), "npx", "wrangler", "d1", "execute", "DB",
+		"--local", "--persist-to", target.state, "--json", "--command", sql)
+	cmd.Dir = target.root
+
+	_, err := cmd.Output()
+
+	return err != nil
+}

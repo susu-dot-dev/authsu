@@ -2,7 +2,7 @@
  * Used only to apply D1 migrations to the Preview database, which Wrangler
  * cannot reach through wrangler.jsonc (it resolves migration targets from the
  * top-level d1_databases). The database_id must match previews.d1_databases
- * in wrangler.jsonc. See docs/devops.md, "D1 migrations".
+ * in wrangler.jsonc. See docs/runbook.md, "Database migrations".
  *
  *   npx wrangler d1 migrations apply PREVIEW_DB --remote --config wrangler.preview-migrations.jsonc
  */

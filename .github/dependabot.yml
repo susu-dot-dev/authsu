@@ -1,9 +1,9 @@
-# Dependency updates. See docs/devops.md ("Dependency automation").
+# Dependency updates. See docs/devops.md ("Lint, size and dependencies").
 #
 # Weekly and grouped to limit noise: one PR per ecosystem per week. Security
 # updates are separate and immediate, and are not delayed by grouping.
 #
-# Not covered here (bumped by hand, see docs/devops.md): TinyGo and
+# Not covered here (bumped by hand, see docs/runbook.md "Upkeep"): TinyGo and
 # golangci-lint versions and checksums in tools.env, and the workers-go fork
 # `replace` in go.mod.
 version: 2

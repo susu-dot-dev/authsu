@@ -5,6 +5,15 @@
 // body, logs the detail, and never sends the cause to the client. Code is
 // therefore free to build, wrap and return errors without deciding how they are
 // shown.
+//
+// Every failure should be classified, with a Code of its own: Internal (500) is
+// the fail-closed fallback for the genuinely unknown, not a default to reach
+// for. The Code is what a log search or an alert keys on, so each failing step
+// gets its own. A database that errors is Unavailable (503) with a code naming
+// the step, a fixed client-safe description, and the driver error as the cause.
+//
+// Errors carry no stack: TinyGo's runtime.Callers returns no frames on wasm.
+// Add context by wrapping with fmt.Errorf("verb noun: %w", err) instead.
 package apierr
 
 import (
@@ -28,32 +37,28 @@ const (
 	PayloadTooLarge
 	RateLimited
 	Unavailable
+	UnsupportedMediaType
 )
 
 // Status returns the HTTP status for the kind. Internal and any unknown kind
 // fail closed to 500.
-//
-//nolint:exhaustive // a flat kind-to-status table; Internal is the default
 func (k Kind) Status() int {
-	switch k {
-	case BadRequest:
-		return http.StatusBadRequest
-	case Unauthorized:
-		return http.StatusUnauthorized
-	case Forbidden:
-		return http.StatusForbidden
-	case NotFound:
-		return http.StatusNotFound
-	case MethodNotAllowed:
-		return http.StatusMethodNotAllowed
-	case Conflict:
-		return http.StatusConflict
-	case PayloadTooLarge:
-		return http.StatusRequestEntityTooLarge
-	case RateLimited:
-		return http.StatusTooManyRequests
-	case Unavailable:
-		return http.StatusServiceUnavailable
+	statuses := [...]int{
+		Internal:             http.StatusInternalServerError,
+		BadRequest:           http.StatusBadRequest,
+		Unauthorized:         http.StatusUnauthorized,
+		Forbidden:            http.StatusForbidden,
+		NotFound:             http.StatusNotFound,
+		MethodNotAllowed:     http.StatusMethodNotAllowed,
+		Conflict:             http.StatusConflict,
+		PayloadTooLarge:      http.StatusRequestEntityTooLarge,
+		RateLimited:          http.StatusTooManyRequests,
+		Unavailable:          http.StatusServiceUnavailable,
+		UnsupportedMediaType: http.StatusUnsupportedMediaType,
+	}
+
+	if int(k) < len(statuses) {
+		return statuses[k]
 	}
 
 	return http.StatusInternalServerError
