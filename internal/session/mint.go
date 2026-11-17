@@ -2,18 +2,18 @@ package session
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/susu-dot-dev/japikey_go"
+
+	"github.com/susu-dot-dev/authsu/internal/deploy"
 )
 
 // Issuer is what the minting and verifying of a token agree on: the base of
 // the issuer URL (the token's iss is "<base>/<kid>"). It is derived from the
-// configured origin, so there is no separate setting to get wrong.
+// API origin, the identity of this service, so there is no separate setting to
+// get wrong.
 type Issuer struct {
 	// Base is the base issuer URL, such as "https://auth.example.com/keys".
 	Base string
@@ -27,49 +27,10 @@ type Issuer struct {
 // served there yet, but the issuer is shaped so it could be.
 const issuerPath = "/keys"
 
-var errBadOrigin = errors.New("origin is not an http(s) origin")
-
-// IssuerFor derives the Issuer from the relying party origin. The origin must be
-// a bare origin: a scheme and a host, with an optional numeric port and nothing
-// else (no user info, path, query or fragment). https is accepted for any host;
-// plain http only for the host "localhost", so a session cookie is never put on
-// a network by a configuration mistake. The host is compared whole: a prefix
-// test would accept "localhost.example.com".
-func IssuerFor(origin string) (Issuer, error) {
-	parsed, err := url.Parse(origin)
-	if err != nil || !bareOrigin(parsed) || parsed.String() != origin {
-		return Issuer{}, fmt.Errorf("%w: %q", errBadOrigin, origin)
-	}
-
-	insecure := parsed.Scheme == "http" && parsed.Hostname() == "localhost"
-	if parsed.Scheme != "https" && !insecure {
-		return Issuer{}, fmt.Errorf("%w: %q", errBadOrigin, origin)
-	}
-
-	return Issuer{Base: origin + issuerPath, Insecure: insecure}, nil
-}
-
-// bareOrigin reports whether u is a scheme, a host and an optional port, with
-// nothing after the authority.
-func bareOrigin(u *url.URL) bool {
-	return u.Hostname() != "" && u.User == nil && noTrailer(u) && validPort(u)
-}
-
-// noTrailer reports whether u has nothing after its authority: no path, query
-// (even an empty one) or fragment, and is not an opaque URL.
-func noTrailer(u *url.URL) bool {
-	return u.Opaque == "" && u.Path == "" && u.RawQuery == "" && !u.ForceQuery && u.Fragment == ""
-}
-
-// validPort reports whether u has no port or a numeric one. url.Parse accepts
-// "host:" with an empty port and Port() reports "" for it as for no port, so the
-// colon is checked on the host itself.
-func validPort(u *url.URL) bool {
-	if strings.HasSuffix(u.Host, ":") {
-		return false
-	}
-
-	return strings.Trim(u.Port(), "0123456789") == ""
+// IssuerFor derives the Issuer from the API origin, which deploy.ParseOrigin
+// has already validated as a bare origin (https, or http for localhost only).
+func IssuerFor(api deploy.Origin) Issuer {
+	return Issuer{Base: api.String + issuerPath, Insecure: api.Insecure}
 }
 
 // Mint creates a session key for userID that expires at expires: a fresh key

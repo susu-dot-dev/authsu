@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	testRPID   = "auth.example.com"
-	testOrigin = "https://auth.example.com"
+	testRPID   = "example.com"
+	testOrigin = "https://example.com"
+	testAPI    = "https://auth.example.com"
 	testCode   = "an-invitation-code-0123456789ABCDEFGHIJKL"
 	beginPath  = "/api/register/begin"
 	typeMember = "type"
@@ -38,10 +39,9 @@ const (
 // registrationEnv is the deployment configuration registration needs.
 func registrationEnv(name string) string {
 	return map[string]string{
-		registration.SecretHMAC:  "registration-secret-0123456789ABCDEFGHIJ",
-		registration.VarRPID:     testRPID,
-		registration.VarRPOrigin: testOrigin,
-		registration.VarRPName:   "Example",
+		registration.SecretHMAC:   "registration-secret-0123456789ABCDEFGHIJ",
+		registration.VarAPIOrigin: testAPI,
+		registration.VarUIOrigin:  testOrigin,
 	}[name]
 }
 

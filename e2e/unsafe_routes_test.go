@@ -12,13 +12,15 @@ import (
 
 // This file checks the CSRF defence end to end: every route that changes
 // something requires Content-Type: application/json, which a browser cannot
-// send cross-origin without a CORS preflight, and the Worker answers no
-// preflight. The host tests prove the rule; these prove the Worker as TinyGo
-// built it, behind workerd, sees the header the same way.
+// send cross-origin without a CORS preflight, and the Worker answers a
+// preflight only for the relying party's origin. The host tests prove the rule;
+// these prove the Worker as TinyGo built it, behind workerd, sees the header
+// the same way.
 
 const (
-	originHeader = "Origin"
-	evilOrigin   = "https://evil.example"
+	originHeader      = "Origin"
+	evilOrigin        = "https://evil.example"
+	contentTypeHeader = "Content-Type"
 )
 
 // unsafeRoutes are the routes that change something. Login begin and logout read
@@ -31,11 +33,11 @@ func unsafeRoutes() []string {
 	}
 }
 
-// rawPost sends a POST with exactly the given headers and body.
-func rawPost(t *testing.T, path, body string, headers map[string]string) reply {
+// rawPost sends a POST with an empty body and exactly the given headers.
+func rawPost(t *testing.T, path string, headers map[string]string) reply {
 	t.Helper()
 
-	return rawRequest(t, http.MethodPost, path, body, headers)
+	return rawRequest(t, http.MethodPost, path, "", headers)
 }
 
 func rawRequest(t *testing.T, method, path, body string, headers map[string]string) reply {
@@ -82,10 +84,10 @@ func TestUnsafeRoutesRequireJSON(t *testing.T) {
 			t.Run(path+" "+contentType, func(t *testing.T) {
 				headers := map[string]string{originHeader: evilOrigin, "Sec-Fetch-Site": "cross-site"}
 				if contentType != "" {
-					headers["Content-Type"] = contentType
+					headers[contentTypeHeader] = contentType
 				}
 
-				got := rawPost(t, path, "", headers)
+				got := rawPost(t, path, headers)
 				if got.status != http.StatusUnsupportedMediaType || !strings.Contains(got.body, `"unsupported_media_type"`) {
 					t.Errorf("POST %s (%q) = %d %s, want 415 unsupported_media_type", path, contentType, got.status, got.body)
 				}
@@ -98,14 +100,15 @@ func TestUnsafeRoutesRequireJSON(t *testing.T) {
 	}
 }
 
-// TestNoCORSPreflightIsAnswered sends each unsafe route the preflight a
-// browser sends before a cross-origin application/json POST. The answer must
-// not allow it: a non-2xx status and no Access-Control-Allow-* header, so the
-// browser never sends the real request. No real response carries CORS headers
-// either.
+// TestForeignOriginGetsNoCORS sends each unsafe route the preflight a browser
+// sends before a cross-origin application/json POST, from an origin that is not
+// the relying party's. The answer must not allow it: a non-2xx status and no
+// Access-Control-* header, so the browser never sends the real request. No real
+// response carries CORS headers either, so script on that origin could not read
+// one.
 //
 //nolint:paralleltest // shares one database with the other tests
-func TestNoCORSPreflightIsAnswered(t *testing.T) {
+func TestForeignOriginGetsNoCORS(t *testing.T) {
 	for _, path := range unsafeRoutes() {
 		t.Run(path, func(t *testing.T) {
 			preflight := rawRequest(t, http.MethodOptions, path, "", map[string]string{
@@ -118,7 +121,7 @@ func TestNoCORSPreflightIsAnswered(t *testing.T) {
 				t.Errorf("preflight = %d, want a refusal", preflight.status)
 			}
 
-			posted := rawPost(t, path, "", map[string]string{originHeader: evilOrigin, "Content-Type": jsonContentType})
+			posted := rawPost(t, path, map[string]string{originHeader: evilOrigin, contentTypeHeader: jsonContentType})
 
 			for name, got := range map[string]reply{"preflight": preflight, "request": posted} {
 				for header := range got.header {
@@ -126,6 +129,51 @@ func TestNoCORSPreflightIsAnswered(t *testing.T) {
 						t.Errorf("%s carries CORS header %s: %q", name, header, got.header.Get(header))
 					}
 				}
+			}
+		})
+	}
+}
+
+// TestRelyingPartyOriginMayCallCrossOrigin is the other half: the UI's origin
+// (UI_ORIGIN, which differs from the Worker's own port) gets a
+// preflight answer that lets a credentialed JSON POST proceed, and the real
+// response may be read. The Worker as built and run under workerd must do this
+// for every route, ahead of the 405 an OPTIONS would otherwise get.
+//
+//nolint:paralleltest // shares one database with the other tests
+func TestRelyingPartyOriginMayCallCrossOrigin(t *testing.T) {
+	for _, path := range unsafeRoutes() {
+		t.Run(path, func(t *testing.T) {
+			preflight := rawRequest(t, http.MethodOptions, path, "", map[string]string{
+				originHeader:                     target.origin,
+				"Access-Control-Request-Method":  http.MethodPost,
+				"Access-Control-Request-Headers": "content-type",
+			})
+
+			if preflight.status != http.StatusNoContent {
+				t.Errorf("preflight = %d %s, want 204", preflight.status, preflight.body)
+			}
+
+			for header, want := range map[string]string{
+				"Access-Control-Allow-Origin":      target.origin,
+				"Access-Control-Allow-Credentials": "true",
+				"Access-Control-Allow-Methods":     http.MethodPost,
+				"Access-Control-Allow-Headers":     contentTypeHeader,
+			} {
+				if got := preflight.header.Get(header); got != want {
+					t.Errorf("preflight %s = %q, want %q", header, got, want)
+				}
+			}
+
+			// An unauthenticated or empty POST still fails in its handler; what
+			// matters is that the failure is readable by the UI's script.
+			posted := rawPost(t, path, map[string]string{originHeader: target.origin, contentTypeHeader: jsonContentType})
+			if got := posted.header.Get("Access-Control-Allow-Origin"); got != target.origin {
+				t.Errorf("response Allow-Origin = %q, want %q", got, target.origin)
+			}
+
+			if got := posted.header.Get("Access-Control-Allow-Credentials"); got != "true" {
+				t.Errorf("response Allow-Credentials = %q, want true", got)
 			}
 		})
 	}
@@ -139,7 +187,7 @@ func TestNoCORSPreflightIsAnswered(t *testing.T) {
 func TestCookieRoutesRequireJSON(t *testing.T) {
 	token := login(t, registerPasskey(t))
 
-	got := rawPost(t, logoutPath, "", map[string]string{"Cookie": cookieName + "=" + token, "Content-Type": "text/plain"})
+	got := rawPost(t, logoutPath, map[string]string{"Cookie": cookieName + "=" + token, contentTypeHeader: "text/plain"})
 	if got.status != http.StatusUnsupportedMediaType {
 		t.Errorf("POST %s with the cookie as text/plain = %d %s, want 415", logoutPath, got.status, got.body)
 	}

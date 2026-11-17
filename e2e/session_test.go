@@ -32,8 +32,6 @@ func setExpiry(t *testing.T, token string, secondsLeft int) {
 //
 //nolint:paralleltest // shares one database with the other tests
 func TestSessionStopsWorkingWhenItsKeyIsNotUsable(t *testing.T) {
-	pk := registerPasskey(t)
-
 	tests := map[string]string{
 		"revoked":                 "UPDATE japikeys SET revoked_at = strftime('%s','now') - 1 WHERE kid = '{KID}'",
 		"expired in the database": "UPDATE japikeys SET expires_at = strftime('%s','now') - 1 WHERE kid = '{KID}'",
@@ -45,7 +43,10 @@ func TestSessionStopsWorkingWhenItsKeyIsNotUsable(t *testing.T) {
 
 	for name, update := range tests {
 		t.Run(name, func(t *testing.T) {
-			token := login(t, pk)
+			// Each case registers its own passkey: the cases run in map order, and
+			// "its passkey deleted" removes the credential, which would make the
+			// login of every case that ran after it fail as an unknown credential.
+			token := login(t, registerPasskey(t))
 
 			if got := call(t, http.MethodGet, sessionPath, nil, token); got.status != http.StatusOK {
 				t.Fatalf("GET /api/session before = %d %s, want 200", got.status, got.body)

@@ -8,6 +8,6 @@
     "build": "PATH=\"$PWD/.tools/tinygo/bin:$PATH\" && go run github.com/syumai/workers-go/cmd/workers-assets-gen && tinygo build -o ./build/app.wasm -target wasm -no-debug ./cmd/worker"
   },
   "devDependencies": {
-    "wrangler": "^4.162.0"
+    "wrangler": "^4.156.0"
   }
 }

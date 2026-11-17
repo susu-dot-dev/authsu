@@ -203,12 +203,33 @@ An unknown credential, a mismatched handle, a bad signature, and a replay are al
 ## Decisions the implementation settled
 
 - **Logout** is `POST /api/logout`. It revokes the presented session at the current time and tells the browser to drop the cookie. The row stays until it expires, for the replay reason above. Logging out a session that is already gone is a 401 like any request without a valid session.
-- **The cookie** is named `__Host-session`. The `__Host-` prefix makes a browser refuse it unless it is `Secure`, has `Path=/` and has no `Domain`, so a sibling subdomain cannot set or shadow it. It is `SameSite=Lax`: a session survives following a link to the site, and the cookie is withheld from cross-site subrequests and POSTs, which is also what stops another site from triggering a logout.
+- **The cookie** is named `__Host-session`. The `__Host-` prefix makes a browser refuse it unless it is `Secure`, has `Path=/` and has no `Domain`, so a sibling subdomain cannot set or shadow it. It is `SameSite=Lax`: a session survives following a link to the site, and the cookie is withheld from cross-site subrequests and POSTs, which is also what stops another site from triggering a logout (see "The UI on another origin" for why that still holds with the UI on a sibling origin).
 - **Reading the session** is `GET /api/session`. It reports who the cookie speaks for and when the session ends, which is also when the user has to sign in again. It never writes.
-- **The issuer** of every token is derived from `RP_ORIGIN`, so there is no new setting to get wrong. japikey requires `https`, so plain `http` is accepted for `localhost` only.
+- **The issuer** of every token is derived from `API_ORIGIN`: the service that mints a token is the one that identifies it, wherever the UI is served. japikey requires `https`, so plain `http` is accepted for `localhost` only.
 - **Configuration** is the deployment's, shared with registration (see [registration_design.md](registration_design.md#deployment-configuration)). Login derives its challenge key from `AUTH_HMAC_SECRET` with its own context. Sessions need no signing key at all: each is a japikey whose private half is discarded as soon as it signs its one token, so there is no key whose leak would be account takeover. When configuration is missing, login answers 503 `login_not_configured` and the session routes 503 `session_not_configured`.
 - **The account's role is read when a request is verified**, not copied into the token. A role change takes effect on the next request, at the cost of joining `users` on the one primary-key read.
 - **Every response about an unusable session is one answer** (401, `unauthenticated`), whether the cookie is missing, malformed, unknown, expired, revoked or for another audience. The cause goes to the log. A failure to read the store is a 503, never a 401, so an outage cannot look like a verdict on someone's session.
+
+## The UI on another origin
+
+The UI is served from `https://susu.dev` and the API from `https://auth.susu.dev` (locally, two `localhost` ports), so the UI's script makes cross-origin requests. Two things follow, and neither weakens the CSRF defence.
+
+- **CORS allows one origin: `UI_ORIGIN`.** That is already the single origin a passkey ceremony is accepted from, so it is by definition the UI's. Reusing it means no second setting that can drift from it, and no list to get wrong. The origin is compared exactly, as a whole string: no wildcard, no pattern, no subdomain or port flexibility, so there is no look-alike to bypass it with. The value is validated as a bare origin before CORS trusts it, so a mistake such as `null` (which every sandboxed iframe and `data:` URL sends) or `*` allows nothing rather than everything. With none configured, nothing is allowed. Credentials are allowed (the session is a cookie), which is only safe because the origin is specific.
+- **The defence is the same, with one origin let through.** Every unsafe route still requires `Content-Type: application/json`, which a browser sends cross-origin only after a preflight succeeds. A preflight now succeeds for the UI's origin and for no other, so another site still cannot make a browser deliver a state-changing request, and cannot read a response. The preflight is answered ahead of routing, because the routes would answer an `OPTIONS` with 405. It allows only the methods and the header (`Content-Type`) the API uses.
+
+The cookie stays `SameSite=Lax`. `SameSite` is about *sites* (registrable domains), not origins: `susu.dev` and `auth.susu.dev` are the same site, and so are two `localhost` ports, so the UI's credentialed `fetch` carries the cookie and `None` is not needed. The `__Host-` cookie is still host-only on the API's host. The cost is a constraint on deployment: **the UI and the API must share a registrable domain.** A UI on an unrelated domain would not receive the cookie and would need `SameSite=None`, which is a different threat model and not supported. Nothing checks this at startup; a mistake shows up as a login that succeeds and a next request that is unauthenticated.
+
+Because the sites match, `SameSite` no longer separates the UI from the API's other sibling hosts: a page on any other subdomain of the registrable domain is same-site too, and the browser would attach the cookie to its requests. What stops such a page is CORS, as above: it is not `UI_ORIGIN`, so its preflight is refused and it can neither send a JSON request nor read a response. Every host under the registrable domain should therefore be treated as inside the trust boundary.
+
+The three origins in play are different things, and keeping them apart is what makes this work:
+
+| Value | Is | Used for |
+|---|---|---|
+| `API_ORIGIN` (`https://auth.susu.dev`) | Where this Worker is served | The session issuer (`iss`) |
+| `UI_ORIGIN` (`https://susu.dev`) | Where the UI and its passkey ceremonies run | The origin a ceremony is accepted from, the one origin CORS allows |
+| Relying party ID (`susu.dev`) | The host of `UI_ORIGIN` | `rpIdHash`, `rp.id` and `rpId` in the options |
+
+The ceremonies run on the UI's page, so the browser writes the UI's origin into `clientDataJSON` and checks the relying party ID against the UI's host. The API's host never appears in a ceremony, which is why the issuer can be the API's origin without affecting passkeys.
 
 ## Open questions
 

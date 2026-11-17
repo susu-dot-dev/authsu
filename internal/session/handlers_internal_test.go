@@ -19,9 +19,10 @@ func TestLoadConfig(t *testing.T) {
 		env     map[string]string
 		wantErr bool
 	}{
-		"https origin":     {env: nil},
-		"origin missing":   {env: map[string]string{deploy.VarRPOrigin: ""}, wantErr: true},
-		"origin not https": {env: map[string]string{deploy.VarRPOrigin: "http://auth.example.com"}, wantErr: true},
+		"https origin":         {env: nil},
+		"api origin missing":   {env: map[string]string{deploy.VarAPIOrigin: ""}, wantErr: true},
+		"api origin not https": {env: map[string]string{deploy.VarAPIOrigin: "http://auth.example.com"}, wantErr: true},
+		"ui origin missing":    {env: map[string]string{deploy.VarUIOrigin: ""}, wantErr: true},
 	}
 
 	for name, tt := range tests {
@@ -162,7 +163,7 @@ func TestEveryRouteReportsMissingConfigurationAsUnavailable(t *testing.T) {
 			fix := newFixture(t)
 			key := fix.issue(t, fix.now.Add(Lifetime/2))
 
-			_, err := handler(fix.svc, getenv(map[string]string{deploy.VarRPOrigin: ""}))(requestWith(t, key)).Get()
+			_, err := handler(fix.svc, getenv(map[string]string{deploy.VarAPIOrigin: ""}))(requestWith(t, key)).Get()
 			wantFailure(t, err, apierr.Unavailable, CodeNotConfigured)
 		})
 

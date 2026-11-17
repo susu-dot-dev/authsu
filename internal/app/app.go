@@ -10,6 +10,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/atomic"
+	"github.com/susu-dot-dev/authsu/internal/deploy"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/login"
@@ -93,7 +94,27 @@ func NewHandler(platform Platform) http.Handler {
 	routes.Handle(http.MethodGet, "/api/session", sessions.WhoAmIHandler(platform.Getenv))
 	routes.Handle(http.MethodPost, "/api/logout", sessions.LogoutHandler(platform.Getenv))
 
-	return routes.mux
+	// CORS is outermost so a preflight is answered before routing, which would
+	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's.
+	return httpapi.CORS(func() string { return allowedOrigin(platform.Getenv) }, routes.mux)
+}
+
+// allowedOrigin returns the one origin allowed to call the API from a browser:
+// UI_ORIGIN, the origin the UI is served from and the only one a passkey
+// ceremony is accepted from. It is empty when it is unset or is not a bare
+// origin (so "null", a wildcard or a path is never trusted), and when no getenv
+// exists (the host stub), which allows nothing.
+func allowedOrigin(getenv func(string) string) string {
+	if getenv == nil {
+		return ""
+	}
+
+	ui, err := deploy.ParseOrigin(getenv(deploy.VarUIOrigin))
+	if err != nil {
+		return ""
+	}
+
+	return ui.String
 }
 
 // healthBody is the JSON response body of /healthz.

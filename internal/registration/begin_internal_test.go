@@ -24,7 +24,7 @@ func TestBeginReturnsCreationOptions(t *testing.T) {
 
 	pk := options.PublicKey
 
-	if pk.RP.ID != testRPID || pk.RP.Name != testRPName {
+	if pk.RP.ID != testRPID || pk.RP.Name != testRPID {
 		t.Errorf("rp = %+v", pk.RP)
 	}
 
@@ -163,11 +163,11 @@ func TestBeginRejectsMissingConfiguration(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]map[string]string{
-		"secret missing":   {SecretHMAC: ""},
-		"secret too short": {SecretHMAC: strings.Repeat("a", MinSecretLen-1)},
-		"rp id missing":    {VarRPID: ""},
-		"rp origin":        {VarRPOrigin: ""},
-		"rp name missing":  {VarRPName: ""},
+		"secret missing":     {SecretHMAC: ""},
+		"secret too short":   {SecretHMAC: strings.Repeat("a", MinSecretLen-1)},
+		"api origin missing": {VarAPIOrigin: ""},
+		"ui origin missing":  {VarUIOrigin: ""},
+		"ui origin invalid":  {VarUIOrigin: "example.com"},
 	}
 
 	for name, env := range tests {

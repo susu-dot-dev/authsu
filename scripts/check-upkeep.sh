@@ -3,6 +3,7 @@
 # workflow (.github/workflows/upkeep.yml). Dependabot cannot update these:
 #   - TinyGo and golangci-lint versions in tools.env
 #   - the workers-go fork `replace` in go.mod
+#   - the Workers `compatibility_date` in wrangler.jsonc and wrangler.e2e.jsonc
 #
 # Prints a markdown report on stdout and exits 0 when everything is current,
 # 1 when something needs attention, 2 when a lookup itself failed (so a broken
@@ -66,6 +67,63 @@ if grep -q '^replace github.com/syumai/workers-go =>' go.mod; then
   fi
 else
   add "- workers-go: no \`replace\` directive (using upstream)"
+fi
+
+# The compatibility date is a deliberate pin, not "the newest": it is the
+# runtime behaviour this code was tested against, and it may be anything the
+# locked workerd supports. It is only reported when it has fallen well behind
+# that workerd (see docs/runbook.md, "Upkeep"). The date is read from
+# package-lock.json, not node_modules, so this runs on a bare checkout. A
+# workerd version is 1.YYYYMMDD.N, so its second field is its newest date.
+COMPAT_STALE_DAYS=90
+
+compat_of() { # file -> its compatibility_date, or nothing
+  sed -n -E 's/^[[:space:]]*"compatibility_date":[[:space:]]*"([0-9]{4}-[0-9]{2}-[0-9]{2})".*/\1/p' "$1" | head -n1
+}
+
+workerd_date() { # -> the newest date the locked workerd supports, as YYYY-MM-DD
+  local v
+  v="$(awk '
+    /"node_modules\/workerd": \{/ { found = 1; next }
+    found && /"version":/ { gsub(/[",]/, "", $2); print $2; exit }' package-lock.json)"
+  v="$(printf '%s' "$v" | cut -d. -f2)"
+  [[ $v =~ ^[0-9]{8}$ ]] || return 1
+  printf '%s-%s-%s' "${v:0:4}" "${v:4:2}" "${v:6:2}"
+}
+
+add ""
+add "## Workers compatibility date"
+add ""
+if ! supported="$(workerd_date)"; then
+  add "- :warning: could not read the locked workerd version from package-lock.json"
+  failed=1
+else
+  newest=""
+  for cfg in wrangler.jsonc wrangler.e2e.jsonc; do
+    date="$(compat_of "$cfg")"
+    if [ -z "$date" ]; then
+      add "- :warning: no \`compatibility_date\` found in \`$cfg\`"
+      failed=1
+      continue
+    fi
+    newest="$date"
+    if [[ "$date" > "$supported" ]]; then
+      add "- **$cfg** has compatibility_date $date, newer than the $supported the locked workerd supports: \`wrangler dev\` will refuse to start. Lower the date, or raise wrangler."
+      stale=1
+      continue
+    fi
+    age=$(( ( $(date -u -d "$supported" +%s) - $(date -u -d "$date" +%s) ) / 86400 ))
+    if [ "$age" -gt "$COMPAT_STALE_DAYS" ]; then
+      add "- **$cfg** has compatibility_date $date, $age days behind the $supported the locked workerd supports. Read the compatibility-flag changes since then (https://developers.cloudflare.com/workers/configuration/compatibility-flags/), then bump it deliberately in both wrangler configs."
+      stale=1
+    else
+      add "- $cfg compatibility_date $date is within $COMPAT_STALE_DAYS days of the locked workerd ($supported)"
+    fi
+  done
+  if [ "$(compat_of wrangler.jsonc)" != "$(compat_of wrangler.e2e.jsonc)" ]; then
+    add "- **wrangler.jsonc and wrangler.e2e.jsonc disagree** on compatibility_date: e2e must test the date that is deployed."
+    stale=1
+  fi
 fi
 
 printf '%s\n' "$report"

@@ -7,7 +7,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "authsu",
 	"main": "./build/worker.mjs",
-	"compatibility_date": "2026-11-13",
+	"compatibility_date": "2026-10-18",
 	"build": {
 		"command": "npm run build"
 	},
@@ -16,17 +16,20 @@
 	},
 	"upload_source_maps": true,
 	/**
-	 * Relying party configuration for passkeys. RP_ID is permanent: a passkey
-	 * is bound to it, so changing it invalidates every registered passkey.
-	 * Set them to your deployment's real domain before the first registration
+	 * The two origins everything is derived from (docs/runbook.md, "Secrets and
+	 * variables"). API_ORIGIN is where this Worker is served; the session issuer
+	 * is derived from it. UI_ORIGIN is where the UI is served: passkey ceremonies
+	 * run on its pages, its host is the relying party ID, and it is the one
+	 * origin CORS allows. The relying party ID is permanent: a passkey is bound
+	 * to it, so changing UI_ORIGIN's host invalidates every registered passkey.
+	 * Set them to your deployment's real domains before the first registration
 	 * (make config-set-vars). `make dev` and the e2e tests override them with
 	 * localhost values, so the values here never apply to local runs.
 	 * AUTH_HMAC_SECRET is a Worker secret (npx wrangler secret put), never a var.
 	 */
 	"vars": {
-		"RP_ID": "susu.dev",
-		"RP_ORIGIN": "https://auth.susu.dev",
-		"RP_NAME": "susu.dev"
+		"API_ORIGIN": "https://auth.susu.dev",
+		"UI_ORIGIN": "https://susu.dev"
 	},
 	"d1_databases": [
 		{
@@ -34,13 +37,5 @@
 			"database_id": "6ae7ad67-1698-45d5-8fc7-df6cff311140",
 			"migrations_dir": "migrations"
 		}
-	],
-	"previews": {
-		"d1_databases": [
-			{
-				"binding": "DB",
-				"database_id": "9fdd4990-ea5a-4ec1-b67b-cfa5a14f619d"
-			}
-		]
-	}
+	]
 }
