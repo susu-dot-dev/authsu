@@ -18,6 +18,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/session"
+	"github.com/susu-dot-dev/authsu/internal/users"
 )
 
 // Platform carries the resources the Worker runtime provides, never services.
@@ -109,6 +110,16 @@ func NewHandler(platform Platform) http.Handler {
 	routes.Handle(http.MethodGet, "/api/session", sessions.WhoAmIHandler(platform.Getenv))
 	routes.Handle(http.MethodPost, "/api/logout", sessions.LogoutHandler(platform.Getenv))
 
+	routes.admin(platform, sessions)
+
+	// CORS is outermost so a preflight is answered before routing, which would
+	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's.
+	return httpapi.CORS(func() string { return allowedOrigin(platform.Getenv) }, routes.mux)
+}
+
+// admin registers the admin APIs. Each authorises through sessions, which reads
+// the caller's role from the account on every request.
+func (r router) admin(platform Platform, sessions *session.Service) {
 	invitationRoutes := invitations.NewService(invitations.Deps{
 		Sessions: sessions,
 		Reader:   invitationReader(platform.DB),
@@ -118,12 +129,17 @@ func NewHandler(platform Platform) http.Handler {
 		NewID:    newID,
 		Types:    invitations.CreatableTypes(),
 	}).Handlers(platform.Getenv)
-	routes.HandleMethods(invitations.CollectionPath, nil, invitationRoutes.Collection)
-	routes.HandleMethods(invitations.ItemPath, invitations.PathWildcards(), invitationRoutes.Item)
+	r.HandleMethods(invitations.CollectionPath, nil, invitationRoutes.Collection)
+	r.HandleMethods(invitations.ItemPath, invitations.PathWildcards(), invitationRoutes.Item)
 
-	// CORS is outermost so a preflight is answered before routing, which would
-	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's.
-	return httpapi.CORS(func() string { return allowedOrigin(platform.Getenv) }, routes.mux)
+	userRoutes := users.NewService(users.Deps{
+		Sessions: sessions,
+		Reader:   userReader(platform.DB),
+		Batch:    platform.Batch,
+		Now:      time.Now,
+	}).Handlers(platform.Getenv)
+	r.HandleMethods(users.CollectionPath, nil, userRoutes.Collection)
+	r.HandleMethods(users.ItemPath, users.PathWildcards(), userRoutes.Item)
 }
 
 // newID returns a fresh UUIDv7 in canonical text form, the id of every row the
@@ -195,4 +211,14 @@ func invitationReader(db *sql.DB) invitations.Reader {
 	}
 
 	return invitations.NewSQLReader(db)
+}
+
+// userReader returns the users Reader over db, or nil when there is no
+// database, so the user routes answer 503 rather than panicking.
+func userReader(db *sql.DB) users.Reader {
+	if db == nil {
+		return nil
+	}
+
+	return users.NewSQLReader(db)
 }

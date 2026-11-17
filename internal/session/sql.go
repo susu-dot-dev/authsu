@@ -7,8 +7,11 @@ package session
 // Revocation is a time and not a flag, compared with now, so the same query
 // would serve a revocation scheduled for later; nothing schedules one today.
 //
-// The role comes from the account, so a role change takes effect on the next
-// request instead of when the session was minted.
+// The role and the account's revocation come from the account, read in this
+// same primary-key lookup, so a role change or a revoked account takes effect
+// on the next request instead of when the session was minted. That join is why
+// the role is not a claim in the token: the key row has to be read anyway, so
+// a claim would save nothing and could only be stale (docs/users_design.md).
 //
 // Arguments: kid, now (unix seconds), now.
 const activeKeyQuery = `
@@ -18,7 +21,8 @@ JOIN users u ON u.id = k.user_id
 WHERE k.kid = ?
   AND k.kind = 'session'
   AND (k.revoked_at IS NULL OR k.revoked_at > ?)
-  AND k.expires_at > ?`
+  AND k.expires_at > ?
+  AND u.revoked_at IS NULL`
 
 // InsertSessionQuery issues a session key. granted_from is the hash of the login
 // challenge, and the column is UNIQUE, which is what makes a login single use: a
@@ -35,11 +39,18 @@ WHERE k.kid = ?
 // defect on our side (a 500 that pages someone) for what is a user deleting
 // their own passkey.
 //
+// The subselect also requires the account not to be revoked, for the same
+// reason: an admin revoking the account between finish's lookup and this write
+// fails the batch as a conflict, so no session is issued to a revoked account.
+// (Verification would refuse such a session anyway; this keeps it from
+// existing.)
+//
 // Arguments, in order: kid, credential_id (for the subselect), jwk, expires_at,
 // granted_from, credential_id, created_at.
 const InsertSessionQuery = `
 INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, granted_from, credential_id, created_at)
-VALUES (?, (SELECT user_id FROM credentials WHERE id = ?), 'session', ?, ?, ?, ?, ?)`
+VALUES (?, (SELECT c.user_id FROM credentials c JOIN users u ON u.id = c.user_id
+            WHERE c.id = ? AND u.revoked_at IS NULL), 'session', ?, ?, ?, ?, ?)`
 
 // logoutQuery revokes a session key now. A key that is already revoked keeps its
 // earlier time, so logging out twice cannot move a revocation later.
