@@ -1,10 +1,7 @@
 /**
  * Wrangler configuration: https://developers.cloudflare.com/workers/wrangler/configuration/
  *
- * The Worker is built by `build.command` below. Compile-time feature flags are
- * Go build tags passed through the GO_TAGS environment variable by the
- * Makefile; the default (no tags) is the production build. See
- * docs/devops.md.
+ * The Worker is built by `build.command` below. See docs/devops.md.
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",

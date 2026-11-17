@@ -65,7 +65,7 @@ func TestSessionRoutesOnlyAcceptTheirMethod(t *testing.T) {
 
 				rec := httptest.NewRecorder()
 				req := newRequest(t, method, path, nil)
-				app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
+				app.NewHandler(app.Platform{}).ServeHTTP(rec, req)
 
 				if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != allow {
 					t.Errorf("status = %d, Allow = %q, want 405 and %s", rec.Code, rec.Header().Get("Allow"), allow)
@@ -83,7 +83,7 @@ func TestThereIsNoRefreshRoute(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequestWithContext(t.Context(), method, "/api/refresh", nil)
-		app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
+		app.NewHandler(app.Platform{}).ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("%s /api/refresh = %d, want 404", method, rec.Code)
@@ -112,7 +112,7 @@ func TestSessionRoutesWithoutADatabaseAreUnavailable(t *testing.T) {
 
 			rec := httptest.NewRecorder()
 			req := newRequest(t, tt.method, tt.path, strings.NewReader(tt.body))
-			app.NewHandler(app.Deps{}, app.Platform{Getenv: loginEnv}).ServeHTTP(rec, req)
+			app.NewHandler(app.Platform{Getenv: loginEnv}).ServeHTTP(rec, req)
 
 			if rec.Code != http.StatusServiceUnavailable {
 				t.Errorf("status = %d, want %d: %s", rec.Code, http.StatusServiceUnavailable, rec.Body)
@@ -127,7 +127,7 @@ func TestLoginBeginNeedsNoDatabase(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := newRequest(t, http.MethodPost, loginBeginPath, nil)
-	app.NewHandler(app.Deps{}, app.Platform{Getenv: loginEnv}).ServeHTTP(rec, req)
+	app.NewHandler(app.Platform{Getenv: loginEnv}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("begin = %d %s", rec.Code, rec.Body)
@@ -143,7 +143,7 @@ func TestLoginFinishRejectsBadJSON(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
-	app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec,
+	app.NewHandler(app.Platform{}).ServeHTTP(rec,
 		newRequest(t, http.MethodPost, loginFinishPath, strings.NewReader(`nope`)))
 
 	if rec.Code != http.StatusBadRequest {
@@ -233,7 +233,7 @@ func newPasskey(t *testing.T) passkey {
 func loginHandler(pk passkey) (http.Handler, *[][]atomic.Statement) {
 	var batches [][]atomic.Statement
 
-	handler := app.NewHandler(app.Deps{}, app.Platform{
+	handler := app.NewHandler(app.Platform{
 		DB: sql.OpenDB(credentialDB{row: []driver.Value{
 			"00000000-0000-7000-8000-000000000001", "00000000-0000-7000-8000-000000000002",
 			pk.cose, int64(0x05), loginHandle(), "admin",

@@ -7,7 +7,7 @@
 // cannot see: TinyGo's net/http differences, the D1 driver, and the wrangler
 // wiring itself.
 //
-// Run them with `make test-e2e`, which builds the production Worker first. This
+// Run them with `make test-e2e`, which builds the Worker first. This
 // harness only runs what was built: wrangler.e2e.jsonc has no build command, so
 // wrangler never rebuilds it.
 package e2e_test

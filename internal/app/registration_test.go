@@ -57,7 +57,7 @@ func TestRegistrationRoutesOnlyAcceptPost(t *testing.T) {
 
 				rec := httptest.NewRecorder()
 				req := newRequest(t, method, path, nil)
-				app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec, req)
+				app.NewHandler(app.Platform{}).ServeHTTP(rec, req)
 
 				if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPost {
 					t.Errorf("status = %d, Allow = %q, want 405 and POST", rec.Code, rec.Header().Get("Allow"))
@@ -75,7 +75,7 @@ func TestRegistrationWithoutADatabaseIsUnavailable(t *testing.T) {
 	for _, path := range registrationRoutes() {
 		rec := httptest.NewRecorder()
 		body := strings.NewReader(`{"invitationCode":"c","name":"n"}`)
-		app.NewHandler(app.Deps{}, app.Platform{Getenv: registrationEnv}).ServeHTTP(rec,
+		app.NewHandler(app.Platform{Getenv: registrationEnv}).ServeHTTP(rec,
 			newRequest(t, http.MethodPost, path, body))
 
 		if rec.Code != http.StatusServiceUnavailable {
@@ -90,7 +90,7 @@ func TestRegistrationRejectsBadJSON(t *testing.T) {
 
 	for _, path := range registrationRoutes() {
 		rec := httptest.NewRecorder()
-		app.NewHandler(app.Deps{}, app.Platform{}).ServeHTTP(rec,
+		app.NewHandler(app.Platform{}).ServeHTTP(rec,
 			newRequest(t, http.MethodPost, path, strings.NewReader(`nope`)))
 
 		if rec.Code != http.StatusBadRequest {
@@ -159,7 +159,7 @@ func TestRegistrationOnTheHost(t *testing.T) {
 
 	var batches [][]atomic.Statement
 
-	handler := app.NewHandler(app.Deps{}, app.Platform{
+	handler := app.NewHandler(app.Platform{
 		DB:     sql.OpenDB(invitationDB{}),
 		Getenv: registrationEnv,
 		Batch: func(_ context.Context, statements ...atomic.Statement) error {

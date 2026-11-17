@@ -29,7 +29,6 @@ func main() {
 	}
 
 	workers.Serve(app.NewHandler(
-		app.Deps{Diagnostics: diagnostics()},
 		app.Platform{DB: db, Batch: batch(db), Getenv: cloudflare.Getenv, Log: logError},
 	))
 }

@@ -55,9 +55,6 @@ func TestFirstRunRefusesWhenOtherInvitationExists(t *testing.T) {
 // invitations or users tables being empty, and it must not be split into
 // parallel subtests.
 //
-// It runs in both the dev and the production build: the endpoint is not behind
-// a build flag, so it must behave identically in each.
-//
 //nolint:paralleltest // shares one database with the other first-run test; the steps are ordered
 func TestFirstRun(t *testing.T) {
 	t.Run("wrong method does not mint", wrongMethodDoesNotMint)

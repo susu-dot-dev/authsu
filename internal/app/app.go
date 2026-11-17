@@ -10,7 +10,6 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/atomic"
-	"github.com/susu-dot-dev/authsu/internal/diag"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/login"
@@ -18,15 +17,6 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/session"
 )
-
-// Deps are the build-time feature flags: pluggable behaviour that must differ
-// between builds. It is not a service registry. Always-on features are built
-// inside this package from Platform, so they exist in every build and cannot
-// be forgotten by a caller.
-type Deps struct {
-	// Diagnostics adds developer routes. Nil means none (production).
-	Diagnostics diag.Diagnostics
-}
 
 // Platform carries the resources the Worker runtime provides, never services.
 type Platform struct {
@@ -50,7 +40,7 @@ type router struct {
 	log httpapi.Logger
 }
 
-// Handle implements diag.Router.
+// Handle registers handler for path and the one method it accepts.
 //
 // TinyGo's http.ServeMux never matches method-qualified patterns such as
 // "GET /x", so the path is registered plain and Serve enforces the method.
@@ -58,8 +48,9 @@ func (r router) Handle(method, path string, handler httpapi.Handler) {
 	r.mux.Handle(path, httpapi.Serve(method, r.log, handler))
 }
 
-// NewHandler returns the Worker's HTTP handler.
-func NewHandler(deps Deps, platform Platform) http.Handler {
+// NewHandler returns the Worker's HTTP handler. Every feature is built here
+// from platform.
+func NewHandler(platform Platform) http.Handler {
 	logger := platform.Log
 	if logger == nil {
 		logger = func(httpapi.Request, *apierr.Error) {}
@@ -101,10 +92,6 @@ func NewHandler(deps Deps, platform Platform) http.Handler {
 	})
 	routes.Handle(http.MethodGet, "/api/session", sessions.WhoAmIHandler(platform.Getenv))
 	routes.Handle(http.MethodPost, "/api/logout", sessions.LogoutHandler(platform.Getenv))
-
-	if deps.Diagnostics != nil {
-		deps.Diagnostics.Register(routes)
-	}
 
 	return routes.mux
 }
