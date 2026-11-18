@@ -34,6 +34,21 @@ const (
 	stateDirEnv   = "E2E_STATE"
 	defaultState  = ".wrangler/e2e-state"
 
+	// shardsEnv is how many Workers a local run spreads the tests over, each
+	// in its own process; unset means defaultShards, 1 turns sharding off.
+	//
+	// shardIndexEnv and shardTotalEnv make one process run one slice of the
+	// suite on its own Worker: slice index (from 0) of total. The local
+	// coordinator sets them on its children, and CI sets them directly, one
+	// job per slice, so a slice is the same thing on one machine or on many.
+	// shardIndexEnv also marks a process as not the coordinator.
+	shardsEnv      = "E2E_SHARDS"
+	shardIndexEnv  = "E2E_SHARD_INDEX"
+	shardTotalEnv  = "E2E_SHARD_TOTAL"
+	defaultShards  = 2
+	listOnlyEnv    = "E2E_LIST_ONLY"
+	listOnlyMarker = "1"
+
 	// wranglerConfig is wrangler.jsonc without its build command, so wrangler
 	// serves the build/ that make produced rather than running TinyGo again.
 	wranglerConfig = "wrangler.e2e.jsonc"
@@ -96,6 +111,21 @@ func run(m *testing.M) int {
 	root, err := filepath.Abs("..")
 	if err != nil {
 		return fail("resolve repo root: %v", err)
+	}
+
+	// A slice, or a run on a single Worker, serves its own Worker. Otherwise
+	// this process only deals the tests out to slices (shards_test.go).
+	switch {
+	case os.Getenv(listOnlyEnv) == listOnlyMarker:
+		// Only listing tests: nothing to serve, so start no Worker.
+		return m.Run()
+	case os.Getenv(shardIndexEnv) == "" && shardCount() > 1:
+		return coordinate(ctx, root)
+	}
+
+	err = selectSlice(ctx)
+	if err != nil {
+		return fail("%v", err)
 	}
 
 	state := os.Getenv(stateDirEnv)

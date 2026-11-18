@@ -3,7 +3,7 @@
 #   - Only actions/* and golangci/golangci-lint-action, each pinned to a full
 #     commit SHA (version in the trailing comment).
 #   - The Worker is built once, in the `build` job, and handed to `size` and
-#     `e2e` as a workflow artifact. Artifacts are scoped to a single run, so
+#     the `e2e` jobs as a workflow artifact. Artifacts are scoped to a single run, so
 #     unlike a cache a pull request cannot plant one for another run to use.
 #   - TinyGo is downloaded from the official release by scripts/install-tinygo.sh
 #     and verified against the SHA-256 pinned in tools.env.
@@ -13,7 +13,9 @@
 # local equivalent of all jobs below; here it is split into parallel jobs, each
 # calling a subset of the same targets, so wall time is the slowest job rather
 # than the sum. Locally `make` shares one build/ between `size` and `test-e2e`;
-# here `build` produces it and the other two download it. Toolchain setup lives
+# here `build` produces it and the others download it. The e2e suite runs as a
+# matrix of slices, one machine each; locally the same slices are parallel
+# processes on one machine. Toolchain setup lives
 # in .github/actions/setup.
 name: CI
 
@@ -97,10 +99,24 @@ jobs:
       - run: make size PREBUILT=1
 
   e2e:
-    name: E2E
+    # One job per slice of the suite, each on its own machine with its own
+    # Worker and database. The slices are the harness's own (docs/TESTING.md,
+    # "End-to-end tests"): slice `shard` of `total` runs every total-th test, so
+    # `total` below and the number of `shard` entries must agree. The aggregate
+    # `ci` job waits for all of them through `needs: e2e`.
+    name: E2E Shard ${{ matrix.shard }}
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      # Let every slice finish: a failure in one should not hide another's.
+      fail-fast: false
+      matrix:
+        total: [2]
+        shard: [0, 1]
+    env:
+      E2E_SHARD_INDEX: ${{ matrix.shard }}
+      E2E_SHARD_TOTAL: ${{ matrix.total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

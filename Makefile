@@ -167,9 +167,15 @@ config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for 
 # simulated D1) on a throwaway state directory and a free port, driven over
 # HTTP. wrangler.e2e.jsonc has no build.command, so wrangler serves exactly the
 # build/ that make produced instead of rebuilding it.
+#
+# The suite is cut into slices that each run on their own Worker and database
+# (docs/TESTING.md, "End-to-end tests"). Locally the harness runs E2E_SHARDS
+# slices (default 2) as parallel processes; E2E_SHARDS=1 runs it all on one
+# Worker. CI runs one slice per job instead: it sets E2E_SHARD_INDEX and
+# E2E_SHARD_TOTAL, which this target passes through to the harness untouched.
 
 .PHONY: test-e2e
-test-e2e: $(WASM) ## End-to-end tests against the built Worker
+test-e2e: $(WASM) ## End-to-end tests against the built Worker (E2E_SHARDS=n for n parallel Workers, default 2)
 	E2E_STATE=$(E2E_STATE) go test -tags e2e -count=1 -timeout 10m ./e2e/...
 
 .PHONY: clean
