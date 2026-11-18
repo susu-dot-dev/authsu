@@ -31,6 +31,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -43,7 +44,6 @@ var _ auth.KeyReader = (*store.Store)(nil)
 var (
 	errDB      = errors.New("SELECT jwk FROM japikeys: database is on fire")
 	errEncode  = errors.New("encoder is broken")
-	errPlain   = errors.New("a requirement that forgot to classify")
 	errRevoked = errors.New("the session was revoked by another request")
 )
 
@@ -87,6 +87,7 @@ const (
 	claimIat   = "iat"
 	claimVer   = "ver"
 	claimScope = "scope"
+	claimAct   = "act"
 	versionV2  = "japikey-v2"
 	audSession = "authsu/session"
 	audForAPI  = "authsu/api_key"
@@ -97,8 +98,10 @@ const (
 const (
 	bodyUnauthenticated = `{"error":{"code":"unauthenticated","message":"not signed in"}}` + "\n"
 	bodyForbidden       = `{"error":{"code":"forbidden","message":"administrator access is required"}}` + "\n"
-	bodyNotConfigured   = `{"error":{"code":"not_configured","message":"the service is not configured"}}` + "\n"
-	bodyUnavailable     = `{"error":{"code":"session_verify_failed",` +
+	bodyNoScope         = `{"error":{"code":"insufficient_scope",` +
+		`"message":"this credential lacks the scope user:read"}}` + "\n"
+	bodyNotConfigured = `{"error":{"code":"not_configured","message":"the service is not configured"}}` + "\n"
+	bodyUnavailable   = `{"error":{"code":"session_verify_failed",` +
 		`"message":"sessions are temporarily unavailable"}}` + "\n"
 	bodyInvalidID = `{"error":{"code":"invalid_id","message":` +
 		`"id must be a lower-case UUID such as 01234567-89ab-cdef-0123-456789abcdef"}}` + "\n"
@@ -214,21 +217,33 @@ func (r *rig) capture(call *auth.Call) result.Result[httpapi.Response] {
 	return result.Ok(httpapi.JSON(http.StatusOK, map[string]bool{"ok": true}))
 }
 
-// getRoute builds a GET route that records its calls.
-func (r *rig) getRoute(path string, credential auth.Credential, require func(auth.Principal) error) auth.Route {
+// accessFor is the access a test route declares by default for a credential:
+// none for a None route (which has no caller to ask about) and Open() for an
+// Authenticated one.
+func accessFor(credential auth.Credential) auth.Access {
+	if credential == auth.Authenticated {
+		return auth.Open()
+	}
+
+	return auth.Access{}
+}
+
+// getRoute builds a GET route that records its calls. A None route has no
+// access, and an Authenticated one declares access.
+func (r *rig) getRoute(path string, credential auth.Credential, access auth.Access) auth.Route {
 	return auth.Route{
-		Method: http.MethodGet, Path: path, MaxBody: 0, Credential: credential, Require: require, Handle: r.capture,
+		Method: http.MethodGet, Path: path, MaxBody: 0, Credential: credential, Access: access, Handle: r.capture,
 	}
 }
 
 // standardRoutes is the route table the boundary tests drive.
 func (r *rig) standardRoutes() []auth.Route {
 	return []auth.Route{
-		r.getRoute(pathPublic, auth.None, nil),
-		r.getRoute(pathPublic+"/{id}", auth.None, nil),
-		r.getRoute(pathMe, auth.Session, nil),
-		r.getRoute(pathAdmin, auth.Session, auth.Admin),
-		r.getRoute(patternItem, auth.Session, nil),
+		r.getRoute(pathPublic, auth.None, auth.Access{}),
+		r.getRoute(pathPublic+"/{id}", auth.None, auth.Access{}),
+		r.getRoute(pathMe, auth.Authenticated, auth.Open()),
+		r.getRoute(pathAdmin, auth.Authenticated, auth.Needs(scope.UserRead)),
+		r.getRoute(patternItem, auth.Authenticated, auth.Open()),
 	}
 }
 
@@ -353,9 +368,9 @@ type forged struct {
 	JWK string
 }
 
-// forge signs a session token for subject under issuer, with claims that mutate
-// may change or delete.
-func forge(t *testing.T, issuer auth.Issuer, subject string, now time.Time, mutate func(claims map[string]any)) forged {
+// forge signs a session token for the standard user under issuer, with claims
+// that mutate may change or delete.
+func forge(t *testing.T, issuer auth.Issuer, now time.Time, mutate func(claims map[string]any)) forged {
 	t.Helper()
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -365,7 +380,7 @@ func forge(t *testing.T, issuer auth.Issuer, subject string, now time.Time, muta
 
 	kid := uuid.NewV7()
 	claims := map[string]any{
-		claimSub: subject,
+		claimSub: userID,
 		claimIss: issuer.Base + "/" + kid.String(),
 		claimAud: auth.Audience(auth.KindSession),
 		claimExp: now.Add(time.Hour).Unix(),
@@ -542,4 +557,99 @@ func migrationLimits(t *testing.T, pattern string) []int {
 	}
 
 	return limits
+}
+
+// bearerSpec describes an API key to create and store, for the tests of the
+// bearer credential and of scopes.
+type bearerSpec struct {
+	// scope is the key's own scope list, signed into its token.
+	scope scope.List
+	// role is the owner's role in the stored row.
+	role string
+	// agent is the agent the key belongs to, or "" for a user's own key.
+	agent string
+	// agentScopes is the agent's stored scope list (JSON), read now.
+	agentScopes string
+	// actor is what the token's act claim says. By default it is agent.
+	actor *string
+	// claims are further claims to sign into the token.
+	claims map[string]any
+	// kind is the kind of key; it defaults to KindAPIKey.
+	kind string
+}
+
+// withActor returns a copy of s whose token names actor as its actor, whatever
+// the row's agent is.
+func (s bearerSpec) withActor(actor string) bearerSpec {
+	s.actor = &actor
+
+	return s
+}
+
+// apiKey creates an API key as spec describes, stores its row as the database
+// would hold it, and returns it.
+func (r *rig) apiKey(spec bearerSpec) auth.Key {
+	r.t.Helper()
+
+	kind := spec.kind
+	if kind == "" {
+		kind = auth.KindAPIKey
+	}
+
+	claims := map[string]any{}
+	maps.Copy(claims, spec.claims)
+
+	actor := spec.agent
+	if spec.actor != nil {
+		actor = *spec.actor
+	}
+
+	if actor != "" {
+		claims[claimAct] = map[string]any{claimSub: actor}
+	}
+
+	key, err := auth.CreateKey(r.issuer, auth.KeySpec{
+		Kind: kind, Subject: userID, Expires: r.now.Add(time.Hour), Scope: spec.scope, Claims: claims,
+	})
+	if err != nil {
+		r.t.Fatalf("CreateKey: %v", err)
+	}
+
+	role := spec.role
+	if role == "" {
+		role = roleMember
+	}
+
+	r.keys.rows[rowKey{kid: key.ID.String(), kind: kind}] = store.ActiveKey{
+		JWK: []byte(key.JWK), UserID: userID, CredentialID: "", Role: role, ExpiresAt: key.ExpiresAt,
+		AgentID: spec.agent, AgentScopes: spec.agentScopes,
+	}
+
+	return key
+}
+
+// bearer is the Authorization header value for key.
+func bearer(key auth.Key) string { return "Bearer " + key.JWT }
+
+// serveWith is serve with Authorization header values.
+func (r *rig) serveWith(
+	routes []auth.Route, target string, authorization []string, cookies []*http.Cookie,
+) *httptest.ResponseRecorder {
+	r.t.Helper()
+
+	httpReq := httptest.NewRequestWithContext(r.t.Context(), http.MethodGet, target, nil)
+	httpReq.Header.Set("Content-Type", jsonType)
+
+	for _, value := range authorization {
+		httpReq.Header.Add("Authorization", value)
+	}
+
+	for _, cookie := range cookies {
+		httpReq.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	auth.Handler(routes, r.deps()).ServeHTTP(rec, httpReq)
+
+	return rec
 }

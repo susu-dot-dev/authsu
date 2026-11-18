@@ -109,6 +109,8 @@ type request struct {
 	body   []byte
 	// token is the session token, sent as the session cookie.
 	token string
+	// bearer is an API key, sent as "Authorization: Bearer <bearer>".
+	bearer string
 	// headers are set after the defaults, so they can replace Content-Type or
 	// Cookie. A header set to "" is removed.
 	headers map[string]string
@@ -150,6 +152,10 @@ func (r request) build(t *testing.T) *http.Request {
 func (r request) applyHeaders(req *http.Request) {
 	if r.token != "" {
 		req.Header.Set("Cookie", cookieName+"="+r.token)
+	}
+
+	if r.bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+r.bearer)
 	}
 
 	for name, value := range r.headers {
@@ -811,7 +817,7 @@ func seedAgent(t *testing.T, id, owner, name string) {
 	t.Helper()
 
 	seed(t, "INSERT INTO agents (id, user_id, name, scopes, created_at) "+
-		"VALUES (?, ?, ?, 'default:agent', strftime('%s','now'))", id, owner, name)
+		"VALUES (?, ?, ?, '[\"default:agent\"]', strftime('%s','now'))", id, owner, name)
 }
 
 // seedAgentKey inserts an API key row for an agent, so a test can see
@@ -820,7 +826,7 @@ func seedAgentKey(t *testing.T, kid, owner, agent string) {
 	t.Helper()
 
 	seed(t, "INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, agent_id, scope, created_at) "+
-		"VALUES (?, ?, 'api_key', '{}', strftime('%s','now') + 3600, ?, 'default:agent', strftime('%s','now'))",
+		"VALUES (?, ?, 'api_key', '{}', strftime('%s','now') + 3600, ?, '[\"default:agent\"]', strftime('%s','now'))",
 		kid, owner, agent)
 }
 

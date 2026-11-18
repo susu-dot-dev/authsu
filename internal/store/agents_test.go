@@ -37,12 +37,12 @@ func agentIDAt(n int) string { return fmt.Sprintf("01900000-0000-7000-8000-%012d
 
 // agentRowAt is a returned agent row: id, name, scopes, revoked_at, created_at.
 func agentRowAt(n int) []any {
-	return row(agentIDAt(n), "agent "+strconv.Itoa(n), "default:agent", nil, int64(1_700_000_000+n))
+	return row(agentIDAt(n), "agent "+strconv.Itoa(n), `["default:agent"]`, nil, int64(1_700_000_000+n))
 }
 
 // agentRow is the row of the agent agentTarget.
 func agentRow() []any {
-	return row(agentTarget, "build bot", "default:agent", nil, int64(1_700_000_000))
+	return row(agentTarget, "build bot", `["default:agent"]`, nil, int64(1_700_000_000))
 }
 
 // agentRevokedRow is agentRow once it is revoked.
@@ -302,13 +302,13 @@ func TestAgentDecoding(t *testing.T) {
 		want store.Agent
 	}{
 		{name: "an active agent", row: agentRow(), want: store.Agent{
-			ID: agentTarget, Name: "build bot", Scopes: "default:agent", RevokedAt: nil, CreatedAt: 1_700_000_000,
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
 		}},
 		{name: "a revoked agent", row: agentRevokedRow(), want: store.Agent{
-			ID: agentTarget, Name: "build bot", Scopes: "default:agent", RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
 		}},
 		{name: "a multibyte name is kept as is", row: with(agentRow(), 1, "ビルド・ボット 🤖"), want: store.Agent{
-			ID: agentTarget, Name: "ビルド・ボット 🤖", Scopes: "default:agent", RevokedAt: nil, CreatedAt: 1_700_000_000,
+			ID: agentTarget, Name: "ビルド・ボット 🤖", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
 		}},
 	}
 
@@ -607,37 +607,52 @@ func TestGetAgentFailures(t *testing.T) {
 		})
 }
 
+// createAgentCase is a user's create and the batch it writes.
+type createAgentCase struct {
+	name  string
+	agent store.NewAgent
+}
+
+// createAgentCases are the creates TestCreateAgentStatements pins.
+func createAgentCases(t *testing.T) []createAgentCase {
+	t.Helper()
+
+	expires := time.Unix(1_707_776_123, 0)
+
+	return []createAgentCase{
+		{name: "a typical agent", agent: store.NewAgent{
+			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
+			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+			KeyExpiresAt: expires, CreatedAt: now,
+		}},
+		{name: "a multibyte name and another limit", agent: store.NewAgent{
+			ID: agentCursorID, Owner: "user-2", Name: mustAgentName(t, "ボット 🤖"), Scopes: `[]`,
+			KeyScope: `[]`, MaxActive: 1, KeyID: "kid-2", KeyJWK: `{"keys":[]}`, KeyExpiresAt: expires.Add(time.Hour),
+			CreatedAt: now.Add(time.Minute),
+		}},
+	}
+}
+
 // TestCreateAgentStatements pins the batch a create writes: the guards that make
 // the agent conditional on its owner, and the key whose owner is read from the
 // agent's row so that no agent means a failed batch.
 func TestCreateAgentStatements(t *testing.T) {
 	t.Parallel()
 
-	expires := time.Unix(1_707_776_123, 0)
-
-	tests := []struct {
-		name  string
-		agent store.NewAgent
-	}{
-		{name: "a typical agent", agent: store.NewAgent{
-			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: "default:agent",
-			MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`, KeyExpiresAt: expires, CreatedAt: now,
-		}},
-		{name: "a multibyte name and another limit", agent: store.NewAgent{
-			ID: agentCursorID, Owner: "user-2", Name: mustAgentName(t, "ボット 🤖"), Scopes: "a:b c:d",
-			MaxActive: 1, KeyID: "kid-2", KeyJWK: `{"keys":[]}`, KeyExpiresAt: expires.Add(time.Hour),
-			CreatedAt: now.Add(time.Minute),
-		}},
-	}
-
-	for _, test := range tests {
+	for _, test := range createAgentCases(t) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := newFake(applied(2))
+			// The agent insert returns the scopes it stored, which is what the
+			// caller reports. Here the row holds what was offered.
+			fake := newFake(createdAgent(test.agent.Scopes))
 
-			err := fake.store().CreateAgent(context.Background(), test.agent)
+			stored, err := fake.store().CreateAgent(context.Background(), test.agent)
 			checkErr(t, err, nil)
+
+			if stored != test.agent.Scopes {
+				t.Errorf("stored scopes = %q, want %q", stored, test.agent.Scopes)
+			}
 
 			agent := test.agent
 
@@ -650,6 +665,8 @@ func TestCreateAgentStatements(t *testing.T) {
 						// the count is part of the write.
 						"WHERE u.id = ?5 AND u.revoked_at IS NULL",
 						"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6",
+						// The stored list comes back from the write itself.
+						"RETURNING scopes",
 					},
 					args: []any{
 						agent.ID, agent.Name.String(), agent.Scopes, agent.CreatedAt.Unix(),
@@ -664,7 +681,7 @@ func TestCreateAgentStatements(t *testing.T) {
 					},
 					args: []any{
 						agent.KeyID, agent.ID, store.KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
-						agent.ID, agent.Scopes, agent.CreatedAt.Unix(),
+						agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
 					},
 				},
 			)
@@ -683,11 +700,136 @@ func TestCreateAgentFailures(t *testing.T) {
 
 	runFailures(t, 2, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
 		func(s *store.Store) error {
-			return passErr(s.CreateAgent(context.Background(), store.NewAgent{
-				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "default:agent",
+			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
 				MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
 			}))
 		})
+}
+
+// TestCreateAgentByAgentStatements pins the batch an agent's create writes. The
+// new agent's scopes are read from the creating agent's row in the write and are
+// not an argument at all, the creating agent must be the owner's and active, and
+// the key's scope is still the one the caller chose (it is checked against the
+// creating key by the feature, which holds the key's list).
+func TestCreateAgentByAgentStatements(t *testing.T) {
+	t.Parallel()
+
+	expires := time.Unix(1_707_776_123, 0)
+	agent := store.NewAgent{
+		ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "child"),
+		// A request's idea of the scopes must never reach the write.
+		Scopes: `["user:read"]`, KeyScope: `["default:agent"]`, CreatedBy: agentCursorID,
+		MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`, KeyExpiresAt: expires, CreatedAt: now,
+	}
+
+	// The creating agent's row holds other scopes than the request offered, and
+	// the write returns the row's: that is what the caller must report.
+	const creatorScopes = `["default:agent","agent:create"]`
+
+	fake := newFake(createdAgent(creatorScopes))
+
+	stored, err := fake.store().CreateAgent(context.Background(), agent)
+	checkErr(t, err, nil)
+
+	if stored != creatorScopes {
+		t.Errorf("stored scopes = %q, want the creating agent's %q", stored, creatorScopes)
+	}
+
+	checkAgentBatch(t, fake,
+		wantStatement{
+			fragments: []string{
+				"INSERT INTO agents (id, user_id, name, scopes, created_at)",
+				// Scopes come from the creating agent's row.
+				"SELECT ?1, u.id, ?2, c.scopes, ?4 FROM users u",
+				// It must be the owner's and not revoked.
+				"JOIN agents c ON c.user_id = u.id AND c.id = ?3 AND c.revoked_at IS NULL",
+				"WHERE u.id = ?5 AND u.revoked_at IS NULL",
+				"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6",
+				// The creating agent's list, as the write read it, comes back.
+				"RETURNING scopes",
+			},
+			args: []any{
+				agent.ID, agent.Name.String(), agent.CreatedBy, agent.CreatedAt.Unix(), agent.Owner, int64(agent.MaxActive),
+			},
+		},
+		wantStatement{
+			fragments: []string{"(SELECT user_id FROM agents WHERE id = ?)"},
+			args: []any{
+				agent.KeyID, agent.ID, store.KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
+				agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
+			},
+		},
+	)
+
+	for _, arg := range fake.calls[0][0].Args {
+		if arg == agent.Scopes {
+			t.Error("the request's scopes were bound in an agent's create; they must come from the creating agent's row")
+		}
+	}
+}
+
+// TestCreateAgentByAgentFailures holds that a revoked creating agent, a revoked
+// owner and the limit (conflicts) and every other failure come back classified.
+func TestCreateAgentByAgentFailures(t *testing.T) {
+	t.Parallel()
+
+	runFailures(t, 2, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
+		func(s *store.Store) error {
+			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
+				CreatedBy: agentCursorID, MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+			}))
+		})
+}
+
+// createdAgent is the outcome of a create batch whose agent insert returned the
+// scopes it stored and whose key insert returned nothing.
+func createdAgent(scopes string) outcome {
+	return outcome{results: []store.Result{{Changes: 1, Rows: [][]any{row(scopes)}}, {Changes: 1, Rows: nil}}, err: nil}
+}
+
+// TestCreateAgentResultShape holds that a batch which succeeded without the
+// promised row is a defect, never a missing agent or a made-up scope list: the
+// key insert depends on the agent row, so a result without it means the
+// database did not do what the statements say.
+func TestCreateAgentResultShape(t *testing.T) {
+	t.Parallel()
+
+	two := func(rows [][]any) outcome {
+		return outcome{results: []store.Result{{Changes: 1, Rows: rows}, {Changes: 1, Rows: nil}}, err: nil}
+	}
+
+	tests := []struct {
+		name string
+		out  outcome
+	}{
+		{name: "no row returned", out: two(nil)},
+		{name: "two rows returned", out: two([][]any{row("[]"), row("[]")})},
+		{name: "scopes not text", out: two([][]any{row(int64(1))})},
+		{name: "scopes is NULL", out: two([][]any{row(nil)})},
+		{name: "an extra column", out: two([][]any{row("[]", "[]")})},
+		{name: "no column", out: two([][]any{row()})},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(test.out)
+
+			stored, err := fake.store().CreateAgent(context.Background(), store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
+				MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+			})
+
+			checkErr(t, err, defectOf(store.CodeAgentCreateRejected))
+
+			if stored != "" {
+				t.Errorf("stored scopes = %q on a defect, want none", stored)
+			}
+		})
+	}
 }
 
 // TestRenameAgent holds the outcomes of a rename: the row is whatever the one
@@ -705,10 +847,10 @@ func TestRenameAgent(t *testing.T) {
 		err  error
 	}{
 		{name: "renamed", rows: [][]any{with(agentRow(), 1, "renamed")}, want: store.Agent{
-			ID: agentTarget, Name: "renamed", Scopes: "default:agent", RevokedAt: nil, CreatedAt: 1_700_000_000,
+			ID: agentTarget, Name: "renamed", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
 		}},
 		{name: "revoked keeps its name and says so", rows: [][]any{agentRevokedRow()}, want: store.Agent{
-			ID: agentTarget, Name: "build bot", Scopes: "default:agent", RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
 		}},
 		{name: "no such agent", rows: nil, err: store.ErrNotFound},
 	}
@@ -782,10 +924,10 @@ func TestRevokeAgent(t *testing.T) {
 		err     error
 	}{
 		{name: "revoked with two keys", outcome: agentRevoked(2, agentRevokedRow()), want: store.Agent{
-			ID: agentTarget, Name: "build bot", Scopes: "default:agent", RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
 		}},
 		{name: "revoked with no key left to revoke", outcome: agentRevoked(0, agentRevokedRow()), want: store.Agent{
-			ID: agentTarget, Name: "build bot", Scopes: "default:agent", RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
 		}},
 		{name: "no such agent", outcome: agentRevoked(0), err: store.ErrNotFound},
 	}

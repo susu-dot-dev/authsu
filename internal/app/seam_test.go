@@ -62,63 +62,93 @@ func TestSessionRowSeam(t *testing.T) {
 		},
 		"expires_at as float64": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, float64(s.key.ExpiresAt.Unix())})
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, float64(s.key.ExpiresAt.Unix()), "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
 		"expires_at as text": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, "1900000000"})
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, "1900000000", "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
 		"expires_at NULL": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, nil})
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, nil, "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
 		"role NULL": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", nil, s.key.ExpiresAt.Unix()})
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", nil, s.key.ExpiresAt.Unix(), "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
 		"role as a blob": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", []byte(roleAdmin), s.key.ExpiresAt.Unix()})
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", []byte(roleAdmin), s.key.ExpiresAt.Unix(), "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
 		"jwk as a blob": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{[]byte(s.key.JWK), s.userID, "", roleMember, s.key.ExpiresAt.Unix()})
+				return s.activeKeyRow([]any{[]byte(s.key.JWK), s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
 		"user_id as an integer": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, int64(7), "", roleMember, s.key.ExpiresAt.Unix()})
+				return s.activeKeyRow([]any{s.key.JWK, int64(7), "", roleMember, s.key.ExpiresAt.Unix(), "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
 		"credential_id NULL": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, nil, roleMember, s.key.ExpiresAt.Unix()})
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, nil, roleMember, s.key.ExpiresAt.Unix(), "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
 		},
+		"agent id NULL": {
+			row: func(s session) step {
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), nil, ""})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
+			wantLogged: []string{store.CodeSessionVerifyRejected},
+		},
+		"agent scopes NULL": {
+			row: func(s session) step {
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", nil})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
+			wantLogged: []string{store.CodeSessionVerifyRejected},
+		},
+		"agent scopes as a blob": {
+			row: func(s session) step {
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", []byte("[]")})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
+			wantLogged: []string{store.CodeSessionVerifyRejected},
+		},
+		"a session whose row names an agent: the token has no actor": {
+			row: func(s session) step {
+				return s.activeKeyRow([]any{
+					s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), agentRowID, `["agent:read"]`,
+				})
+			},
+			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+			wantLogged: []string{auth.CodeUnauthenticated},
+		},
 		"a column short": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember})
+				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeSessionVerifyRejected},
@@ -155,14 +185,14 @@ func TestSessionRowSeam(t *testing.T) {
 		},
 		"the row belongs to someone else": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, memberID, "", roleAdmin, s.key.ExpiresAt.Unix()})
+				return s.activeKeyRow([]any{s.key.JWK, memberID, "", roleAdmin, s.key.ExpiresAt.Unix(), "", ""})
 			},
 			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
 			wantLogged: []string{auth.CodeUnauthenticated},
 		},
 		"stored key is not a JWK": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{jwkMalformed, s.userID, "", roleMember, s.key.ExpiresAt.Unix()})
+				return s.activeKeyRow([]any{jwkMalformed, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", ""})
 			},
 			wantStatus: http.StatusServiceUnavailable,
 			wantBody:   `{"error":{"code":"session_verify_failed","message":"sessions are temporarily unavailable"}}` + "\n",
@@ -464,8 +494,8 @@ func TestLogout(t *testing.T) {
 			}
 
 			args := h.exec.calls[1][0].Args
-			if len(args) != 3 || args[1] != signedIn.key.ID.String() || args[2] != store.KindSession {
-				t.Errorf("revoke args = %v, want the presented key id and the session kind", args)
+			if len(args) != 3 || args[1] != signedIn.key.ID.String() || args[2] != memberID {
+				t.Errorf("revoke args = %v, want the time, the presented key id and its owner, and no kind", args)
 			}
 		})
 	}

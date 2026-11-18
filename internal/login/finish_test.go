@@ -634,8 +634,11 @@ func checkSessionWrite(t *testing.T, r *rig, challengeBytes []byte, user string,
 		JWK:             key.JWK,
 		ExpiresAt:       expires,
 		GrantedFrom:     grant[:],
-		Flags:           flags,
-		CreatedAt:       r.now,
+		// The session is written with the scope that was signed into its token:
+		// the default:session bundle, spelled out so a change is deliberate.
+		Scope:     `["default:session"]`,
+		Flags:     flags,
+		CreatedAt: r.now,
 	}
 
 	if len(r.store.created) != 1 || !reflect.DeepEqual(r.store.created[0], want) {

@@ -109,7 +109,7 @@ func TestQueriesAreFound(t *testing.T) {
 	queries := packageQueries(t)
 
 	for _, name := range []string{
-		"activeKeyQuery", "updateFlagsQuery", "insertSessionQuery", "revokeSessionQuery",
+		"activeKeyQuery", "updateFlagsQuery", "insertSessionQuery", "revokeKeyQuery",
 		"invitationQuery", "insertUserQuery", "insertCredentialQuery", "credentialQuery",
 		"firstRunStateQuery", "insertFirstRunQuery",
 	} {
@@ -423,7 +423,7 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 				Flags: 0xff, CreatedAt: farthest,
 			})
 		},
-		"RevokeSession": func(s *store.Store) { _, _ = s.RevokeSession(ctx, "kid", farthest) },
+		"RevokeKey": func(s *store.Store) { _, _ = s.RevokeKey(ctx, "user", "kid", farthest) },
 		"RedeemableInvitationType": func(s *store.Store) {
 			_, _, _ = s.RedeemableInvitationType(ctx, mustCode(t, "code"), farthest)
 		},
@@ -453,8 +453,8 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		},
 		"GetAgent": func(s *store.Store) { _, _ = s.GetAgent(ctx, "owner", agentID) },
 		"CreateAgent": func(s *store.Store) {
-			_ = s.CreateAgent(ctx, store.NewAgent{
-				ID: "id", Owner: "owner", Name: mustAgentName(t, "agent"), Scopes: "default:agent", MaxActive: 1 << 30,
+			_, _ = s.CreateAgent(ctx, store.NewAgent{
+				ID: "id", Owner: "owner", Name: mustAgentName(t, "agent"), Scopes: "[]", KeyScope: "[]", MaxActive: 1 << 30,
 				KeyID: "kid", KeyJWK: "{}", KeyExpiresAt: farthest, CreatedAt: farthest,
 			})
 		},

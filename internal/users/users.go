@@ -34,6 +34,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -94,15 +95,15 @@ func Routes(deps Deps) []auth.Route {
 	return []auth.Route{
 		{
 			Method: http.MethodGet, Path: collectionPath, MaxBody: maxBody,
-			Credential: auth.Session, Require: auth.Admin, Handle: api.list,
+			Credential: auth.Authenticated, Access: auth.Needs(scope.UserRead), Handle: api.list,
 		},
 		{
 			Method: http.MethodGet, Path: itemPath, MaxBody: maxBody,
-			Credential: auth.Session, Require: auth.Admin, Handle: api.get,
+			Credential: auth.Authenticated, Access: auth.Needs(scope.UserRead), Handle: api.get,
 		},
 		{
 			Method: http.MethodDelete, Path: itemPath, MaxBody: maxBody,
-			Credential: auth.Session, Require: auth.Admin, Handle: api.revoke,
+			Credential: auth.Authenticated, Access: auth.Needs(scope.UserRevoke), Handle: api.revoke,
 		},
 	}
 }

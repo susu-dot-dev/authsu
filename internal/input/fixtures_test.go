@@ -3,6 +3,9 @@ package input_test
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -424,4 +427,45 @@ func textOracle(spec textSpec) func(string) bool {
 
 		return length <= spec.max && !hostileRunes(s, spec.identifying) && !blank(s, spec.identifying)
 	}
+}
+
+// migrationNumbers returns the numbers captured by pattern in the migrations'
+// text, whitespace collapsed, one entry per match across all of them in
+// migration order. A pattern that matches nothing fails the test, so a
+// reworded migration is noticed.
+func migrationNumbers(t *testing.T, pattern string) []int {
+	t.Helper()
+
+	paths, err := filepath.Glob("../../migrations/*.sql")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no migrations found: %v", err)
+	}
+
+	slices.Sort(paths)
+
+	var numbers []int
+
+	for _, path := range paths {
+		raw, err := os.ReadFile(path) //nolint:gosec // the paths are a glob of the repository's own migrations
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+
+		text := strings.Join(strings.Fields(string(raw)), " ")
+
+		for _, match := range regexp.MustCompile(pattern).FindAllStringSubmatch(text, -1) {
+			n, err := strconv.Atoi(match[1])
+			if err != nil {
+				t.Fatalf("number %q: %v", match[1], err)
+			}
+
+			numbers = append(numbers, n)
+		}
+	}
+
+	if len(numbers) == 0 {
+		t.Fatalf("no CHECK matches %s; was the migration text changed?", pattern)
+	}
+
+	return numbers
 }

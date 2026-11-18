@@ -31,9 +31,10 @@ const (
 // satisfies it. Failures must come back classified, as the store's do, because
 // they are sent as they are.
 type Store interface {
-	// RevokeSession ends the session kid as of now. It reports false when there
-	// was nothing to revoke: the session was already revoked.
-	RevokeSession(ctx context.Context, kid string, now time.Time) (bool, error)
+	// RevokeKey ends the key kid of the user as of now: the one the request
+	// presented, a session or an API key alike. It reports false when there was
+	// nothing to revoke: the key was already revoked.
+	RevokeKey(ctx context.Context, userID, kid string, now time.Time) (bool, error)
 }
 
 // Deps are the collaborators of Routes. All are required.
@@ -75,11 +76,11 @@ func Routes(deps Deps) []auth.Route {
 	return []auth.Route{
 		{
 			Method: http.MethodGet, Path: PathSession, MaxBody: 0,
-			Credential: auth.Session, Require: nil, Handle: whoAmI,
+			Credential: auth.Authenticated, Access: auth.Open(), Handle: whoAmI,
 		},
 		{
 			Method: http.MethodPost, Path: PathLogout, MaxBody: 0,
-			Credential: auth.Session, Require: nil, Handle: deps.logout,
+			Credential: auth.Authenticated, Access: auth.Open(), Handle: deps.logout,
 		},
 	}
 }
@@ -97,12 +98,14 @@ func whoAmI(call *auth.Call) result.Result[httpapi.Response] {
 	}))
 }
 
-// logout answers POST /api/logout. The revocation is one conditional write
-// (store.RevokeSession): the boundary saw the key active, so a write that
-// changes nothing means another request revoked it in between. The session is
-// gone, which is what any request without one is told.
+// logout answers POST /api/logout: it revokes the key the request presented
+// (key:revoke_self in docs/permissions_design.md), so a session ends itself and
+// an API key ends itself, with no scope. The revocation is one conditional write
+// (store.RevokeKey): the boundary saw the key active, so a write that changes
+// nothing means another request revoked it in between. The key is gone, which is
+// what any request without one is told.
 func (d Deps) logout(call *auth.Call) result.Result[httpapi.Response] {
-	return result.Of(d.Store.RevokeSession(call.Request.Context, call.Principal.KeyID, d.Now())).
+	return result.Of(d.Store.RevokeKey(call.Request.Context, call.Principal.UserID, call.Principal.KeyID, d.Now())).
 		Then(func(revoked bool) (httpapi.Response, error) {
 			if !revoked {
 				return httpapi.Response{}, auth.Unauthenticated(errRevokedFirst)

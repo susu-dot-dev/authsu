@@ -23,6 +23,15 @@ Go compiled with TinyGo to WebAssembly, run as a Cloudflare Worker through [`wor
 - **Do not** run `make ci` after every edit, after documentation-only changes, or to re-check one target. If it fails, fix the cause with the narrow target that reproduces it, then run `make ci` once more.
 - Run the Worker with `make dev`, not bare `npx wrangler dev`, which skips the migrations and the localhost relying party overrides.
 
+## Error flow: Result first
+
+Code that runs a sequence of fallible steps is written as a `result.Result` chain (`Of`, `Then`, `Map`, `Check`, `MapErr`), not as a repeated `if err != nil { return ..., err }`. The first failure ends the chain and every later step is skipped, so the happy path reads top to bottom and each step is a small named function that is tested on its own. Unit tests are exempt.
+
+- **Keep the Result across function boundaries.** A function whose body is a chain returns `result.Result[T]`, and its caller continues the chain with `Then` instead of unwrapping it. This is the default, and it is what keeps `.Get()` and `.Err()` out of production code. Convert the helpers a chain calls (a parser, a step that reads a claim) to return a `Result` too, rather than unwrapping at each one.
+- **Unwrap only where a signature is fixed.** A chain ends in `.Get()` or `.Err()` when the function must return `(T, error)`: a public API that other packages or an interface pin down, a callback a library calls (japikey's lookup), or a `Store` method. Everywhere else, return the `Result`.
+- **Fall back to `if err != nil` when a chain is the worse code.** Plain control flow is right when the steps do not feed each other (state carried through a closure or a side channel, as in the key lookup in `internal/auth`), when a function is two sequential calls that each add their own cause (`fmt.Errorf("%w: %w", ...)`), or when a function cannot fail at all and only turns a bad value into a safe one. Do not force a chain where it needs more machinery than the branches it replaces.
+- **A chain that must end in `(T, error)` needs one suppression.** `wrapcheck` is on, and it decides from the `return` line alone that the error of a call into another package (here `result`) is unwrapped, so it flags `return chain.Get()`. It cannot see that every error in the chain is already classified (`apierr`, a parser's client error, or wrapped with what failed), and wrapping a classified error again would only change what the log shows. Put one `//nolint:wrapcheck // <reason>` on that `return` line, and make the reason say why the chain's errors are already classified. Assign the chain to a variable first when the chain itself would push the line past the length limit. Do not widen `wrapcheck` in `.golangci.yml` to ignore `Get` or `Err`: they are also how a raw, unwrapped foreign error would leave a chain, and the linter is what catches that.
+
 ## Where documentation goes
 
 Ask what kind of statement it is.

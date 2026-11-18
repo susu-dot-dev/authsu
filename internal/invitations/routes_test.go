@@ -2,12 +2,12 @@ package invitations_test
 
 import (
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/invitations"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 )
 
 // validCreate is a body POST accepts.
@@ -54,11 +54,12 @@ func TestRoutesAreDeclaredAsAdminOnlySessions(t *testing.T) {
 
 	want := []struct {
 		method, path string
+		scope        scope.Scope
 	}{
-		{http.MethodGet, "/api/invitation"},
-		{http.MethodPost, "/api/invitation"},
-		{http.MethodPatch, "/api/invitation/{id}"},
-		{http.MethodDelete, "/api/invitation/{id}"},
+		{http.MethodGet, "/api/invitation", scope.InvitationRead},
+		{http.MethodPost, "/api/invitation", scope.InvitationCreate},
+		{http.MethodPatch, "/api/invitation/{id}", scope.InvitationUpdate},
+		{http.MethodDelete, "/api/invitation/{id}", scope.InvitationRevoke},
 	}
 
 	if len(routes) != len(want) {
@@ -73,28 +74,32 @@ func TestRoutesAreDeclaredAsAdminOnlySessions(t *testing.T) {
 		t.Run(want[i].method+" "+want[i].path, func(t *testing.T) {
 			t.Parallel()
 
-			wantDeclared(t, route, want[i].method, want[i].path)
+			wantDeclared(t, route, want[i].method, want[i].path, want[i].scope)
 		})
 	}
 }
 
 // wantDeclared checks one route's declaration: where it is, that it needs a
-// session and that the requirement is auth.Admin.
-func wantDeclared(t *testing.T, route auth.Route, method, path string) {
+// credential, and that its access is exactly its own admin scope. An admin
+// scope makes the boundary require the administrator role as well, so the
+// declaration is the whole rule.
+func wantDeclared(t *testing.T, route auth.Route, method, path string, needs scope.Scope) {
 	t.Helper()
 
 	if route.Method != method || route.Path != path {
 		t.Errorf("route = %s %s, want %s %s", route.Method, route.Path, method, path)
 	}
 
-	if route.Credential != auth.Session {
-		t.Errorf("Credential = %v, want auth.Session", route.Credential)
+	if route.Credential != auth.Authenticated {
+		t.Errorf("Credential = %v, want auth.Authenticated", route.Credential)
 	}
 
-	// Functions are not comparable, but their code pointer is: this is
-	// auth.Admin, and not nil and not some other requirement.
-	if route.Require == nil || reflect.ValueOf(route.Require).Pointer() != reflect.ValueOf(auth.Admin).Pointer() {
-		t.Error("Require is not auth.Admin")
+	if route.Access != auth.Needs(needs) {
+		t.Errorf("Access = %+v, want %+v", route.Access, auth.Needs(needs))
+	}
+
+	if !scope.IsAdmin(needs) {
+		t.Errorf("%s is not an admin scope: a member could use the route", needs)
 	}
 
 	if route.MaxBody != invitations.MaxBody || route.Handle == nil {

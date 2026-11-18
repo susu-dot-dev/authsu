@@ -23,7 +23,7 @@ The obvious argument for a role claim is "avoid joining `users`". It does not ho
 
 Caching the account has the same flaw in another form: an isolate's memory is short-lived and not shared, KV is eventually consistent, and any cache delays a revocation by its TTL. If latency ever matters, the lever is D1 read replication (check current Cloudflare documentation first), not a cache that weakens revocation.
 
-Enforcement is the same for every admin route: the route declares a session and the `Admin` requirement, and the boundary authenticates, then requires the role, then runs the handler. A feature does no authentication of its own. There is no degraded mode: a missing dependency stops the Worker at start instead of answering 503 per request.
+Enforcement is the same for every admin route: the route declares an admin scope (`user:read`, `user:revoke`), and the boundary authenticates, then requires the administrator role and the scope together, then runs the handler. A feature does no authentication of its own. There is no degraded mode: a missing dependency stops the Worker at start instead of answering 503 per request.
 
 ## Revoking
 

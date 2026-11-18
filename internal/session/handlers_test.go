@@ -149,8 +149,9 @@ func TestLogout(t *testing.T) {
 				t.Errorf("Set-Cookie = %q, want %q", got, clearedCookie)
 			}
 
-			// The session is revoked as of the routes' clock, not the boundary's.
-			wantRevokes := []revokeCall{{kid: kid, now: rig.logoutNow}}
+			// The session is revoked as of the routes' clock, not the boundary's,
+			// and for the user who owns it: the write binds the owner too.
+			wantRevokes := []revokeCall{{userID: userID, kid: kid, now: rig.logoutNow}}
 			if len(rig.store.calls) != 1 || rig.store.calls[0] != wantRevokes[0] {
 				t.Errorf("revocations = %v, want %v", rig.store.calls, wantRevokes)
 			}

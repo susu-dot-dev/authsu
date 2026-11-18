@@ -51,8 +51,8 @@ func TestRoutesDeclarations(t *testing.T) {
 				t.Errorf("Credential = %d, want %d", route.Credential, tc.credential)
 			}
 
-			if route.Require != nil {
-				t.Error("an open route has a requirement")
+			if route.Access != (auth.Access{}) {
+				t.Error("a route with no credential declares an access")
 			}
 
 			if route.Handle == nil {

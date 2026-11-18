@@ -39,9 +39,9 @@ func TestRouteDeclaration(t *testing.T) {
 		t.Errorf("Credential = %v, want None", route.Credential)
 	}
 
-	if route.Require != nil || route.MaxBody != 0 || route.Handle == nil {
-		t.Errorf("Require set = %t, MaxBody = %d, Handle set = %t, want nil, 0, set",
-			route.Require != nil, route.MaxBody, route.Handle != nil)
+	if route.Access != (auth.Access{}) || route.MaxBody != 0 || route.Handle == nil {
+		t.Errorf("Access = %+v, MaxBody = %d, Handle set = %t, want none, 0, set",
+			route.Access, route.MaxBody, route.Handle != nil)
 	}
 }
 

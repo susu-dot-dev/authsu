@@ -13,6 +13,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 )
 
 // panicOf runs build and reports whether it panicked, and with what.
@@ -42,7 +43,8 @@ func okHandle(*auth.Call) result.Result[httpapi.Response] {
 // goodRoute is a valid declaration; each case below spoils one thing about it.
 func goodRoute() auth.Route {
 	return auth.Route{
-		Method: http.MethodGet, Path: "/x/{id}", MaxBody: 0, Credential: auth.Session, Require: auth.Admin, Handle: okHandle,
+		Method: http.MethodGet, Path: "/x/{id}", MaxBody: 0, Credential: auth.Authenticated,
+		Access: auth.Needs(scope.UserRead), Handle: okHandle,
 	}
 }
 
@@ -75,7 +77,7 @@ const (
 	saysMethod  = "the method is not"
 	saysSlash   = "the path must start with /"
 	saysWhole   = "whole {id} segment"
-	saysKind    = "Credential must be None or Session"
+	saysKind    = "Credential must be None or Authenticated"
 	saysMaxBody = "MaxBody must be from 0"
 )
 
@@ -90,10 +92,14 @@ func routeProblems() map[string]struct {
 	}
 
 	return map[string]problem{
-		"nil Handle":                 {spoiled(func(r *auth.Route) { r.Handle = nil }), "Handle is nil"},
-		"credential not set":         {withCredential(0), saysKind},
-		"credential not known":       {withCredential(99), saysKind},
-		"Require on a None route":    {withCredential(auth.None), "Require needs an authenticated"},
+		"nil Handle":             {spoiled(func(r *auth.Route) { r.Handle = nil }), "Handle is nil"},
+		"credential not set":     {withCredential(0), saysKind},
+		"credential not known":   {withCredential(99), saysKind},
+		"Access on a None route": {withCredential(auth.None), "Access needs an authenticated"},
+		"Access not declared":    {spoiled(func(r *auth.Route) { r.Access = auth.Access{} }), "Access must be declared"},
+		"Access names no such scope": {
+			spoiled(func(r *auth.Route) { r.Access = auth.Needs("nope:read") }), "scope that does not exist",
+		},
 		"negative MaxBody":           {withMaxBody(-1), saysMaxBody},
 		"MaxBody over the default":   {withMaxBody(httpapi.DefaultMaxBody + 1), saysMaxBody},
 		"no method":                  {withMethod(""), saysMethod},
@@ -143,7 +149,7 @@ func duplicateProblems() map[string]struct {
 	}
 
 	other := goodRoute()
-	other.Require = nil
+	other.Access = auth.Open()
 
 	renamed := goodRoute()
 	renamed.Method = http.MethodPost
@@ -215,7 +221,10 @@ func TestHandlerPanicsOnAProgrammingError(t *testing.T) {
 
 // route is a route that is valid on its own.
 func route(method, path string, credential auth.Credential, maxBody int64) auth.Route {
-	return auth.Route{Method: method, Path: path, MaxBody: maxBody, Credential: credential, Require: nil, Handle: okHandle}
+	return auth.Route{
+		Method: method, Path: path, MaxBody: maxBody, Credential: credential,
+		Access: accessFor(credential), Handle: okHandle,
+	}
 }
 
 // TestHandlerAcceptsEveryValidDeclaration: the counterpart of the panics, so a
@@ -223,7 +232,7 @@ func route(method, path string, credential auth.Credential, maxBody int64) auth.
 func TestHandlerAcceptsEveryValidDeclaration(t *testing.T) {
 	t.Parallel()
 
-	get, none, session := http.MethodGet, auth.None, auth.Session
+	get, none, session := http.MethodGet, auth.None, auth.Authenticated
 
 	tests := map[string][]auth.Route{
 		"no routes":                     nil,
@@ -265,19 +274,19 @@ func (r *rig) record(name string) func(*auth.Call) result.Result[httpapi.Respons
 // one.
 func (r *rig) dispatchTable() []auth.Route {
 	return []auth.Route{
-		r.recording(http.MethodPatch, patternMulti, auth.Session, nil, "patch"),
-		r.recording(http.MethodGet, patternMulti, auth.None, nil, "get"),
-		r.recording(http.MethodDelete, patternMulti, auth.Session, auth.Admin, "delete"),
-		r.recording(http.MethodGet, pathSingle, auth.Session, nil, "single"),
+		r.recording(http.MethodPatch, patternMulti, auth.Authenticated, auth.Open(), "patch"),
+		r.recording(http.MethodGet, patternMulti, auth.None, auth.Access{}, "get"),
+		r.recording(http.MethodDelete, patternMulti, auth.Authenticated, auth.Needs(scope.UserRead), "delete"),
+		r.recording(http.MethodGet, pathSingle, auth.Authenticated, auth.Open(), "single"),
 	}
 }
 
 // recording is a route whose body records its name.
 func (r *rig) recording(
-	method, path string, credential auth.Credential, require func(auth.Principal) error, name string,
+	method, path string, credential auth.Credential, access auth.Access, name string,
 ) auth.Route {
 	return auth.Route{
-		Method: method, Path: path, MaxBody: 0, Credential: credential, Require: require, Handle: r.record(name),
+		Method: method, Path: path, MaxBody: 0, Credential: credential, Access: access, Handle: r.record(name),
 	}
 }
 
@@ -370,7 +379,7 @@ const (
 func (r *rig) limitTable() []auth.Route {
 	return []auth.Route{
 		r.limited(http.MethodPost, pathLimits, small, auth.None, "post"),
-		r.limited(http.MethodPatch, pathLimits, medium, auth.Session, "patch"),
+		r.limited(http.MethodPatch, pathLimits, medium, auth.Authenticated, "patch"),
 		r.limited(http.MethodPut, pathLimits, 0, auth.None, "put"),
 		r.limited(http.MethodDelete, pathLimits, httpapi.DefaultMaxBody, auth.None, "delete"),
 		r.limited(http.MethodPost, pathOther, medium, auth.None, "other"),
@@ -380,7 +389,8 @@ func (r *rig) limitTable() []auth.Route {
 // limited is a route with a body limit whose body records its name.
 func (r *rig) limited(method, path string, maxBody int64, credential auth.Credential, name string) auth.Route {
 	return auth.Route{
-		Method: method, Path: path, MaxBody: maxBody, Credential: credential, Require: nil, Handle: r.record(name),
+		Method: method, Path: path, MaxBody: maxBody,
+		Credential: credential, Access: accessFor(credential), Handle: r.record(name),
 	}
 }
 
@@ -483,8 +493,8 @@ func TestUnsafeMethodsNeedJSONBeforeAuth(t *testing.T) {
 		"patch without a type":      {http.MethodPatch, none, auth.None, 415},
 		"delete as text":            {http.MethodDelete, textPlain, auth.None, 415},
 		"get needs no type":         {http.MethodGet, none, auth.None, 200},
-		"session post as text":      {http.MethodPost, textPlain, auth.Session, 415},
-		"session post without type": {http.MethodPost, none, auth.Session, 415},
+		"session post as text":      {http.MethodPost, textPlain, auth.Authenticated, 415},
+		"session post without type": {http.MethodPost, none, auth.Authenticated, 415},
 	}
 
 	for name, tt := range tests {
@@ -493,7 +503,8 @@ func TestUnsafeMethodsNeedJSONBeforeAuth(t *testing.T) {
 
 			r := newRig(t)
 			routes := []auth.Route{{
-				Method: tt.method, Path: "/c", MaxBody: 0, Credential: tt.credential, Require: nil, Handle: r.record("c"),
+				Method: tt.method, Path: "/c", MaxBody: 0,
+				Credential: tt.credential, Access: accessFor(tt.credential), Handle: r.record("c"),
 			}}
 
 			rec := r.serve(routes, request{method: tt.method, target: "/c", contentType: tt.contentType})
@@ -571,7 +582,8 @@ func TestARouteMayClaimTheRoot(t *testing.T) {
 
 			r := newRig(t)
 			routes := []auth.Route{{
-				Method: http.MethodGet, Path: tt.path, MaxBody: 0, Credential: auth.None, Require: nil, Handle: r.record("root"),
+				Method: http.MethodGet, Path: tt.path, MaxBody: 0,
+				Credential: auth.None, Access: accessFor(auth.None), Handle: r.record("root"),
 			}}
 
 			rec := r.serve(routes, request{method: tt.method, target: tt.target})
@@ -626,7 +638,8 @@ func TestHandleResultsReachTheClient(t *testing.T) {
 
 			r := newRig(t)
 			routes := []auth.Route{{
-				Method: http.MethodGet, Path: "/h", MaxBody: 0, Credential: auth.None, Require: nil, Handle: tt.handle,
+				Method: http.MethodGet, Path: "/h", MaxBody: 0,
+				Credential: auth.None, Access: accessFor(auth.None), Handle: tt.handle,
 			}}
 
 			rec := r.serve(routes, request{target: "/h"})

@@ -21,10 +21,10 @@ func TestRouteDeclarations(t *testing.T) {
 		method     string
 		path       string
 		credential auth.Credential
-		admin      bool
+		access     auth.Access
 	}{
-		{name: "who am i", method: http.MethodGet, path: "/api/session", credential: auth.Session, admin: false},
-		{name: "logout", method: http.MethodPost, path: "/api/logout", credential: auth.Session, admin: false},
+		{name: "who am i", method: http.MethodGet, path: "/api/session", credential: auth.Authenticated, access: auth.Open()},
+		{name: "logout", method: http.MethodPost, path: "/api/logout", credential: auth.Authenticated, access: auth.Open()},
 	}
 
 	routes := newRig(t).routes()
@@ -47,8 +47,8 @@ func TestRouteDeclarations(t *testing.T) {
 				t.Errorf("Credential = %v, want %v", route.Credential, tt.credential)
 			}
 
-			if (route.Require != nil) != tt.admin {
-				t.Errorf("Require set = %t, want %t", route.Require != nil, tt.admin)
+			if route.Access != tt.access {
+				t.Errorf("Access = %+v, want %+v", route.Access, tt.access)
 			}
 
 			if route.MaxBody != 0 {

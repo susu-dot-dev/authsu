@@ -7,6 +7,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -121,7 +122,7 @@ func TestAdminRoutesRefuseAMemberBeforeTheID(t *testing.T) {
 			t.Parallel()
 
 			r := newRig(t)
-			routes := []auth.Route{r.getRoute(patternItem, auth.Session, auth.Admin)}
+			routes := []auth.Route{r.getRoute(patternItem, auth.Authenticated, auth.Needs(scope.UserRead))}
 			rec := r.serve(routes, request{target: pathItems + id, cookies: withRole(roleMember)(r)})
 
 			wantFailure(t, r, rec, http.StatusForbidden, bodyForbidden, auth.CodeForbidden, nil)

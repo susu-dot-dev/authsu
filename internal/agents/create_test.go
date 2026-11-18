@@ -14,6 +14,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -21,12 +22,7 @@ import (
 func nameBody(t *testing.T, name string) string {
 	t.Helper()
 
-	encoded, err := json.Marshal(map[string]string{"name": name})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return string(encoded)
+	return marshal(t, map[string]string{fieldName: name})
 }
 
 // claimString is the string claim name of verified, or "".
@@ -68,14 +64,14 @@ func TestCreateWritesTheAgentAndItsKey(t *testing.T) {
 
 	// The response is built from what was written.
 	wantAgent := createdAgent(newAgentID, "assistant", rg.now.Unix())
-	if response.Agent != wantAgent {
+	if !reflect.DeepEqual(response.Agent, wantAgent) {
 		t.Errorf("agent = %+v, want %+v", response.Agent, wantAgent)
 	}
 
 	wantKey := agents.Key{
-		ID: written.KeyID, Token: created.key.JWT, Scope: agents.DefaultScopes, ExpiresAt: expires.Unix(),
+		ID: written.KeyID, Token: created.key.JWT, Scopes: []string{scope.DefaultAgent}, ExpiresAt: expires.Unix(),
 	}
-	if response.Key != wantKey {
+	if !reflect.DeepEqual(response.Key, wantKey) {
 		t.Errorf("key = %+v, want %+v", response.Key, wantKey)
 	}
 
@@ -119,11 +115,8 @@ func checkKeyCreation(t *testing.T, rg *rig, expires time.Time) keyCall {
 	want := keyCall{
 		issuer: auth.IssuerFor(origin),
 		spec: auth.KeySpec{
-			Kind: auth.KindAPIKey, Subject: userA, Expires: expires,
-			Claims: map[string]any{
-				claimAct:   map[string]any{claimSub: newAgentID},
-				claimScope: agents.DefaultScopes,
-			},
+			Kind: auth.KindAPIKey, Subject: userA, Expires: expires, Scope: agents.DefaultScopes(),
+			Claims: map[string]any{claimAct: map[string]any{claimSub: newAgentID}},
 		},
 		key: made.key,
 	}
@@ -146,8 +139,9 @@ func checkWrite(t *testing.T, rg *rig, made keyCall, expires time.Time) store.Ne
 	}
 
 	want := store.NewAgent{
-		ID: newAgentID, Owner: userA, Name: name, Scopes: agents.DefaultScopes, MaxActive: agents.MaxAgentsPerUser,
-		KeyID: made.key.ID.String(), KeyJWK: made.key.JWK, KeyExpiresAt: expires, CreatedAt: rg.now,
+		ID: newAgentID, Owner: userA, Name: name, Scopes: defaultAgentJSON, KeyScope: defaultAgentJSON,
+		MaxActive: agents.MaxAgentsPerUser, KeyID: made.key.ID.String(), KeyJWK: made.key.JWK,
+		KeyExpiresAt: expires, CreatedAt: rg.now,
 	}
 
 	if len(rg.store.calls) != 1 || rg.store.calls[0].method != methodCreate {
@@ -165,7 +159,8 @@ func checkWrite(t *testing.T, rg *rig, made keyCall, expires time.Time) store.Ne
 // createdAgent is the agent a create returns.
 func createdAgent(id, name string, createdAt int64) agents.Agent {
 	return agents.Agent{
-		ID: id, Name: name, Scopes: agents.DefaultScopes, Status: agents.StatusActive, RevokedAt: nil, CreatedAt: createdAt,
+		ID: id, Name: name, Scopes: []string{scope.DefaultAgent}, Status: agents.StatusActive, RevokedAt: nil,
+		CreatedAt: createdAt,
 	}
 }
 
@@ -178,11 +173,11 @@ func checkClaims(t *testing.T, verified verifiedKey, written store.NewAgent, exp
 
 	got := map[string]any{
 		"kid": verified.kid.String(), claimSub: claimString(claims, claimSub), "iss": claimString(claims, "iss"),
-		claimScope: claimString(claims, claimScope), "act.sub": actor[claimSub], "act.len": len(actor),
+		claimScope: fmt.Sprint(claims[claimScope]), "act.sub": actor[claimSub], "act.len": len(actor),
 	}
 	want := map[string]any{
 		"kid": written.KeyID, claimSub: userA, "iss": apiOrigin + "/keys/" + written.KeyID,
-		claimScope: agents.DefaultScopes, "act.sub": newAgentID, "act.len": 1,
+		claimScope: "[" + scope.DefaultAgent + "]", "act.sub": newAgentID, "act.len": 1,
 	}
 
 	for name, value := range want {
