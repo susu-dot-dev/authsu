@@ -1,6 +1,6 @@
 # First-run bootstrap: design rationale
 
-> This document explains *why* bootstrap works the way it does. It is not a spec. Statuses, endpoints, and commands below illustrate the flow; the code is authoritative for what actually exists.
+> This document explains *why* bootstrap works the way it does. It is not a spec. 
 
 Related: [invitations_design.md](invitations_design.md), [registration_design.md](registration_design.md)
 

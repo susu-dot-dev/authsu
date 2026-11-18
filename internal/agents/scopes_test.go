@@ -588,7 +588,7 @@ func TestAgentsMayNotRenameOrRevokeWhateverTheyHold(t *testing.T) {
 	everything := scope.List{scope.DefaultSession}
 
 	routes := []agentRoute{
-		{name: routeRename, method: http.MethodPatch, target: itemPrefix + agentA2, body: bodyRenamed},
+		{name: routePatch, method: http.MethodPatch, target: itemPrefix + agentA2, body: bodyRenamed},
 		{name: routeRevoke, method: http.MethodDelete, target: itemPrefix + agentA2, body: ""},
 	}
 
@@ -646,8 +646,8 @@ func TestKeysScopeBoundsEveryRoute(t *testing.T) {
 		{"get without it", scope.List{}, routeGet, no},
 		{"create needs agent:create", scope.List{agentCreate}, routeCreate, http.StatusCreated},
 		{"create without it", scope.List{agentRead, "agent:update"}, routeCreate, no},
-		{"rename needs agent:update", scope.List{"agent:update"}, routeRename, ok},
-		{"rename without it", scope.List{"agent:revoke"}, routeRename, no},
+		{"rename needs agent:update", scope.List{"agent:update"}, routePatch, ok},
+		{"rename without it", scope.List{"agent:revoke"}, routePatch, no},
 		{"revoke needs agent:revoke", scope.List{"agent:revoke"}, routeRevoke, ok},
 		{"revoke without it", scope.List{"agent:update"}, routeRevoke, no},
 		{"the user bundle does all of them", scope.List{bundleUser}, routeRevoke, ok},

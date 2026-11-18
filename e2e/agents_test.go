@@ -53,7 +53,7 @@ const (
 	agCodeMissing = "agent_not_found"
 	agCodeRevoked = "agent_revoked"
 	agCodeBadName = "invalid_agent_name"
-	agCodeNoName  = "missing_agent_name"
+	agCodeNoName  = "missing_agent_change"
 	agCodeLimitQ  = "invalid_limit"
 	agCodeCursorQ = "invalid_cursor"
 
@@ -78,6 +78,7 @@ type agView struct {
 	Status    string   `json:"status"`
 	RevokedAt *int64   `json:"revokedAt"`
 	CreatedAt int64    `json:"createdAt"`
+	Labels    []string `json:"labels"`
 }
 
 // agKey is the JSON view of a created key.
@@ -340,7 +341,7 @@ func TestAgentCreateStoresExactlyWhatItReturns(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	wantAgentKeys := []string{"createdAt", "id", "name", "scopes", "status"}
+	wantAgentKeys := []string{"createdAt", "id", "labels", "name", "scopes", "status"}
 	wantKeyKeys := []string{"expiresAt", "id", "scopes", "token"}
 
 	if slices.Sorted(mapKeys(generic["agent"])) == nil || !slices.Equal(slices.Sorted(mapKeys(generic["agent"])), wantAgentKeys) {
@@ -1771,7 +1772,7 @@ func TestAgentOwnershipConfusion(t *testing.T) {
 // TestAgentRename: the response is the row as the write left it; same name is
 // fine; names have the same bounds as create and are stored exactly; a revoked
 // agent is 409 agent_revoked and keeps its name; unknown is 404; a missing name
-// is missing_agent_name.
+// is missing_agent_change (a patch with no name and no label to change).
 //
 //nolint:paralleltest,funlen // shares one database; the case table is the test
 func TestAgentRename(t *testing.T) {

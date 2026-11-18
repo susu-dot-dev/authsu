@@ -1,11 +1,12 @@
 // Package agents implements the API for the agents described in
-// docs/agents_design.md: list a user's agents, create one, rename one, and
-// revoke one.
+// docs/agents_design.md: list a user's agents, create one (optionally with its
+// labels), change one (rename it, add and remove its labels), and revoke one.
 //
-//	GET    /api/agent        one page of the caller's agents, revoked ones included
-//	POST   /api/agent        create an agent and its first API key
+//	GET    /api/agent        one page of the caller's agents, revoked ones included;
+//	                         ?label=x keeps only those that have the label x
+//	POST   /api/agent        create an agent, its first API key and its labels, if any
 //	GET    /api/agent/{id}   one of the caller's agents
-//	PATCH  /api/agent/{id}   rename it
+//	PATCH  /api/agent/{id}   rename it, and add and remove labels, atomically
 //	DELETE /api/agent/{id}   revoke it and its keys
 //
 // An agent is not an account. It is something a user has, so every route acts
@@ -29,6 +30,13 @@
 // the agent's first key, once: only the public half is stored, so a lost key
 // cannot be shown again. Agents are short-lived, and there is no rotation:
 // replace an agent by revoking it and creating another.
+//
+// A create may give the new agent labels, whoever is creating. They are written
+// in the same batch as the agent and its key, so a create gives the agent all of
+// them or creates nothing, and the agent is never seen without them. Labels are
+// the owner's own bookkeeping and carry no authority, so, unlike scopes, they
+// are not bounded by the creating agent and are not copied from it. Edits after
+// creation are PATCH's (add and remove), never a replacement of the whole set.
 package agents
 
 import (
@@ -63,17 +71,24 @@ func DefaultScopes() scope.List { return scope.List{scope.DefaultAgent} }
 // found. *store.Store satisfies it. A failure must come back classified (the
 // store does), because it is sent as is.
 type Store interface {
-	// ListAgents returns a page of the owner's agents, newest first.
-	ListAgents(ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit) (store.AgentPage, error)
+	// ListAgents returns a page of the owner's agents, newest first, only those
+	// with the filter's label when it is set.
+	ListAgents(
+		ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit, filter input.LabelFilter,
+	) (store.AgentPage, error)
 	// GetAgent returns one of the owner's agents, or store.ErrNotFound.
 	GetAgent(ctx context.Context, owner string, id input.ID) (store.Agent, error)
-	// CreateAgent writes an agent and its first key as one batch and returns the
-	// agent's scope list as the write stored it (JSON), or returns
-	// store.ErrConflict when the owner is at the limit or was revoked.
+	// CreateAgent writes an agent, its first key and its labels as one batch and
+	// returns the agent's scope list as the write stored it (JSON), or returns
+	// store.ErrConflict when the owner is at the limit or was revoked, in which
+	// case nothing was written, labels included.
 	CreateAgent(ctx context.Context, agent store.NewAgent) (string, error)
-	// RenameAgent renames one of the owner's agents and returns it as the
-	// write left it (a revoked agent keeps its name), or store.ErrNotFound.
-	RenameAgent(ctx context.Context, owner string, id input.ID, name input.AgentName) (store.Agent, error)
+	// PatchAgent renames one of the owner's agents and adds and removes its
+	// labels as one batch, and returns it as the batch left it (a revoked agent
+	// is left as it is). It returns store.ErrNotFound when the owner has no such
+	// agent, and store.ErrConflict when the patch would leave the agent with
+	// more labels than patch.MaxLabels, in which case nothing changed.
+	PatchAgent(ctx context.Context, owner string, id input.ID, patch store.AgentPatch) (store.Agent, error)
 	// RevokeAgent revokes one of the owner's agents and its keys and returns
 	// the agent as the write left it, or store.ErrNotFound.
 	RevokeAgent(ctx context.Context, owner string, id input.ID, now time.Time) (store.Agent, error)
@@ -111,7 +126,7 @@ const (
 type Agent struct {
 	ID string `json:"id"`
 
-	// Name is the label its user gave it.
+	// Name is the display name its user gave it.
 	Name string `json:"name"`
 
 	// Scopes is the agent's scope list as stored, as written.
@@ -123,6 +138,10 @@ type Agent struct {
 
 	// CreatedAt is in Unix seconds.
 	CreatedAt int64 `json:"createdAt"`
+
+	// Labels are the agent's labels, in ascending order. It is always present,
+	// and an empty list for an agent with none.
+	Labels []string `json:"labels"`
 }
 
 // present is the client's view of a stored agent. Any revoked_at at all
@@ -135,6 +154,6 @@ func present(stored store.Agent) Agent {
 
 	return Agent{
 		ID: stored.ID, Name: stored.Name, Scopes: scope.Read(stored.Scopes).Claim(), Status: status,
-		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt,
+		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt, Labels: stored.Labels,
 	}
 }

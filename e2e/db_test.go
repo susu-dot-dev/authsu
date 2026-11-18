@@ -153,6 +153,7 @@ func refused(t *testing.T, query string, args ...any) bool {
 // tableAgents is named because several tests count it.
 const (
 	tableAgents      = "agents"
+	tableLabels      = "agent_labels"
 	tableCredentials = "credentials"
 	tableKeys        = "japikeys"
 	tableUsers       = "users"
@@ -162,7 +163,7 @@ const (
 // tables are every table a test may leave rows in, children first so a foreign
 // key never blocks a delete.
 func tables() []string {
-	return []string{tableKeys, tableAgents, tableCredentials, tableUsers, tableInvitations}
+	return []string{tableKeys, tableLabels, tableAgents, tableCredentials, tableUsers, tableInvitations}
 }
 
 // reset empties every table, so a test starts from a fresh deployment whatever

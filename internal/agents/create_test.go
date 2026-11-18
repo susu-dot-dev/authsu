@@ -160,7 +160,7 @@ func checkWrite(t *testing.T, rg *rig, made keyCall, expires time.Time) store.Ne
 func createdAgent(id, name string, createdAt int64) agents.Agent {
 	return agents.Agent{
 		ID: id, Name: name, Scopes: []string{scope.DefaultAgent}, Status: agents.StatusActive, RevokedAt: nil,
-		CreatedAt: createdAt,
+		CreatedAt: createdAt, Labels: []string{},
 	}
 }
 
@@ -268,7 +268,7 @@ func TestCreateRefusesNamesThatAreNotCanonicalText(t *testing.T) {
 		{name: "only a no-break space", value: "\u00a0"},
 		{name: "only an ideographic space", value: "\u3000"},
 		{name: "a tab", value: "a\tb"},
-		{name: "a newline", value: "a\nb"},
+		{name: "a line feed", value: "a\nb"},
 		{name: "a NUL, which SQLite's length() stops at", value: "a\x00b"},
 		{name: "a delete character", value: "a\x7fb"},
 		{name: "a C1 control", value: "a\u0085b"},
@@ -291,7 +291,7 @@ func TestCreateRefusesNamesThatAreNotCanonicalText(t *testing.T) {
 			rg := newRig(t)
 			rec := rg.as(rg.signIn(userA, roleMember), http.MethodPost, collection, nameBody(t, tt.value))
 
-			wantCode(t, rg, rec, http.StatusBadRequest, codeInvalidName)
+			wantBadRequest(t, rg, rec, codeInvalidName)
 			rg.untouched()
 		})
 	}
@@ -330,7 +330,7 @@ func TestCreateRefusesBodiesThatAreNotARequest(t *testing.T) {
 		{name: "a null body", body: `null`, code: codeInvalidName},
 		{name: "a member in another case", body: `{"Name":"a"}`, code: codeUnknownField},
 		{name: "an unknown member", body: `{"name":"a","extra":1}`, code: codeUnknownField},
-		{name: "a repeated name", body: `{"name":"a","name":"b"}`, code: "duplicate_field"},
+		{name: "a repeated name", body: `{"name":"a","name":"b"}`, code: codeDuplicate},
 		{name: "trailing data", body: `{"name":"a"} {}`, code: "trailing_data"},
 		{name: "invalid utf-8", body: "{\"name\":\"a\xffb\"}", code: codeInvalidText},
 		{name: "a lone surrogate", body: `{"name":"a\ud800b"}`, code: codeInvalidText},
@@ -344,7 +344,7 @@ func TestCreateRefusesBodiesThatAreNotARequest(t *testing.T) {
 			rg := newRig(t)
 			rec := rg.as(rg.signIn(userA, roleMember), http.MethodPost, collection, tt.body)
 
-			wantCode(t, rg, rec, http.StatusBadRequest, tt.code)
+			wantBadRequest(t, rg, rec, tt.code)
 			rg.untouched()
 		})
 	}
@@ -407,7 +407,7 @@ func TestBodyCap(t *testing.T) {
 					wantFailure(t, rg, rec, http.StatusRequestEntityTooLarge,
 						errorBody("body_too_large", "request body is too large"), "body_too_large")
 				} else {
-					wantCode(t, rg, rec, http.StatusBadRequest, codeInvalidName)
+					wantBadRequest(t, rg, rec, codeInvalidName)
 				}
 
 				rg.untouched()

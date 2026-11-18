@@ -143,7 +143,7 @@ func everyRoute() []agentRoute {
 		{name: routeList, method: http.MethodGet, target: collection, body: ""},
 		{name: routeCreate, method: http.MethodPost, target: collection, body: bodyAssistant},
 		{name: routeGet, method: http.MethodGet, target: itemPrefix + agentA1, body: ""},
-		{name: routeRename, method: http.MethodPatch, target: itemPrefix + agentA1, body: bodyRenamed},
+		{name: routePatch, method: http.MethodPatch, target: itemPrefix + agentA1, body: bodyRenamed},
 		{name: routeRevoke, method: http.MethodDelete, target: itemPrefix + agentA1, body: ""},
 	}
 }
@@ -376,7 +376,7 @@ func TestAnyRoleMayUseTheirAgents(t *testing.T) {
 
 	statuses := map[string]int{
 		routeList: http.StatusOK, routeCreate: http.StatusCreated, routeGet: http.StatusOK,
-		routeRename: http.StatusOK, routeRevoke: http.StatusOK,
+		routePatch: http.StatusOK, routeRevoke: http.StatusOK,
 	}
 
 	for _, role := range []string{roleAdmin, roleMember, ""} {

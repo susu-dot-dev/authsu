@@ -409,24 +409,41 @@ func TestRolesAtTheRoutes(t *testing.T) {
 }
 
 // TestAgentsBelongToTheCaller: the agent routes act for the signed-in user. The
-// owner in the query is the token's account, never anything in the request.
+// owner in the query is the token's account, never anything in the request, and
+// the label filter, when there is one, is the fourth argument (NULL for none).
 func TestAgentsBelongToTheCaller(t *testing.T) {
 	t.Parallel()
 
-	signedIn := newSession(t, memberID)
-	h := newHarness(t, fullEnv(),
-		signedIn.activeKeyStep(roleMember),
-		step{match: "FROM agents", results: rows(), err: nil},
-	)
-
-	rec := h.do(request{method: http.MethodGet, path: "/api/agent?limit=5", cookies: []*http.Cookie{signedIn.cookie}})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	tests := []struct {
+		name  string
+		query string
+		label any
+	}{
+		{name: "no filter", query: "?limit=5", label: nil},
+		{name: "a label", query: "?limit=5&label=prod", label: "prod"},
+		{name: "a label, with an owner in the request", query: "?limit=5&label=a.b-c_d&owner=" + adminID, label: "a.b-c_d"},
 	}
 
-	args := h.exec.calls[1][0].Args
-	if len(args) != 3 || args[0] != memberID || args[2] != int64(6) {
-		t.Errorf("agent list args = %v, want the caller's id and a page of 5 plus one", args)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			signedIn := newSession(t, memberID)
+			h := newHarness(t, fullEnv(),
+				signedIn.activeKeyStep(roleMember),
+				step{match: "FROM agents", results: rows(), err: nil},
+			)
+
+			rec := h.do(request{method: http.MethodGet, path: "/api/agent" + tt.query, cookies: []*http.Cookie{signedIn.cookie}})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+			}
+
+			args := h.exec.calls[1][0].Args
+			if len(args) != 4 || args[0] != memberID || args[2] != int64(6) || args[3] != tt.label {
+				t.Errorf("agent list args = %v, want the caller's id, a page of 5 plus one and the label %v", args, tt.label)
+			}
+		})
 	}
 }
 

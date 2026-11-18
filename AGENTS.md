@@ -39,7 +39,7 @@ The `Makefile` is the only entrypoint; CI runs the same targets. `make help` lis
 | `make dev` | Run the Worker locally on :8787 with a local D1 |
 | `make fmt` | Format Go code |
 
-The e2e, and size checks are expensive to run. Minimize the times it must be run by focusing on make check for the dev cycle, and only running make e2e at the end. Save the e2e results to a log file, so you can immediately get logs upon error, rather than having to retry
+The e2e, and size checks are expensive to run. Minimize the times it must be run by focusing on make check for the dev cycle, and only running make test-e2e at the end. Save the e2e results to a log file, so you can immediately get logs upon error, rather than having to retry
 
 ## Conventions
 

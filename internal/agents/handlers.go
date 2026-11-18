@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
@@ -28,9 +29,10 @@ const (
 	// CodeKeyFailed is the creation of an agent's key failing, before anything
 	// was written.
 	CodeKeyFailed = "agent_key_failed"
-	// CodeMissingName is a rename without a name.
-	CodeMissingName = "missing_agent_name"
-	// CodeRevoked is a rename of an agent that is revoked.
+	// CodeNothingToChange is a PATCH that names nothing to change: no name, and
+	// no label to add or remove.
+	CodeNothingToChange = "missing_agent_change"
+	// CodeRevoked is a change to an agent that is revoked.
 	CodeRevoked = "agent_revoked"
 	// CodeScopesInherited is an agent that tried to choose the scopes of the
 	// agent it creates: they are always its own.
@@ -38,6 +40,9 @@ const (
 	// CodeKeyScopesExceeded is an agent that asked for a key holding a scope its
 	// own key does not list.
 	CodeKeyScopesExceeded = "key_scopes_exceeded"
+	// CodeLabelLimit is a PATCH that would leave an agent with more than
+	// input.MaxLabelsPerAgent labels. Nothing in the request took effect.
+	CodeLabelLimit = "agent_label_limit_reached"
 )
 
 // Paths. The collection takes GET and POST; one agent takes GET, PATCH and
@@ -78,7 +83,7 @@ func Routes(deps Deps) []auth.Route {
 		declare(http.MethodGet, collectionPath, auth.Needs(scope.AgentRead), deps.list),
 		declare(http.MethodPost, collectionPath, auth.Needs(scope.AgentCreate), deps.create),
 		declare(http.MethodGet, itemPath, auth.Needs(scope.AgentRead), deps.get),
-		declare(http.MethodPatch, itemPath, auth.Needs(scope.AgentUpdate).WithoutAgents(), deps.rename),
+		declare(http.MethodPatch, itemPath, auth.Needs(scope.AgentUpdate).WithoutAgents(), deps.patch),
 		declare(http.MethodDelete, itemPath, auth.Needs(scope.AgentRevoke).WithoutAgents(), deps.revoke),
 	}
 }
@@ -105,11 +110,12 @@ type ListResponse struct {
 type page struct {
 	cursor input.Cursor
 	limit  input.PageLimit
+	filter input.LabelFilter
 }
 
-// parsePage reads the limit and cursor from the query. Each may appear at most
-// once: a repeated parameter is ambiguous, and which value wins differs between
-// layers, so it is refused rather than guessed.
+// parsePage reads the limit, cursor and label from the query. Each may appear
+// at most once: a repeated parameter is ambiguous, and which value wins differs
+// between layers, so it is refused rather than guessed.
 func parsePage(query map[string][]string) result.Result[page] {
 	return result.Of(input.ParsePageLimit(query["limit"])).
 		Map(func(limit input.PageLimit) page { return page{limit: limit} }).
@@ -117,13 +123,18 @@ func parsePage(query map[string][]string) result.Result[page] {
 			return result.Of(input.ParseCursor(query["cursor"])).
 				Map(func(cursor input.Cursor) page { p.cursor = cursor; return p }).
 				Get()
+		}).
+		Then(func(p page) (page, error) {
+			return result.Of(input.ParseLabelFilter(query["label"])).
+				Map(func(filter input.LabelFilter) page { p.filter = filter; return p }).
+				Get()
 		})
 }
 
 func (d Deps) list(call *auth.Call) result.Result[httpapi.Response] {
 	return parsePage(call.Request.Query).
 		Then(func(p page) (store.AgentPage, error) {
-			return d.Store.ListAgents(call.Request.Context, call.Principal.UserID, p.cursor, p.limit)
+			return d.Store.ListAgents(call.Request.Context, call.Principal.UserID, p.cursor, p.limit, p.filter)
 		}).
 		Map(func(stored store.AgentPage) ListResponse {
 			out := ListResponse{Agents: make([]Agent, 0, len(stored.Agents)), Next: stored.Next}
@@ -166,6 +177,13 @@ type createBody struct {
 	// Name is a label for the agent.
 	Name string `json:"name"`
 
+	// Labels are the labels the new agent starts with. Absent, null and empty
+	// all mean none. They are written in the same batch as the agent, so a
+	// create either gives the agent every one of them or creates nothing. The
+	// array carries a maxitems tag, so the decoder refuses an oversized one
+	// before it has allocated it; input.ParseLabelSet checks the bound again.
+	Labels *[]string `json:"labels" maxitems:"20"`
+
 	// Scopes is the new agent's scope list, and KeyScopes its first key's.
 	// Absent means the default (DefaultScopes); an empty list is a credential
 	// that can use only the routes that need no scope. An agent creating an
@@ -197,23 +215,30 @@ type Key struct {
 	ExpiresAt int64 `json:"expiresAt"`
 }
 
-// request is a create request that has been parsed: the name and the scope
-// lists the new agent and its key are to have.
+// request is a create request that has been parsed: the name, the labels and
+// the scope lists the new agent and its key are to have.
 type request struct {
 	name      input.AgentName
+	labels    input.LabelSet
 	scopes    scope.List
 	keyScopes scope.List
 }
 
-// parseCreate parses the new agent's name and scope lists. A list that is
-// absent is the default; one that is present is parsed strictly, so a typo or an
-// unknown name is a 400 and not a credential that silently can do nothing.
+// parseCreate parses the new agent's name, labels and scope lists. A scope list
+// that is absent is the default; one that is present is parsed strictly, so a
+// typo or an unknown name is a 400 and not a credential that silently can do
+// nothing.
 //
 // The caller decides what an absent list means (an agent creating an agent
 // inherits), so absence is reported and not resolved here.
 func parseCreate(body createBody) result.Result[request] {
 	return result.Of(input.ParseAgentName(body.Name)).
 		Map(func(name input.AgentName) request { return request{name: name} }).
+		Then(func(req request) (request, error) {
+			return result.Of(input.ParseLabelSet(deref(body.Labels))).
+				Map(func(labels input.LabelSet) request { req.labels = labels; return req }).
+				Get()
+		}).
 		Then(func(req request) (request, error) {
 			return parseOptionalScopes(body.Scopes).
 				Map(func(scopes scope.List) request { req.scopes = scopes; return req }).
@@ -238,9 +263,9 @@ func parseOptionalScopes(raw *[]string) result.Result[scope.List] {
 		Map(func(parsed input.ScopeList) scope.List { return parsed.List() })
 }
 
-// creation is a create request that has been planned: the agent and its key
-// exactly as they will be written, and the key's token. Once written it also
-// holds the agent's scopes as the write stored them.
+// creation is a create request that has been planned: the agent, its key and its
+// labels exactly as they will be written, and the key's token. Once written it
+// also holds the agent's scopes as the write stored them.
 type creation struct {
 	agent store.NewAgent
 	token string
@@ -395,7 +420,7 @@ func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
 			return creation{
 				agent: store.NewAgent{
 					ID: id, Owner: owner, Name: req.name, Scopes: req.scopes.JSON(), KeyScope: key.Scope,
-					CreatedBy: call.Principal.AgentID, MaxActive: MaxAgentsPerUser,
+					Labels: req.labels, CreatedBy: call.Principal.AgentID, MaxActive: MaxAgentsPerUser,
 					KeyID: key.ID.String(), KeyJWK: key.JWK, KeyExpiresAt: key.ExpiresAt, CreatedAt: now,
 				},
 				token:     key.JWT,
@@ -406,34 +431,70 @@ func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
 
 // respondCreated is the response to a create, built from what was written: the
 // agent's scopes are the ones the write returned, and the row is not read back.
+// The labels are the ones the batch wrote, in ascending order as every read of
+// an agent lists them, and an empty list when there are none.
 func respondCreated(plan creation) CreateResponse {
 	agent := plan.agent
 
 	return CreateResponse{
 		Agent: Agent{
 			ID: agent.ID, Name: agent.Name.String(), Scopes: plan.scopes.Claim(), Status: StatusActive,
-			RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(),
+			RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(), Labels: sortedLabels(agent.Labels),
 		},
 		Key: Key{ID: agent.KeyID, Token: plan.token, Scopes: plan.keyScopes.Claim(), ExpiresAt: agent.KeyExpiresAt.Unix()},
 	}
 }
 
-// renameBody is the body of PATCH /api/agent/{id}. It is a patch, so each
-// field is optional, but at least one must be present; the name is the only
-// one there is.
-type renameBody struct {
-	Name *string `json:"name"`
+// sortedLabels is the text of a create's labels in ascending order, as an agent
+// is always shown, and never nil: an agent with no labels has an empty list.
+func sortedLabels(set input.LabelSet) []string {
+	labels := set.Labels()
+	text := make([]string, len(labels))
+
+	for i, label := range labels {
+		text[i] = label.String()
+	}
+
+	slices.Sort(text)
+
+	return text
 }
 
-func (d Deps) rename(call *auth.Call) result.Result[httpapi.Response] {
-	return httpapi.Decode[renameBody](call.Request).
-		Then(parseRename).
-		Then(func(name input.AgentName) (store.Agent, error) {
-			return d.Store.RenameAgent(call.Request.Context, call.Principal.UserID, call.ID(), name)
+// patchBody is the body of PATCH /api/agent/{id}. Every member is optional, but
+// at least one must be present.
+//
+// Labels are changed by adding and removing members and never by sending the
+// whole set, so two requests that change different labels cannot undo each
+// other: sending the set would turn every edit into a read-modify-write that
+// the second writer wins. Adding a label the agent has, and removing one it
+// lacks, succeed and change nothing, so a retry is safe.
+//
+// The arrays carry maxitems tags, so the decoder refuses an oversized one before
+// it has allocated it; input.ParseLabelPatch checks the bound again.
+type patchBody struct {
+	Name         *string   `json:"name"`
+	AddLabels    *[]string `json:"addLabels"    maxitems:"20"`
+	RemoveLabels *[]string `json:"removeLabels" maxitems:"20"`
+}
+
+// change is a parsed PATCH: what to write.
+type change struct {
+	name   *input.AgentName
+	labels input.LabelPatch
+}
+
+func (d Deps) patch(call *auth.Call) result.Result[httpapi.Response] {
+	return httpapi.Decode[patchBody](call.Request).
+		Then(parsePatch).
+		Then(func(c change) (store.Agent, error) {
+			return d.Store.PatchAgent(call.Request.Context, call.Principal.UserID, call.ID(), store.AgentPatch{
+				Name: c.name, Labels: c.labels, MaxLabels: input.MaxLabelsPerAgent,
+			})
 		}).
-		MapErr(notFound).
-		// The store returns the row as the write left it, so a revoked agent
-		// comes back with its old name and is refused here.
+		MapErr(patchFailed).
+		// The store returns the row as the batch left it, and every write of it
+		// skips a revoked agent, so a revoked agent comes back unchanged and is
+		// refused here.
 		Check(func(agent store.Agent) error {
 			if agent.RevokedAt != nil {
 				return apierr.New(apierr.Conflict, CodeRevoked, "the agent is revoked and cannot be changed")
@@ -445,18 +506,66 @@ func (d Deps) rename(call *auth.Call) result.Result[httpapi.Response] {
 		Map(func(out Agent) httpapi.Response { return httpapi.JSON(http.StatusOK, out) })
 }
 
-// parseRename requires the name to be present, then parses it.
-func parseRename(body renameBody) (input.AgentName, error) {
-	if body.Name == nil {
-		return input.AgentName{}, missingName()
+// parsePatch parses every part of a patch that is present, and refuses one that
+// changes nothing. A member that is present but null is absent, as for any
+// optional member.
+func parsePatch(body patchBody) (change, error) {
+	var name *input.AgentName
+
+	if body.Name != nil {
+		parsed, err := input.ParseAgentName(*body.Name)
+		if err != nil {
+			return change{}, err //nolint:wrapcheck // the parser's error is already the classified client error
+		}
+
+		name = &parsed
 	}
 
-	return input.ParseAgentName(*body.Name) //nolint:wrapcheck // the parser's error is already the classified client error
+	labels, err := input.ParseLabelPatch(deref(body.AddLabels), deref(body.RemoveLabels))
+	if err != nil {
+		return change{}, err //nolint:wrapcheck // the parser's error is already the classified client error
+	}
+
+	if name == nil && labels.Empty() {
+		return change{}, nothingToChange()
+	}
+
+	return change{name: name, labels: labels}, nil
 }
 
-// missingName is the client's 400 for a rename that names nothing to change.
-func missingName() *apierr.Error {
-	return apierr.New(apierr.BadRequest, CodeMissingName, "name is required")
+// nothingToChange is the client's 400 for a PATCH that names nothing to change.
+func nothingToChange() *apierr.Error {
+	return apierr.New(apierr.BadRequest, CodeNothingToChange, "a name, labels to add or labels to remove is required")
+}
+
+// deref returns the list a pointer holds, or none.
+func deref(list *[]string) []string {
+	if list == nil {
+		return nil
+	}
+
+	return *list
+}
+
+// patchFailed maps what the store says about a patch to the client's answer: no
+// such agent is a 404 and a patch that would exceed the label limit is a 409.
+// Anything else is returned as it is.
+func patchFailed(err error) error {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return noSuchAgent(err)
+	case errors.Is(err, store.ErrConflict):
+		return labelLimit(err)
+	default:
+		return err
+	}
+}
+
+// labelLimit is the client's 409 for a patch that would leave an agent with more
+// labels than it may have. The store's batch changed nothing.
+func labelLimit(cause error) *apierr.Error {
+	return apierr.New(apierr.Conflict, CodeLabelLimit,
+		fmt.Sprintf("an agent may have at most %d labels", input.MaxLabelsPerAgent)).WithCause(cause)
 }
 
 // revoke revokes an agent and every key it holds, as one batch, and returns the

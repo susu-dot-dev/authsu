@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 )
 
 const (
+	bodyNoAgents  = `{"agents":[]}`
 	bodyBadLimit  = `{"error":{"code":"invalid_limit","message":"limit must be a single integer from 1 to 100"}}` + "\n"
 	bodyBadCursor = `{"error":{"code":"invalid_cursor","message":"cursor must be a single lower-case UUID"}}` + "\n"
 )
@@ -46,10 +48,10 @@ func TestListPassesItsPageToTheStore(t *testing.T) {
 			rg := newRig(t)
 			rec := rg.as(rg.signIn(userA, roleMember), http.MethodGet, collection+tt.query, "")
 
-			wantOK(t, rg, rec, http.StatusOK, `{"agents":[]}`+"\n")
+			wantOK(t, rg, rec, http.StatusOK, bodyNoAgents+"\n")
 
 			want := []storeCall{{method: methodList, owner: userA, cursor: tt.cursor, limit: tt.limit}}
-			if len(rg.store.calls) != 1 || rg.store.calls[0] != want[0] {
+			if !reflect.DeepEqual(rg.store.calls, want) {
 				t.Errorf("store calls = %+v, want %+v", rg.store.calls, want)
 			}
 		})
@@ -165,7 +167,7 @@ func TestListPages(t *testing.T) {
 			name: "a page of one", query: "?limit=1&cursor=" + agentA3,
 			body: `{"agents":[` + jsonMiddle + `],"next":"` + agentA2 + `"}`,
 		},
-		{name: "past the end", query: "?cursor=" + agentA1, body: `{"agents":[]}`},
+		{name: "past the end", query: "?cursor=" + agentA1, body: bodyNoAgents},
 		{
 			name: "the default limit returns them all", query: "",
 			body: `{"agents":[` + jsonNewest + `,` + jsonMiddle +
@@ -243,8 +245,8 @@ func TestStoreFailuresReachTheClientAsTheStoreClassifiedThem(t *testing.T) {
 			method: methodCreate, failed: store.CodeAgentCreateFailed, rejected: store.CodeAgentCreateRejected,
 		},
 		{
-			route:  agentRoute{name: routeRename, method: http.MethodPatch, target: itemPrefix + agentA1, body: bodyX},
-			method: methodRename, failed: store.CodeAgentUpdateFailed, rejected: store.CodeAgentUpdateRejected,
+			route:  agentRoute{name: routePatch, method: http.MethodPatch, target: itemPrefix + agentA1, body: bodyX},
+			method: methodPatch, failed: store.CodeAgentUpdateFailed, rejected: store.CodeAgentUpdateRejected,
 		},
 		{
 			route:  agentRoute{name: routeRevoke, method: http.MethodDelete, target: itemPrefix + agentA1, body: ""},
@@ -265,7 +267,7 @@ func TestStoreFailuresReachTheClientAsTheStoreClassifiedThem(t *testing.T) {
 
 				wantFailure(t, rg, rec, failure.status, failure.body, failure.logged)
 
-				if got := rg.store.agent(t, agentA1); got != stored(agentA1, nameAlpha, 1, nil) {
+				if got := rg.store.agent(t, agentA1); !sameAgent(got, stored(agentA1, nameAlpha, 1, nil)) {
 					t.Errorf("a failed request changed the agent to %+v", got)
 				}
 			})
@@ -339,6 +341,249 @@ func walkPages(t *testing.T, rg *rig, cookie *http.Cookie, size, maxPages int) [
 
 		if page.Next != page.Agents[len(page.Agents)-1].ID {
 			t.Fatalf("next = %s, want the last agent of the page", page.Next)
+		}
+
+		cursor = "&cursor=" + page.Next
+	}
+
+	t.Fatal("paging did not end")
+
+	return nil
+}
+
+const bodyBadLabel = `{"error":{"code":"invalid_label_filter","message":"label must be given at most once, ` +
+	`as 1 to 63 characters, each a lower-case letter, a digit, '.', '_' or '-'"}}` + "\n"
+
+// TestListFiltersByLabel: ?label= keeps the agents that have the label, each
+// with ALL of its labels, in the same order and with the same paging as an
+// unfiltered list, and only the caller's.
+func TestListFiltersByLabel(t *testing.T) {
+	t.Parallel()
+
+	one := labelled(stored(agentA1, "one", 100, nil), "prod", "web")
+	two := labelled(stored(agentA2, "two", 200, new(int64(250))), "prod")
+	three := labelled(stored(agentA3, "three", 300, nil), "staging", "web")
+
+	jsonOne := agentJSONWith(agentA1, "one", 100, nil, `["prod","web"]`)
+	jsonTwo := agentJSONWith(agentA2, "two", 200, new(int64(250)), `["prod"]`)
+	jsonThree := agentJSONWith(agentA3, "three", 300, nil, `["staging","web"]`)
+
+	tests := []struct {
+		name  string
+		query string
+		body  string
+	}{
+		{name: "a label some have", query: "?label=prod", body: `{"agents":[` + jsonTwo + `,` + jsonOne + `]}`},
+		{name: "a label others have", query: "?label=web", body: `{"agents":[` + jsonThree + `,` + jsonOne + `]}`},
+		{name: "a label one has", query: "?label=staging", body: `{"agents":[` + jsonThree + `]}`},
+		{name: "a label nobody has", query: "?label=nope", body: bodyNoAgents},
+		{name: "a label only another user has", query: "?label=theirs", body: bodyNoAgents},
+		{
+			name: "a revoked agent is listed", query: "?label=prod&limit=1",
+			body: `{"agents":[` + jsonTwo + `],"next":"` + agentA2 + `"}`,
+		},
+		{
+			name: "the next page of a filtered list", query: "?label=prod&limit=1&cursor=" + agentA2,
+			body: `{"agents":[` + jsonOne + `]}`,
+		},
+		{name: "the filter does not change the labels shown", query: "?label=web&limit=5&cursor=" + agentA3,
+			body: `{"agents":[` + jsonOne + `]}`},
+		{
+			name: "no filter lists everything", query: "",
+			body: `{"agents":[` + jsonThree + `,` + jsonTwo + `,` + jsonOne + `]}`,
+		},
+		{name: "a label is matched whole, not as a prefix", query: "?label=pro", body: bodyNoAgents},
+		{name: "a label is matched whole, not as a suffix", query: "?label=rod", body: bodyNoAgents},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rg := newRig(t)
+			rg.seed(userA, one, two, three)
+			rg.seed(userB, labelled(stored(agentB1, "theirs", 400, nil), "theirs", "prod"))
+
+			rec := rg.as(rg.signIn(userA, roleMember), http.MethodGet, collection+tt.query, "")
+
+			wantOK(t, rg, rec, http.StatusOK, tt.body+"\n")
+		})
+	}
+}
+
+// TestListPassesTheLabelFilterToTheStore: what the query says is what the store
+// is asked, for the session's user, and no filter is no label.
+func TestListPassesTheLabelFilterToTheStore(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		query string
+		label string
+	}{
+		{name: "no filter", query: "", label: ""},
+		{name: "a label", query: "?label=abc", label: "abc"},
+		{name: "a label with every allowed character", query: "?label=a.b_c-9", label: "a.b_c-9"},
+		{name: "the longest label", query: "?label=" + strings.Repeat("a", 63), label: strings.Repeat("a", 63)},
+		{name: "with paging", query: "?limit=3&label=x&cursor=" + agentA2, label: "x"},
+		{name: "a parameter that is not label", query: "?labels=abc&Label=abc", label: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rg := newRig(t)
+			rec := rg.as(rg.signIn(userA, roleMember), http.MethodGet, collection+tt.query, "")
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+			}
+
+			if len(rg.store.calls) != 1 || rg.store.calls[0].label != tt.label || rg.store.calls[0].owner != userA {
+				t.Errorf("store calls = %+v, want one list for %s with label %q", rg.store.calls, userA, tt.label)
+			}
+		})
+	}
+}
+
+// TestListRefusesALabelItCannotRead: a label that is not exactly right is
+// refused, not corrected, and the store is not asked.
+func TestListRefusesALabelItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "empty", query: "?label="},
+		{name: "no value", query: "?label"},
+		{name: caseUpper, query: "?label=Prod"},
+		{name: "a space", query: "?label=a%20b"},
+		{name: "a plus is a space", query: "?label=a+b"},
+		{name: "a comma list", query: "?label=a,b"},
+		{name: "given twice", query: "?label=a&label=b"},
+		{name: "given twice, the same", query: "?label=a&label=a"},
+		{name: "given twice, the first empty", query: "?label=&label=a"},
+		{name: "one over the longest", query: "?label=" + strings.Repeat("a", 64)},
+		{name: caseNUL, query: "?label=a%00"},
+		{name: "a line feed", query: "?label=a%0a"},
+		{name: "a SQL injection", query: "?label=" + url.QueryEscape("' OR '1'='1")},
+		{name: caseWildcard, query: "?label=%25"},
+		{name: "another script", query: "?label=%D0%B0"},
+		{name: "an emoji", query: "?label=%F0%9F%98%80"},
+		{name: "invalid UTF-8", query: "?label=%ff"},
+		{name: "a good label and a bad limit is the limit's error", query: "?label=a&limit=0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rg := newRig(t)
+			rg.seed(userA, labelled(stored(agentA1, nameAlpha, 1, nil), "a"))
+
+			rec := rg.as(rg.signIn(userA, roleMember), http.MethodGet, collection+tt.query, "")
+
+			code := codeLabelFilter
+			if strings.HasSuffix(tt.query, "limit=0") {
+				code = codeLimit
+			}
+
+			wantBadRequest(t, rg, rec, code)
+			rg.untouched()
+		})
+	}
+}
+
+// TestLabelFilterRefusalBody pins the exact refusal of a bad filter.
+func TestLabelFilterRefusalBody(t *testing.T) {
+	t.Parallel()
+
+	rg := newRig(t)
+	rec := rg.as(rg.signIn(userA, roleMember), http.MethodGet, collection+"?label=A", "")
+
+	wantFailure(t, rg, rec, http.StatusBadRequest, bodyBadLabel, codeLabelFilter)
+}
+
+// TestFilteredPagesCoverEveryMatchOnce follows the cursors of a filtered list at
+// every page size: each agent that has the label is seen once, newest first, and
+// none that lacks it is.
+func TestFilteredPagesCoverEveryMatchOnce(t *testing.T) {
+	t.Parallel()
+
+	const total = 9
+
+	var (
+		ids  = make([]string, total)
+		want []string
+	)
+
+	for i := range ids {
+		ids[i] = fmt.Sprintf("00000000-0000-7000-8000-0000000002%02d", i)
+	}
+
+	for i := range slices.Backward(ids) {
+		if i%3 != 1 {
+			want = append(want, ids[i])
+		}
+	}
+
+	for size := 1; size <= total+1; size++ {
+		t.Run(fmt.Sprintf("page size %d", size), func(t *testing.T) {
+			t.Parallel()
+
+			rg := newRig(t)
+
+			for i, id := range ids {
+				agent := stored(id, "agent", int64(i), nil)
+				if i%3 != 1 {
+					agent = labelled(agent, "keep")
+				} else {
+					agent = labelled(agent, "drop")
+				}
+
+				rg.seed(userA, agent)
+			}
+
+			seen := walkLabelledPages(t, rg, rg.signIn(userA, roleMember), size, total)
+
+			if !slices.Equal(seen, want) {
+				t.Errorf("paging saw %v, want %v", seen, want)
+			}
+		})
+	}
+}
+
+// walkLabelledPages is walkPages for the label keep.
+func walkLabelledPages(t *testing.T, rg *rig, cookie *http.Cookie, size, maxPages int) []string {
+	t.Helper()
+
+	var (
+		seen   []string
+		cursor string
+	)
+
+	for range maxPages + 1 {
+		rec := rg.as(cookie, http.MethodGet, fmt.Sprintf("%s?label=keep&limit=%d%s", collection, size, cursor), "")
+
+		var page ListResponse
+
+		err := json.Unmarshal(rec.Body.Bytes(), &page)
+		if rec.Code != http.StatusOK || err != nil || len(page.Agents) > size {
+			t.Fatalf("a page = %d %q (%v), want at most %d agents", rec.Code, rec.Body.String(), err, size)
+		}
+
+		for _, agent := range page.Agents {
+			if !slices.Contains(agent.Labels, "keep") {
+				t.Fatalf("agent %s without the label was listed: %v", agent.ID, agent.Labels)
+			}
+
+			seen = append(seen, agent.ID)
+		}
+
+		if page.Next == "" {
+			return seen
 		}
 
 		cursor = "&cursor=" + page.Next

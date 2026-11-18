@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/input"
@@ -54,16 +55,31 @@ type Agent struct {
 
 	// CreatedAt is in Unix seconds.
 	CreatedAt int64
+
+	// Labels are the agent's labels, in ascending order. It is never nil.
+	Labels []string
 }
 
 // readAgent reads one agent row, in the column order every agent statement
-// selects or returns: id, name, scopes, revoked_at, created_at.
+// selects or returns: id, name, scopes, revoked_at, created_at, labels.
+//
+// labels is the agent's labels as the text of a JSON array, sorted, and "[]" for
+// none. Every statement computes it with a subselect over agent_labels, and not
+// a join, so a read stays one row per agent, which keyset paging and LIMIT
+// depend on (a join repeats the agent once per label). The label alphabet has no
+// character JSON escapes, so the text decodes to the labels exactly. Each query
+// writes the subselect out in full, because the queries are single literals that
+// a test reads.
 func readAgent(r *row) Agent {
 	// Struct fields are evaluated in order, which is the column order.
-	return Agent{
+	agent := Agent{
 		ID: r.text(), Name: r.text(), Scopes: r.text(),
-		RevokedAt: r.optInteger(), CreatedAt: r.integer(),
+		RevokedAt: r.optInteger(), CreatedAt: r.integer(), Labels: nil,
 	}
+
+	agent.Labels = r.labels()
+
+	return agent
 }
 
 // agentListQuery reads one page of a user's agents, revoked ones included,
@@ -77,12 +93,20 @@ func readAgent(r *row) Agent {
 //
 // The owner is part of the match, so a user's page holds only their agents.
 //
+// ?4 is the label to filter by, or NULL for no filter, so every page has one
+// shape. The filter is a semi-join on agent_labels' primary key, not a join, so
+// an agent with the label is one row however many labels it has. The labels
+// column still lists ALL of the agent's labels, not only the one filtered by.
+//
 // Arguments, by number: ?1 user id, ?2 cursor (the id to start below;
-// agentsFirstPage for the first page), ?3 rows wanted.
+// agentsFirstPage for the first page), ?3 rows wanted, ?4 the label or NULL.
 const agentListQuery = `
-SELECT id, name, scopes, revoked_at, created_at
+SELECT id, name, scopes, revoked_at, created_at,
+  (SELECT json_group_array(label)
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels
 FROM agents
 WHERE user_id = ?1 AND id < ?2
+  AND (?4 IS NULL OR EXISTS (SELECT 1 FROM agent_labels f WHERE f.agent_id = agents.id AND f.label = ?4))
 ORDER BY id DESC
 LIMIT ?3`
 
@@ -98,12 +122,13 @@ type AgentPage struct {
 
 // ListAgents returns up to limit of the user's agents with an id below the
 // cursor, revoked ones included, newest first. An empty cursor starts at the
-// newest agent. owner is the authenticated user's id.
+// newest agent. owner is the authenticated user's id. A label filter limits the
+// page to agents that have that label.
 //
 // It reads one row more than the page holds. If that row is there, there is a
 // next page, and it starts below the last agent that is returned.
 func (s *Store) ListAgents(
-	ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit,
+	ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit, filter input.LabelFilter,
 ) (AgentPage, error) {
 	o := op{failed: CodeAgentListFailed, rejected: CodeAgentListRejected, description: agentsDescription}
 
@@ -117,8 +142,14 @@ func (s *Store) ListAgents(
 	size := max(limit.Int(), 1)
 	wanted := size + 1
 
+	// No filter is a NULL, which the query reads as "any label".
+	var label any
+	if filtered, ok := filter.Label(); ok {
+		label = filtered.String()
+	}
+
 	agents, err := queryAll(ctx, s, o,
-		Statement{Query: agentListQuery, Args: []any{owner, before, int64(wanted)}}, readAgent)
+		Statement{Query: agentListQuery, Args: []any{owner, before, int64(wanted), label}}, readAgent)
 	if err != nil {
 		return AgentPage{}, err
 	}
@@ -143,7 +174,9 @@ func (s *Store) ListAgents(
 //
 // Arguments: id, user id.
 const agentGetQuery = `
-SELECT id, name, scopes, revoked_at, created_at
+SELECT id, name, scopes, revoked_at, created_at,
+  (SELECT json_group_array(label)
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels
 FROM agents
 WHERE id = ? AND user_id = ?`
 
@@ -226,6 +259,25 @@ const insertAgentKeyQuery = `
 INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, agent_id, scope, created_at)
 VALUES (?, (SELECT user_id FROM agents WHERE id = ?), ?, ?, ?, ?, ?, ?)`
 
+// insertAgentLabelQuery gives a new agent one label, in the batch that creates
+// it. Like insertAgentKeyQuery it reads the agent's id from the agent's row, in
+// the write: if the agent was not created (the user was at the limit, or was
+// revoked in the meantime, or the creating agent was revoked) the subselect is
+// NULL, agent_id is NOT NULL, and the whole batch fails as a conflict, which
+// rolls the agent insert back with it. A plain VALUES (?1, ?2) would instead
+// fail on the foreign key, which is a defect and not the conflict this is.
+//
+// There is no cap here, unlike agentLabelAddQuery: the agent has just been
+// created in the same batch, so it has no labels, and the labels written are
+// the parsed set, which input.ParseLabelSet bounds at input.MaxLabelsPerCreate
+// and refuses to repeat. No ON CONFLICT clause either, for the same reason: a
+// repeat would be a defect and must not be hidden.
+//
+// Arguments, by number: ?1 agent id, ?2 label.
+const insertAgentLabelQuery = `
+INSERT INTO agent_labels (agent_id, label)
+VALUES ((SELECT id FROM agents WHERE id = ?1), ?2)`
+
 // NewAgent is an agent and its first API key, as a create writes them. The
 // caller has already made the key: the store only records it.
 type NewAgent struct {
@@ -252,6 +304,11 @@ type NewAgent struct {
 	// come from and what must still be active (see insertAgentByAgentQuery).
 	CreatedBy string
 
+	// Labels are the labels the new agent starts with, possibly none. They are
+	// written in the same batch as the agent, so an agent is never seen
+	// without them and a create that cannot give them creates nothing.
+	Labels input.LabelSet
+
 	// MaxActive is how many active agents a user may have: the create is
 	// refused when the owner already has that many.
 	MaxActive int
@@ -266,10 +323,10 @@ type NewAgent struct {
 	CreatedAt time.Time
 }
 
-// CreateAgent writes an agent and its first key as one batch: either both exist
-// or neither does. See insertAgentQuery and insertAgentKeyQuery for how the
-// owner being revoked or at the limit fails the batch and not just the first
-// statement.
+// CreateAgent writes an agent, its first key and its labels as one batch:
+// either all of them exist or none does. See insertAgentQuery,
+// insertAgentKeyQuery and insertAgentLabelQuery for how the owner being revoked
+// or at the limit fails the batch and not just the first statement.
 //
 // It returns the scope list the agent's row was written with, as the write
 // left it. For an agent created by another agent that is the creating agent's
@@ -294,12 +351,24 @@ func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (string, error)
 		}}
 	}
 
-	stored, err := result.Of(s.run(ctx, o, insert,
-		Statement{Query: insertAgentKeyQuery, Args: []any{
-			agent.KeyID, agent.ID, KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
-			agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
-		}},
-	)).
+	key := Statement{Query: insertAgentKeyQuery, Args: []any{
+		agent.KeyID, agent.ID, KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
+		agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
+	}}
+
+	labels := agent.Labels.Labels()
+	labelInserts := make([]Statement, len(labels))
+
+	for i, label := range labels {
+		labelInserts[i] = Statement{Query: insertAgentLabelQuery, Args: []any{agent.ID, label.String()}}
+	}
+
+	// The agent, its key, then each label: every statement after the first
+	// reads the agent's row, so none of them can be written for an agent that
+	// was not.
+	statements := slices.Concat([]Statement{insert, key}, labelInserts)
+
+	stored, err := result.Of(s.run(ctx, o, statements...)).
 		Then(func(results []Result) (string, error) { return one(results[0].Rows, o, readScopes) }).
 		MapErr(func(err error) error { return agentInsertShape(o, err) }).
 		Get()
@@ -322,41 +391,146 @@ func agentInsertShape(o op, err error) error {
 // readScopes reads the one column an agent insert returns.
 func readScopes(r *row) string { return r.text() }
 
-// agentRenameQuery renames an agent, unless it is revoked. A revoked agent is
-// final, as for invitations: changing it would suggest it could be revived.
+// agentPatchReadQuery is the last statement of PatchAgent: it reads the agent as
+// the batch left it. The batch is one transaction, so this reads the writes
+// before it and nothing another request did in between.
 //
-// The row is matched by id and owner alone, and the CASE decides whether the
-// name changes, so RETURNING reports the row as the statement left it, and the
-// outcome is read off it. The agent was renamed if it is not revoked. No row
-// returned means the user has no such agent.
+// The outcome is read off the row, as for rename: no row is no such agent for
+// this owner (the earlier statements matched nothing too), and revoked_at set
+// means the earlier statements, which skip a revoked agent, changed nothing.
 //
-// RETURNING is the columns readAgent reads, in that order.
+// It is a SELECT of its own, and not a RETURNING of one write, because the
+// rename and the label writes are separate statements and the read must see all
+// of them.
+//
+// Arguments, by number: ?1 id, ?2 user id.
+const agentPatchReadQuery = `
+SELECT id, name, scopes, revoked_at, created_at,
+  (SELECT json_group_array(label)
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels
+FROM agents
+WHERE id = ?1 AND user_id = ?2`
+
+// agentLabelRemoveQuery removes one label from an agent, unless the agent is not
+// the owner's or is revoked. Removing a label the agent does not have matches no
+// row and is not an error, so removal is idempotent. The owner and the agent
+// being active are part of the DELETE, because D1 has no interactive
+// transaction and a read before it could be stale by the time it ran.
+//
+// Arguments, by number: ?1 agent id, ?2 label, ?3 user id.
+const agentLabelRemoveQuery = `
+DELETE FROM agent_labels
+WHERE agent_id = ?1 AND label = ?2
+  AND EXISTS (SELECT 1 FROM agents a WHERE a.id = ?1 AND a.user_id = ?3 AND a.revoked_at IS NULL)`
+
+// agentLabelAddQuery adds one label to an agent, if the agent is the owner's, is
+// not revoked, and either already has the label or has fewer than ?4 labels.
+//
+//   - The agent row is selected under the owner and active conditions, so another
+//     user's agent, a revoked one and a missing one match no row and nothing is
+//     inserted: the final read reports why.
+//   - ON CONFLICT DO NOTHING makes adding a label the agent has a no-op, so the
+//     call is idempotent and two requests adding the same label both succeed.
+//   - The cap is part of the write: the count is taken here, not read earlier, so
+//     two requests adding different labels at the cap cannot both succeed. The
+//     agent_id is a CASE that is NULL when the agent is at the cap and lacks the
+//     label, and agent_id is NOT NULL, so that case is a constraint failure,
+//     which fails the whole batch and rolls back the removals and adds before it:
+//     a patch that would exceed the cap changes nothing, and is not partly
+//     applied. A conditional INSERT ... SELECT that matched nothing would be
+//     silent, and the batch would commit the rest. The label being present is
+//     checked in the CASE too, because the conflict is only found after the
+//     CASE has run, and re-adding a label at the cap must not fail.
+//
+// A NOT NULL failure is therefore this statement's, and only this statement's,
+// ErrConflict: every other guard matches no row instead.
+//
+// Arguments, by number: ?1 agent id, ?2 label, ?3 user id, ?4 the most labels an
+// agent may have.
+const agentLabelAddQuery = `
+INSERT INTO agent_labels (agent_id, label)
+SELECT CASE
+         WHEN (SELECT count(*) FROM agent_labels l WHERE l.agent_id = a.id) < ?4
+           OR EXISTS (SELECT 1 FROM agent_labels l WHERE l.agent_id = a.id AND l.label = ?2)
+         THEN a.id
+       END, ?2
+FROM agents a
+WHERE a.id = ?1 AND a.user_id = ?3 AND a.revoked_at IS NULL
+ON CONFLICT DO NOTHING`
+
+// agentPatchRenameQuery renames an agent as part of a patch, unless it is
+// revoked. A revoked agent is final, as for invitations: changing it would
+// suggest it could be revived. It has no RETURNING: PatchAgent reads the agent
+// once, after every write, with agentPatchReadQuery, so the outcome and the row
+// are the same instant.
 //
 // Arguments, by number: ?1 name, ?2 id, ?3 user id.
-const agentRenameQuery = `
+const agentPatchRenameQuery = `
 UPDATE agents
-SET name = CASE WHEN revoked_at IS NULL THEN ?1 ELSE name END
-WHERE id = ?2 AND user_id = ?3
-RETURNING id, name, scopes, revoked_at, created_at`
+SET name = ?1
+WHERE id = ?2 AND user_id = ?3 AND revoked_at IS NULL`
 
-// RenameAgent renames one of the user's agents and returns the agent as the
-// write left it. A revoked agent keeps its name and is returned as it is: the
-// row comes back from the same statement that decided, so there is no read in
-// between to disagree, and the caller reads RevokedAt to tell it was refused.
-// It returns ErrNotFound when the user has no such agent.
+// AgentPatch is a change to one agent: a new name, and labels to add and remove.
+// Each part is optional. The labels are applied removals first, then additions,
+// so a patch at the label limit may swap one label for another.
+type AgentPatch struct {
+	// Name is the new name, or nil to keep it.
+	Name *input.AgentName
+
+	// Labels are the labels to add and remove.
+	Labels input.LabelPatch
+
+	// MaxLabels is how many labels an agent may have: the patch is refused when
+	// it would leave the agent with more.
+	MaxLabels int
+}
+
+// PatchAgent applies a patch to one of the user's agents as one batch: the new
+// name, the removed labels, then the added labels, then a read of the agent. Either
+// every part takes effect or none does, so a patch that would exceed MaxLabels
+// changes nothing, not even the name.
 //
-// The statement sets nothing the code has not checked, so a constraint failure
-// of any kind is a defect on our side, a conflict included.
-func (s *Store) RenameAgent(ctx context.Context, owner string, id input.ID, name input.AgentName) (Agent, error) {
+// It returns the agent as the batch left it. A revoked agent is returned
+// unchanged, for the caller to refuse: every write skips a revoked agent, so the
+// row comes back with revoked_at set. It returns
+// ErrNotFound when the user has no such agent, which includes one that belongs
+// to someone else. It returns ErrConflict when the patch would leave the agent
+// with more than MaxLabels labels.
+//
+// A patch that changes nothing is valid and returns the agent. Every other
+// constraint failure is a defect on our side (a label is bounded by its parser,
+// and nothing else the batch writes can collide), but the label cap's
+// ErrConflict is the batch working as designed, so it is returned as is.
+func (s *Store) PatchAgent(ctx context.Context, owner string, id input.ID, patch AgentPatch) (Agent, error) {
 	o := op{failed: CodeAgentUpdateFailed, rejected: CodeAgentUpdateRejected, description: agentsDescription}
 
-	results, err := s.run(ctx, o,
-		Statement{Query: agentRenameQuery, Args: []any{name.String(), id.String(), owner}})
-	if err != nil {
-		return Agent{}, rejectAgentConflict(o, err)
+	statements := make([]Statement, 0, 1+len(patch.Labels.Remove())+len(patch.Labels.Add())+1)
+
+	if patch.Name != nil {
+		statements = append(statements,
+			Statement{Query: agentPatchRenameQuery, Args: []any{patch.Name.String(), id.String(), owner}})
 	}
 
-	return one(results[0].Rows, o, readAgent)
+	for _, label := range patch.Labels.Remove() {
+		statements = append(statements,
+			Statement{Query: agentLabelRemoveQuery, Args: []any{id.String(), label.String(), owner}})
+	}
+
+	for _, label := range patch.Labels.Add() {
+		statements = append(statements,
+			Statement{Query: agentLabelAddQuery, Args: []any{id.String(), label.String(), owner, int64(patch.MaxLabels)}})
+	}
+
+	// The read is last, so it sees every write. It is the only statement whose
+	// rows are read.
+	statements = append(statements, Statement{Query: agentPatchReadQuery, Args: []any{id.String(), owner}})
+
+	results, err := s.run(ctx, o, statements...)
+	if err != nil {
+		return Agent{}, err
+	}
+
+	return one(results[len(results)-1].Rows, o, readAgent)
 }
 
 // agentRevokeQuery revokes an agent now. The row is matched by id and owner, so
@@ -372,7 +546,9 @@ const agentRevokeQuery = `
 UPDATE agents
 SET revoked_at = COALESCE(revoked_at, ?1)
 WHERE id = ?2 AND user_id = ?3
-RETURNING id, name, scopes, revoked_at, created_at`
+RETURNING id, name, scopes, revoked_at, created_at,
+  (SELECT json_group_array(label)
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels`
 
 // agentRevokeKeysQuery revokes every key of an agent, in the same batch as
 // agentRevokeQuery and after it. It applies only if the agent is revoked once
@@ -396,7 +572,7 @@ WHERE agent_id = ?2
 // ErrNotFound when the user has no such agent, in which case no key is touched
 // either.
 //
-// As for RenameAgent, a constraint failure of any kind is a defect.
+// As for PatchAgent, a constraint failure of any kind is a defect.
 func (s *Store) RevokeAgent(ctx context.Context, owner string, id input.ID, now time.Time) (Agent, error) {
 	o := op{failed: CodeAgentRevokeFailed, rejected: CodeAgentRevokeRejected, description: agentsDescription}
 

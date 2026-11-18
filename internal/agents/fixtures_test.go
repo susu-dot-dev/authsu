@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -70,9 +71,15 @@ const (
 	routeList   = "list"
 	routeCreate = "create"
 	routeGet    = "get"
-	routeRename = "rename"
+	routePatch  = "patch"
 	routeRevoke = "revoke"
 	nameAlpha   = "alpha"
+
+	// Names of the malformed-input cases that the id, label and scope tables
+	// share.
+	caseUpper    = "upper case"
+	caseNUL      = "a NUL"
+	caseWildcard = "a wildcard"
 
 	// Codes that several tables name.
 	codeUnknownField = "unknown_field"
@@ -85,6 +92,7 @@ const (
 	codeLimit        = "invalid_limit"
 	codeCursor       = "invalid_cursor"
 	codeNoRoute      = "not_found"
+	codeDuplicate    = "duplicate_field"
 	codeNotAllowed   = "method_not_allowed"
 
 	// fieldName is the member of a body that names an agent.
@@ -112,7 +120,7 @@ const (
 	methodList   = "ListAgents"
 	methodGet    = "GetAgent"
 	methodCreate = "CreateAgent"
-	methodRename = "RenameAgent"
+	methodPatch  = "PatchAgent"
 	methodRevoke = "RevokeAgent"
 )
 
@@ -136,10 +144,13 @@ type storeCall struct {
 	// cursor is the cursor's id, "" for the first page.
 	cursor string
 	limit  int
-	name   string
 	now    time.Time
 	// agent is the NewAgent of a create.
 	agent store.NewAgent
+	// patch is the AgentPatch of a patch.
+	patch store.AgentPatch
+	// label is the label filter of a list, "" for none.
+	label string
 }
 
 // ownedAgent is an agent as the fake database holds it: with its owner.
@@ -158,29 +169,30 @@ type fakeStore struct {
 }
 
 // ListAgents is the contract of store.ListAgents: the owner's agents with an id
-// below the cursor, newest first, at most limit, and Next set when more remain.
+// below the cursor, newest first, at most limit, only those with the filter's
+// label when it is set, and Next set when more remain.
 func (f *fakeStore) ListAgents(
-	_ context.Context, owner string, cursor input.Cursor, limit input.PageLimit,
+	_ context.Context, owner string, cursor input.Cursor, limit input.PageLimit, filter input.LabelFilter,
 ) (store.AgentPage, error) {
 	before := ""
 	if id, ok := cursor.ID(); ok {
 		before = id.String()
 	}
 
-	f.calls = append(f.calls, storeCall{method: methodList, owner: owner, cursor: before, limit: limit.Int()})
+	want := ""
+	if label, ok := filter.Label(); ok {
+		want = label.String()
+	}
+
+	f.calls = append(f.calls,
+		storeCall{method: methodList, owner: owner, cursor: before, limit: limit.Int(), label: want})
 
 	err := f.fail(methodList)
 	if err != nil {
 		return store.AgentPage{}, err
 	}
 
-	var mine []store.Agent
-
-	for _, row := range f.rows {
-		if row.owner == owner && (before == "" || row.agent.ID < before) {
-			mine = append(mine, row.agent)
-		}
-	}
+	mine := f.matching(owner, before, want)
 
 	slices.SortFunc(mine, func(a, b store.Agent) int { return cmp.Compare(b.ID, a.ID) })
 
@@ -207,7 +219,18 @@ func (f *fakeStore) GetAgent(_ context.Context, owner string, id input.ID) (stor
 		return store.Agent{}, store.ErrNotFound
 	}
 
-	return f.rows[at].agent, nil
+	return normalised(f.rows[at].agent), nil
+}
+
+// normalised returns agent with a non-nil, sorted label list, as the store
+// returns it.
+func normalised(agent store.Agent) store.Agent {
+	agent.Labels = slices.Sorted(slices.Values(agent.Labels))
+	if agent.Labels == nil {
+		agent.Labels = []string{}
+	}
+
+	return agent
 }
 
 // CreateAgent is the contract of store.CreateAgent. A programmed failure is
@@ -235,22 +258,31 @@ func (f *fakeStore) CreateAgent(_ context.Context, agent store.NewAgent) (string
 		scopes = f.rows[at].agent.Scopes
 	}
 
+	// The contract: the labels are written with the agent, in the same batch.
+	labels := make([]string, 0, len(agent.Labels.Labels()))
+	for _, label := range agent.Labels.Labels() {
+		labels = append(labels, label.String())
+	}
+
 	f.rows = append(f.rows, ownedAgent{owner: agent.Owner, agent: store.Agent{
 		ID: agent.ID, Name: agent.Name.String(), Scopes: scopes, RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(),
+		Labels: labels,
 	}})
 
 	// The contract: what the row holds is what is returned.
 	return scopes, nil
 }
 
-// RenameAgent is the contract of store.RenameAgent: a revoked agent keeps its
-// name and is returned as it is.
-func (f *fakeStore) RenameAgent(
-	_ context.Context, owner string, id input.ID, name input.AgentName,
+// PatchAgent is the contract of store.PatchAgent: the whole patch takes effect
+// or none of it does. A revoked agent is returned as it is. The removals are
+// applied before the additions, an added label the agent has is a no-op, and a
+// patch that would leave the agent over patch.MaxLabels is ErrConflict.
+func (f *fakeStore) PatchAgent(
+	_ context.Context, owner string, id input.ID, patch store.AgentPatch,
 ) (store.Agent, error) {
-	f.calls = append(f.calls, storeCall{method: methodRename, owner: owner, id: id.String(), name: name.String()})
+	f.calls = append(f.calls, storeCall{method: methodPatch, owner: owner, id: id.String(), patch: patch})
 
-	err := f.fail(methodRename)
+	err := f.fail(methodPatch)
 	if err != nil {
 		return store.Agent{}, err
 	}
@@ -260,11 +292,36 @@ func (f *fakeStore) RenameAgent(
 		return store.Agent{}, store.ErrNotFound
 	}
 
-	if f.rows[at].agent.RevokedAt == nil {
-		f.rows[at].agent.Name = name.String()
+	if f.rows[at].agent.RevokedAt != nil {
+		return normalised(f.rows[at].agent), nil
 	}
 
-	return f.rows[at].agent, nil
+	updated := f.rows[at].agent
+	updated.Labels = slices.Clone(updated.Labels)
+
+	for _, label := range patch.Labels.Remove() {
+		updated.Labels = slices.DeleteFunc(updated.Labels, func(have string) bool { return have == label.String() })
+	}
+
+	for _, label := range patch.Labels.Add() {
+		if slices.Contains(updated.Labels, label.String()) {
+			continue
+		}
+
+		if len(updated.Labels) >= patch.MaxLabels {
+			return store.Agent{}, store.ErrConflict
+		}
+
+		updated.Labels = append(updated.Labels, label.String())
+	}
+
+	if patch.Name != nil {
+		updated.Name = patch.Name.String()
+	}
+
+	f.rows[at].agent = updated
+
+	return normalised(updated), nil
 }
 
 // RevokeAgent is the contract of store.RevokeAgent: an agent already revoked
@@ -287,7 +344,24 @@ func (f *fakeStore) RevokeAgent(_ context.Context, owner string, id input.ID, no
 		f.rows[at].agent.RevokedAt = &unix
 	}
 
-	return f.rows[at].agent, nil
+	return normalised(f.rows[at].agent), nil
+}
+
+// matching is the owner's agents with an id below before (any, when it is ""),
+// and with the label (any, when it is "").
+func (f *fakeStore) matching(owner, before, label string) []store.Agent {
+	var mine []store.Agent
+
+	for _, row := range f.rows {
+		below := before == "" || row.agent.ID < before
+		labelled := label == "" || slices.Contains(row.agent.Labels, label)
+
+		if row.owner == owner && below && labelled {
+			mine = append(mine, normalised(row.agent))
+		}
+	}
+
+	return mine
 }
 
 // fail is the failure programmed for method, if any.
@@ -312,11 +386,25 @@ func (f *fakeStore) agent(t *testing.T, id string) store.Agent {
 	return f.rows[at].agent
 }
 
-// stored is a stored agent with the fixture's name and scopes.
+// stored is a stored agent with the fixture's name and scopes, and no labels.
 func stored(id, name string, createdAt int64, revokedAt *int64) store.Agent {
 	return store.Agent{
 		ID: id, Name: name, Scopes: agents.DefaultScopes().JSON(), RevokedAt: revokedAt, CreatedAt: createdAt,
+		Labels: []string{},
 	}
+}
+
+// labelled is stored with labels.
+func labelled(agent store.Agent, labels ...string) store.Agent {
+	agent.Labels = labels
+
+	return agent
+}
+
+// sameAgent reports whether two stored agents are equal: Agent holds a slice,
+// so it cannot be compared with ==.
+func sameAgent(a, b store.Agent) bool {
+	return reflect.DeepEqual(normalised(a), normalised(b))
 }
 
 // fakeKeys is the key store the boundary reads keys from: rows by kid and kind,
@@ -507,7 +595,7 @@ func (r *rig) writes() int {
 	count := 0
 
 	for _, call := range r.store.calls {
-		if call.method == methodCreate || call.method == methodRename || call.method == methodRevoke {
+		if call.method == methodCreate || call.method == methodPatch || call.method == methodRevoke {
 			count++
 		}
 	}
@@ -584,15 +672,21 @@ func wantOK(t *testing.T, r *rig, rec *httptest.ResponseRecorder, status int, bo
 	}
 }
 
-// agentJSON is the exact JSON of an agent in a response.
+// agentJSON is the exact JSON of an agent in a response, with no labels.
 func agentJSON(id, name string, createdAt int64, revokedAt *int64) string {
+	return agentJSONWith(id, name, createdAt, revokedAt, "[]")
+}
+
+// agentJSONWith is agentJSON with the JSON text of the labels, such as `["a","b"]`.
+func agentJSONWith(id, name string, createdAt int64, revokedAt *int64, labels string) string {
 	if revokedAt != nil {
-		return fmt.Sprintf(`{"id":%q,"name":%q,"scopes":["default:agent"],"status":"revoked","revokedAt":%d,"createdAt":%d}`,
-			id, name, *revokedAt, createdAt)
+		return fmt.Sprintf(
+			`{"id":%q,"name":%q,"scopes":["default:agent"],"status":"revoked","revokedAt":%d,"createdAt":%d,"labels":%s}`,
+			id, name, *revokedAt, createdAt, labels)
 	}
 
-	return fmt.Sprintf(`{"id":%q,"name":%q,"scopes":["default:agent"],"status":"active","createdAt":%d}`,
-		id, name, createdAt)
+	return fmt.Sprintf(`{"id":%q,"name":%q,"scopes":["default:agent"],"status":"active","createdAt":%d,"labels":%s}`,
+		id, name, createdAt, labels)
 }
 
 // verifiedKey is a key token that japikey accepted.
@@ -633,6 +727,13 @@ func verifyToken(t *testing.T, token, jwk, kind string) (verifiedKey, error) {
 	}
 
 	return verifiedKey{kid: verified.KeyID, claims: verified.Claims}, nil
+}
+
+// wantBadRequest is wantCode for the common case, a 400.
+func wantBadRequest(t *testing.T, r *rig, rec *httptest.ResponseRecorder, code string) {
+	t.Helper()
+
+	wantCode(t, r, rec, http.StatusBadRequest, code)
 }
 
 // wantCode asserts a failure's status and the code in its body, for a table
