@@ -73,3 +73,21 @@ SET revoked_at = ?1
 WHERE user_id = ?2
   AND (revoked_at IS NULL OR revoked_at > ?1)
   AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)`
+
+// revokeAgentsQuery revokes every agent of the account, in the same batch as
+// revokeQuery and after it, because an agent's authority is borrowed from its
+// user (docs/agents_design.md). The agents' keys are already revoked by
+// revokeKeysQuery, which matches every key of the account; this keeps the
+// agents table honest, so an agent lists as revoked and cannot be renamed.
+//
+// It applies only if the account is revoked once revokeQuery has run, so a
+// refused revocation (the last admin) changes no agent. An agent that is already
+// revoked keeps its earlier time.
+//
+// Arguments, by number: ?1 revoked_at (unix seconds), ?2 user id.
+const revokeAgentsQuery = `
+UPDATE agents
+SET revoked_at = ?1
+WHERE user_id = ?2
+  AND revoked_at IS NULL
+  AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)`

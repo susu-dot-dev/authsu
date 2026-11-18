@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -180,6 +181,69 @@ func TestMintFailsOnAnInvalidRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMintKeySignsTheClaimsAndTheKindsAudience: an API key's audience is its
+// kind's, so a session verifier refuses it, and the extra claims are in the
+// signed token, where they cannot be edited.
+func TestMintKeySignsTheClaimsAndTheKindsAudience(t *testing.T) {
+	t.Parallel()
+
+	fix := newFixture(t)
+
+	key, err := MintKey(fix.issuer, Spec{
+		Kind: KindAPIKey, Subject: testUserID, Expires: fix.now.Add(time.Hour),
+		Claims: map[string]any{"act": map[string]any{"sub": "agent-1"}, "scope": "default:agent"},
+	})
+	if err != nil {
+		t.Fatalf("MintKey: %v", err)
+	}
+
+	claims := payloadOf(t, key.JWT)
+
+	if claims["sub"] != testUserID || claims["scope"] != "default:agent" {
+		t.Errorf("claims = %v, want the user as sub and the scope claim", claims)
+	}
+
+	if act, _ := claims["act"].(map[string]any); act["sub"] != "agent-1" {
+		t.Errorf("act = %v, want the agent as actor", claims["act"])
+	}
+
+	if claims["aud"] != Audience(KindAPIKey) {
+		t.Errorf("aud = %v, want %q", claims["aud"], Audience(KindAPIKey))
+	}
+
+	// A session verifier must not accept it, even with its key known.
+	fix.reader.keys[key.ID.String()] = ActiveKey{JWK: key.JWK, UserID: testUserID, ExpiresAt: key.ExpiresAt}
+
+	_, err = fix.verifier().Verify(t.Context(), key.JWT)
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("Verify(api key) = %v, want ErrUnauthorized", err)
+	}
+}
+
+// payloadOf decodes a JWT's claims without verifying it.
+func payloadOf(t *testing.T, token string) map[string]any {
+	t.Helper()
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("token has %d parts, want 3", len(parts))
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+
+	var claims map[string]any
+
+	err = json.Unmarshal(raw, &claims)
+	if err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	return claims
 }
 
 func TestVerifyAcceptsAMintedSession(t *testing.T) {
@@ -432,7 +496,8 @@ func TestMintFailsWhenTheKeyCannotBeEncoded(t *testing.T) {
 
 	fix := newFixture(t)
 
-	_, err := mintWith(func(any) ([]byte, error) { return nil, errDB }, fix.issuer, testUserID, fix.now.Add(time.Hour))
+	_, err := mintWith(func(any) ([]byte, error) { return nil, errDB }, fix.issuer,
+		Spec{Kind: KindSession, Subject: testUserID, Expires: fix.now.Add(time.Hour), Claims: nil})
 	if !errors.Is(err, errDB) {
 		t.Errorf("err = %v, want it to wrap the encoder's error", err)
 	}

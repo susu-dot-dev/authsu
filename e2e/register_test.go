@@ -267,6 +267,8 @@ func TestRegistration(t *testing.T) {
 	// First-run tests leave a user and an invitation behind. Start from the
 	// state a fresh deployment has, so the first-run invitation is minted here
 	// by the real endpoint and redeemed by the real registration.
+	query(t, "DELETE FROM japikeys")
+	query(t, "DELETE FROM agents")
 	query(t, "DELETE FROM credentials")
 	query(t, "DELETE FROM users")
 	query(t, "DELETE FROM invitations")

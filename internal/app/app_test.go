@@ -17,6 +17,14 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 )
 
+// Names shared by the per-feature wiring tests.
+const (
+	caseCollection = "collection"
+	caseItem       = "item"
+	caseList       = "list"
+	caseRevoke     = "revoke"
+)
+
 func TestHealthz(t *testing.T) {
 	t.Parallel()
 

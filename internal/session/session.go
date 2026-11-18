@@ -24,6 +24,9 @@ import (
 const (
 	// KindSession is a login session, carried in a cookie.
 	KindSession = "session"
+	// KindAPIKey is a key presented as a bearer token, by a user's software or
+	// by an agent. Nothing verifies one yet: only minting exists.
+	KindAPIKey = "api_key"
 )
 
 // Audience is the token's audience for a kind. Each route verifies with the

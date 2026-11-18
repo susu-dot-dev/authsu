@@ -65,12 +65,13 @@ type requestOptions struct {
 
 // registerPasskey creates the first administrator through the real
 // registration endpoints and returns the passkey it registered. It clears the
-// users, credentials, invitations and keys first, so it can be called more than
+// users, credentials, invitations, agents and keys first, so it can be called more than
 // once.
 func registerPasskey(t *testing.T) passkey {
 	t.Helper()
 
 	query(t, "DELETE FROM japikeys")
+	query(t, "DELETE FROM agents")
 	query(t, "DELETE FROM credentials")
 	query(t, "DELETE FROM users")
 	query(t, "DELETE FROM invitations")

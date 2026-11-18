@@ -8,6 +8,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/susu-dot-dev/authsu/internal/agents"
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/atomic"
 	"github.com/susu-dot-dev/authsu/internal/deploy"
@@ -110,11 +111,27 @@ func NewHandler(platform Platform) http.Handler {
 	routes.Handle(http.MethodGet, "/api/session", sessions.WhoAmIHandler(platform.Getenv))
 	routes.Handle(http.MethodPost, "/api/logout", sessions.LogoutHandler(platform.Getenv))
 
+	routes.agents(platform, sessions)
 	routes.admin(platform, sessions)
 
 	// CORS is outermost so a preflight is answered before routing, which would
 	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's.
 	return httpapi.CORS(func() string { return allowedOrigin(platform.Getenv) }, routes.mux)
+}
+
+// agents registers the agent API. Unlike the admin APIs it needs no role: every
+// user has agents, and each route acts only on the signed-in user's own.
+func (r router) agents(platform Platform, sessions *session.Service) {
+	agentRoutes := agents.NewService(agents.Deps{
+		Sessions: sessions,
+		Reader:   agentReader(platform.DB),
+		Batch:    platform.Batch,
+		Now:      time.Now,
+		NewID:    newID,
+		Mint:     session.MintKey,
+	}).Handlers(platform.Getenv)
+	r.HandleMethods(agents.CollectionPath, nil, agentRoutes.Collection)
+	r.HandleMethods(agents.ItemPath, agents.PathWildcards(), agentRoutes.Item)
 }
 
 // admin registers the admin APIs. Each authorises through sessions, which reads
@@ -221,4 +238,14 @@ func userReader(db *sql.DB) users.Reader {
 	}
 
 	return users.NewSQLReader(db)
+}
+
+// agentReader returns the agents Reader over db, or nil when there is no
+// database, so the agent routes answer 503 rather than panicking.
+func agentReader(db *sql.DB) agents.Reader {
+	if db == nil {
+		return nil
+	}
+
+	return agents.NewSQLReader(db)
 }

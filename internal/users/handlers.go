@@ -211,17 +211,18 @@ func (s *Service) revokeHandler(getenv func(string) string) httpapi.Handler {
 	}
 }
 
-// revoke revokes an account and every key it holds, as one batch, and returns
-// the account as the write left it. Revoking an account that is already
-// revoked succeeds and keeps the earlier time, so the call is idempotent. The
-// last active admin is refused with 409; see revokeQuery for why that check is
-// inside the write.
+// revoke revokes an account, every key it holds and every agent it has, as one
+// batch, and returns the account as the write left it. Revoking an account that
+// is already revoked succeeds and keeps the earlier time, so the call is
+// idempotent. The last active admin is refused with 409; see revokeQuery for why
+// that check is inside the write.
 func (s *Service) revoke(ctx context.Context, id string) (Row, error) {
 	now := s.now().Unix()
 
 	statements := []atomic.Statement{
 		{Query: revokeQuery, Args: []any{now, id, registration.RoleAdmin}},
 		{Query: revokeKeysQuery, Args: []any{now, id}},
+		{Query: revokeAgentsQuery, Args: []any{now, id}},
 	}
 
 	results, err := s.batch(ctx, statements...)
