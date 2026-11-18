@@ -28,6 +28,7 @@ package e2e_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -815,7 +816,10 @@ func TestAgentCreateNames(t *testing.T) {
 func agBigPost(t *testing.T, body []byte, token string) (int, string, error) {
 	t.Helper()
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, target.baseURL+pathAgent, bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(t.Context(), bigRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.baseURL+pathAgent, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -918,7 +922,7 @@ func TestAgentCreateBodySizes(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			status, text, err := agBigPost(t, []byte(body), world.tokenB)
-			if err == nil && (status != http.StatusRequestEntityTooLarge || !strings.Contains(text, codeBodyTooLarge)) {
+			if !isEarlyRefusal(status, text, err) {
 				t.Errorf("%s = %d %q, want 413 %s", name, status, text, codeBodyTooLarge)
 			}
 

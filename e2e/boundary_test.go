@@ -26,6 +26,7 @@ package e2e_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/hmac"
@@ -33,11 +34,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -930,13 +933,55 @@ func TestBndContentTypeRuleForSafeMethods(t *testing.T) {
 
 // ---- 3. body limits ----------------------------------------------------------
 
+// bigRequestTimeout bounds one far-oversized upload. The Worker refuses it in
+// well under a second; a request still going after this long is hung (workerd
+// can stall an upload on a starved machine) and must fail the test rather than
+// block the run until the package timeout.
+const bigRequestTimeout = 30 * time.Second
+
+// isTimeout reports whether err is a request that ran out of time. It is not an
+// early refusal: the Worker never answered, so isEarlyRefusal must not accept it.
+func isTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)
+}
+
+// isEarlyRefusal reports whether a reply to a far-oversized body is the Worker
+// refusing it early, which is all those tests ask. The Worker answers 413 as
+// soon as the cap is exceeded and stops reading, so a client still writing
+// either gets the 413 or sees the connection closed. When it is closed, workerd
+// may also report that to the client as its own 500 "Network connection
+// lost." (a runtime page, not the Worker's: the Worker logged a 413). That
+// happens when the upload and the Worker's close race, which a loaded machine
+// makes common (reproduced against a bare `wrangler dev` with no test code at
+// all). Anything else, a 200 or a Worker-made 5xx, is still a failure.
+func isEarlyRefusal(status int, body string, err error) bool {
+	return isEarlyRefusalWith(status, body, err, codeBodyTooLarge)
+}
+
+// isEarlyRefusalWith is isEarlyRefusal for a caller that knows the exact 413
+// body: it must then match in full. A want that is just the error code is
+// looked for inside the body instead.
+func isEarlyRefusalWith(status int, body string, err error, want string) bool {
+	switch {
+	case err != nil:
+		return !isTimeout(err)
+	case status == http.StatusRequestEntityTooLarge:
+		return body == want || (want == codeBodyTooLarge && strings.Contains(body, want))
+	default:
+		return status == http.StatusInternalServerError && strings.HasPrefix(body, "Error: Network connection lost")
+	}
+}
+
 // bndBigRequest sends a very large body to route and returns the status, body
 // and the transport error, if the connection was cut before a response arrived.
 func bndBigRequest(t *testing.T, route bndRoute, data []byte) (int, string, error) {
 	t.Helper()
 
+	ctx, cancel := context.WithTimeout(t.Context(), bigRequestTimeout)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(
-		t.Context(),
+		ctx,
 		route.method,
 		target.baseURL+route.path(idMissing),
 		bytes.NewReader(data),
@@ -1068,11 +1113,9 @@ func TestBndBodyLimitOnEveryRoute(t *testing.T) {
 			status, body, err := bndBigRequest(t, route, huge)
 			elapsed := time.Since(start)
 
-			// The Worker answers as soon as the cap is exceeded and does not read
-			// the rest, so a client still writing may see the connection closed
-			// instead of the response. That is an early refusal too, never a
-			// buffered read; what is not acceptable is any other status.
-			if err == nil && (status != http.StatusRequestEntityTooLarge || body != bndErrTooLarge) {
+			// See isEarlyRefusal: a 413, or the connection cut while still writing,
+			// is an early refusal; any other status is not acceptable.
+			if !isEarlyRefusalWith(status, body, err, bndErrTooLarge) {
 				t.Errorf("%s with 10 MiB = %d %q, want 413", route.name, status, body)
 			}
 

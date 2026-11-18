@@ -24,8 +24,9 @@ func TestDatabaseIsOnlyOpenedHere(t *testing.T) {
 
 	for _, file := range files {
 		// This file names the forbidden strings; harness_test.go starts the
-		// Worker, which is why it alone may run a command.
-		if file == "db_test.go" || file == "guard_test.go" || file == "harness_test.go" {
+		// Worker and shards_test.go starts the shards of the harness, which is
+		// why they alone may run a command.
+		if file == "db_test.go" || file == "guard_test.go" || file == "harness_test.go" || file == "shards_test.go" {
 			continue
 		}
 
