@@ -1,0 +1,301 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/susu-dot-dev/authsu/internal/input"
+)
+
+// Error codes of the invitation operations. They are stable: clients and
+// dashboards may match on them.
+const (
+	CodeInvitationListFailed     = "invitation_list_failed"
+	CodeInvitationListRejected   = "invitation_list_rejected"
+	CodeInvitationCreateFailed   = "invitation_create_failed"
+	CodeInvitationCreateRejected = "invitation_create_rejected"
+	CodeInvitationUpdateFailed   = "invitation_update_failed"
+	CodeInvitationUpdateRejected = "invitation_update_rejected"
+	CodeInvitationRevokeFailed   = "invitation_revoke_failed"
+	CodeInvitationRevokeRejected = "invitation_revoke_rejected"
+)
+
+// invitationsDescription is the client-safe text of every invitation
+// operation's Unavailable error.
+const invitationsDescription = "invitations are temporarily unavailable"
+
+// MaxInvitationTypeLen is the longest invitation type the invitations.type
+// column accepts (its CHECK is length(type) BETWEEN 1 AND 64). Types are chosen
+// by code, never by a client, so this is checked where they are configured.
+const MaxInvitationTypeLen = 64
+
+// Invitation is one invitation as an admin sees it, with its use count. It
+// never carries the code or its hash: no query here selects them.
+type Invitation struct {
+	ID    string
+	Type  string
+	Label string
+
+	// NumInvites is how many accounts it may create.
+	NumInvites int64
+
+	// Uses is how many accounts it has created: the users that point at it. The
+	// account is the redemption (docs/invitations_design.md).
+	Uses int64
+
+	// ExpiresAt, RevokedAt and CreatedBy are nil when not set (Unix seconds for
+	// the times). CreatedBy is also nil for the first-run invitation, which no
+	// account created.
+	ExpiresAt *int64
+	RevokedAt *int64
+	CreatedBy *string
+
+	// CreatedAt is in Unix seconds.
+	CreatedAt int64
+}
+
+// readInvitation reads the nine columns every invitation statement returns, in
+// this order: id, type, label, num_invites, uses, expires_at, revoked_at,
+// created_by, created_at.
+func readInvitation(r *row) Invitation {
+	// Struct fields are evaluated in order, which is the column order.
+	return Invitation{
+		ID: r.text(), Type: r.text(), Label: r.text(),
+		NumInvites: r.integer(), Uses: r.integer(),
+		ExpiresAt: r.optInteger(), RevokedAt: r.optInteger(), CreatedBy: r.optText(),
+		CreatedAt: r.integer(),
+	}
+}
+
+// listInvitationsQuery reads every invitation, revoked ones included, newest
+// first. The id is a UUIDv7, so it breaks ties between invitations created in
+// the same second in creation order.
+//
+// The use count is the number of users pointing at the invitation. The code and
+// its hash are not selected: nothing here can return them. The count has an
+// alias of its own, because a batch returns rows keyed by column name.
+//
+// Arguments: none.
+const listInvitationsQuery = `
+SELECT i.id, i.type, i.label, i.num_invites,
+       (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) AS uses,
+       i.expires_at, i.revoked_at, i.created_by, i.created_at
+FROM invitations i
+ORDER BY i.created_at DESC, i.id DESC`
+
+// ListInvitations returns every invitation, revoked ones included, newest
+// first. It is not paged: the list is the admin's own and short. The result is
+// empty and not nil when there are none.
+func (s *Store) ListInvitations(ctx context.Context) ([]Invitation, error) {
+	o := op{failed: CodeInvitationListFailed, rejected: CodeInvitationListRejected,
+		description: invitationsDescription}
+
+	return queryAll(ctx, s, o, Statement{Query: listInvitationsQuery, Args: nil}, readInvitation)
+}
+
+// insertInvitationQuery creates an invitation. The creator is an admin, who is
+// a user, so created_by is bound to a real account (a FOREIGN KEY, which makes
+// an unknown creator a defect and not a client error).
+//
+// RETURNING gives the row as the database stored it, so the response to a
+// create is the database's view and not the caller's copy of what it sent. It
+// has the columns of listInvitationsQuery. The use count is the same subselect
+// the reads use: it reads users, not the table being modified, which SQLite
+// allows in RETURNING, and for a row that did not exist a moment ago it is 0.
+//
+// Arguments, in order: id, code_hash, type, label, num_invites, expires_at,
+// created_by, created_at.
+const insertInvitationQuery = `
+INSERT INTO invitations (id, code_hash, type, label, num_invites, expires_at, created_by, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING
+  id, type, label, num_invites,
+  (SELECT count(*) FROM users u WHERE u.invitation_id = invitations.id) AS uses,
+  expires_at, revoked_at, created_by, created_at`
+
+// errGeneratedValueTaken is the cause of a create that collided with a row on a
+// value the server generated.
+var errGeneratedValueTaken = errors.New("a generated invitation id or code hash is already taken")
+
+// NewInvitation is an invitation to create. The code is generated by the
+// server, so it arrives as its hash, and so do the id and the time.
+type NewInvitation struct {
+	// ID is the new invitation's id (a UUIDv7 in canonical text form).
+	ID string
+
+	// CodeHash is the SHA-256 of the code (input.InvitationCode.Hash): the code
+	// itself is never stored.
+	CodeHash []byte
+
+	// Type is what the invitation grants. The caller decides which types it may
+	// create.
+	Type string
+
+	// Label is a note for admins. It may be empty.
+	Label input.InvitationLabel
+
+	// NumInvites is how many accounts it may create.
+	NumInvites input.NumInvites
+
+	// ExpiresAt is when it stops working. Nil means it does not expire.
+	ExpiresAt *input.Expiry
+
+	// CreatedBy is the id of the admin creating it.
+	CreatedBy string
+
+	// CreatedAt is when it was created.
+	CreatedAt time.Time
+}
+
+// CreateInvitation inserts an invitation and returns the row as the database
+// stored it.
+//
+// There is no conflict outcome. The id and the code hash are both generated by
+// the server (a UUIDv7 and the hash of 256 random bits), so a UNIQUE collision
+// is not something the client did or can resolve by changing its request: it
+// is a defect (or an entropy failure), reported under
+// CodeInvitationCreateRejected like a CHECK or FOREIGN KEY refusal. The client
+// may simply try again, which generates a new code.
+func (s *Store) CreateInvitation(ctx context.Context, invitation NewInvitation) (Invitation, error) {
+	o := op{failed: CodeInvitationCreateFailed, rejected: CodeInvitationCreateRejected,
+		description: invitationsDescription}
+
+	// A nil Expiry is bound as SQL NULL.
+	var expiresAt any
+	if invitation.ExpiresAt != nil {
+		expiresAt = invitation.ExpiresAt.Unix()
+	}
+
+	created, err := queryOne(ctx, s, o, Statement{Query: insertInvitationQuery, Args: []any{
+		invitation.ID, invitation.CodeHash, invitation.Type, invitation.Label.String(),
+		invitation.NumInvites.Int64(), expiresAt, invitation.CreatedBy, invitation.CreatedAt.Unix(),
+	}}, readInvitation)
+
+	switch {
+	case errors.Is(err, ErrNotFound):
+		// An INSERT with VALUES always returns the row it inserted.
+		return Invitation{}, o.defect(fmt.Errorf("%w: INSERT ... RETURNING returned no row", errRowCount))
+	case errors.Is(err, ErrConflict):
+		// The text is kept for the log, but the sentinel is not: a feature that
+		// looks for ErrConflict in the chain must not see this as the client's.
+		return Invitation{}, o.defect(fmt.Errorf("%w: %s", errGeneratedValueTaken, err.Error()))
+	default:
+		return created, err
+	}
+}
+
+// updateNumInvitesQuery changes how many accounts an invitation may create. It
+// is a conditional write, because D1 has no interactive transaction and a
+// read-then-write would race with a registration finishing in between:
+//
+//   - The invitation must not be revoked. A revoked invitation is final, and
+//     changing it would suggest it could be revived.
+//   - The new cap must not be below the accounts it has already created. The
+//     count is read in the write itself, so an account created after the
+//     handler looked cannot be left over the cap.
+//
+// A WHERE that carried those conditions would match nothing when they fail, and
+// a write that matches nothing says nothing about why. So the row is matched by
+// id alone, the conditions decide whether the SET changes it (the CASE), and
+// RETURNING reports the row as the statement left it together with whether the
+// change applied. The statement is one transaction, so the row, its count of
+// accounts and the verdict are all the same instant: nothing can slip in
+// between the write and the account of it. No row returned means no such
+// invitation.
+//
+// The verdict is the CASE's own test, written out again, and not derived from
+// the new num_invites: setting the cap to the value it already has would
+// otherwise look the same as a refusal. Nothing in the statement changes
+// revoked_at or the users table, so the test reads the same in RETURNING as it
+// did in the SET.
+//
+// RETURNING is "applied" (1 or 0) followed by the columns of
+// listInvitationsQuery in the same order. Each column has a distinct name,
+// which D1's batch results need: columns that share one collapse into one.
+//
+// Arguments, by number: ?1 the new num_invites, ?2 the same value (compared
+// with the count), ?3 id.
+const updateNumInvitesQuery = `
+UPDATE invitations
+SET num_invites = CASE
+      WHEN revoked_at IS NULL
+       AND (SELECT count(*) FROM users u WHERE u.invitation_id = invitations.id) <= ?2
+      THEN ?1
+      ELSE num_invites
+    END
+WHERE id = ?3
+RETURNING
+  (revoked_at IS NULL
+   AND (SELECT count(*) FROM users u WHERE u.invitation_id = invitations.id) <= ?2) AS applied,
+  id, type, label, num_invites,
+  (SELECT count(*) FROM users u WHERE u.invitation_id = invitations.id) AS uses,
+  expires_at, revoked_at, created_by, created_at`
+
+// UpdateNumInvites sets how many accounts an invitation may create. It returns
+// the invitation as the write left it and whether the change applied.
+//
+// It does not apply, and the invitation comes back unchanged, when the
+// invitation is revoked or when it has already created more accounts than n;
+// the returned row says which (RevokedAt, Uses), as of the same instant the
+// write ran. It returns ErrNotFound when there is no such invitation.
+func (s *Store) UpdateNumInvites(ctx context.Context, id input.ID, n input.NumInvites) (Invitation, bool, error) {
+	o := op{failed: CodeInvitationUpdateFailed, rejected: CodeInvitationUpdateRejected,
+		description: invitationsDescription}
+
+	type verdict struct {
+		applied    bool
+		invitation Invitation
+	}
+
+	got, err := queryOne(ctx, s, o,
+		Statement{Query: updateNumInvitesQuery, Args: []any{n.Int64(), n.Int64(), id.String()}},
+		func(r *row) verdict {
+			// Evaluated in order: the verdict is the first column.
+			return verdict{applied: r.boolean(), invitation: readInvitation(r)}
+		})
+	if err != nil {
+		return Invitation{}, false, err
+	}
+
+	return got.invitation, got.applied, nil
+}
+
+// revokeInvitationQuery revokes an invitation now. One that is already revoked
+// keeps its earlier time (the COALESCE), so revoking twice cannot move the
+// revocation later (as with sessions). The row is never deleted: accounts
+// reference it, and the audit question "who came from this code?" must stay
+// answerable.
+//
+// The row is matched by id alone and RETURNING gives it back as the statement
+// left it, so both ways a revoke can end are the same answer, which the caller
+// reads off the row: it was revoked now, or it already was. Neither is told
+// apart, because neither differs to the client. No row returned means no such
+// invitation, which a WHERE on revoked_at could not distinguish from one that
+// was already revoked.
+//
+// RETURNING is the columns of listInvitationsQuery, in that order. The use
+// count is a column of the row, counted in the same statement.
+//
+// Arguments, by number: ?1 revoked_at (unix seconds), ?2 id.
+const revokeInvitationQuery = `
+UPDATE invitations
+SET revoked_at = COALESCE(revoked_at, ?1)
+WHERE id = ?2
+RETURNING
+  id, type, label, num_invites,
+  (SELECT count(*) FROM users u WHERE u.invitation_id = invitations.id) AS uses,
+  expires_at, revoked_at, created_by, created_at`
+
+// RevokeInvitation revokes an invitation as of now and returns it as the write
+// left it. Revoking one that is already revoked succeeds and changes nothing,
+// so the call is idempotent: the earlier revocation time is kept. It returns
+// ErrNotFound when there is no such invitation.
+func (s *Store) RevokeInvitation(ctx context.Context, id input.ID, now time.Time) (Invitation, error) {
+	o := op{failed: CodeInvitationRevokeFailed, rejected: CodeInvitationRevokeRejected,
+		description: invitationsDescription}
+
+	return queryOne(ctx, s, o,
+		Statement{Query: revokeInvitationQuery, Args: []any{now.Unix(), id.String()}}, readInvitation)
+}

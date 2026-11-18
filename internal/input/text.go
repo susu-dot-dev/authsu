@@ -1,0 +1,95 @@
+package input
+
+// Bounds for the display-text types. Each is the Go-side limit; the schema
+// CHECK it must fit inside is named on the constant.
+const (
+	// MaxAccountNameBytes bounds AccountName, in bytes. The name is stored in
+	// users.profile as the JSON {"name": "..."}, which the CHECK
+	// `length(profile) <= 1024` (migration 0001) limits to 1024 bytes. JSON
+	// escaping can expand a character up to six-fold ("<" becomes \u003c), so
+	// 128 bytes encode to at most 768 bytes plus the 10 bytes of the object
+	// syntax, which leaves room for further profile fields.
+	MaxAccountNameBytes = 128
+
+	// MaxAgentNameRunes bounds AgentName, in Unicode code points. The schema
+	// CHECK `length(cast(name AS BLOB)) BETWEEN 1 AND 1024` (migration 0005)
+	// counts bytes; 256 runes of at most 4 bytes each is exactly 1024.
+	MaxAgentNameRunes = 256
+
+	// MaxInvitationLabelRunes bounds InvitationLabel, in Unicode code points.
+	// The schema CHECK `length(label) <= 256` (migration 0001) counts
+	// characters for TEXT, which is the same unit; a label is also refused if
+	// it contains NUL, the one character length() stops at.
+	MaxInvitationLabelRunes = 256
+)
+
+// Error codes of the display-text types.
+const (
+	CodeInvalidName      = "invalid_name"
+	CodeInvalidAgentName = "invalid_agent_name"
+	CodeInvalidLabel     = "invalid_label"
+)
+
+const (
+	textRules            = " of normalised text without control or formatting characters"
+	displayRules         = " of normalised text without control characters or hidden formatting"
+	descInvalidName      = "name must be 1 to 128 bytes" + textRules
+	descInvalidAgentName = "agent name must be 1 to 256 characters" + displayRules
+	descInvalidLabel     = "label must be at most 256 characters" + displayRules
+)
+
+// AccountName is the display name a person gives their account. It is what an
+// administrator recognises an account by, and it is shown by the browser's
+// passkey prompt, so it may not hide or reorder text: it admits no formatting
+// character at all, joiners included.
+//
+// The other display text (AgentName, InvitationLabel) is not what anyone is
+// identified by, and may hold the zero-width joiner and non-joiner so that emoji
+// sequences and Persian, Indic and Sinhala text can be written. It still
+// refuses controls, bidi controls, zero-width space and the other formatting
+// characters, so it cannot reorder or hide text either.
+type AccountName struct{ v string }
+
+// ParseAccountName accepts display text of 1 to MaxAccountNameBytes bytes.
+func ParseAccountName(raw string) (AccountName, error) {
+	if !displayText(raw, textRule{unit: unitBytes, max: MaxAccountNameBytes, allowEmpty: false, identifying: true}) {
+		return AccountName{}, refuse(CodeInvalidName, descInvalidName)
+	}
+
+	return AccountName{v: raw}, nil
+}
+
+// String returns the name exactly as it was parsed.
+func (n AccountName) String() string { return n.v }
+
+// AgentName is the label a user gives an agent to tell their agents apart.
+type AgentName struct{ v string }
+
+// ParseAgentName accepts display text of 1 to MaxAgentNameRunes runes.
+func ParseAgentName(raw string) (AgentName, error) {
+	if !displayText(raw, textRule{unit: unitRunes, max: MaxAgentNameRunes, allowEmpty: false, identifying: false}) {
+		return AgentName{}, refuse(CodeInvalidAgentName, descInvalidAgentName)
+	}
+
+	return AgentName{v: raw}, nil
+}
+
+// String returns the name exactly as it was parsed.
+func (n AgentName) String() string { return n.v }
+
+// InvitationLabel is the note an administrator attaches to an invitation. It
+// may be empty.
+type InvitationLabel struct{ v string }
+
+// ParseInvitationLabel accepts the empty string, or display text of up to
+// MaxInvitationLabelRunes runes. Text that is only whitespace is refused.
+func ParseInvitationLabel(raw string) (InvitationLabel, error) {
+	if !displayText(raw, textRule{unit: unitRunes, max: MaxInvitationLabelRunes, allowEmpty: true, identifying: false}) {
+		return InvitationLabel{}, refuse(CodeInvalidLabel, descInvalidLabel)
+	}
+
+	return InvitationLabel{v: raw}, nil
+}
+
+// String returns the label exactly as it was parsed.
+func (l InvitationLabel) String() string { return l.v }

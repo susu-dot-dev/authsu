@@ -1,4 +1,4 @@
-# authsu developer commands. Run `make help`. See docs/devops.md.
+# authsu developer commands. Run `make help`. See docs/CONTRIBUTING.md.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help

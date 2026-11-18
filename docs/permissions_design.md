@@ -12,7 +12,7 @@ Three things limit a request:
 
 - **The user**, whose authority it always is. Their standing (role, revocation) can change at any time.
 - **The agent**, if one is acting. Its limit is set when it is created.
-- **The key**, the credential presented. Its limit is set when it is minted.
+- **The key**, the credential presented. Its limit is set when it is created.
 
 The design keeps one rule throughout: **each layer can only narrow the ones above it.** A key never adds to its agent, and an agent never adds to its user.
 
@@ -28,7 +28,7 @@ Bundles are **expanded when a request is checked**, not when a list is written. 
 
 The default bundles are where "elevated, never a default" lives. `default:user` includes `agent:create`, because users are expected to create agents for most things rather than give their own keys to software. `default:agent` does not, so an agent can create agents only if `agent:create` is named for it.
 
-Scope names that the code does not know are rejected wherever a list is written (minting a key, creating an agent). A typo should fail loudly, not produce a credential that silently can do nothing.
+Scope names that the code does not know are rejected wherever a list is written (creating a key, creating an agent). A typo should fail loudly, not produce a credential that silently can do nothing.
 
 ## Where scopes live
 
@@ -63,21 +63,21 @@ effective = E(key.scope)
 
 `E` expands bundles. The key's scopes come from the verified token. The user and agent rows are joined into the single read that verification already makes, so this adds no query.
 
-**A session is a user key for this purpose.** It is minted with the user's default list like any other key, and goes through the same calculation. Nothing about scopes treats sessions specially.
+**A session is a user key for this purpose.** It is created with the user's default list like any other key, and goes through the same calculation. Nothing about scopes treats sessions specially.
 
-A key may list scopes its holder does not have. That is harmless, because the intersection removes them, but they are latent: if the holder later gains them, the key gains them too. That is the price of letting a key be minted with a plain default, and it is why defaults are bundles rather than snapshots.
+A key may list scopes its holder does not have. That is harmless, because the intersection removes them, but they are latent: if the holder later gains them, the key gains them too. That is the price of letting a key be created with a plain default, and it is why defaults are bundles rather than snapshots.
 
 ## Checks outside scopes
 
 Some requirements are about *what kind of credential* is in use, not what it is allowed. These are checked alongside the scope, never folded into it:
 
 - **`kind == 'session'`**: the credential came from a passkey ceremony, so a person was present. Creating keys requires this.
-- **`role == 'admin'`**: admin actions require the role *and* their `default:admin` scope. An admin who mints a key without `default:admin` gets a key that cannot do admin things, even though the admin can.
+- **`role == 'admin'`**: admin actions require the role *and* their `default:admin` scope. An admin who creates a key without `default:admin` gets a key that cannot do admin things, even though the admin can.
 **`act == XXX`**: All actor tokens are granted under act, so callers can restrict agents from performing actions, regardless of scopes
 
 ## Creating keys
 
-The key-creation API requires a session and always refuses when an agent is acting, whatever the scopes. A leaked key cannot use it to mint more keys, and an agent cannot mint keys for itself or for other agents. The user mints and rotates their agents' keys.
+The key-creation API requires a session and always refuses when an agent is acting, whatever the scopes. A leaked key cannot use it to create more keys, and an agent cannot create keys for itself or for other agents. The user creates and rotates their agents' keys.
 
 The scopes requested are not checked against the user's: the intersection on each request bounds them. They are checked only against the known names.
 
@@ -85,7 +85,7 @@ Keys only ever have `kind = 'api_key'`. Sessions come only from login.
 
 ## Creating agents
 
-`agent:create` creates an agent and returns its first key in the same response. Internally it calls the same minting code as the key-creation API, without that API's session and agent checks. This is the only way an agent's key is minted other than by its user. Without it, an agent created by software could not act.
+`agent:create` creates an agent and returns its first key in the same response. Internally it calls the same key-creation code as the key-creation API, without that API's session and agent checks. This is the only way an agent's key is created other than by its user. Without it, an agent created by software could not act.
 
 Creating an agent requires `agent:create` in the request's effective permissions and counts against the per-user agent limit. What happens next depends on who is asking.
 
@@ -104,7 +104,7 @@ effective(new) = E(new key) ∩ E(new agent) ∩ E(user)
                = effective(creator)
 ```
 
-An agent cannot create an agent more capable than the key it used, and since agents cannot mint keys any other way, there is no second route to check.
+An agent cannot create an agent more capable than the key it used, and since agents cannot create keys any other way, there is no second route to check.
 
 The new agent is an ordinary agent of the same user, as [agents_design.md](agents_design.md) requires. Nothing records which agent created it, and nothing needs to.
 
@@ -114,3 +114,16 @@ The new agent is an ordinary agent of the same user, as [agents_design.md](agent
 - **`key:revoke_agent`** revokes keys belonging to the user's agents. Agents are not permitted to use this, because are flat under their user, so an agent holding it could revoke its siblings' keys.
 
 Leak recovery is the user revoking all of their keys. Every key, an agent's included, is a `japikeys` row whose subject is the user, so one revocation by user ends the user's sessions, their keys, and every agent's keys, including any agents the leaked key created. Those agents remain, but with no keys they cannot act.
+
+
+## 401 and 403 mean different things to a client
+
+The two statuses are kept strictly apart so a client can act on the status alone:
+
+- **401 means the caller's credential is not valid, so the user is signed out.** It is the answer to a request with no session, a malformed, expired, revoked or forged one, and a revoked account (`unauthenticated`), to a login that does not verify (`invalid_login`), and to a logout whose session was already gone. A client treats any 401 from a route that needs a session as "show the sign-in page".
+- **403 means the credential is valid and the caller may not do this.** The session stays; the client shows "not allowed" and does not sign the user out. Today that is a member calling an admin route (`forbidden`) and registering with a code that is not redeemable (`invalid_invitation`, which has no session to lose).
+- **A failure of ours is never either.** A store that cannot be read is 503 `session_verify_failed`, so an outage cannot look like a sign-out.
+
+The credential is judged before anything else about the request that depends on who is asking: the route's requirement, the path id and the body. A signed-out caller is therefore 401 and a member on an admin route is 403 whatever the id or body holds.
+
+Revoking an account, including your own while another admin remains, does not clear the browser's cookie. The session stops verifying on the next request, which is then a 401, and the client signs out on it.

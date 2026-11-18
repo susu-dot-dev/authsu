@@ -1,7 +1,7 @@
 # Shared toolchain setup for the CI jobs. A local composite action: no third-party
 # code, and every `uses:` below is pinned to a full commit SHA like in ci.yml.
 # Callers opt in to each tool, so a job only pays for what it runs. See
-# docs/devops.md ("Continuous integration and supply chain").
+# docs/CI.md ("Continuous integration and supply chain").
 name: Setup toolchain
 description: Install the pinned Go, golangci-lint, Node and TinyGo as requested.
 

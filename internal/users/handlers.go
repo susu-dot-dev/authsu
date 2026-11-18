@@ -1,126 +1,70 @@
 package users
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
-	"github.com/susu-dot-dev/authsu/internal/atomic"
+	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
-	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/result"
-	"github.com/susu-dot-dev/authsu/internal/session"
+	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// Error codes. Each failing step has its own, so a log line or an alert names
-// the step. They are stable: clients and dashboards may match on them.
+// Error codes of this package. They are stable: clients and dashboards may
+// match on them. Failures of the database have the store's codes
+// (store.CodeUserListFailed and its siblings), and a malformed id has
+// input.CodeInvalidID.
 const (
-	CodeNotConfigured  = "users_not_configured"
-	CodeForbidden      = "users_forbidden"
-	CodeListFailed     = "user_list_failed"
-	CodeLookupFailed   = "user_lookup_failed"
-	CodeRevokeFailed   = "user_revoke_failed"
-	CodeRevokeRejected = "user_revoke_rejected"
-	CodeNotFound       = "user_not_found"
-	CodeInvalidID      = "invalid_user_id"
-	CodeLastAdmin      = "user_last_admin"
+	// CodeNotFound means there is no account with the id.
+	CodeNotFound = "user_not_found"
+	// CodeLastAdmin means the account is the last active administrator.
+	CodeLastAdmin = "user_last_admin"
+	// CodeProfileInvalid means a stored profile is not a JSON object. The
+	// schema does not constrain it, and registration writes an object, so this
+	// is a defect in the stored data. It is logged under this code with the
+	// account named, and the account is served with an empty profile: the
+	// request does not fail.
+	CodeProfileInvalid = "user_profile_invalid"
 )
 
-// PathWildcards returns the {name} wildcards of ItemPath, for
-// httpapi.ServeMethods.
-func PathWildcards() []string { return []string{"id"} }
+// errProfile is the cause, in the log, of a stored profile that is not a JSON
+// object.
+var errProfile = errors.New("profile is not a JSON object")
 
-// Paths. The collection takes GET; one account takes GET and DELETE.
+// Status is where an account stands. It is derived from the row, never stored.
+type Status string
+
+// Statuses.
 const (
-	CollectionPath = "/api/user"
-	ItemPath       = "/api/user/{id}"
+	// StatusActive means the account can log in.
+	StatusActive Status = "active"
+	// StatusRevoked means an admin revoked it.
+	StatusRevoked Status = "revoked"
 )
 
-// canonicalUUIDLen is the length of a UUID in 8-4-4-4-12 form.
-const canonicalUUIDLen = 36
-
-func notConfigured(cause error) error {
-	return apierr.Wrap(cause, apierr.Unavailable, CodeNotConfigured, "user management is not available")
-}
-
-// refusal builds a classified error with nothing underneath it.
-func refusal(kind apierr.Kind, code, description string) error {
-	return apierr.Wrap(errRefused, kind, code, description)
-}
-
-// errRefused is the cause of a failure that has nothing underneath it, so Wrap
-// (which is nil-in, nil-out) still produces an error.
-var errRefused = errors.New("refused")
-
-// admin authenticates the request and requires an admin. The account's role is
-// read from the database on every request (see session.Verifier), so a role
-// removed since login is refused here.
-//
-// A missing store is refused first, without authenticating: there is nothing to
-// authorise against.
-func (s *Service) admin(
-	ctx context.Context, getenv func(string) string, req httpapi.Request,
-) result.Result[session.Principal] {
-	return result.Ok(req).
-		Check(func(httpapi.Request) error { return s.requireStore() }).
-		Then(func(req httpapi.Request) (session.Principal, error) {
-			// Authenticate's errors are already classified (401, or 503 when
-			// sessions cannot be verified); Wrap keeps that.
-			principal, err := s.sessions.Authenticate(ctx, getenv, req)
-
-			return principal, apierr.Wrap(err, apierr.Unauthorized, session.CodeUnauthenticated, "not signed in")
-		}).
-		Check(requireAdmin)
-}
-
-func (s *Service) requireStore() error {
-	if s.reader == nil {
-		return notConfigured(errNoStore)
-	}
-
-	return nil
-}
-
-func (s *Service) requireBatch() error {
-	if s.batch == nil {
-		return notConfigured(errNoStore)
-	}
-
-	return nil
-}
-
-// requireAdmin refuses a principal that is not an admin.
-func requireAdmin(principal session.Principal) error {
-	if principal.Role != registration.RoleAdmin {
-		return refusal(apierr.Forbidden, CodeForbidden, "administrator access is required")
-	}
-
-	return nil
-}
-
-// Routes are the handlers of the two paths, each by method, ready for
-// httpapi.ServeMethods.
-type Routes struct {
-	// Collection is CollectionPath: GET lists.
-	Collection map[string]httpapi.Handler
-	// Item is ItemPath: GET reads, DELETE revokes.
-	Item map[string]httpapi.Handler
-}
-
-// Handlers returns the handlers for both paths.
-func (s *Service) Handlers(getenv func(string) string) Routes {
-	return Routes{
-		Collection: map[string]httpapi.Handler{
-			http.MethodGet: s.listHandler(getenv),
-		},
-		Item: map[string]httpapi.Handler{
-			http.MethodGet:    s.getHandler(getenv),
-			http.MethodDelete: s.revokeHandler(getenv),
-		},
-	}
+// User is one account as an admin sees it. It never carries the WebAuthn user
+// handle, which is an identifier for authenticators, not for people: the store
+// does not select it, so there is nothing here to leak.
+type User struct {
+	ID   string `json:"id"`
+	Role string `json:"role"`
+	// InvitationID is the invitation the account was created from.
+	InvitationID string `json:"invitationId"`
+	// Profile is users.profile as stored: a JSON object, such as the name given
+	// at registration. An account whose stored profile is not one is served
+	// with {} (see present).
+	Profile json.RawMessage `json:"profile"`
+	Status  Status          `json:"status"`
+	// RevokedAt is absent when the account is not revoked.
+	RevokedAt *int64 `json:"revokedAt,omitempty"`
+	// CreatedAt is in Unix seconds.
+	CreatedAt int64 `json:"createdAt"`
 }
 
 // ListResponse is the body of GET /api/user.
@@ -128,162 +72,109 @@ type ListResponse struct {
 	Users []User `json:"users"`
 }
 
-func (s *Service) listHandler(getenv func(string) string) httpapi.Handler {
-	return func(req httpapi.Request) result.Result[httpapi.Response] {
-		return s.admin(req.Context, getenv, req).
-			Then(func(session.Principal) ([]Row, error) { return s.readAll(req.Context) }).
-			Map(presentAll).
-			Map(func(out ListResponse) httpapi.Response { return httpapi.JSON(http.StatusOK, out) })
+// handlers are the route bodies, with what they depend on.
+type handlers struct {
+	store Store
+	now   func() time.Time
+	log   httpapi.Logger
+}
+
+// list answers GET /api/user.
+func (h handlers) list(call *auth.Call) result.Result[httpapi.Response] {
+	return result.Of(h.store.ListUsers(call.Request.Context)).
+		Map(func(users []store.User) ListResponse { return h.presentAll(call.Request, users) }).
+		Map(ok)
+}
+
+// get answers GET /api/user/{id}.
+func (h handlers) get(call *auth.Call) result.Result[httpapi.Response] {
+	return result.Of(h.store.GetUser(call.Request.Context, call.ID())).
+		MapErr(outcome).
+		Map(func(stored store.User) User { return h.present(call.Request, stored) }).
+		Map(ok)
+}
+
+// revoke answers DELETE /api/user/{id}. Revoking an account that is already
+// revoked succeeds and reports the earlier time, and so does an admin revoking
+// themself while another active admin remains.
+func (h handlers) revoke(call *auth.Call) result.Result[httpapi.Response] {
+	return result.Of(h.store.RevokeUser(call.Request.Context, call.ID(), auth.RoleAdmin, h.now())).
+		MapErr(outcome).
+		Map(func(stored store.User) User { return h.present(call.Request, stored) }).
+		Map(ok)
+}
+
+// ok is the 200 response carrying body.
+func ok[T any](body T) httpapi.Response { return httpapi.JSON(http.StatusOK, body) }
+
+// outcome maps the store's business outcomes to client errors. Anything else
+// is a failure the store already classified, and is returned as it is.
+func outcome(err error) error {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return refuse(apierr.NotFound, CodeNotFound, "no such user", err)
+	case errors.Is(err, store.ErrLastAdmin):
+		return refuse(apierr.Conflict, CodeLastAdmin, "the last active administrator cannot be revoked", err)
+	default:
+		return err
 	}
 }
 
-func (s *Service) readAll(ctx context.Context) ([]Row, error) {
-	rows, err := s.reader.List(ctx)
-
-	return rows, apierr.Wrap(err, apierr.Unavailable, CodeListFailed, "users are temporarily unavailable")
+// refuse is the classified error for a store outcome or a defect, with cause
+// kept for the log.
+func refuse(kind apierr.Kind, code, description string, cause error) *apierr.Error {
+	return apierr.New(kind, code, description).WithCause(cause)
 }
 
-func presentAll(rows []Row) ListResponse {
-	out := ListResponse{Users: make([]User, 0, len(rows))}
+// presentAll is the client's view of every account. The list is an empty array,
+// never null, when there are none.
+func (h handlers) presentAll(req httpapi.Request, users []store.User) ListResponse {
+	out := ListResponse{Users: make([]User, 0, len(users))}
 
-	for _, row := range rows {
-		out.Users = append(out.Users, present(row))
+	for _, stored := range users {
+		out.Users = append(out.Users, h.present(req, stored))
 	}
 
 	return out
 }
 
-// present is the client's view of row.
-func present(row Row) User {
+// present is the client's view of an account. The profile is sent as stored,
+// which json would otherwise refuse only when marshalling the response, as an
+// anonymous "marshal_failed" with nothing to say which row it was. A profile
+// that is not a JSON object is logged, naming the account, and replaced by an
+// empty object: the account is still listed and a revocation that was applied
+// is still reported as done.
+func (h handlers) present(req httpapi.Request, stored store.User) User {
+	profile := json.RawMessage(stored.Profile)
+
+	if !isObject(stored.Profile) {
+		h.log(req, refuse(apierr.Internal, CodeProfileInvalid, "stored profile is not a JSON object",
+			fmt.Errorf("%w: account %s", errProfile, stored.ID)))
+
+		profile = json.RawMessage(emptyProfile)
+	}
+
+	status := StatusActive
+	if stored.RevokedAt != nil {
+		status = StatusRevoked
+	}
+
 	return User{
-		ID: row.ID, Role: row.Role, InvitationID: row.InvitationID, Profile: json.RawMessage(row.Profile),
-		Status: StatusOf(row), RevokedAt: row.RevokedAt, CreatedAt: row.CreatedAt,
+		ID: stored.ID, Role: stored.Role, InvitationID: stored.InvitationID,
+		Profile: profile, Status: status,
+		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt,
 	}
 }
 
-func (s *Service) getHandler(getenv func(string) string) httpapi.Handler {
-	return func(req httpapi.Request) result.Result[httpapi.Response] {
-		return s.admin(req.Context, getenv, req).
-			Then(func(session.Principal) (string, error) { return idOf(req) }).
-			Then(func(id string) (Row, error) { return s.readOne(req.Context, id) }).
-			Map(present).
-			Map(func(out User) httpapi.Response { return httpapi.JSON(http.StatusOK, out) })
-	}
-}
+// emptyProfile is what an account whose stored profile is unusable is served
+// with.
+const emptyProfile = `{}`
 
-func (s *Service) readOne(ctx context.Context, id string) (Row, error) {
-	row, err := s.reader.Get(ctx, id)
-
-	switch {
-	case err == nil:
-		return row, nil
-	case errors.Is(err, ErrNotFound):
-		return Row{}, notFound()
-	default:
-		return Row{}, apierr.Wrap(err, apierr.Unavailable, CodeLookupFailed, "users are temporarily unavailable")
-	}
-}
-
-func notFound() error {
-	return refusal(apierr.NotFound, CodeNotFound, "no such user")
-}
-
-// idOf reads the account id from the path. It is checked for shape before it
-// reaches SQL, though it is only ever bound as a value.
-func idOf(req httpapi.Request) (string, error) {
-	id := req.PathValues["id"]
-
-	if len(id) != canonicalUUIDLen || strings.Trim(id, "0123456789abcdef-") != "" {
-		return "", refusal(apierr.BadRequest, CodeInvalidID, "user id is not valid")
-	}
-
-	return id, nil
-}
-
-func (s *Service) revokeHandler(getenv func(string) string) httpapi.Handler {
-	return func(req httpapi.Request) result.Result[httpapi.Response] {
-		return s.admin(req.Context, getenv, req).
-			Check(func(session.Principal) error { return s.requireBatch() }).
-			Then(func(session.Principal) (string, error) { return idOf(req) }).
-			Then(func(id string) (Row, error) { return s.revoke(req.Context, id) }).
-			Map(present).
-			Map(func(out User) httpapi.Response { return httpapi.JSON(http.StatusOK, out) })
-	}
-}
-
-// revoke revokes an account, every key it holds and every agent it has, as one
-// batch, and returns the account as the write left it. Revoking an account that
-// is already revoked succeeds and keeps the earlier time, so the call is
-// idempotent. The last active admin is refused with 409; see revokeQuery for why
-// that check is inside the write.
-func (s *Service) revoke(ctx context.Context, id string) (Row, error) {
-	now := s.now().Unix()
-
-	statements := []atomic.Statement{
-		{Query: revokeQuery, Args: []any{now, id, registration.RoleAdmin}},
-		{Query: revokeKeysQuery, Args: []any{now, id}},
-		{Query: revokeAgentsQuery, Args: []any{now, id}},
-	}
-
-	results, err := s.batch(ctx, statements...)
-	if err != nil {
-		return Row{}, writeError(err)
-	}
-
-	// One result per statement; anything else is the platform misreporting.
-	if len(results) != len(statements) {
-		return Row{}, rejected(errBatchResults)
-	}
-
-	row, err := returnedRow(results[0].Rows)
-	if err != nil {
-		return Row{}, err
-	}
-
-	if row.RevokedAt == nil {
-		return Row{}, refusal(apierr.Conflict, CodeLastAdmin, "the last active administrator cannot be revoked")
-	}
-
-	return row, nil
-}
-
-// returnedRow reads the one account row the revoke returned. None is a missing
-// account (404). More than one, or a row that is not an account, is the
-// platform returning something the statement cannot produce.
-func returnedRow(rows [][]any) (Row, error) {
-	if len(rows) == 0 {
-		return Row{}, notFound()
-	}
-
-	if len(rows) != 1 {
-		return Row{}, rejected(errBatchResults)
-	}
-
-	row, err := rowOfValues(rows[0])
-	if err != nil {
-		return Row{}, rejected(err)
-	}
-
-	return row, nil
-}
-
-// rejected is a defect on our side: 500 under its own code.
-func rejected(cause error) error {
-	return apierr.Wrap(cause, apierr.Internal, CodeRevokeRejected, "internal error")
-}
-
-// errBatchResults is the cause of a batch that did not return what the
-// statements promised.
-var errBatchResults = errors.New("batch returned the wrong number of results")
-
-// writeError classifies a failed revoke. Neither statement inserts or sets a
-// constrained column to anything but a time, so any constraint failure is a
-// defect on our side (500); anything else is the database being unavailable
-// (503).
-func writeError(err error) error {
-	if errors.Is(err, atomic.ErrRejected) || errors.Is(err, atomic.ErrConflict) {
-		return rejected(err)
-	}
-
-	return apierr.Wrap(err, apierr.Unavailable, CodeRevokeFailed, "users are temporarily unavailable")
+// isObject reports whether text is one valid JSON object in valid UTF-8, which
+// is what makes it safe to write into a response as it is: json.Valid alone
+// accepts invalid UTF-8 inside a string.
+func isObject(text string) bool {
+	return utf8.ValidString(text) &&
+		strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "{") &&
+		json.Valid([]byte(text))
 }

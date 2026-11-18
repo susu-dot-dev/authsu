@@ -1,6 +1,6 @@
 # Runbook
 
-Procedures for operating a deployment. [devops.md](devops.md) says how the project is built and checked; this says how to configure, migrate and deploy it. Cloudflare's tooling changes, so check current Wrangler and D1 documentation before relying on a command here.
+Procedures for operating a deployment. [CONTRIBUTING.md](CONTRIBUTING.md) says how the project is built and checked; this says how to configure, migrate and deploy it. Cloudflare's tooling changes, so check current Wrangler and D1 documentation before relying on a command here.
 
 ## Secrets and variables
 
@@ -17,7 +17,7 @@ To the Worker a variable and a secret look the same: both are string properties 
 
 Anything non-sensitive belongs in `wrangler.jsonc`, where it is reviewable; anything sensitive must be a secret, never a var. This project does not use Cloudflare's account-wide Secrets Store.
 
-Which names exist, what each is for and what happens when one is missing is part of the feature that reads it: see `internal/deploy`, [registration_design.md](registration_design.md), [login_design.md](login_design.md) and [first_run_design.md](first_run_design.md).
+Which names exist, what each is for and what happens when one is missing is part of the feature that reads it: see `internal/config`, [registration_design.md](registration_design.md), [login_design.md](login_design.md) and [first_run_design.md](first_run_design.md).
 
 ### Helper commands
 
@@ -53,7 +53,7 @@ The UI may be served from a different origin than the API (`https://susu.dev` ca
 
 ## Database migrations
 
-Conventions for writing migrations are in [devops.md](devops.md). Applying them:
+Conventions for writing migrations are in [DATABASE.md](DATABASE.md). Applying them:
 
 - **Local:** `make dev` applies migrations to a persisted local database in `.wrangler/state` (git-ignored) and serves the Worker against it. `make migrate-local` applies them on their own; `make db-reset` deletes the state. E2E uses a separate state directory that it wipes on every run.
 - **Always pass `--local`** for anything that is not a deliberate remote migration. Local and e2e use the same `DB` binding name as production but are simulated.
@@ -77,9 +77,13 @@ Two paths, both running the same `npx wrangler deploy`.
 
 TinyGo's version and checksum come from `tools.env`, so bumping it there updates CI and Cloudflare together.
 
+### Ceremonies in flight when the challenge format changes
+
+A deploy that changes how challenges are signed (the shared layout in `internal/challenge` did) invalidates every challenge issued before it. A registration or login that began on the old version and finishes on the new one fails once (400 `invalid_challenge` or 401 `invalid_login`) and succeeds when retried. Challenges last five minutes, so prefer a quiet moment for such a deploy; nothing needs repairing afterwards. The same is true of rotating `AUTH_HMAC_SECRET`.
+
 ### The japikey_go module is private
 
-Sessions depend on `github.com/susu-dot-dev/japikey_go`, a private repository, so `go mod download` fails without credentials: on a developer machine with no GitHub access, on CI, and on Workers Builds. This is the one place the "no secrets in CI" stance in [devops.md](devops.md) does not hold by itself. This section is temporary: publishing the module removes it.
+Sessions depend on `github.com/susu-dot-dev/japikey_go`, a private repository, so `go mod download` fails without credentials: on a developer machine with no GitHub access, on CI, and on Workers Builds. This is the one place the "no secrets in CI" stance in [CI.md](CI.md) does not hold by itself. This section is temporary: publishing the module removes it.
 
 Until then a build needs:
 

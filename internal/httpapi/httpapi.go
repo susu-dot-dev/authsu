@@ -1,12 +1,13 @@
 // Package httpapi is the boundary between net/http and the rest of the code.
 //
 // Handlers are pure functions from a Request to a Result[Response]: they never
-// see an http.ResponseWriter and never choose a status for a failure. Serve
-// wraps a handler as an http.Handler and does everything that touches HTTP,
-// once: method check, reading the request, converting a failure into a status
-// and JSON body, logging it, and writing headers.
+// see an http.ResponseWriter and never choose a status for a failure.
+// ServeRoutes wraps the handlers of one path as an http.Handler and does
+// everything that touches HTTP, once: method check, reading the request,
+// converting a failure into a status and JSON body, logging it, and writing
+// headers. ServeAny does the same for the catch-all that answers every method.
 //
-// Serve is the only place that does this, so the contract holds for every route:
+// They are the only places that do this, so the contract holds for every route:
 //
 //   - A route whose method is not GET or HEAD requires the request's
 //     Content-Type to be application/json, even when the body is empty (415
@@ -16,7 +17,7 @@
 //     such a request: this is the CSRF defence for every unsafe route (see
 //     isJSON and CORS).
 //   - A request body is capped at 1 MiB (413 body_too_large), or at a smaller
-//     limit a route asks for with ServeLimited.
+//     limit a route asks for (MethodRoute.MaxBody).
 //   - A handler runs inside a recover, so a panic still gets the JSON error
 //     contract and a log line, as Internal handler_panic.
 //   - Responses carry Content-Type and Cache-Control: no-store, and the status
@@ -31,8 +32,8 @@
 //
 // Routes are registered as plain paths, optionally with {name} wildcards
 // (see Request.PathValues): TinyGo's http.ServeMux ignores method-qualified
-// patterns, so Serve does the method check instead, and ServeMethods lets one
-// path answer several methods.
+// patterns, so ServeRoutes does the method check instead, and lets one path
+// answer several methods, each with its own handler and body limit.
 package httpapi
 
 import (
@@ -169,27 +170,24 @@ func decodeError(err error) *apierr.Error {
 	return apierr.New(apierr.BadRequest, "invalid_json", "request body is not valid JSON").WithCause(err)
 }
 
-// Serve returns an http.Handler that runs handler for requests using method,
-// and answers every other method with 405 and an Allow header. A panic in the
-// handler is recovered and reported as an Internal error.
-func Serve(method string, logger Logger, handler Handler) http.Handler {
-	return serve([]string{method}, maxBodyBytes, logger, handler)
+// MethodRoute is how ServeRoutes answers one method of a path.
+type MethodRoute struct {
+	// Handler answers the method.
+	Handler Handler
+	// MaxBody caps this method's request body, in bytes. Zero or less means
+	// DefaultMaxBody, and a larger value is clamped to it: a route can only
+	// tighten the cap, never raise it.
+	MaxBody int64
 }
 
-// ServeLimited is Serve for a route whose legitimate bodies are small: a body
-// over maxBody bytes is refused with 413 body_too_large, and never read past
-// that, so a client cannot make the route spend time on a megabyte it could
-// never use. maxBody is clamped to DefaultMaxBody, so a route can only tighten
-// the cap, never raise it.
-func ServeLimited(method string, maxBody int64, logger Logger, handler Handler) http.Handler {
-	return serve([]string{method}, min(maxBody, maxBodyBytes), logger, handler)
-}
-
-// ServeMethods is Serve for one path that answers several methods, each with
-// its own handler. The routes map is keyed by method; any other method gets 405
-// with an Allow header listing the keys, sorted. Every rule in the package doc
-// applies per method, so a method that is not GET or HEAD still requires
-// Content-Type: application/json.
+// ServeRoutes returns the http.Handler for one path that answers several
+// methods, each with its own handler and body limit. The routes map is keyed by
+// method; any other method gets 405 with an Allow header listing the keys,
+// sorted. Every rule in the package doc applies per method, so a method that is
+// not GET or HEAD still requires Content-Type: application/json. A request is
+// measured against the body limit of the method it used, so a tight limit on
+// one method does not constrain another. A panic in a handler is recovered and
+// reported as an Internal error.
 //
 // wildcards names the {name} wildcards in the path the handler is registered
 // for. net/http can only look a wildcard up by name, not list them, so the
@@ -197,26 +195,35 @@ func ServeLimited(method string, maxBody int64, logger Logger, handler Handler) 
 //
 // It exists because TinyGo's http.ServeMux cannot route by method: a path is
 // registered once, and the method is chosen here.
-func ServeMethods(logger Logger, wildcards []string, routes map[string]Handler) http.Handler {
+func ServeRoutes(logger Logger, wildcards []string, routes map[string]MethodRoute) http.Handler {
 	methods := slices.Sorted(maps.Keys(routes))
 
-	return serveWith(methods, wildcards, maxBodyBytes, logger, func(req Request) result.Result[Response] {
-		return routes[req.Method](req)
+	limit := func(method string) int64 {
+		if own := routes[method].MaxBody; own > 0 {
+			return min(own, maxBodyBytes)
+		}
+
+		return maxBodyBytes
+	}
+
+	return serveWith(methods, wildcards, limit, logger, func(req Request) result.Result[Response] {
+		return routes[req.Method].Handler(req)
 	})
 }
 
-// ServeAny is Serve for a handler that accepts every method.
+// ServeAny is ServeRoutes for a handler that accepts every method: the
+// catch-all, whose answer to an unknown path does not depend on how it was
+// asked. It has no wildcards, and so no method check and no Content-Type rule.
 func ServeAny(logger Logger, handler Handler) http.Handler {
-	return serve(nil, maxBodyBytes, logger, handler)
+	return serveWith(nil, nil, func(string) int64 { return maxBodyBytes }, logger, handler)
 }
 
-// serve implements Serve. No methods accepts every method.
-func serve(methods []string, maxBody int64, logger Logger, handler Handler) http.Handler {
-	return serveWith(methods, nil, maxBody, logger, handler)
-}
-
-// serveWith is serve for a route whose path has the named wildcards.
-func serveWith(methods, wildcards []string, maxBody int64, logger Logger, handler Handler) http.Handler {
+// serveWith implements ServeRoutes and ServeAny for a route whose path has the
+// named wildcards and whose body limit may depend on the method: limit returns
+// the cap for a method. No methods accepts every method.
+func serveWith(
+	methods, wildcards []string, limit func(method string) int64, logger Logger, handler Handler,
+) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
 
@@ -246,7 +253,7 @@ func serveWith(methods, wildcards []string, maxBody int64, logger Logger, handle
 			return
 		}
 
-		body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, maxBody))
+		body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, limit(req.Method)))
 		if err != nil {
 			write(writer, logger, request, result.Fail[Response](bodyReadError(err)))
 

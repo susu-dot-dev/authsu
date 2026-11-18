@@ -73,7 +73,7 @@ The challenge is the only field we control, so any state that `begin` wants back
 The challenge is a single opaque byte string made of two parts concatenated together:
 
 ```
-state     = version || expires_at || user_handle        -- illustrative layout
+state     = version || expires_at || nonce              -- the nonce is the user handle
 signature = HMAC(K, state || SHA-256(invitation_code) || SHA-256(name))
 challenge = state || signature
 ```
@@ -84,11 +84,11 @@ The invitation code is the subtle part. It is **an input to the signature, but i
 
 - the challenge was forged;
 - the challenge was altered;
-- the challenge was minted for a different code;
-- the challenge was minted for a different name;
+- the challenge was created for a different code;
+- the challenge was created for a different name;
 - the request is just malformed.
 
-If the signature matches, the server checks that `expires_at` hasn't passed, and then trusts `user_handle`. The order matters: the expiry is read only after the signature has verified, so a client-chosen expiry is never acted on, and a challenge that is both forged and expired is reported as forged.
+If the signature matches, the server checks that `expires_at` hasn't passed and isn't further ahead than the ceremony timeout, and then trusts `user_handle`. The order matters: the expiry is read only after the signature has verified, so a client-chosen expiry is never acted on, and a challenge that is both forged and expired is reported as forged. The far-future bound is what limits a leaked key: a challenge forged with a distant expiry is refused even though its signature is valid. Registration and login share one implementation of all this, `internal/challenge`, and both apply the bound. A key must be exactly 32 bytes (what the derivation produces); HMAC would silently zero-pad a shorter one, so any other length is refused as the server's fault (a 500), never treated as a bad challenge.
 
 Hashing the code and the name to fixed width before mixing them in also means two different pairs can never produce the same bytes. Plain concatenation would let `("ab", "c")` and `("a", "bc")` collide.
 
@@ -102,7 +102,7 @@ Some consequences of this shape:
 
 ### Where the challenge's entropy comes from
 
-WebAuthn asks for at least 16 random bytes per challenge. Nothing in our challenge is random except the user handle: the version is a constant, the expiry is a time, and the signature is deterministic. The handle is 32 random bytes, so every `begin` produces a unique challenge, and that is the property the spec's requirement exists to provide. This is easy to break by accident (a deterministic handle would silently make challenges repeat), so a test asserts that two begins never produce the same challenge.
+WebAuthn asks for at least 16 random bytes per challenge. Nothing in our challenge is random except the nonce, which is the user handle: the version is a constant, the expiry is a time, and the signature is deterministic. The nonce is 32 random bytes, so every `begin` produces a unique challenge, and that is the property the spec's requirement exists to provide. This is easy to break by accident (a deterministic handle would silently make challenges repeat), so a test asserts that two begins never produce the same challenge.
 
 ### The challenge is read from `clientDataJSON`
 
@@ -129,7 +129,7 @@ If size ever matters, there are easy levers:
 - the HMAC tag can be truncated to 16 bytes;
 - the expiry can be stored in fewer bytes.
 
-Together those shrink the challenge to around 40 bytes. Whatever the final layout, the passkey PR should confirm it works on the major browsers, both mobile platforms, and at least one password-manager extension. The server should also put its own cap on the `clientDataJSON` size it is willing to parse, since it is client-supplied input.
+Together those shrink the challenge to around 40 bytes. The server caps the client-supplied input it is willing to parse: `clientDataJSON` is at most `webauthn.MaxClientDataJSON` (2048) bytes, and the whole finish request is at most `MaxFinishBody`, a sum of what each member may legally be, so a request that could only be an attempt to make the server read more is 413 before anything is parsed.
 
 ### Where this departs from the spec's advice
 
@@ -151,18 +151,18 @@ What remains is that a challenge never used to finish stays valid until it expir
 It is worth being precise about what a leaked signing key would allow, because that determines how carefully the key must be handled:
 
 - **A leaked key cannot create accounts by itself.** The signature protects the integrity of the ceremony. It does not authorize anything. An attacker with the key can forge challenges but still needs a redeemable invitation at `finish`. The invitation remains the only authorization, as the invitation design intends.
-- **Rotating the key is cheap.** Rotation breaks only ceremonies in flight, which is a few minutes' worth of retries. That is acceptable.
+- **Rotating the key is cheap.** Rotation breaks only ceremonies in flight, which is a few minutes' worth of retries. That is acceptable. The same holds for the deploy that introduced the shared challenge layout: challenges issued before it do not verify after it, and fail once with 400 `invalid_challenge` (registration) or 401 `invalid_login` (login).
 - **The key must not be reused for anything where a signature *is* authorization,** such as sessions. If a session token were signed with the same key, a leak would mean account takeover. So the deployed secret is treated as root key material, and each purpose derives its own key from it with a distinct context. This is a constraint on future work as much as a description of current work.
 
 The key needs its own secret rather than being derived from `FIRST_RUN_SECRET`, because registration has to keep working long after the bootstrap secret is retired ([first_run_design.md](first_run_design.md)).
 
 ### Deployment configuration
 
-Registration, login and sessions share three settings, read by `internal/deploy`:
+Registration, login and sessions share three settings, read by `internal/config`:
 
 | Name | Kind | Purpose |
 |---|---|---|
-| `AUTH_HMAC_SECRET` | secret | Root key material, at least 32 characters (a generated one is 43). Each purpose derives its own key from it with a distinct context (`internal/deploy.DeriveKey`; registration uses `authsu/registration-challenge/v1`). Never used directly, and never for anything where a signature is authorization |
+| `AUTH_HMAC_SECRET` | secret | Root key material, at least 32 characters (a generated one is 43). Each purpose gets its own key, derived from it with a distinct context and exposed by `internal/config` (registration's uses `authsu/registration-challenge/v1`), so no caller holds the root secret and a test asserts the contexts differ. Never used directly, and never for anything where a signature is authorization |
 | `API_ORIGIN` | var | The origin this Worker is served from, such as `https://auth.example.com`. It is the identity of the service: the session issuer is derived from it |
 | `UI_ORIGIN` | var | The origin the UI is served from, such as `https://example.com`. Passkey ceremonies run on the UI's pages, so it is the one origin ceremonies are accepted from (compared as an exact string), and it is the one origin allowed to call the API cross-origin (see [login_design.md](login_design.md#the-ui-on-another-origin)) |
 
@@ -178,7 +178,7 @@ The ID is therefore always the UI's host exactly. A deployment cannot choose a p
 
 The variables are non-sensitive and live in `wrangler.jsonc`; `AUTH_HMAC_SECRET` must be a secret, never a var. [runbook.md](runbook.md) covers setting them. They are configuration, not derived from the request, for the reason given under Verification below.
 
-While either origin is missing or invalid, or the secret is too short, registration answers 503 `registration_not_configured`. Login (`login_not_configured`) and the session routes (`session_not_configured`) fail the same way. Sessions need no variable of their own: their issuer is derived from `API_ORIGIN`.
+While either origin is missing or invalid, or the secret is too short, every route that needs configuration answers 503 `not_configured`: registration, login and the session routes alike, with the reason only in the log. Sessions need no variable of their own: their issuer is derived from `API_ORIGIN`.
 
 ## The point of acceptance
 
@@ -211,8 +211,8 @@ What `finish` verifies is deliberately narrow, and everything outside it fails c
 - **Strict `clientDataJSON`.** Member names are matched exactly and a repeated name is an error, because `encoding/json` alone would match case-insensitively and keep the last duplicate, so a document could mean one thing to the browser and another to us. Unknown members are ignored, as the spec requires, except `crossOrigin: true` and `topOrigin`, which are refused. A present `crossOrigin` must be a boolean (null is refused, where `encoding/json` would read it as false), and `type`, `challenge` and `origin` must be strings. JSON escapes are decoded before comparison. The origin is compared exactly as a whole string. One deliberate deviation: section 7.1 step 5 strips a leading byte order mark, but no conforming client writes one, so it is refused.
 - **Authenticator data.** The RP ID hash must match, user presence and user verification must both be set (we request both), attested credential data must be present, extension data must be absent (we send none), reserved bits must be clear, and backup state without backup eligibility is invalid. Reserved bits are refused even though section 7.1 does not check them, failing closed on flags we do not understand. The credential id must be 1 to 1023 bytes and equal both the `id` and the `rawId` the client reported. The signature counter is deliberately not stored: synced passkeys always report zero.
 - **Transports** are a client hint, not something we verify, so they are stored as reported, unknown values included (section 5.2.1 says relying parties SHOULD accept them). The spec says clients send them sorted and unique, but real providers do not, and a hint is not worth failing a registration over, so we normalise the list instead of refusing it. Only a list too large to be a hint is refused.
-- **The request body** is what `PublicKeyCredential.toJSON()` returns (`RegistrationResponseJSON`), unmodified. `authenticatorData`, `publicKey` and `publicKeyAlgorithm` are copies of what `attestationObject` holds; everything is read from `attestationObject`, so they are ignored. `clientExtensionResults` must be empty, because we request no extensions. The body is decoded strictly: member names must match exactly, may not repeat, and text must be valid UTF-8.
-- **The account name** must be valid UTF-8 in Unicode Normalization Form C, with no control (Cc) or format (Cf) code points: no NUL, bidirectional overrides, or zero-width characters. This is the core of the PRECIS Nickname profile section 5.4.3 asks for.
+- **The request body** is what `PublicKeyCredential.toJSON()` returns (`RegistrationResponseJSON`), unmodified. Each route has its own body limit: a few KiB for `begin`, which carries two short strings, and 32 KiB for `finish`, the sum of what its members may legally hold. `authenticatorData`, `publicKey` and `publicKeyAlgorithm` are copies of what `attestationObject` holds; everything is read from `attestationObject`, so they are ignored. `clientExtensionResults` must be empty, because we request no extensions. The body is decoded strictly: member names must match exactly, may not repeat, and text must be valid UTF-8.
+- **The account name** and **invitation code** are parsed once, into `internal/input` types, before anything else looks at them, and a value that is not already in canonical form is refused rather than corrected. The name must be 1 to 128 bytes of valid UTF-8 in Unicode Normalization Form C, not blank, with no control (Cc) or format (Cf) code points: no NUL, bidirectional overrides, or zero-width characters, joiners included (`invalid_name`). It is the one text an administrator recognises an account by, so it is stricter than the display text of agents and invitations, which may hold the zero-width joiner and non-joiner so that emoji sequences and Persian, Indic and Sinhala text can be written. This is the core of the PRECIS Nickname profile section 5.4.3 asks for. The code is 1 to 256 bytes of the base64url alphabet (`invalid_invitation`).
 
 Both the relying party ID and the origin come from configuration (`UI_ORIGIN`), never from the request, because a `Host` header is attacker-influenced and a Worker is reachable on several hostnames. The ID is permanent: a passkey is bound to it.
 
@@ -220,11 +220,12 @@ The parsers are fuzzed (`go test -fuzz=FuzzVerify ./internal/webauthn`), with th
 
 ## Decisions that were open
 
-- **The routes** are `POST /api/register/begin` and `POST /api/register/finish`, under `/api/` like `/api/first-run`. The bare `/register` path is the browser page.
+- **The routes** are `POST /api/register/begin` and `POST /api/register/finish`, under `/api/` like `/api/first-run`. The bare `/register` path is the browser page. Both are declared as needing no credential: the caller has no session yet.
+- **Failure codes** name the step that failed. A code that is not well formed is 400 `invalid_invitation`, and one that is well formed but not redeemable is 403 with the same code, so the status says which and nothing reveals why (unknown, used up, revoked and expired are one answer). A passkey response that does not verify is 400 `invalid_credential`; a challenge that is forged, altered, created for another code or name, expired or implausibly far ahead is 400 `invalid_challenge`.
 - **The account name** is supplied by the user at `begin`, because `begin` has to return it in the creation options, and it is bound into the challenge as described above. It is one field used as both `name` and `displayName`, and is stored in `users.profile`.
-- **Role.** `RoleFor` maps an invitation type to a role in Go (`first_run` is `admin`) and fails closed on an unknown type. The user insert also requires the invitation to still have the type the role was chosen for, so a type that changed between the read and the write cannot receive another type's role.
+- **Role.** `auth.RoleForInvitation` maps an invitation type to a role in Go (`first_run` is `admin`) and fails closed on an unknown type. The user insert also requires the invitation to still have the type the role was chosen for, so a type that changed between the read and the write cannot receive another type's role.
 - **`finish` issues no session.** Registering the passkey is the whole job here; sessions need their own key derivation (see the key-separation constraint above), a cookie or bearer decision and a login ceremony, which is the next feature.
-- **Failure of the atomic write.** A batch the database refused on a constraint (the invitation was used up, or the handle or credential id is a replay) is a 409. Any other failure is a 503. `finish` reads the invitation before the write, so a request that is already stale gets a clean 403 without reaching it, and the 409 is for the race that read cannot close.
+- **Failure of the atomic write.** A batch the database refused on a constraint (the invitation was used up, or the handle or credential id is a replay) is a 409 `registration_accept_failed`. A database that is unavailable is a 503 with that operation's `_failed` code, and a write the schema refused as a backstop for the code, which is a defect and not the client's doing, is a 500 `_rejected`. `finish` reads the invitation before the write, so a request that is already stale gets a clean 403 without reaching it, and the 409 is for the race that read cannot close.
 
 ## Open questions
 

@@ -1,105 +1,114 @@
-// Package session verifies and ends the sessions described in
-// docs/login_design.md, and mints the keys they are made of.
+// Package session is the part of the API a signed-in caller uses to ask about
+// and end their own session (docs/login_design.md): who the cookie speaks for,
+// and logout.
 //
-// A session is a japikey: a fresh ES256 key pair whose private half was
-// discarded right after it signed one JWT. The JWT travels in an HttpOnly,
-// Secure cookie; the public half is a row in japikeys. Verifying a request is
-// one primary-key read plus the signature check.
-//
-// A session lasts a fixed time and is never extended: when it ends the user
-// signs in with their passkey again. Login (internal/login) is the only thing
-// that issues one, in the same atomic write that consumes its challenge.
+// It is thin because the boundary does the rest. internal/auth reads the cookie,
+// verifies the token, checks the stored key and its account, and hands each
+// route here a Principal; a request without a valid session never reaches
+// these handlers. Login (internal/login) is what issues a session.
 package session
 
 import (
 	"context"
-	"crypto"
-	"crypto/sha256"
+	"errors"
+	"net/http"
 	"time"
-	"uuid"
+
+	"github.com/susu-dot-dev/authsu/internal/auth"
+	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
-// Kinds of key in japikeys. The schema does not constrain the column, so a new
-// kind needs no migration; Go interprets it.
+// Paths of the routes.
 const (
-	// KindSession is a login session, carried in a cookie.
-	KindSession = "session"
-	// KindAPIKey is a key presented as a bearer token, by a user's software or
-	// by an agent. Nothing verifies one yet: only minting exists.
-	KindAPIKey = "api_key"
+	// PathSession is the path of GET /api/session.
+	PathSession = "/api/session"
+	// PathLogout is the path of POST /api/logout.
+	PathLogout = "/api/logout"
 )
 
-// Audience is the token's audience for a kind. Each route verifies with the
-// audience it expects, so a token minted for one kind cannot be presented as
-// another: the kind is in the database so it can be queried and in the signed
-// token so it cannot be forged.
-func Audience(kind string) string { return "authsu/" + kind }
-
-// Lifetime is how long a session lasts. It is a starting value, not part of the
-// design. A session is not extended or renewed: the lifetime is the whole of it,
-// and it is what bounds how long a stolen cookie is good for.
-const Lifetime = 14 * 24 * time.Hour
-
-// CookieName is the session cookie. The __Host- prefix makes browsers refuse
-// the cookie unless it is Secure, has Path=/ and has no Domain, so a sibling
-// subdomain cannot set or shadow it.
-const CookieName = "__Host-session"
-
-// Key is a minted session key, ready to store.
-type Key struct {
-	// ID is the kid.
-	ID uuid.UUID
-	// JWT is the bearer token. It is sent to the client and never stored.
-	JWT string
-	// JWK is the public key as the JSON document japikey defines.
-	JWK []byte
-	// ExpiresAt is the token's exp.
-	ExpiresAt time.Time
-	// PublicKey is the public half, for tests and callers that verify at once.
-	PublicKey crypto.PublicKey
+// Store is the part of the database the session routes write. *store.Store
+// satisfies it. Failures must come back classified, as the store's do, because
+// they are sent as they are.
+type Store interface {
+	// RevokeSession ends the session kid as of now. It reports false when there
+	// was nothing to revoke: the session was already revoked.
+	RevokeSession(ctx context.Context, kid string, now time.Time) (bool, error)
 }
 
-// LoginGrant is the granted_from value for the session a login challenge
-// produced: the SHA-256 of the challenge. The column is unique, so a replayed
-// login produces the same value and collides with the session the first one
-// made.
-func LoginGrant(challenge []byte) []byte {
-	sum := sha256.Sum256(challenge)
-
-	return sum[:]
+// Deps are the collaborators of Routes. All are required.
+type Deps struct {
+	// Store revokes a session on logout.
+	Store Store
+	// Now is the clock, the time a logout takes effect.
+	Now func() time.Time
 }
 
-// Principal is who a verified session token speaks for.
-type Principal struct {
-	// UserID is the account.
-	UserID string
-	// KeyID is the kid of the token presented.
-	KeyID string
-	// ExpiresAt is when the token expires.
-	ExpiresAt time.Time
-	// CredentialID is the passkey the session was issued for.
-	CredentialID string
-	// Role is the account's role.
-	Role string
+// WhoAmIResponse is the body of GET /api/session. ExpiresAt is also when the
+// user has to sign in again: a session is never extended.
+type WhoAmIResponse struct {
+	UserID string `json:"userId"`
+	Role   string `json:"role"`
+	// ExpiresAt is when this session ends, in Unix seconds.
+	ExpiresAt int64 `json:"expiresAt"`
 }
 
-// Reader is the read side of the key store.
-type Reader interface {
-	// ActiveKey returns the public JWK of a session key and who it belongs to,
-	// if the key exists, has not expired and is not revoked at now.
-	ActiveKey(ctx context.Context, kid string, now time.Time) (ActiveKey, bool, error)
+// errRevokedFirst is the cause of a logout that found its session already
+// revoked by a concurrent request.
+var errRevokedFirst = errors.New("session was revoked by another request")
+
+// Routes returns the session routes, for auth.Handler. It panics when a
+// dependency is missing: the routes would fail on first use, and a missing
+// dependency is a wiring mistake to find at start, not in a request.
+//
+//   - GET /api/session: who the session cookie speaks for. It never writes.
+//   - POST /api/logout: revoke the presented session now and clear the cookie.
+//     A session that is already gone is a 401 like any request without one.
+//
+// Both need a session and no more: a caller may always ask about and end their
+// own, whatever their role.
+func Routes(deps Deps) []auth.Route {
+	if deps.Store == nil || deps.Now == nil {
+		panic("session: Deps.Store and Deps.Now are required")
+	}
+
+	return []auth.Route{
+		{
+			Method: http.MethodGet, Path: PathSession, MaxBody: 0,
+			Credential: auth.Session, Require: nil, Handle: whoAmI,
+		},
+		{
+			Method: http.MethodPost, Path: PathLogout, MaxBody: 0,
+			Credential: auth.Session, Require: nil, Handle: deps.logout,
+		},
+	}
 }
 
-// ActiveKey is a stored key that is currently usable.
-type ActiveKey struct {
-	// JWK is the stored public key document.
-	JWK []byte
-	// UserID is the account.
-	UserID string
-	// CredentialID is the passkey the session was issued for.
-	CredentialID string
-	// Role is the account's role.
-	Role string
-	// ExpiresAt is the stored copy of exp.
-	ExpiresAt time.Time
+// whoAmI answers GET /api/session from the verified principal. Everything in it
+// was read for this request, so a changed role or a shortened session shows at
+// once.
+func whoAmI(call *auth.Call) result.Result[httpapi.Response] {
+	principal := call.Principal
+
+	return result.Ok(httpapi.JSON(http.StatusOK, WhoAmIResponse{
+		UserID:    principal.UserID,
+		Role:      principal.Role,
+		ExpiresAt: principal.ExpiresAt.Unix(),
+	}))
+}
+
+// logout answers POST /api/logout. The revocation is one conditional write
+// (store.RevokeSession): the boundary saw the key active, so a write that
+// changes nothing means another request revoked it in between. The session is
+// gone, which is what any request without one is told.
+func (d Deps) logout(call *auth.Call) result.Result[httpapi.Response] {
+	return result.Of(d.Store.RevokeSession(call.Request.Context, call.Principal.KeyID, d.Now())).
+		Then(func(revoked bool) (httpapi.Response, error) {
+			if !revoked {
+				return httpapi.Response{}, auth.Unauthenticated(errRevokedFirst)
+			}
+
+			return httpapi.Response{Status: http.StatusNoContent, Body: nil, Cookies: nil}.
+				WithCookies(auth.ClearSessionCookie()), nil
+		})
 }

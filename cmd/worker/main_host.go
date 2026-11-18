@@ -8,15 +8,11 @@ package main
 import (
 	"fmt"
 	"os"
-
-	"github.com/susu-dot-dev/authsu/internal/app"
 )
 
 func main() {
 	// The platform resources (D1, the Worker environment) exist only in
-	// js/wasm, so the host stub supplies none.
-	_ = app.NewHandler(app.Platform{})
-
+	// js/wasm, so there is nothing for the host to hand to internal/app.
 	fmt.Fprintln(os.Stderr, "authsu runs as a Cloudflare Worker; use `make dev`.")
 	os.Exit(1)
 }

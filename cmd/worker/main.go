@@ -17,8 +17,8 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/app"
-	"github.com/susu-dot-dev/authsu/internal/atomic"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
 func main() {
@@ -29,9 +29,7 @@ func main() {
 		log.Fatalf("open D1 binding: %v", err)
 	}
 
-	workers.Serve(app.NewHandler(
-		app.Platform{DB: db, Batch: batch(db), Getenv: cloudflare.Getenv, Log: logError},
-	))
+	workers.Serve(app.NewHandler(app.Platform{Exec: batch(db), Getenv: cloudflare.Getenv, Log: logError}))
 }
 
 // logError writes the full detail of a failed request, including the cause the
@@ -42,12 +40,13 @@ func logError(req httpapi.Request, failure *apierr.Error) {
 		failure.Code, failure.Kind.Status(), req.Method, req.Path, failure)
 }
 
-// batch returns the atomic write function: D1's batch call, which rolls the
-// whole batch back if any statement fails. It only converts the statement and
-// result types and classifies the failure; the SQL lives with the feature that
-// issues it.
-func batch(db *sql.DB) atomic.Batch {
-	return func(ctx context.Context, statements ...atomic.Statement) ([]atomic.Result, error) {
+// batch returns the database port: D1's batch call, which runs every statement
+// as one transaction and rolls the whole batch back if any fails. Every read
+// and write goes through it, a read as a one-statement batch. It only converts
+// the statement and result types and classifies the failure; the SQL lives in
+// internal/store.
+func batch(db *sql.DB) store.Exec {
+	return func(ctx context.Context, statements ...store.Statement) ([]store.Result, error) {
 		converted := make([]d1.Statement, len(statements))
 		for i, statement := range statements {
 			converted[i] = d1.Statement{Query: statement.Query, Args: statement.Args}
@@ -55,12 +54,12 @@ func batch(db *sql.DB) atomic.Batch {
 
 		raw, err := d1.Batch(ctx, db, converted...)
 		if err != nil {
-			return nil, atomic.Classify(err)
+			return nil, store.Classify(err)
 		}
 
-		results := make([]atomic.Result, len(raw))
+		results := make([]store.Result, len(raw))
 		for i, one := range raw {
-			results[i] = atomic.Result{Changes: one.Meta.Changes, Rows: rowsOf(one.Rows)}
+			results[i] = store.Result{Changes: one.Meta.Changes, Rows: rowsOf(one.Rows)}
 		}
 
 		return results, nil
