@@ -52,19 +52,19 @@ The obvious alternative was go-webauthn. We chose to extend our own verifier ins
 
 ### Stateless and signed, as at registration
 
-The challenge uses registration's approach: a fixed binary layout carrying its own expiry, authenticated with an HMAC, so that `begin` stores nothing:
+The challenge uses registration's approach: a fixed binary layout carrying its own expiry, authenticated with an HMAC, so that `begin` stores nothing. Both ceremonies share one implementation (`internal/challenge`):
 
 ```
-state     = version || expires_at || nonce               -- illustrative layout
+state     = version || expires_at || nonce
 signature = HMAC(K_login, state)
 challenge = state || signature
 ```
 
 Here is how it differs from registration's challenge, and why:
 
-- **It carries a random nonce of its own.** Registration's challenge got its entropy for free from the 32-byte random user handle. At login there is no handle to mint, so the challenge needs its own random bytes: at least the 16 the spec asks for. This is what makes every challenge unique, and as at registration, a test should assert that two calls to `begin` never produce the same challenge.
+- **Its nonce is only entropy.** Registration uses the same 32-byte nonce as the user handle, so the entropy comes for free. At login there is no handle, so the nonce is just the random bytes the challenge needs: at least the 16 the spec asks for. This is what makes every challenge unique, and as at registration, a test should assert that two calls to `begin` never produce the same challenge.
 - **It has no associated data.** Registration bound the invitation code and the account name into the signature, because the client supplies both at `begin`. A login `begin` takes no input, so there is nothing to bind.
-- **It uses its own derived key.** Registration's challenge key is derived from the root secret with its own context, and the login key is derived the same way with a different context. Both are integrity keys of the same kind. Separating them means a challenge minted for one ceremony can never verify as the other, even if the `clientDataJSON` type checks were ever wrong.
+- **It uses its own derived key.** Registration's challenge key is derived from the root secret with its own context, and the login key is derived the same way with a different context. Both are integrity keys of the same kind. Separating them means a challenge created for one ceremony can never verify as the other, even if the `clientDataJSON` type checks were ever wrong.
 
 As at registration, the challenge is read only from `clientDataJSON`, and its expiry is read only after the signature has verified.
 
@@ -74,7 +74,7 @@ The registration document makes the point that a signing key which merely protec
 
 With the login key, an attacker can forge challenges, but a challenge is worthless without a passkey's signature over it. The browser binds that signature to our origin, so the attacker cannot get a user to sign a forged challenge without running script on our origin. A leak is therefore not account takeover. Rotation breaks only ceremonies in flight.
 
-There is one way a leaked key could combine with replay, covered below: a forged challenge with a far-future expiry. `finish` defends against it by refusing any challenge whose signed expiry lies further ahead than the ceremony timeout, even when its signature is valid.
+There is one way a leaked key could combine with replay, covered below: a forged challenge with a far-future expiry. `finish` defends against it by refusing any challenge whose signed expiry lies further ahead than the ceremony timeout, even when its signature is valid. (Registration applies the same bound, though nothing there depends on it as login does.)
 
 ## Replay
 
@@ -116,15 +116,15 @@ The challenge record lives on the key's row, so deleting the row deletes the rec
 
 ## The token: japikeys
 
-Login ends by issuing a session. We use the same mechanism as API keys: a *japikey*. For each key we mint a fresh ES256 (P-256) key pair, sign one JWT with the private key, store only the public key, and discard the private key. The JWT is the bearer credential. Verifying it means looking up its public key by key id (`kid`) and checking the signature.
+Login ends by issuing a session. We use the same mechanism as API keys: a *japikey*. For each key we create a fresh ES256 (P-256) key pair, sign one JWT with the private key, store only the public key, and discard the private key. The JWT is the bearer credential. Verifying it means looking up its public key by key id (`kid`) and checking the signature.
 
 We chose this over an HMAC-signed session token, a random opaque token, and a long-lived signing key:
 
 - **There is no signing secret to leak.** The registration document's key-separation rule ("the key must not be reused for anything where a signature *is* authorization") exists because a leaked session-signing key would mean account takeover. With japikeys no such key exists: every private key is gone once its one token is signed. A database leak exposes only public keys. The remaining trust assumption, which japikey states plainly, is that anyone who can *write* to the database can insert a key of their own.
 - **Revocation is per key.** It is a property of the row, and takes effect at the time recorded there. Logout sets it to now.
-- **Sessions and API keys are one mechanism.** They share minting, verification, revocation, and listing.
+- **Sessions and API keys are one mechanism.** They share creation, verification, revocation, and listing.
 - **Public verifiability stays possible.** A japikey's issuer URL leads to a JWKS document holding just that key. We don't publish these yet, but we store the public key as a JWK so that a `/.well-known/jwks.json`-style endpoint could later be served from the row unchanged. That is most likely to matter for API keys, which third parties may want to verify.
-- **The cost is small and was measured.** Minting takes about 1 ms and verifying about 2 ms in our Worker, and the library builds under TinyGo within our size budget.
+- **The cost is small and was measured.** Creating a key takes about 1 ms and verifying one about 2 ms in our Worker, and the library builds under TinyGo within our size budget.
 
 Every claim the verifier needs is signed into the token: subject, audience, expiry, issued-at, and version. The database is consulted per request for the public key and for revocation, as one primary-key read.
 
@@ -184,7 +184,7 @@ Like registration, what `finish` accepts is deliberately narrow, and everything 
 - **The signature** is ES256 over the authenticator data followed by the SHA-256 of `clientDataJSON`, checked with the key stored at registration. At registration nothing cryptographically bound the client's claims. Here everything above is covered by this signature, which is why login takes user verification from these signed flags and never from what registration stored.
 - **The signature counter** is not checked, consistent with not storing it.
 
-An unknown credential, a mismatched handle, a bad signature, and a replay are all reported identically, so a failed login reveals nothing about which check failed.
+An unknown credential, a mismatched handle, a bad signature, and a replay are all reported identically (401 `invalid_login`), so a failed login reveals nothing about which check failed.
 
 ## Decisions that were open
 
@@ -205,10 +205,12 @@ An unknown credential, a mismatched handle, a bad signature, and a replay are al
 - **Logout** is `POST /api/logout`. It revokes the presented session at the current time and tells the browser to drop the cookie. The row stays until it expires, for the replay reason above. Logging out a session that is already gone is a 401 like any request without a valid session.
 - **The cookie** is named `__Host-session`. The `__Host-` prefix makes a browser refuse it unless it is `Secure`, has `Path=/` and has no `Domain`, so a sibling subdomain cannot set or shadow it. It is `SameSite=Lax`: a session survives following a link to the site, and the cookie is withheld from cross-site subrequests and POSTs, which is also what stops another site from triggering a logout (see "The UI on another origin" for why that still holds with the UI on a sibling origin).
 - **Reading the session** is `GET /api/session`. It reports who the cookie speaks for and when the session ends, which is also when the user has to sign in again. It never writes.
-- **The issuer** of every token is derived from `API_ORIGIN`: the service that mints a token is the one that identifies it, wherever the UI is served. japikey requires `https`, so plain `http` is accepted for `localhost` only.
-- **Configuration** is the deployment's, shared with registration (see [registration_design.md](registration_design.md#deployment-configuration)). Login derives its challenge key from `AUTH_HMAC_SECRET` with its own context. Sessions need no signing key at all: each is a japikey whose private half is discarded as soon as it signs its one token, so there is no key whose leak would be account takeover. When configuration is missing, login answers 503 `login_not_configured` and the session routes 503 `session_not_configured`.
+- **The issuer** of every token is derived from `API_ORIGIN`: the service that creates a token is the one that identifies it, wherever the UI is served. japikey requires `https`, so plain `http` is accepted for `localhost` only.
+- **Configuration** is the deployment's, shared with registration (see [registration_design.md](registration_design.md#deployment-configuration)). Login derives its challenge key from `AUTH_HMAC_SECRET` with its own context. Sessions need no signing key at all: each is a japikey whose private half is discarded as soon as it signs its one token, so there is no key whose leak would be account takeover. When configuration is missing, every route that needs it, login and the session routes alike, answers 503 `not_configured`.
 - **The account's role is read when a request is verified**, not copied into the token. A role change takes effect on the next request, at the cost of joining `users` on the one primary-key read. The same join checks that the account is not revoked (see [users_design.md](users_design.md)).
-- **Every response about an unusable session is one answer** (401, `unauthenticated`), whether the cookie is missing, malformed, unknown, expired, revoked or for another audience. The cause goes to the log. A failure to read the store is a 503, never a 401, so an outage cannot look like a verdict on someone's session.
+- **Every response about an unusable session is one answer** (401, `unauthenticated`), whether the cookie is missing, malformed, oversized, unknown, expired, revoked, for another audience or issuer, or signed for a subject that is not the key's owner. The cause goes to the log. A request carrying two session cookies, even if one is empty, is refused the same way instead of choosing one: whoever controls the other cookie (a sibling subdomain, a proxy) would otherwise decide which session is meant. A failure to read the store is a 503 `session_verify_failed`, never a 401, so an outage cannot look like a verdict on someone's session.
+- **Verification belongs to the route boundary, not to the session feature.** `internal/auth` reads the cookie, verifies the token and reads the stored key (one primary-key read in `internal/store`) before any handler runs, and a route says whether it needs a session or none. On a route that has an `{id}` it is parsed after all of this, once the caller and the route's requirement are settled, so a caller who is not let in learns nothing about what a valid id looks like. The session feature (`GET /api/session`, `POST /api/logout`) is only what a signed-in caller does with their own session.
+- **A login that does not verify is one answer** (401 `invalid_login`): an unknown or revoked-account credential, a handle that is not the account's, a bad signature, a challenge that is forged, expired or implausibly far ahead, and a replay all look alike. A session key that could not be created is a 500 `session_create_failed`. A stored passkey whose public key does not parse is a 500 `stored_credential_invalid`, not a 401: registration refuses such a key before it is stored, so finding one means the database no longer holds what was written, and the failure is meant to be seen in the logs and not to pass for a bad signature.
 
 ## The UI on another origin
 

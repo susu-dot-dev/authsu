@@ -1,4 +1,4 @@
-// Package invitations implements the admin API for invitations described in
+// Package invitations is the admin API for invitations described in
 // docs/invitations_design.md: list them, create one, change how many accounts
 // it may create, and revoke it.
 //
@@ -7,209 +7,120 @@
 //	PATCH  /api/invitation/{id}   change the number of accounts it may create
 //	DELETE /api/invitation/{id}   revoke it
 //
-// Every route requires a session (401) whose account is an admin (403). The
-// role is the one stored on the account, read on each request, so demoting an
-// admin takes effect at once.
+// Every route needs a session (401) whose account is an admin (403): both are
+// declared on the routes and enforced by the auth boundary before a handler
+// runs. The role is the one stored on the account, read on each request, so
+// demoting an admin takes effect at once.
 //
 // An invitation is identified by its id, never by its code. The code is shown
-// once, in the response to the POST that created it; only its hash is stored,
-// so no route can return it again.
+// once, in the response to the POST that created it; only its hash is stored
+// (input.InvitationCode.Hash, the one place codes are hashed), so no route can
+// return it again.
+//
+// Each request reads the clock once, and that reading is the request's "now":
+// the expiry a create is checked against, the time a revoke records and the
+// instant a status is derived at are the same moment.
 package invitations
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"errors"
 	"io"
+	"net/http"
 	"time"
 
-	"github.com/susu-dot-dev/authsu/internal/atomic"
-	"github.com/susu-dot-dev/authsu/internal/firstrun"
+	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/result"
-	"github.com/susu-dot-dev/authsu/internal/session"
+	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// Limits on what a client may ask for. The schema has no upper bound on
-// num_invites, and the label is capped at 256 characters by a CHECK; these are
-// the limits Go refuses first, so a client gets a proper error rather than a
-// database rejection.
+// The routes' paths. The collection takes GET and POST; one invitation takes
+// PATCH and DELETE.
 const (
-	// MaxNumInvites is the most accounts one invitation may create.
-	MaxNumInvites = 10_000
-	// MaxLabelChars is the longest label, in characters (the schema counts
-	// characters for TEXT).
-	MaxLabelChars = 256
-	// CodeBytes is the entropy of a generated code: 256 bits, which is 43
-	// base64url characters, matching what docs/invitations_design.md assumes.
-	CodeBytes = 32
+	CollectionPath = "/api/invitation"
+	ItemPath       = CollectionPath + "/{id}"
 )
 
-// CreatableTypes are the types an invitation may be created with. A type
-// decides the role an account created from it gets, and that mapping lives in
-// internal/registration. None is creatable through this API yet: first run is
-// minted only by GET /api/first-run, because it is bound to there being no
-// account at all. Adding a type here, and its role in registration.RoleFor, is
-// what makes POST accept it.
-func CreatableTypes() []string { return nil }
+// MaxBody is the largest request body any invitation route reads, in bytes.
+// The biggest legitimate one is a create with a 256-character label that is
+// all escapes (6 bytes each), about 1.6 KiB, so this leaves room and refuses
+// anything that could only be an attempt to make the route read more.
+const MaxBody = 4 << 10
 
-// Status is where an invitation stands now. It is derived from the row and the
-// clock, never stored.
-type Status string
+// CodeBytes is the entropy of a generated code: 256 bits, which is 43
+// base64url characters, matching what docs/invitations_design.md assumes.
+const CodeBytes = 32
 
-// Statuses, in the order they are decided: a revoked invitation is revoked
-// even if it has also expired or been used up.
-const (
-	// StatusRevoked means an admin revoked it.
-	StatusRevoked Status = "revoked"
-	// StatusExpired means its expiry has passed.
-	StatusExpired Status = "expired"
-	// StatusExhausted means it has created as many accounts as it may.
-	StatusExhausted Status = "exhausted"
-	// StatusActive means it can still be redeemed.
-	StatusActive Status = "active"
-)
-
-// Invitation is one invitation as an admin sees it. It never carries the code
-// or its hash.
-type Invitation struct {
-	ID    string `json:"id"`
-	Type  string `json:"type"`
-	Label string `json:"label"`
-	// NumInvites is how many accounts it may create.
-	NumInvites int64 `json:"numInvites"`
-	// Uses is how many accounts it has created: the users that point at it.
-	Uses   int64  `json:"uses"`
-	Status Status `json:"status"`
-	// ExpiresAt, RevokedAt and CreatedBy are absent when not set.
-	ExpiresAt *int64  `json:"expiresAt,omitempty"`
-	RevokedAt *int64  `json:"revokedAt,omitempty"`
-	CreatedBy *string `json:"createdBy,omitempty"`
-	// CreatedAt is in Unix seconds.
-	CreatedAt int64 `json:"createdAt"`
+// Store is the part of the database the routes use. *store.Store satisfies it.
+// Failures come back already classified (see the store package), and the routes
+// send them as they are.
+type Store interface {
+	// ListInvitations returns every invitation, newest first.
+	ListInvitations(ctx context.Context) ([]store.Invitation, error)
+	// CreateInvitation inserts an invitation and returns the stored row.
+	CreateInvitation(ctx context.Context, invitation store.NewInvitation) (store.Invitation, error)
+	// UpdateNumInvites sets the cap and returns the row as the write left it
+	// and whether it applied; store.ErrNotFound when there is no such row.
+	UpdateNumInvites(ctx context.Context, id input.ID, n input.NumInvites) (store.Invitation, bool, error)
+	// RevokeInvitation revokes as of now and returns the row as the write left
+	// it; store.ErrNotFound when there is no such row.
+	RevokeInvitation(ctx context.Context, id input.ID, now time.Time) (store.Invitation, error)
 }
 
-// Row is an invitation as stored, with its use count. Status is derived from
-// it by StatusOf.
-type Row struct {
-	ID         string
-	Type       string
-	Label      string
-	NumInvites int64
-	Uses       int64
-	ExpiresAt  *int64
-	RevokedAt  *int64
-	CreatedBy  *string
-	CreatedAt  int64
-}
-
-// StatusOf returns the status of r at now. Revocation, expiry and the cap
-// follow the same rules as the redemption query in internal/registration: any
-// revoked_at at all revokes (even one set in the future), and an invitation
-// expires at, not after, its expires_at.
-func StatusOf(r Row, now time.Time) Status {
-	switch {
-	case r.RevokedAt != nil:
-		return StatusRevoked
-	case r.ExpiresAt != nil && *r.ExpiresAt <= now.Unix():
-		return StatusExpired
-	case r.Uses >= r.NumInvites:
-		return StatusExhausted
-	default:
-		return StatusActive
-	}
-}
-
-// Reader is the read side of the invitation store.
-type Reader interface {
-	// List returns every invitation, revoked ones included, newest first.
-	List(ctx context.Context) ([]Row, error)
-	// Get returns one invitation, or an error wrapping ErrNotFound if there is
-	// none with this id.
-	Get(ctx context.Context, id string) (Row, error)
-}
-
-// Service is the invitation API.
-type Service struct {
-	sessions Authenticator
-	reader   Reader
-	batch    atomic.Batch
-	now      func() time.Time
-	entropy  io.Reader
-	newID    func() string
-	// creatable is the set of types POST accepts.
-	creatable map[string]struct{}
-}
-
-// Authenticator verifies a request's session. *session.Service is one.
-type Authenticator interface {
-	Authenticate(ctx context.Context, getenv func(string) string, req httpapi.Request) (session.Principal, error)
-}
-
-// Deps are the service's collaborators. Time, randomness and identifiers are
-// injected so every branch is reachable from a test.
+// Deps are the collaborators of the routes. All are required, and Routes panics
+// on a missing one: a deployment that lacks a dependency is not an invitation
+// service with a degraded mode.
 type Deps struct {
-	Sessions Authenticator
-	Reader   Reader
-	// Batch performs the writes. Nil disables the routes that write.
-	Batch atomic.Batch
+	Store Store
 	// Now is the clock.
 	Now func() time.Time
-	// Entropy supplies random bytes for codes (crypto/rand.Reader in
+	// Entropy supplies the random bytes of a code (crypto/rand.Reader in
 	// production).
 	Entropy io.Reader
 	// NewID returns a fresh UUIDv7 in canonical text form.
 	NewID func() string
-	// Types are the invitation types POST accepts. Production passes
-	// CreatableTypes(); it is a dependency so a test can exercise creation
-	// while no type is creatable.
-	Types []string
 }
 
-// NewService returns a Service.
-func NewService(deps Deps) *Service {
-	return &Service{
-		sessions:  deps.Sessions,
-		reader:    deps.Reader,
-		batch:     deps.Batch,
-		now:       deps.Now,
-		entropy:   deps.Entropy,
-		newID:     deps.NewID,
-		creatable: typeSet(deps.Types),
+// Routes returns the four invitation routes. It panics when a dependency is
+// missing, a programming error.
+func Routes(deps Deps) []auth.Route {
+	handlers := newHandlers(deps)
+
+	return []auth.Route{
+		route(http.MethodGet, CollectionPath, handlers.list),
+		route(http.MethodPost, CollectionPath, handlers.create),
+		route(http.MethodPatch, ItemPath, handlers.update),
+		route(http.MethodDelete, ItemPath, handlers.revoke),
 	}
 }
 
-func typeSet(types []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(types))
-	for _, name := range types {
-		set[name] = struct{}{}
+// route declares one admin-only route. Every invitation route is the same
+// shape: the declaration is the whole of the access rule.
+func route(method, path string, handle func(*auth.Call) result.Result[httpapi.Response]) auth.Route {
+	return auth.Route{
+		Method: method, Path: path, MaxBody: MaxBody,
+		Credential: auth.Session, Require: auth.Admin, Handle: handle,
+	}
+}
+
+// handlers carries the dependencies of the route handlers.
+type handlers struct {
+	store   Store
+	now     func() time.Time
+	entropy io.Reader
+	newID   func() string
+}
+
+// newHandlers validates deps.
+func newHandlers(deps Deps) *handlers {
+	for name, missing := range map[string]bool{
+		"Store": deps.Store == nil, "Now": deps.Now == nil, "Entropy": deps.Entropy == nil, "NewID": deps.NewID == nil,
+	} {
+		if missing {
+			panic("invitations: Deps." + name + " is required")
+		}
 	}
 
-	return set
+	return &handlers{store: deps.Store, now: deps.Now, entropy: deps.Entropy, newID: deps.NewID}
 }
-
-// ErrNotFound is what Reader.Get reports for an id nothing has.
-var ErrNotFound = errors.New("no such invitation")
-
-var errNoStore = errors.New("no database is configured")
-
-// codeHash is how invitation codes are stored and looked up: the SHA-256 of the
-// code, matching internal/registration and internal/firstrun.
-func codeHash(code string) []byte {
-	sum := sha256.Sum256([]byte(code))
-
-	return sum[:]
-}
-
-// newCode returns a fresh code: CodeBytes of entropy, base64url without
-// padding.
-func newCode(entropy io.Reader) result.Result[string] {
-	raw := make([]byte, CodeBytes)
-
-	return result.Of(io.ReadFull(entropy, raw)).
-		Map(func(int) string { return base64.RawURLEncoding.EncodeToString(raw) })
-}
-
-// firstRunType is the type minted only by GET /api/first-run.
-const firstRunType = firstrun.InvitationType

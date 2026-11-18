@@ -21,7 +21,7 @@ const (
 // corsMethods are the methods a preflight may be answered for: the ones the API
 // has routes for. PATCH and DELETE are not CORS-safelisted, so they always
 // need a preflight, and so are as protected as POST; every unsafe method also
-// requires Content-Type: application/json (see Serve).
+// requires Content-Type: application/json (see ServeRoutes).
 func corsMethods() []string {
 	return []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete}
 }

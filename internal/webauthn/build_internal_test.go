@@ -8,6 +8,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
@@ -190,4 +195,47 @@ func (r response) build(tb testing.TB) Registration {
 	}
 
 	return reg
+}
+
+// migrationLimits reads the numbers a CHECK of the migrations states, by a
+// pattern whose capture groups are the numbers, over the migrations' text with
+// whitespace collapsed. A pattern that matches nothing fails the test, so a
+// reworded migration is noticed.
+func migrationLimits(t *testing.T, pattern string) []int {
+	t.Helper()
+
+	paths, err := filepath.Glob("../../migrations/*.sql")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no migrations found: %v", err)
+	}
+
+	var text strings.Builder
+
+	for _, path := range paths {
+		raw, err := os.ReadFile(path) //nolint:gosec // the paths are a glob of the repository's own migrations
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+
+		text.Write(raw)
+		text.WriteString("\n")
+	}
+
+	match := regexp.MustCompile(pattern).FindStringSubmatch(strings.Join(strings.Fields(text.String()), " "))
+	if match == nil {
+		t.Fatalf("no CHECK matches %s; was the migration text changed?", pattern)
+	}
+
+	limits := make([]int, 0, len(match)-1)
+
+	for _, captured := range match[1:] {
+		number, err := strconv.Atoi(captured)
+		if err != nil {
+			t.Fatalf("limit %q: %v", captured, err)
+		}
+
+		limits = append(limits, number)
+	}
+
+	return limits
 }

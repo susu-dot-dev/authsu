@@ -1,5 +1,5 @@
 // Command covgate enforces the 100% statement coverage gate described in
-// docs/devops.md ("Testing").
+// docs/TESTING.md ("Coverage").
 //
 // It reads a Go coverage profile and ignores:
 //

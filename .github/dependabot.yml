@@ -1,4 +1,4 @@
-# Dependency updates. See docs/devops.md ("Lint, size and dependencies").
+# Dependency updates. See docs/CI.md ("Lint, size and dependencies").
 #
 # Weekly and grouped to limit noise: one PR per ecosystem per week. Security
 # updates are separate and immediate, and are not delayed by grouping.

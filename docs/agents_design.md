@@ -6,23 +6,24 @@ Related: [permissions_design.md](permissions_design.md), [invitations_design.md]
 
 ## What exists
 
-The agent table and its management API are implemented (`internal/agents`, `migrations/0005_agents.sql`). Scopes, API-key verification, OAuth and sharing are not.
+The agent table and its management API are implemented (`internal/agents`, with its SQL in `internal/store`, and `migrations/0005_agents.sql`). Scopes, API-key verification, OAuth and sharing are not.
 
 | Route | Does |
 |---|---|
-| `GET /api/agent` | Lists one page of the caller's agents, revoked ones included, newest first. `limit` (1 to 100, default 25) and `cursor` (the `next` of the previous page) are optional and are refused, not corrected, when invalid. The response carries `next` while there is another page. |
+| `GET /api/agent` | Lists one page of the caller's agents, revoked ones included, newest first. `limit` (a plain decimal from 1 to 100, default 25, `invalid_limit`) and `cursor` (the `next` of the previous page, a canonical UUID, `invalid_cursor`) are optional and are refused, not corrected, when invalid; a parameter given twice is refused too, because which value wins differs between layers. The response carries `next` while there is another page. |
 | `POST /api/agent` | Creates an agent and returns its first API key, once. |
 | `GET /api/agent/{id}` | Reads one of the caller's agents. |
 | `PATCH /api/agent/{id}` | Renames it (a revoked agent is refused with 409). |
 | `DELETE /api/agent/{id}` | Revokes it and its keys. |
 
-- **Every route acts for the signed-in user, on that user's agents only.** There is no role check, and no route takes an owner: an agent of another user is answered as one that does not exist (404). An admin has no extra reach here, as the design requires.
-- **A passkey-backed session is the only credential these routes accept.** Nothing verifies an API key yet, so an agent cannot call them, and so cannot create agents. When keys can authenticate, "agent creates an agent" and the `kind == 'session'` rule for minting keys arrive with scopes.
-- **Creating an agent mints its first key in the same batch.** The key is an `api_key` whose subject is the user and whose `act` claim names the agent, with its audience `authsu/api_key` so a session verifier refuses it. The agent and the key stand or fall together: the key's owner is read from the agent's row in the write, so an agent that was not inserted (the user is at the limit, or was revoked in the meantime) fails the whole batch. Only the public key is stored; the token is shown once. There is no rotation or way to mint a second key yet: agents are short-lived, and are replaced by revoking and creating another.
+- **Every route acts for the signed-in user, on that user's agents only.** Each route declares a session and no further requirement, and none takes an owner: an agent of another user is answered as one that does not exist (404). An admin has no extra reach here, as the design requires.
+- **A passkey-backed session is the only credential these routes accept.** Nothing verifies an API key yet, so an agent cannot call them, and so cannot create agents. When keys can authenticate, "agent creates an agent" and the `kind == 'session'` rule for creating keys arrive with scopes.
+- **Creating an agent writes its first key in the same batch.** The key is created first, so a failure to create it (500 `agent_key_failed`) writes nothing, and the token is signed with the session's user as subject. The key is an `api_key` whose subject is the user and whose `act` claim names the agent, with its audience `authsu/api_key` so a session verifier refuses it. The agent and the key stand or fall together: the key's owner is read from the agent's row in the write, so an agent that was not inserted (the user is at the limit, or was revoked in the meantime) fails the whole batch. Only the public key is stored; the token is shown once. There is no rotation or way to create a second key yet: agents are short-lived, and are replaced by revoking and creating another.
 - **Lists are paged by id.** An agent's id is a UUIDv7, so it is in creation order, and it is the sort key and the cursor: a page is the agents with an id below the cursor, newest first. Keyset paging neither skips nor repeats an agent that exists throughout, whatever is created or revoked meanwhile. Revoked agents are never deleted and do not count toward the limit below, so the list can grow without bound; paging is what keeps a response small.
-- **A user may have 25 active agents** (`MaxAgentsPerUser`; revoked agents do not count). The count is part of the insert, so two creates at the limit cannot both succeed. A key lasts 90 days (`KeyLifetime`) and is never extended.
+- **The session is verified before the `{id}` is read.** A signed-out caller is 401 whatever the id is, and only a signed-in one is told a malformed id is 400 `invalid_id`, so an anonymous caller learns nothing about the route. A request body is capped at 8 KiB (`agents.MaxBody`): the largest legitimate one, a 256-character name of four-byte characters each escaped as a surrogate pair, is about 3 KiB.
+- **A user may have 25 active agents** (`MaxAgentsPerUser`; revoked agents do not count). The count is part of the insert, so two creates at the limit cannot both succeed; the one that loses, and a create by a user revoked since the session was checked, are 409 `agent_limit_reached`. A key lasts 90 days (`KeyLifetime`) and is never extended.
 - **Revoking an agent revokes it and its keys, and nothing else**, in one batch. **Revoking a user revokes all of their agents** in the same batch as the account, after it, so a refused revocation (the last admin) touches no agent.
-- **Text is checked in Go and again, by bytes, in the schema.** A name is refused if it is blank, over 256 characters, or holds control, format (zero-width, bidirectional) or replacement characters. The schema's CHECKs count bytes and refuse NUL, because SQLite's `length()` stops at a NUL and would otherwise let an unbounded value through.
+- **Text is parsed in Go and checked again, by bytes, in the schema.** A name is parsed once into an `internal/input` type and refused, never corrected, if it is blank, over 256 characters, not in Unicode NFC, or holds control, format (bidirectional, zero-width space and the like; the zero-width joiner and non-joiner are allowed so that emoji sequences and several scripts can be written, but a name of nothing but them is blank) or replacement characters (`invalid_agent_name`; a rename with no name is `missing_agent_name`). The schema's CHECKs count bytes and refuse NUL, because SQLite's `length()` stops at a NUL and would otherwise let an unbounded value through.
 - **Scopes are placeholders.** `agents.scopes` is a `NOT NULL` text column, written as `default:agent` on every agent, and the same text is signed into each key as the `scope` claim and copied to `japikeys.scope`. Nothing reads or enforces it. The database never validates its contents, so adding scopes and bundles needs no migration; the lists will be validated in Go and enforced in a later change, which will be a breaking one for any client that relies on today's defaults.
 
 ## The problem
@@ -64,7 +65,7 @@ An agent's owner is fixed for its whole life. Transferring an agent would move a
 
 ## Delegation is something a person does
 
-Creating an agent hands out authority, so it must come from the person whose authority it is. A credential that can create agents could use a leak to keep itself alive: create a new agent and new keys before the original key is revoked. So an agent cannot create agents unless its user explicitly allowed it, and only a passkey-backed session can mint keys directly. A user's own API keys may create agents, so that agents can be created programmatically; the remedy for a leaked key is for the user to revoke all of their keys, which ends every agent's keys too.
+Creating an agent hands out authority, so it must come from the person whose authority it is. A credential that can create agents could use a leak to keep itself alive: create a new agent and new keys before the original key is revoked. So an agent cannot create agents unless its user explicitly allowed it, and only a passkey-backed session can create keys directly. A user's own API keys may create agents, so that agents can be created programmatically; the remedy for a leaked key is for the user to revoke all of their keys, which ends every agent's keys too.
 
 These rules are expressed with scopes rather than special cases. [permissions_design.md](permissions_design.md) sets them out.
 
@@ -116,4 +117,4 @@ These scopes only ever subtract from the user's access. They never stand alone, 
 ## Open questions
 
 - How OAuth agents and user consent fit together.
-- Whether a user may mint further keys for an existing agent, once keys can be verified and scoped.
+- Whether a user may create further keys for an existing agent, once keys can be verified and scoped.

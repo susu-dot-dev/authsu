@@ -6,7 +6,7 @@ Related: [first_run_design.md](first_run_design.md), [registration_design.md](re
 
 ## The problem
 
-authsu has no open sign-up. Accounts exist only because someone with authority decided they should. That someone is an admin, and the mechanism is an invitation: an admin mints a secret code, hands it to a person, and that person can turn it into an account.
+authsu has no open sign-up. Accounts exist only because someone with authority decided they should. That someone is an admin, and the mechanism is an invitation: an admin creates a secret code, hands it to a person, and that person can turn it into an account.
 
 That makes the invitation the single thing that authorizes account creation. Other pieces of the system, such as signed challenges and passkey attestation, protect the *integrity* of the registration ceremony. None of them decide *who may register*. Keeping that responsibility in one place is the main theme of this document. If authorization leaks into several places, every one of them becomes something to audit.
 
@@ -59,18 +59,22 @@ This leads to a hard requirement on registration. There must be exactly one mome
 
 An invitation describes the code and also what the resulting account should be, most importantly its role. The role is copied from the invitation when the account is created. The client never supplies it.
 
-This keeps the admin-creates-admin and bootstrap cases from needing special code in registration. The first-run invitation is just an invitation whose grant is "admin". A future "invite a co-admin" feature would be the same thing, minted by an existing admin. Registration does not need to know why an invitation grants admin, only that it does.
+This keeps the admin-creates-admin and bootstrap cases from needing special code in registration. The first-run invitation is just an invitation whose grant is "admin". A future "invite a co-admin" feature would be the same thing, created by an existing admin. Registration does not need to know why an invitation grants admin, only that it does.
 
 ## Managing invitations
 
-Admins manage invitations through `/api/invitation`: `GET` lists every invitation (revoked ones included), `POST` creates one, `PATCH /api/invitation/{id}` changes how many accounts it may create, and `DELETE /api/invitation/{id}` revokes it. Every route requires a session whose account is an admin; the role is read from the account on each request, so demoting an admin takes effect at once (why the role is not a claim in the token is in [users_design.md](users_design.md)). The code is the one thing never returned by a read: it is in the response to the `POST` that created the invitation and nowhere else.
+Admins manage invitations through `/api/invitation`: `GET` lists every invitation (revoked ones included), `POST` creates one, `PATCH /api/invitation/{id}` changes how many accounts it may create, and `DELETE /api/invitation/{id}` revokes it. Every route requires a session whose account is an admin (401 without a session, 403 `forbidden` for any other role); the role is read from the account on each request, so demoting an admin takes effect at once (why the role is not a claim in the token is in [users_design.md](users_design.md)). The code is the one thing never returned by a read: it is in the response to the `POST` that created the invitation and nowhere else.
+
+The access rule is declared on each route, and the auth boundary enforces it before any handler runs, so the checks come in a fixed order: the body limit, then the session and the role, then a malformed `{id}` (400 `invalid_id`), and only then the body is decoded and its values parsed. A caller who may not use the route therefore learns nothing about what the id or the body should have held.
 
 A few choices worth keeping in mind:
 
 - **Revoke, never delete.** Accounts reference the invitation, and "who came from this code?" must stay answerable, so `DELETE` sets `revoked_at` and the row stays. Revoking twice succeeds and keeps the first time, so a retry is safe and cannot move a revocation later.
 - **Status is derived, not stored.** `revoked`, `expired`, `exhausted` or `active`, decided in that order from the row and the clock. There is no status column to fall out of step with the facts it summarises.
 - **The cap cannot go below the accounts already made.** That condition is part of the write, not a check before it, because a registration can finish between a read and a write. A revoked invitation cannot be changed: revocation is final, and editing one would suggest it could be revived.
-- **No invitation type can be created yet.** `POST` takes a `type`, and every value is refused. First run is bound to there being no account at all, so only `GET /api/first-run` mints it. A new type is one entry in the invitations package plus its role in `registration.RoleFor`; registration refuses a type that has no role.
+- **Every client-sent value is parsed, and refused rather than corrected.** `numInvites` is an integer from 1 to 10000 (`invalid_num_invites`), `label` is optional display text of at most 256 characters (`invalid_label`), and `expiresAt` is optional, in Unix seconds, strictly in the future and no more than ten years ahead (`invalid_expires_at`). An update without `numInvites` is `missing_num_invites`. The bounds sit beside the parsers, and a test holds each inside the schema's constraint.
+- **A refused change says why.** An unknown id is 404 `invitation_not_found`; changing a revoked invitation is 409 `invitation_revoked`; a cap below the accounts already created is 409 `num_invites_below_uses`, with the count in `data.uses`. All of them come from the one statement that tried the write, so the reason describes the same instant as the refusal.
+- **The type is what the invitation grants, and the set of types is fixed in code.** `POST` takes a `type` of `member` or `admin`, and the account that registers with the code gets the role of that name. Which types exist and the role each grants live together in `auth` (`RoleForInvitation`), not in configuration, so a deployment cannot be wired with a type that has no role: a type is creatable exactly when it has a role and is not first run (`CreatableInvitationType`). Any other value is 400 `invalid_invitation_type`, whatever it is, with the same body for all of them. First run is bound to there being no account at all, so only `GET /api/first-run` creates it. A new type is one entry in `auth`'s table.
 
 ## Where invitations are stored
 

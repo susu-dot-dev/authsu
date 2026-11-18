@@ -48,7 +48,7 @@ func run(t *testing.T, in call, handler httpapi.Handler) outcome {
 
 	req := httptest.NewRequestWithContext(t.Context(), in.method, in.target, strings.NewReader(in.body))
 	setContentType(req, in.contentType)
-	httpapi.Serve(http.MethodPost, logger, handler).ServeHTTP(out.rec, req)
+	serve(http.MethodPost, logger, handler).ServeHTTP(out.rec, req)
 
 	return out
 }
@@ -340,7 +340,7 @@ func TestServeBodyReadErrors(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", tt.body)
 			setContentType(req, nil)
-			httpapi.Serve(http.MethodPost, logger, handler).ServeHTTP(rec, req)
+			serve(http.MethodPost, logger, handler).ServeHTTP(rec, req)
 
 			if handled {
 				t.Error("handler ran although the body could not be read")
@@ -579,7 +579,7 @@ func TestServeReadsRequestCookies(t *testing.T) {
 	// request carries; the attributes belong to Set-Cookie.
 	req.Header.Add("Cookie", "a=1; b=2")
 
-	httpapi.Serve(http.MethodPost, nil, handler).ServeHTTP(rec, req)
+	serve(http.MethodPost, nil, handler).ServeHTTP(rec, req)
 
 	if len(got) != 2 || got[0].Name != "a" || got[1].Value != "2" {
 		t.Errorf("cookies = %v, want a=1 and b=2", got)
@@ -714,7 +714,7 @@ func TestServeSafeMethodsNeedNoContentType(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequestWithContext(t.Context(), method, "/x", nil)
-		httpapi.Serve(method, nil, respond(httpapi.JSON(http.StatusOK, 1))).ServeHTTP(rec, req)
+		serve(method, nil, respond(httpapi.JSON(http.StatusOK, 1))).ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s with no Content-Type = %d, want 200", method, rec.Code)
@@ -785,7 +785,7 @@ type negativeLimit struct {
 
 // TestDecodeRefusesAMalformedLimit: a bad tag is a bug in the code, not in the
 // request, so it must not silently leave the array unbounded. Decode panics,
-// which Serve turns into an Internal error.
+// which ServeRoutes turns into an Internal error.
 func TestDecodeRefusesAMalformedLimit(t *testing.T) {
 	t.Parallel()
 
@@ -811,63 +811,6 @@ func TestDecodeRefusesAMalformedLimit(t *testing.T) {
 	}
 }
 
-// TestServeLimited covers the per-route body cap: a body over the route's cap
-// is refused with 413 without reaching the handler, a body at the cap is
-// delivered whole, and a route cannot raise the cap above the default.
-func TestServeLimited(t *testing.T) {
-	t.Parallel()
-
-	const limit = 64
-
-	tests := map[string]struct {
-		maxBody    int64
-		bodyLen    int
-		wantStatus int
-		wantCalled bool
-	}{
-		"under the cap":              {maxBody: limit, bodyLen: limit - 1, wantStatus: http.StatusOK, wantCalled: true},
-		"at the cap":                 {maxBody: limit, bodyLen: limit, wantStatus: http.StatusOK, wantCalled: true},
-		"one byte over the cap":      {maxBody: limit, bodyLen: limit + 1, wantStatus: http.StatusRequestEntityTooLarge},
-		"far over the cap":           {maxBody: limit, bodyLen: 512 << 10, wantStatus: http.StatusRequestEntityTooLarge},
-		"cannot raise above default": {maxBody: 1 << 30, bodyLen: 2 << 20, wantStatus: http.StatusRequestEntityTooLarge},
-		"default cap still allows":   {maxBody: 1 << 30, bodyLen: 1 << 20, wantStatus: http.StatusOK, wantCalled: true},
-	}
-
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			called := false
-			handler := func(req httpapi.Request) result.Result[httpapi.Response] {
-				called = true
-
-				if len(req.Body) != tt.bodyLen {
-					t.Errorf("handler got %d bytes, want %d", len(req.Body), tt.bodyLen)
-				}
-
-				return result.Ok(httpapi.JSON(http.StatusOK, 1))
-			}
-
-			rec := httptest.NewRecorder()
-			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x",
-				strings.NewReader(strings.Repeat("a", tt.bodyLen)))
-			setContentType(req, nil)
-
-			logger := func(httpapi.Request, *apierr.Error) {}
-
-			httpapi.ServeLimited(http.MethodPost, tt.maxBody, logger, handler).ServeHTTP(rec, req)
-
-			if rec.Code != tt.wantStatus || called != tt.wantCalled {
-				t.Errorf("status = %d, handler called = %v; want %d, %v", rec.Code, called, tt.wantStatus, tt.wantCalled)
-			}
-
-			if tt.wantStatus == http.StatusRequestEntityTooLarge && !strings.Contains(rec.Body.String(), "body_too_large") {
-				t.Errorf("body = %q, want code body_too_large", rec.Body.String())
-			}
-		})
-	}
-}
-
 // echoMethod answers with the method the handler saw, so a test can tell which
 // of several handlers ran.
 func echoMethod(req httpapi.Request) result.Result[httpapi.Response] {
@@ -875,14 +818,14 @@ func echoMethod(req httpapi.Request) result.Result[httpapi.Response] {
 }
 
 func methodsHandler(logger httpapi.Logger, wildcards []string) http.Handler {
-	return httpapi.ServeMethods(logger, wildcards, map[string]httpapi.Handler{
+	return serveMethods(logger, wildcards, map[string]httpapi.Handler{
 		http.MethodGet:    echoMethod,
 		http.MethodPatch:  echoMethod,
 		http.MethodDelete: echoMethod,
 	})
 }
 
-func TestServeMethodsDispatchesByMethod(t *testing.T) {
+func TestServeRoutesDispatchesByMethod(t *testing.T) {
 	t.Parallel()
 
 	for _, method := range []string{http.MethodGet, http.MethodPatch, http.MethodDelete} {
@@ -902,7 +845,7 @@ func TestServeMethodsDispatchesByMethod(t *testing.T) {
 	}
 }
 
-func TestServeMethodsRefusesOtherMethods(t *testing.T) {
+func TestServeRoutesRefusesOtherMethods(t *testing.T) {
 	t.Parallel()
 
 	var logged []*apierr.Error
@@ -926,10 +869,10 @@ func TestServeMethodsRefusesOtherMethods(t *testing.T) {
 	}
 }
 
-// TestServeMethodsRequiresJSONForUnsafeMethods holds the CSRF rule per method:
+// TestServeRoutesRequiresJSONForUnsafeMethods holds the CSRF rule per method:
 // GET needs no Content-Type, PATCH and DELETE need application/json, and the
 // refusal comes before the handler.
-func TestServeMethodsRequiresJSONForUnsafeMethods(t *testing.T) {
+func TestServeRoutesRequiresJSONForUnsafeMethods(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
@@ -984,7 +927,7 @@ func TestPathValues(t *testing.T) {
 
 			var got map[string]string
 
-			handler := httpapi.ServeMethods(func(httpapi.Request, *apierr.Error) {}, tt.wildcards,
+			handler := serveMethods(func(httpapi.Request, *apierr.Error) {}, tt.wildcards,
 				map[string]httpapi.Handler{http.MethodGet: func(req httpapi.Request) result.Result[httpapi.Response] {
 					got = req.PathValues
 
@@ -999,6 +942,173 @@ func TestPathValues(t *testing.T) {
 
 			if rec.Code != http.StatusOK || !maps.Equal(got, tt.want) {
 				t.Errorf("PathValues = %v (status %d), want %v", got, rec.Code, tt.want)
+			}
+		})
+	}
+}
+
+// routeLimits are the caps the ServeRoutes tests give each method of one path:
+// two tight ones, the default three ways (zero, negative and an absurd value,
+// which is clamped) and nothing in between.
+func routeLimits() map[string]int64 {
+	return map[string]int64{
+		http.MethodPatch:  10,
+		http.MethodPost:   64,
+		http.MethodPut:    0,
+		http.MethodDelete: -5,
+		http.MethodGet:    1 << 40,
+	}
+}
+
+// recordingRoutes gives every method of limits a handler that records how much
+// body it received.
+func recordingRoutes(limits map[string]int64, delivered *int) map[string]httpapi.MethodRoute {
+	routes := map[string]httpapi.MethodRoute{}
+
+	for method, limit := range limits {
+		handler := func(req httpapi.Request) result.Result[httpapi.Response] {
+			*delivered = len(req.Body)
+
+			return result.Ok(httpapi.JSON(http.StatusOK, req.Method))
+		}
+
+		routes[method] = httpapi.MethodRoute{MaxBody: limit, Handler: handler}
+	}
+
+	return routes
+}
+
+// TestServeRoutesLimitsBodiesPerMethod: each method of one path is measured
+// against its own cap. A tight cap on one method does not constrain another,
+// a body exactly at the cap is delivered whole and one byte more is refused
+// before the handler, and a cap of zero, below or above the default means the
+// default (a route can only tighten it).
+func TestServeRoutesLimitsBodiesPerMethod(t *testing.T) {
+	t.Parallel()
+
+	const (
+		oneMiB  = 1 << 20
+		overMiB = oneMiB + 1
+		tooBig  = http.StatusRequestEntityTooLarge
+	)
+
+	tests := map[string]struct {
+		method     string
+		bodyLen    int
+		wantStatus int
+	}{
+		"patch at its cap":              {http.MethodPatch, 10, http.StatusOK},
+		"patch one over its cap":        {http.MethodPatch, 11, tooBig},
+		"post keeps its own cap":        {http.MethodPost, 64, http.StatusOK},
+		"post one over its cap":         {http.MethodPost, 65, tooBig},
+		"post far over its cap":         {http.MethodPost, 512 << 10, tooBig},
+		"post is not held to patch cap": {http.MethodPost, 11, http.StatusOK},
+		"zero means the default":        {http.MethodPut, oneMiB, http.StatusOK},
+		"zero default one over":         {http.MethodPut, overMiB, tooBig},
+		"negative means the default":    {http.MethodDelete, oneMiB, http.StatusOK},
+		"negative default one over":     {http.MethodDelete, overMiB, tooBig},
+		"cannot be raised":              {http.MethodGet, overMiB, tooBig},
+		"huge cap is the default":       {http.MethodGet, oneMiB, http.StatusOK},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			delivered := -1
+			routes := recordingRoutes(routeLimits(), &delivered)
+
+			rec := httptest.NewRecorder()
+			body := strings.NewReader(strings.Repeat("a", tt.bodyLen))
+			req := httptest.NewRequestWithContext(t.Context(), tt.method, "/x", body)
+			req.Header.Set("Content-Type", jsonType)
+
+			httpapi.ServeRoutes(func(httpapi.Request, *apierr.Error) {}, nil, routes).ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tt.wantStatus, rec.Body)
+			}
+
+			if tt.wantStatus == http.StatusOK && delivered != tt.bodyLen {
+				t.Errorf("handler got %d bytes, want %d", delivered, tt.bodyLen)
+			}
+
+			if tt.wantStatus != http.StatusOK && (delivered != -1 || !strings.Contains(rec.Body.String(), "body_too_large")) {
+				t.Errorf("handler ran (%d bytes) or body = %q, want body_too_large without the handler", delivered, rec.Body)
+			}
+		})
+	}
+}
+
+// TestServeRoutesAnswersOtherMethodsWithAllow: a method the path does not have
+// is 405 with the others listed, sorted, whatever the limits are.
+func TestServeRoutesAnswersOtherMethodsWithAllow(t *testing.T) {
+	t.Parallel()
+
+	routes := map[string]httpapi.MethodRoute{
+		http.MethodPost:   {Handler: echoMethod, MaxBody: 8},
+		http.MethodDelete: {Handler: echoMethod, MaxBody: 0},
+		http.MethodGet:    {Handler: echoMethod, MaxBody: 0},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPatch, "/x", nil)
+	req.Header.Set("Content-Type", jsonType)
+
+	httpapi.ServeRoutes(func(httpapi.Request, *apierr.Error) {}, nil, routes).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "DELETE, GET, POST" {
+		t.Errorf("status = %d, Allow = %q, want 405 and the sorted methods", rec.Code, rec.Header().Get("Allow"))
+	}
+}
+
+// TestServeRoutesKeepsTheContentTypeAndWildcardRules: ServeRoutes is the same
+// boundary for every method, so an unsafe method still needs application/json
+// (checked before the body is read) and named wildcards reach the handler.
+func TestServeRoutesKeepsTheContentTypeAndWildcardRules(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		contentType string
+		want        int
+	}{
+		"json":    {contentType: jsonType, want: http.StatusOK},
+		"missing": {contentType: "", want: http.StatusUnsupportedMediaType},
+		"text":    {contentType: plainType, want: http.StatusUnsupportedMediaType},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var got map[string]string
+
+			handler := func(req httpapi.Request) result.Result[httpapi.Response] {
+				got = req.PathValues
+
+				return result.Ok(httpapi.JSON(http.StatusOK, nil))
+			}
+
+			routes := map[string]httpapi.MethodRoute{http.MethodPatch: {MaxBody: 4, Handler: handler}}
+
+			mux := http.NewServeMux()
+			mux.Handle("/x/{id}", httpapi.ServeRoutes(func(httpapi.Request, *apierr.Error) {}, []string{"id"}, routes))
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPatch, "/x/abc", nil)
+
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+
+			if tt.want == http.StatusOK && !maps.Equal(got, map[string]string{"id": "abc"}) {
+				t.Errorf("PathValues = %v", got)
 			}
 		})
 	}

@@ -1,118 +1,108 @@
-// Package users implements the admin API for accounts described in
+// Package users is the admin API for accounts described in
 // docs/users_design.md: list them, read one, and revoke one.
 //
 //	GET    /api/user        list every account, revoked ones included
 //	GET    /api/user/{id}   one account
 //	DELETE /api/user/{id}   revoke it
 //
-// Every route requires a session (401) whose account is an admin (403). The
-// role is the one stored on the account, read on each request in the same
-// lookup that verifies the session (see session.Verifier), so demoting or
-// revoking an admin takes effect at once.
+// Every route is declared with a session credential and the auth.Admin
+// requirement, so the boundary refuses a request without a session (401) and one
+// from a signed-in account that is not an admin (403) before any handler here
+// runs. The role is the one stored on the account, read on every request in the
+// lookup that verifies the session (store.ActiveKey), so revoking an admin
+// takes effect at once.
 //
 // Revoking is final and never deletes: the row stays, the account cannot log
 // in, and none of its sessions verify. The last active admin cannot be
 // revoked, because the only recovery from having none is wiping the database.
+// An admin may revoke themselves, as long as another active admin remains.
+//
+// A stored profile that is not a JSON object is logged and served as an empty
+// object: one corrupt row must not hide every other account from the admin who
+// needs to find and revoke them, nor make a revocation that was applied look as
+// if it failed.
+//
+// The package holds no SQL: the store owns it, including the last-admin guard,
+// which must be part of the write (store.RevokeUser).
 package users
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
+	"net/http"
 	"time"
 
-	"github.com/susu-dot-dev/authsu/internal/atomic"
+	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
-	"github.com/susu-dot-dev/authsu/internal/session"
+	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// Status is where an account stands. It is derived from the row, never stored.
-type Status string
-
-// Statuses.
+// Paths of the routes.
 const (
-	// StatusActive means the account can log in.
-	StatusActive Status = "active"
-	// StatusRevoked means an admin revoked it.
-	StatusRevoked Status = "revoked"
+	collectionPath = "/api/user"
+	itemPath       = "/api/user/{id}"
 )
 
-// User is one account as an admin sees it. It never carries the WebAuthn user
-// handle, which is an identifier for authenticators, not for people.
-type User struct {
-	ID   string `json:"id"`
-	Role string `json:"role"`
-	// InvitationID is the invitation the account was created from.
-	InvitationID string `json:"invitationId"`
-	// Profile is users.profile as stored: a JSON object, such as the name
-	// given at registration.
-	Profile json.RawMessage `json:"profile"`
-	Status  Status          `json:"status"`
-	// RevokedAt is absent when the account is not revoked.
-	RevokedAt *int64 `json:"revokedAt,omitempty"`
-	// CreatedAt is in Unix seconds.
-	CreatedAt int64 `json:"createdAt"`
+// maxBody is the most a request body may be. No route reads a body, so this
+// only bounds the work a client can make the boundary do before it is refused.
+const maxBody = 1024
+
+// Store is the part of the account store the routes use. *store.Store
+// satisfies it. Failures of the database must come back classified, as the
+// store does, because they are sent to the client as they are.
+type Store interface {
+	// ListUsers returns every account, revoked ones included, newest first.
+	ListUsers(ctx context.Context) ([]store.User, error)
+	// GetUser returns the account id, or store.ErrNotFound.
+	GetUser(ctx context.Context, id input.ID) (store.User, error)
+	// RevokeUser revokes the account id and returns it as the write left it:
+	// store.ErrNotFound for no such account, store.ErrLastAdmin when the
+	// account is the last active holder of adminRole.
+	RevokeUser(ctx context.Context, id input.ID, adminRole string, now time.Time) (store.User, error)
 }
 
-// Row is an account as stored.
-type Row struct {
-	ID           string
-	Role         string
-	InvitationID string
-	Profile      string
-	RevokedAt    *int64
-	CreatedAt    int64
+// Deps are the collaborators of Routes. All are required.
+type Deps struct {
+	// Store holds the accounts.
+	Store Store
+	// Now is the clock, read once per revocation.
+	Now func() time.Time
+	// Log records an account whose stored profile is not a JSON object. The
+	// request still succeeds, with an empty profile for that account, so the
+	// entry is the only sign that the stored data is wrong.
+	Log httpapi.Logger
 }
 
-// StatusOf returns the status of r. Any revoked_at at all revokes, matching the
-// session and login queries, which test only that it is set.
-func StatusOf(r Row) Status {
-	if r.RevokedAt != nil {
-		return StatusRevoked
+// Routes returns the account routes. It panics when a dependency is missing:
+// there is no degraded mode, and a deployment that lacks one is found at start
+// and not by a request.
+func Routes(deps Deps) []auth.Route {
+	if deps.Store == nil {
+		panic("users: Deps.Store is required")
 	}
 
-	return StatusActive
+	if deps.Now == nil {
+		panic("users: Deps.Now is required")
+	}
+
+	if deps.Log == nil {
+		panic("users: Deps.Log is required")
+	}
+
+	api := handlers{store: deps.Store, now: deps.Now, log: deps.Log}
+
+	return []auth.Route{
+		{
+			Method: http.MethodGet, Path: collectionPath, MaxBody: maxBody,
+			Credential: auth.Session, Require: auth.Admin, Handle: api.list,
+		},
+		{
+			Method: http.MethodGet, Path: itemPath, MaxBody: maxBody,
+			Credential: auth.Session, Require: auth.Admin, Handle: api.get,
+		},
+		{
+			Method: http.MethodDelete, Path: itemPath, MaxBody: maxBody,
+			Credential: auth.Session, Require: auth.Admin, Handle: api.revoke,
+		},
+	}
 }
-
-// Reader is the read side of the account store.
-type Reader interface {
-	// List returns every account, revoked ones included, newest first.
-	List(ctx context.Context) ([]Row, error)
-	// Get returns one account, or an error wrapping ErrNotFound if there is
-	// none with this id.
-	Get(ctx context.Context, id string) (Row, error)
-}
-
-// Authenticator verifies a request's session. *session.Service is one.
-type Authenticator interface {
-	Authenticate(ctx context.Context, getenv func(string) string, req httpapi.Request) (session.Principal, error)
-}
-
-// Service is the account API.
-type Service struct {
-	sessions Authenticator
-	reader   Reader
-	batch    atomic.Batch
-	now      func() time.Time
-}
-
-// Deps are the service's collaborators. The clock is injected so every branch
-// is reachable from a test.
-type Deps struct {
-	Sessions Authenticator
-	Reader   Reader
-	// Batch performs the writes. Nil disables revocation.
-	Batch atomic.Batch
-	// Now is the clock.
-	Now func() time.Time
-}
-
-// NewService returns a Service.
-func NewService(deps Deps) *Service {
-	return &Service{sessions: deps.Sessions, reader: deps.Reader, batch: deps.Batch, now: deps.Now}
-}
-
-// ErrNotFound is what Reader.Get reports for an id nothing has.
-var ErrNotFound = errors.New("no such user")
-
-var errNoStore = errors.New("no database is configured")

@@ -33,7 +33,11 @@ Run the Worker through `make dev`, not `npx wrangler dev`: the Makefile applies 
 
 ## Documentation
 
-- [docs/devops.md](docs/devops.md): the scaffolding: how the project is built, checked, tested and shipped. This is the authority on tooling and conventions; start here before changing anything.
+- Contributing, the scaffolding: how the project is built, checked, tested and shipped. Start with [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), which links the rest:
+  - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): code structure and layering
+  - [docs/TESTING.md](docs/TESTING.md): unit, coverage and e2e conventions
+  - [docs/DATABASE.md](docs/DATABASE.md): migrations and D1 conventions
+  - [docs/CI.md](docs/CI.md): lint, size budget, CI and supply chain
 - [docs/runbook.md](docs/runbook.md): operating a deployment: configuration, migrations, deploying and upkeep.
 - Design rationale (why, not a spec):
   - [docs/invitations_design.md](docs/invitations_design.md)

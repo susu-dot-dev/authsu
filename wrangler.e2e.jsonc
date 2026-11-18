@@ -3,7 +3,7 @@
  * wrangler.jsonc without `build`: the Worker is built once by `make build` and
  * wrangler serves that build/ as is, instead of running the TinyGo build again
  * on every start. Local-only, so no observability or source-map upload.
- * See docs/devops.md, "Testing".
+ * See docs/TESTING.md, "End-to-end tests".
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",

@@ -8,11 +8,11 @@ Admins manage accounts through `/api/user`:
 | `GET /api/user/{id}` | Reads one account. |
 | `DELETE /api/user/{id}` | Revokes it. |
 
-Every route requires a session (401) whose account is an admin (403). An account is shown as its id, role, the invitation it came from, its profile, a derived status (`active` or `revoked`), `revokedAt` when set, and `createdAt`. The WebAuthn user handle is never returned.
+Every route requires a session (401) whose account is an admin (403 `forbidden`). The access rule is declared on the route and enforced by the auth boundary before the handler runs, and a malformed `{id}` is 400 `invalid_id` only for a caller the route lets in: a signed-out caller is 401 and a member is 403 whatever the id. An unknown id is 404 `user_not_found`. An account is shown as its id, role, the invitation it came from, its profile, a derived status (`active` or `revoked`), `revokedAt` when set, and `createdAt`. The WebAuthn user handle is never returned.
 
 ## Authorization: the role is read live, not carried in the token
 
-The role is not a claim in the session token. It is read from the `users` row on every request, in the same query that verifies the session.
+The role is not a claim in the session token. It is read from the `users` row on every request, in the same query that verifies the session (`ActiveKey` in `internal/store`, called from `internal/auth`).
 
 The obvious argument for a role claim is "avoid joining `users`". It does not hold here:
 
@@ -23,7 +23,7 @@ The obvious argument for a role claim is "avoid joining `users`". It does not ho
 
 Caching the account has the same flaw in another form: an isolate's memory is short-lived and not shared, KV is eventually consistent, and any cache delays a revocation by its TTL. If latency ever matters, the lever is D1 read replication (check current Cloudflare documentation first), not a cache that weakens revocation.
 
-Enforcement is the pattern `/api/invitation` already uses: authenticate, then require the role, then act. Each package defines its own small `Authenticator` interface. A missing database is refused before authenticating, since there is nothing to authorise against.
+Enforcement is the same for every admin route: the route declares a session and the `Admin` requirement, and the boundary authenticates, then requires the role, then runs the handler. A feature does no authentication of its own. There is no degraded mode: a missing dependency stops the Worker at start instead of answering 503 per request.
 
 ## Revoking
 
@@ -39,9 +39,13 @@ Enforcement is the pattern `/api/invitation` already uses: authenticate, then re
 
 ### The last active admin cannot be revoked
 
-The only recovery from having no admin is wiping the database ([first_run_design.md](first_run_design.md)), so a revoke that would leave none is refused with 409 `user_last_admin`. This includes revoking yourself when you are the only admin.
+The only recovery from having no admin is wiping the database ([first_run_design.md](first_run_design.md)), so a revoke that would leave none is refused with 409 `user_last_admin` (`store.ErrLastAdmin`). This includes revoking yourself when you are the only admin.
 
 The check is part of the write, not a read before it. D1 has no interactive transaction, so two admins revoking each other at the same moment would each see the other as active and both writes would apply. As one statement, the second sees the first's revocation and is refused. The statement matches the row by id and `RETURNING` gives it back as it left it, so the outcome is read off the row (`revoked_at` set, or still NULL because the guard refused), with no second read to disagree with it. Only active admins count: a revoked admin, or an active account with another role, does not.
+
+## Stored data is checked on the way out
+
+A profile is stored as JSON text that the schema does not constrain to an object, and registration always writes one. The response sends it as stored, so it is checked first: a profile that is not a JSON object, or not valid UTF-8, is logged as `user_profile_invalid`, naming the account, and the account is served with `{}`. The request does not fail. One corrupt row must not hide every other account from the admin who has to find and revoke them, and a revocation that was applied must not be reported as failed. (Invalid UTF-8 inside D1 is already replaced with U+FFFD before Go sees it, so it is served as that, which is valid text; the check cannot see it.)
 
 ## What is not here
 

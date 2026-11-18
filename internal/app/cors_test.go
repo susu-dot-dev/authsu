@@ -1,145 +1,189 @@
+//nolint:goconst // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
 package app_test
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/susu-dot-dev/authsu/internal/app"
 )
 
-// corsRoute is a path and one method it takes.
-type corsRoute struct{ path, method string }
+// corsHeaders returns the response's Access-Control-* header names.
+func corsHeaders(header http.Header) []string {
+	var names []string
 
-// corsRoutes are the API routes, one entry per method each takes.
-func corsRoutes() []corsRoute {
-	return []corsRoute{
-		{"/healthz", http.MethodGet},
-		{"/api/first-run", http.MethodGet},
-		{beginPath, http.MethodPost}, {finishPath, http.MethodPost},
-		{loginBeginPath, http.MethodPost}, {loginFinishPath, http.MethodPost},
-		{sessionPath, http.MethodGet}, {logoutPath, http.MethodPost},
-		{invitationPath, http.MethodGet}, {invitationPath, http.MethodPost},
-		{invitationItem, http.MethodPatch}, {invitationItem, http.MethodDelete},
-		{userPath, http.MethodGet}, {userItem, http.MethodGet}, {userItem, http.MethodDelete},
-		{agentPath, http.MethodGet}, {agentPath, http.MethodPost},
-		{agentItem, http.MethodGet}, {agentItem, http.MethodPatch}, {agentItem, http.MethodDelete},
+	for name := range header {
+		if strings.HasPrefix(name, "Access-Control-") {
+			names = append(names, name)
+		}
 	}
+
+	return names
 }
 
-// TestCORSAllowsOnlyTheRelyingPartyOrigin checks the wiring: the origin the UI
-// runs passkey ceremonies from (UI_ORIGIN) may preflight and call every route
-// from a browser, before routing would have answered an OPTIONS with 405, and
-// no other origin can.
-func TestCORSAllowsOnlyTheRelyingPartyOrigin(t *testing.T) {
+// allowsOnly reports whether header answers a preflight by allowing origin,
+// with credentials, for method alone and for the Content-Type header alone.
+func allowsOnly(header http.Header, origin, method string) bool {
+	return header.Get("Access-Control-Allow-Origin") == origin &&
+		header.Get("Access-Control-Allow-Credentials") == "true" &&
+		header.Get("Access-Control-Allow-Methods") == method &&
+		header.Get("Access-Control-Allow-Headers") == "Content-Type"
+}
+
+// TestCORSPreflight: the origin the UI runs passkey ceremonies from may
+// preflight every route of the API (answered before routing, which would
+// otherwise answer OPTIONS with 405), and no other origin gets any CORS header.
+// A preflight never reaches the database.
+func TestCORSPreflight(t *testing.T) {
 	t.Parallel()
 
-	for _, route := range corsRoutes() {
-		path, method := route.path, route.method
-
-		t.Run(method+" "+path, func(t *testing.T) {
+	for _, route := range inventory() {
+		t.Run(route.method+" "+pathPattern(route.path), func(t *testing.T) {
 			t.Parallel()
 
-			handler := app.NewHandler(app.Platform{Getenv: registrationEnv})
+			h := newHarness(t, fullEnv())
 
-			preflight := func(origin string) *httptest.ResponseRecorder {
-				req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, path, nil)
-				req.Header.Set("Origin", origin)
-				req.Header.Set("Access-Control-Request-Method", method)
-				req.Header.Set("Access-Control-Request-Headers", "content-type")
+			preflight := func(origin string) (int, http.Header) {
+				rec := h.do(request{
+					method: http.MethodOptions, path: route.path, noContentType: true,
+					headers: map[string]string{
+						"Origin":                         origin,
+						"Access-Control-Request-Method":  route.method,
+						"Access-Control-Request-Headers": "content-type",
+					},
+				})
 
-				rec := httptest.NewRecorder()
-				handler.ServeHTTP(rec, req)
-
-				return rec
+				return rec.Code, rec.Header()
 			}
 
-			allowed := preflight(testOrigin)
-			if allowed.Code != http.StatusNoContent ||
-				allowed.Header().Get("Access-Control-Allow-Origin") != testOrigin ||
-				allowed.Header().Get("Access-Control-Allow-Credentials") != "true" ||
-				allowed.Header().Get("Access-Control-Allow-Methods") != method {
-				t.Errorf("RP origin preflight = %d %v, want 204 allowing %s", allowed.Code, allowed.Header(), method)
+			code, header := preflight(uiOrigin)
+			if code != http.StatusNoContent || !allowsOnly(header, uiOrigin, route.method) {
+				t.Errorf("UI origin preflight = %d %v, want 204 allowing %s", code, header, route.method)
 			}
 
-			refused := preflight("https://evil.example")
-			if refused.Code < 400 {
-				t.Errorf("foreign preflight = %d, want a refusal", refused.Code)
-			}
-
-			for name := range refused.Header() {
-				if strings.HasPrefix(name, "Access-Control-") {
-					t.Errorf("foreign preflight carries %s", name)
+			for _, origin := range []string{
+				"https://evil.example", apiOrigin, uiOrigin + ".evil.example", "null", "http://example.com", "HTTPS://EXAMPLE.COM",
+			} {
+				code, header := preflight(origin)
+				if code < http.StatusBadRequest || len(corsHeaders(header)) != 0 {
+					t.Errorf("origin %q preflight = %d %v, want a refusal with no CORS header", origin, code, header)
 				}
+			}
+
+			if got := h.exec.callCount(); got != 0 {
+				t.Errorf("Exec calls = %d, want 0", got)
 			}
 		})
 	}
 }
 
-// TestCORSNeedsConfiguration: with no UI_ORIGIN, or no environment at all (the
-// host stub), no origin is allowed.
-func TestCORSNeedsConfiguration(t *testing.T) {
+// TestCORSOnRealResponses: CORS is outermost, so even a failure that the
+// auth boundary produced carries the headers the UI needs to read it, and a
+// foreign origin's request gets none (and still the answer it would have had).
+func TestCORSOnRealResponses(t *testing.T) {
 	t.Parallel()
 
-	platforms := map[string]app.Platform{
-		"no getenv":    {},
-		"empty origin": {Getenv: func(string) string { return "" }},
+	tests := map[string]struct {
+		origin      string
+		wantAllowed bool
+	}{
+		"the UI":      {origin: uiOrigin, wantAllowed: true},
+		"a stranger":  {origin: "https://evil.example", wantAllowed: false},
+		"no origin":   {origin: "", wantAllowed: false},
+		"the API one": {origin: apiOrigin, wantAllowed: false},
 	}
 
-	for name, platform := range platforms {
+	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/healthz", nil)
-			req.Header.Set("Origin", testOrigin)
-			req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+			h := newHarness(t, fullEnv())
+			headers := map[string]string{}
 
-			rec := httptest.NewRecorder()
-			app.NewHandler(platform).ServeHTTP(rec, req)
+			if tt.origin != "" {
+				headers["Origin"] = tt.origin
+			}
 
-			if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Access-Control-Allow-Origin") != "" {
-				t.Errorf("= %d %v, want 405 with no CORS header", rec.Code, rec.Header())
+			rec := h.do(request{method: http.MethodGet, path: "/api/session", headers: headers})
+
+			if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
+				t.Errorf("= %d %s, want the 401 whatever the origin", rec.Code, rec.Body)
+			}
+
+			header := rec.Header()
+			if tt.wantAllowed {
+				if header.Get("Access-Control-Allow-Origin") != tt.origin ||
+					header.Get("Access-Control-Allow-Credentials") != "true" {
+					t.Errorf("headers = %v, want the origin allowed with credentials", header)
+				}
+			} else if len(corsHeaders(header)) != 0 {
+				t.Errorf("response carries %v", corsHeaders(header))
+			}
+
+			wantVary := tt.origin != ""
+			if got := strings.Contains(rec.Header().Get("Vary"), "Origin"); got != wantVary {
+				t.Errorf("Vary: Origin = %t, want %t", got, wantVary)
 			}
 		})
 	}
 }
 
-// TestCORSTrustsOnlyAWellFormedOrigin: a UI_ORIGIN that is not a bare origin
-// allows nothing, even to a request that sends exactly that string. Otherwise a
-// configuration slip such as "null" (which every sandboxed iframe and data: URL
-// sends) or "*" would hand a hostile page credentialed, readable access.
+// TestCORSTrustsOnlyAWellFormedOrigin: a UI_ORIGIN that is unset or is not a
+// bare origin allows nothing, even to a request that sends exactly that string.
+// Otherwise a configuration slip such as "null" (which every sandboxed iframe
+// and data: URL sends) or "*" would hand a hostile page credentialed, readable
+// access.
 func TestCORSTrustsOnlyAWellFormedOrigin(t *testing.T) {
 	t.Parallel()
 
-	malformed := []string{
-		"null", "*", "example.com", "https://example.com/", "https://example.com/x", "http://example.com",
-	}
-
-	for _, configured := range malformed {
-		t.Run(configured, func(t *testing.T) {
+	for _, configured := range []string{
+		"", "null", "*", "example.com", "https://example.com/", "https://example.com/x",
+		"http://example.com", "HTTPS://EXAMPLE.COM", "https://user@example.com", " https://example.com",
+	} {
+		t.Run("UI_ORIGIN="+configured, func(t *testing.T) {
 			t.Parallel()
 
-			platform := app.Platform{Getenv: func(name string) string {
-				if name == "UI_ORIGIN" {
-					return configured
-				}
+			env := fullEnv()
+			env["UI_ORIGIN"] = configured
+			h := newHarness(t, env)
 
-				return ""
-			}}
+			origin := configured
+			if origin == "" {
+				origin = uiOrigin
+			}
 
-			req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/healthz", nil)
-			req.Header.Set("Origin", configured)
-			req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+			rec := h.do(request{
+				method: http.MethodOptions, path: "/healthz", noContentType: true,
+				headers: map[string]string{"Origin": origin, "Access-Control-Request-Method": http.MethodGet},
+			})
 
-			rec := httptest.NewRecorder()
-			app.NewHandler(platform).ServeHTTP(rec, req)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want 405 (the preflight is not answered)", rec.Code)
+			}
 
-			for name := range rec.Header() {
-				if strings.HasPrefix(name, "Access-Control-") {
-					t.Errorf("UI_ORIGIN %q: response carries %s", configured, name)
-				}
+			if names := corsHeaders(rec.Header()); len(names) != 0 {
+				t.Errorf("UI_ORIGIN %q: response carries %v", configured, names)
 			}
 		})
+	}
+}
+
+// TestCORSAllowsALocalhostUI: the development origin is a bare http origin on
+// localhost, which is valid.
+func TestCORSAllowsALocalhostUI(t *testing.T) {
+	t.Parallel()
+
+	const local = "http://localhost:3000"
+
+	env := fullEnv()
+	env["UI_ORIGIN"] = local
+	h := newHarness(t, env)
+
+	rec := h.do(request{
+		method: http.MethodOptions, path: "/api/session", noContentType: true,
+		headers: map[string]string{"Origin": local, "Access-Control-Request-Method": http.MethodGet},
+	})
+
+	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != local {
+		t.Errorf("= %d %v, want 204 allowing %s", rec.Code, rec.Header(), local)
 	}
 }

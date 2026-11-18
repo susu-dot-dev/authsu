@@ -1,173 +1,663 @@
 //go:build e2e
 
+//nolint:goconst,funlen,cyclop,lll // table-driven tests repeat case names and inputs on purpose and the case table is the test; a constant or a line break per row would hide it
 package e2e_test
 
+// firstrun_test.go drives GET /api/first-run against the real Worker (TinyGo
+// wasm, workerd, the real D1 driver and SQLite). The unit tests fake the
+// database, so they re-implement the guards that live in the SQL; only the real
+// database can prove them:
+//
+//   - the conditional INSERT ... WHERE NOT EXISTS ... RETURNING that admits one
+//     first-run invitation however many checks race (interleaving);
+//   - the one-statement snapshot of "any user / any first-run invitation";
+//   - that nothing secret (the FIRST_RUN_SECRET or its hash) ever reaches a
+//     response (permission confusion / information disclosure);
+//   - that a wrong method or a stray body can neither create nor change state.
+//
+// REVIEW.md categories covered: input edge cases (method, query, body on GET),
+// interleaving (concurrent checks from an empty database, a check racing a
+// registration), permission confusion (the route is open and must stay inert).
+//
+// missing_secret is not reachable here: the Worker under test always has a
+// valid FIRST_RUN_SECRET (harness_test.go), and it is read per request from the
+// environment, which a test cannot change.
+
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
 	"net/http"
-	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 )
 
 const (
-	missingSecretBody = `{"status":"missing_secret"}` + "\n"
-	pendingBody       = `{"status":"invitation_pending"}` + "\n"
-	acceptedBody      = `{"status":"invitation_accepted"}` + "\n"
+	frPending  = `{"status":"invitation_pending"}` + "\n"
+	frAccepted = `{"status":"invitation_accepted"}` + "\n"
+	frBlocked  = `{"error":{"code":"first_run_blocked","message":` +
+		`"first-run setup cannot finish with this database: wipe it and redeploy"}}` + "\n"
+
+	frLabel = "First run: initial administrator"
+
+	// frOtherType is an invitation type that is not first_run.
+	frOtherType = "e2e_invite"
 )
 
-// TestFirstRunRefusesWhenOtherInvitationExists checks the guard that lives in
-// the insert's SQL: first run is minted only when there are no invitations at
-// all. The unit tests cannot prove this, because their fake database
-// re-implements the rule; only the real SQLite does.
-//
-// The Worker and its database are shared by every e2e test and the first-run
-// tests change it, so they depend on source order and must not run in
-// parallel. This one runs first, against the still-empty database, and removes
-// what it adds so TestFirstRun starts from empty too.
-//
-//nolint:paralleltest // shares one database with TestFirstRun and depends on running before it
-func TestFirstRunRefusesWhenOtherInvitationExists(t *testing.T) {
-	const otherID = "01a1e2db-3124-7000-9746-a3e074c3b350"
-
-	query(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
-		"VALUES ('"+otherID+"', zeroblob(32), 'admin_invite', 'someone else', 1, 1)")
-
-	t.Cleanup(func() { query(t, "DELETE FROM invitations WHERE id = '"+otherID+"'") })
-
-	// A valid secret is configured, so a missing guard would mint here. The
-	// status stays missing_secret because no invitation was minted from it.
-	expectFirstRun(t, missingSecretBody)
-	expectCount(t, "invitations", "1")
-	expectCount(t, "invitations WHERE type = 'first_run'", "0")
-}
-
-// TestFirstRun walks GET /api/first-run through the bootstrap states against
-// the real Worker, TinyGo build and D1, in order: a wrong method, the first
-// check that mints, repeat checks, and finally a user closing first run.
-//
-// It changes the shared database (see TestFirstRunRefusesWhenOtherInvitationExists)
-// and ends with a user in it, so no other e2e test may depend on the
-// invitations or users tables being empty, and it must not be split into
-// parallel subtests.
-//
-//nolint:paralleltest // shares one database with the other first-run test; the steps are ordered
-func TestFirstRun(t *testing.T) {
-	t.Run("wrong method does not mint", wrongMethodDoesNotMint)
-	t.Run("first check mints and reports pending", firstCheckMints)
-	t.Run("repeat check does not mint again", repeatCheckDoesNotMint)
-	t.Run("a user closes first run", userClosesFirstRun)
-}
-
-func wrongMethodDoesNotMint(t *testing.T) {
-	status, _ := get(t, http.MethodPost, "/api/first-run")
-	if status != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", status, http.StatusMethodNotAllowed)
-	}
-
-	// A valid secret is configured and the system is empty, so a handler that
-	// let a POST through to the service would mint here.
-	expectCount(t, "invitations", "0")
-}
-
-func firstCheckMints(t *testing.T) {
-	expectFirstRun(t, pendingBody)
-
+// frSecretHashHex is the hex of sha256(FIRST_RUN_SECRET): the code_hash the
+// Worker must store.
+func frSecretHashHex() string {
 	sum := sha256.Sum256([]byte(firstRunSecret))
-	wantRow := strings.ToUpper(hex.EncodeToString(sum[:])) + "|first_run|First run: initial administrator|1"
 
-	got := query(t, "SELECT hex(code_hash) || '|' || type || '|' || label || '|' || num_invites AS v FROM invitations")
-	if got != wantRow {
-		t.Errorf("stored invitation = %q, want %q", got, wantRow)
-	}
-
-	expectCount(t, "invitations WHERE created_by IS NULL", "1")
+	return hex.EncodeToString(sum[:])
 }
 
-func repeatCheckDoesNotMint(t *testing.T) {
-	for range 3 {
-		expectFirstRun(t, pendingBody)
+// frExpectStatus asks GET /api/first-run and requires a 200 with body.
+func frExpectStatus(t *testing.T, what, want string) {
+	t.Helper()
+
+	got := get(t, pathFirstRun, "")
+	if got.status != http.StatusOK || got.body != want {
+		t.Errorf("%s: GET %s = %d %q, want 200 %q", what, pathFirstRun, got.status, got.body, want)
+	}
+}
+
+// frSeedFirstRunInvitation inserts a first_run invitation whose code is the
+// configured secret, as the Worker would have, with the given extra columns.
+func frSeedFirstRunInvitation(t *testing.T, id, extraColumn string, extraValue any) {
+	t.Helper()
+
+	query := "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at"
+	args := []any{id, mustDecodeHex(t, frSecretHashHex()), "first_run", frLabel}
+
+	if extraColumn != "" {
+		query += ", " + extraColumn
+	}
+
+	query += ") VALUES (?, ?, ?, ?, 1, strftime('%s','now')"
+
+	if extraColumn != "" {
+		query += ", ?"
+
+		args = append(args, extraValue)
+	}
+
+	query += ")"
+
+	seed(t, query, args...)
+}
+
+func mustDecodeHex(t *testing.T, s string) []byte {
+	t.Helper()
+
+	out, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("hex %q: %v", s, err)
+	}
+
+	return out
+}
+
+// TestFirstRunCreatesTheInvitation proves the empty -> pending transition and
+// the exact row the Worker stores, and that repeats create nothing more.
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunCreatesTheInvitation(t *testing.T) {
+	reset(t)
+
+	expectCount(t, "invitations", "0")
+	frExpectStatus(t, "first check on an empty database", frPending)
+	expectCount(t, "invitations", "1")
+
+	// The stored row, column by column.
+	row := func(column string) string { return scalar(t, "SELECT "+column+" FROM invitations") }
+
+	if got := row("lower(hex(code_hash))"); got != frSecretHashHex() {
+		t.Errorf("code_hash = %s, want sha256 of the secret %s", got, frSecretHashHex())
+	}
+
+	if got := row("typeof(code_hash)"); got != "blob" {
+		t.Errorf("typeof(code_hash) = %s, want blob", got)
+	}
+
+	for column, want := range map[string]string{
+		"type":                "first_run",
+		"label":               frLabel,
+		"num_invites":         "1",
+		"typeof(num_invites)": "integer",
+		"expires_at IS NULL":  "1",
+		"revoked_at IS NULL":  "1",
+		"created_by IS NULL":  "1",
+		"typeof(created_at)":  "integer",
+		"length(id)":          "36",
+	} {
+		if got := row(column); got != want {
+			t.Errorf("invitations.%s = %q, want %q", column, got, want)
+		}
+	}
+
+	// created_at is "now": within a minute of the database clock.
+	if got := scalar(t, "SELECT abs(created_at - strftime('%s','now')) < 60 FROM invitations"); got != "1" {
+		t.Errorf("created_at is not recent: %s", scalar(t, "SELECT created_at FROM invitations"))
+	}
+
+	// The id is a UUIDv7: version nibble 7.
+	if got := scalar(t, "SELECT substr(id, 15, 1) FROM invitations"); got != "7" {
+		t.Errorf("invitation id %s is not a UUIDv7", scalar(t, "SELECT id FROM invitations"))
+	}
+
+	id := row("id")
+
+	for range 5 {
+		frExpectStatus(t, "repeat check", frPending)
 	}
 
 	expectCount(t, "invitations", "1")
-}
+	expectCount(t, "users", "0")
 
-func userClosesFirstRun(t *testing.T) {
-	query(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
-		"SELECT '01a1e2db-3124-7000-9746-a3e074c3b34f', x'0102', 'admin', id, 1 FROM invitations")
-
-	expectFirstRun(t, acceptedBody)
-}
-
-// expectFirstRun issues GET /api/first-run and checks that it answers 200 with
-// wantBody.
-func expectFirstRun(t *testing.T, wantBody string) {
-	t.Helper()
-
-	status, body := get(t, http.MethodGet, "/api/first-run")
-	if status != http.StatusOK || body != wantBody {
-		t.Errorf("GET /api/first-run = %d %q, want %d %q", status, body, http.StatusOK, wantBody)
+	if got := row("id"); got != id {
+		t.Errorf("a repeat check replaced the invitation: id %s -> %s", id, got)
 	}
 }
 
-// expectCount checks the number of rows in a table, optionally filtered:
-// pass "invitations" or "invitations WHERE type = 'first_run'".
-func expectCount(t *testing.T, from, want string) {
-	t.Helper()
+// TestFirstRunStateMachine walks the database states first-run reads, against
+// the real SQL. Each row seeds one state and states what GET /api/first-run
+// must answer and what it must leave in the invitations table.
+//
+// The revoked / exhausted / expired first_run rows document a real property:
+// FirstRunState asks only whether a first_run row EXISTS, so a dead first-run
+// invitation still reads as pending even though registration refuses its code.
+// The design's answer is "recovery is a wipe" (docs/first_run_design.md).
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunStateMachine(t *testing.T) {
+	const (
+		idFirstRun = "00000000-0000-7000-8000-00000000f001"
+		idOther    = "00000000-0000-7000-8000-00000000f002"
+	)
 
-	if got := query(t, "SELECT count(*) AS v FROM "+from); got != want {
-		t.Errorf("count of %s = %s, want %s", from, got, want)
+	tests := []struct {
+		name  string
+		setup func(t *testing.T)
+		// wantStatus and wantBody are the response.
+		wantStatus int
+		wantBody   string
+		// wantInvitations is the invitation count afterwards, wantFirstRun
+		// how many of them are first_run.
+		wantInvitations string
+		wantFirstRun    string
+	}{
+		{
+			name:       "empty database creates the invitation",
+			setup:      func(*testing.T) {},
+			wantStatus: http.StatusOK, wantBody: frPending, wantInvitations: "1", wantFirstRun: "1",
+		},
+		{
+			name:       "a first_run invitation exists: pending, nothing created",
+			setup:      func(t *testing.T) { t.Helper(); frSeedFirstRunInvitation(t, idFirstRun, "", nil) },
+			wantStatus: http.StatusOK, wantBody: frPending, wantInvitations: "1", wantFirstRun: "1",
+		},
+		{
+			name: "a first_run invitation with a DIFFERENT code hash is still pending (the secret is not consulted)",
+			setup: func(t *testing.T) {
+				t.Helper()
+				seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
+					"VALUES (?, randomblob(32), 'first_run', 'older secret', 1, 1)", idFirstRun)
+			},
+			wantStatus: http.StatusOK, wantBody: frPending, wantInvitations: "1", wantFirstRun: "1",
+		},
+		{
+			name: "a revoked first_run invitation and no account reads pending (dead end: wipe)",
+			setup: func(t *testing.T) {
+				t.Helper()
+				frSeedFirstRunInvitation(t, idFirstRun, "revoked_at", 1)
+			},
+			wantStatus: http.StatusOK, wantBody: frPending, wantInvitations: "1", wantFirstRun: "1",
+		},
+		{
+			name: "an expired first_run invitation and no account reads pending (dead end: wipe)",
+			setup: func(t *testing.T) {
+				t.Helper()
+				frSeedFirstRunInvitation(t, idFirstRun, "expires_at", 1)
+			},
+			wantStatus: http.StatusOK, wantBody: frPending, wantInvitations: "1", wantFirstRun: "1",
+		},
+		{
+			name: "an invitation of another type and no account is blocked, nothing created",
+			setup: func(t *testing.T) {
+				t.Helper()
+				seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
+					"VALUES (?, randomblob(32), ?, 'seeded', 1, 1)", idOther, frOtherType)
+			},
+			wantStatus: http.StatusConflict, wantBody: frBlocked, wantInvitations: "1", wantFirstRun: "0",
+		},
+		{
+			name: "another type plus an account reads accepted: the secret is never consulted",
+			setup: func(t *testing.T) {
+				t.Helper()
+				seedInvitation(t, idOther, 1)
+				seedUser(t, idUserB, "e2e_member")
+			},
+			wantStatus: http.StatusOK, wantBody: frAccepted, wantInvitations: "1", wantFirstRun: "0",
+		},
+		{
+			name: "a first_run invitation plus an account reads accepted",
+			setup: func(t *testing.T) {
+				t.Helper()
+				frSeedFirstRunInvitation(t, idFirstRun, "", nil)
+				seedUser(t, idUserB, roleAdmin)
+			},
+			wantStatus: http.StatusOK, wantBody: frAccepted, wantInvitations: "1", wantFirstRun: "1",
+		},
+		{
+			name: "an account whose invitation was revoked still reads accepted",
+			setup: func(t *testing.T) {
+				t.Helper()
+				frSeedFirstRunInvitation(t, idFirstRun, "", nil)
+				seedUser(t, idUserB, roleAdmin)
+				seed(t, "UPDATE invitations SET revoked_at = 1")
+			},
+			wantStatus: http.StatusOK, wantBody: frAccepted, wantInvitations: "1", wantFirstRun: "1",
+		},
+		{
+			name: "a revoked account does not reopen first run",
+			setup: func(t *testing.T) {
+				t.Helper()
+				frSeedFirstRunInvitation(t, idFirstRun, "", nil)
+				seedUser(t, idUserB, roleAdmin)
+				seed(t, "UPDATE users SET revoked_at = 1")
+			},
+			wantStatus: http.StatusOK, wantBody: frAccepted, wantInvitations: "1", wantFirstRun: "1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reset(t)
+			tt.setup(t)
+
+			usersBefore := count(t, "users")
+
+			got := get(t, pathFirstRun, "")
+			if got.status != tt.wantStatus || got.body != tt.wantBody {
+				t.Errorf("GET %s = %d %q, want %d %q", pathFirstRun, got.status, got.body, tt.wantStatus, tt.wantBody)
+			}
+
+			expectCount(t, "invitations", tt.wantInvitations)
+			expectCount(t, "invitations WHERE type = 'first_run'", tt.wantFirstRun)
+			expectCount(t, "users", usersBefore)
+
+			// Idempotent: the same question gets the same answer.
+			again := get(t, pathFirstRun, "")
+			if again.status != tt.wantStatus || again.body != tt.wantBody {
+				t.Errorf("second GET = %d %q, want %d %q", again.status, again.body, tt.wantStatus, tt.wantBody)
+			}
+
+			expectCount(t, "invitations", tt.wantInvitations)
+		})
 	}
 }
 
-// query runs one SQL statement against the Worker's local D1 database and
-// returns column "v" of its first row as text, or "" if there is no row.
-// Statements that return nothing (INSERT) need no alias.
-func query(t *testing.T, sql string) string {
-	t.Helper()
+// TestFirstRunDeadInvitationCannotRegister is the other half of the dead-end
+// rows above: a first_run invitation that reads "pending" but is revoked or
+// expired is refused by registration, so the owner is told to continue to a
+// page that cannot succeed. The design accepts this ("recovery is a wipe"); the
+// test pins it so a change is a conscious one.
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunDeadInvitationCannotRegister(t *testing.T) {
+	for _, column := range []string{"revoked_at", "expires_at"} {
+		t.Run(column, func(t *testing.T) {
+			reset(t)
+			frSeedFirstRunInvitation(t, "00000000-0000-7000-8000-00000000f001", column, 1)
 
-	// `wrangler d1 execute` is the only way to reach the simulated D1 from
-	// outside the Worker. --json keeps the output machine-readable.
-	cmd := exec.CommandContext(context.Background(), "npx", "wrangler", "d1", "execute", "DB",
-		"--local", "--persist-to", target.state, "--json", "--command", sql)
-	cmd.Dir = target.root
-
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("d1 execute %q: %v\n%s", sql, err, out)
+			frExpectStatus(t, "dead invitation", frPending)
+			beginRegistration(t, firstRunSecret, "Admin").
+				expect(t, "begin with a dead first-run code", http.StatusForbidden, "invalid_invitation")
+			expectCount(t, "users", "0")
+		})
 	}
 
-	var parsed []struct {
-		Results []map[string]any `json:"results"`
-	}
+	t.Run("an exhausted first_run invitation (num_invites reached by another account) reads accepted", func(t *testing.T) {
+		reset(t)
+		frSeedFirstRunInvitation(t, "00000000-0000-7000-8000-00000000f001", "", nil)
+		seedUser(t, idUserB, roleAdmin)
 
-	err = json.Unmarshal(out, &parsed)
-	if err != nil {
-		t.Fatalf("parse d1 output for %q: %v\n%s", sql, err, out)
-	}
-
-	if len(parsed) != 1 || len(parsed[0].Results) == 0 {
-		return ""
-	}
-
-	return fmt.Sprint(parsed[0].Results[0]["v"])
+		frExpectStatus(t, "exhausted", frAccepted)
+		beginRegistration(t, firstRunSecret, "Admin").
+			expect(t, "begin after exhaustion", http.StatusForbidden, "invalid_invitation")
+	})
 }
 
-// queryFails runs one SQL statement against the Worker's local D1 database and
-// reports whether the database refused it. A refusal is an outcome here, not a
-// test failure: the caller is asserting that a constraint held.
-func queryFails(t *testing.T, sql string) bool {
-	t.Helper()
+// TestFirstRunRequestShapes sends the route things it must ignore or refuse and
+// proves that none of them creates or changes anything.
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunRequestShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		req  request
+		// wantStatus is the response status; wantBody (when set) the exact
+		// body; wantCode the error code of a refusal.
+		wantStatus int
+		wantCode   string
+		wantBody   string
+		// wantCreated says whether the request may have created the
+		// invitation (only a GET may).
+		wantCreated bool
+	}{
+		{name: "plain GET", req: request{path: pathFirstRun}, wantStatus: http.StatusOK, wantBody: frPending, wantCreated: true},
+		{
+			name:       "GET with a query string is harmless",
+			req:        request{path: pathFirstRun + "?status=invitation_accepted&secret=x&code=y"},
+			wantStatus: http.StatusOK, wantBody: frPending, wantCreated: true,
+		},
+		{
+			name:       "GET with a body is harmless",
+			req:        request{path: pathFirstRun, body: []byte(`{"secret":"x"}`)},
+			wantStatus: http.StatusOK, wantBody: frPending, wantCreated: true,
+		},
+		{
+			name:       "GET with a huge body is harmless",
+			req:        request{path: pathFirstRun, body: []byte(strings.Repeat("x", 4096))},
+			wantStatus: http.StatusOK, wantBody: frPending, wantCreated: true,
+		},
+		{
+			name:       "GET with a session cookie of nobody is harmless",
+			req:        request{path: pathFirstRun, token: "not.a.token"},
+			wantStatus: http.StatusOK, wantBody: frPending, wantCreated: true,
+		},
+		{
+			name:       "GET with a foreign Origin header does not echo CORS",
+			req:        request{path: pathFirstRun, headers: map[string]string{"Origin": "https://evil.example"}},
+			wantStatus: http.StatusOK, wantBody: frPending, wantCreated: true,
+		},
+		{
+			name:       "POST is refused and creates nothing",
+			req:        request{method: http.MethodPost, path: pathFirstRun, body: []byte("{}")},
+			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllow,
+		},
+		{
+			name:       "PUT is refused and creates nothing",
+			req:        request{method: http.MethodPut, path: pathFirstRun, body: []byte("{}")},
+			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllow,
+		},
+		{
+			name:       "PATCH is refused and creates nothing",
+			req:        request{method: http.MethodPatch, path: pathFirstRun, body: []byte("{}")},
+			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllow,
+		},
+		{
+			name:       "DELETE is refused and creates nothing",
+			req:        request{method: http.MethodDelete, path: pathFirstRun},
+			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllow,
+		},
+		{
+			name:       "HEAD is refused and creates nothing (only GET may create)",
+			req:        request{method: http.MethodHead, path: pathFirstRun},
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:       "OPTIONS is refused and creates nothing",
+			req:        request{method: http.MethodOptions, path: pathFirstRun},
+			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllow,
+		},
+		{
+			name:       "TRACE is refused and creates nothing",
+			req:        request{method: http.MethodTrace, path: pathFirstRun},
+			wantStatus: http.StatusMethodNotAllowed, wantCode: codeMethodNotAllow,
+		},
+		{
+			name:       "a path that only looks like it is not found and creates nothing",
+			req:        request{path: pathFirstRun + "/"},
+			wantStatus: http.StatusNotFound, wantCode: codeNotFound,
+		},
+		{
+			name:       "a longer path is not found and creates nothing",
+			req:        request{path: pathFirstRun + "/x"},
+			wantStatus: http.StatusNotFound, wantCode: codeNotFound,
+		},
+	}
 
-	cmd := exec.CommandContext(context.Background(), "npx", "wrangler", "d1", "execute", "DB",
-		"--local", "--persist-to", target.state, "--json", "--command", sql)
-	cmd.Dir = target.root
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reset(t)
 
-	_, err := cmd.Output()
+			got := send(t, tt.req)
+			if got.status != tt.wantStatus {
+				t.Errorf("%s %s = %d %q, want %d", tt.req.method, tt.req.path, got.status, got.body, tt.wantStatus)
+			}
 
-	return err != nil
+			if tt.wantCode != "" && got.errorCode() != tt.wantCode {
+				t.Errorf("error code = %q, want %q (body %q)", got.errorCode(), tt.wantCode, got.body)
+			}
+
+			if tt.wantBody != "" && got.body != tt.wantBody {
+				t.Errorf("body = %q, want %q", got.body, tt.wantBody)
+			}
+
+			want := "0"
+			if tt.wantCreated {
+				want = "1"
+			}
+
+			expectCount(t, "invitations", want)
+			expectCount(t, "users", "0")
+
+			if got.header.Get("Access-Control-Allow-Origin") == "https://evil.example" || got.header.Get("Access-Control-Allow-Origin") == "*" {
+				t.Errorf("a foreign origin was allowed: %v", got.header)
+			}
+
+			if got.header.Get("Cache-Control") != "no-store" && got.status == http.StatusOK {
+				t.Errorf("Cache-Control = %q, want no-store", got.header.Get("Cache-Control"))
+			}
+		})
+	}
+}
+
+// TestFirstRunNeverDisclosesTheSecret checks every response of the route, in
+// every state it can be in, for the secret, its hash and the invitation's id.
+// The route is open to the world, so anything it said would be public.
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunNeverDisclosesTheSecret(t *testing.T) {
+	reset(t)
+
+	forbidden := func(extra ...string) []string {
+		return append([]string{
+			firstRunSecret, b64([]byte(firstRunSecret)), frSecretHashHex(), strings.ToUpper(frSecretHashHex()),
+			b64(mustDecodeHex(t, frSecretHashHex())), "code_hash", "invitation_id",
+		}, extra...)
+	}
+
+	check := func(what string, got reply, extra ...string) {
+		t.Helper()
+
+		var builder strings.Builder
+
+		builder.WriteString(got.body)
+
+		for name, values := range got.header {
+			builder.WriteString("\n" + name + ": " + strings.Join(values, ","))
+		}
+
+		blob := builder.String()
+
+		for _, bad := range forbidden(extra...) {
+			if strings.Contains(blob, bad) {
+				t.Errorf("%s leaks %q: %s", what, bad, blob)
+			}
+		}
+	}
+
+	// Pending (the first check creates the invitation).
+	check("first check", get(t, pathFirstRun, ""), scalar(t, "SELECT 'no-such-id'"))
+	id := scalar(t, "SELECT id FROM invitations")
+	check("pending", get(t, pathFirstRun, ""), id)
+
+	// Accepted.
+	registerWith(t, "Admin")
+	check("accepted", get(t, pathFirstRun, ""), id, scalar(t, "SELECT id FROM users"))
+
+	// Blocked.
+	reset(t)
+	seedInvitation(t, idInvitationA, 1)
+	check("blocked", get(t, pathFirstRun, ""), idInvitationA)
+}
+
+// TestFirstRunConcurrentChecksCreateOneInvitation releases many checks at once
+// against an empty database. The conditional INSERT admits exactly one row;
+// every request must answer 200 pending (the losers re-read and see the
+// winner's row), and none may fail.
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunConcurrentChecksCreateOneInvitation(t *testing.T) {
+	const (
+		rounds  = 4
+		callers = 32
+	)
+
+	for round := range rounds {
+		reset(t)
+
+		type outcome struct {
+			status int
+			body   string
+		}
+
+		outcomes := make([]outcome, callers)
+		start := make(chan struct{})
+
+		var wg sync.WaitGroup
+
+		for i := range callers {
+			wg.Go(func() {
+				<-start
+
+				got := get(t, pathFirstRun, "")
+				outcomes[i] = outcome{status: got.status, body: got.body}
+			})
+		}
+
+		close(start)
+		wg.Wait()
+
+		mix := map[string]int{}
+
+		for _, o := range outcomes {
+			mix[o.body]++
+
+			if o.status != http.StatusOK || o.body != frPending {
+				t.Errorf("round %d: concurrent check = %d %q, want 200 pending", round, o.status, o.body)
+			}
+		}
+
+		t.Logf("round %d: %v", round, mix)
+
+		expectCount(t, "invitations", "1")
+		expectCount(t, "invitations WHERE type = 'first_run' AND num_invites = 1", "1")
+		expectCount(t, "users", "0")
+
+		if got := scalar(t, "SELECT lower(hex(code_hash)) FROM invitations"); got != frSecretHashHex() {
+			t.Errorf("round %d: code_hash = %s, want %s", round, got, frSecretHashHex())
+		}
+	}
+}
+
+// TestFirstRunRacesARegistration interleaves GET /api/first-run with the
+// registration that closes first run. Whatever the order, the registration
+// succeeds exactly once, every check answers 200 with pending or accepted
+// (never an error, never a second invitation), and afterwards the state is
+// accepted.
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunRacesARegistration(t *testing.T) {
+	const (
+		rounds   = 3
+		checkers = 16
+	)
+
+	for round := range rounds {
+		reset(t)
+		frExpectStatus(t, "setup", frPending)
+
+		options := mustBeginRegistration(t, firstRunSecret, "Racer")
+		auth := newAuthenticator()
+		body := auth.finishBody(t, options, firstRunSecret, "Racer")
+
+		start := make(chan struct{})
+		statuses := make([]reply, checkers)
+
+		var (
+			wg     sync.WaitGroup
+			finish reply
+		)
+
+		wg.Go(func() {
+			<-start
+
+			finish = post(t, pathRegisterEnd, body, "")
+		})
+
+		for i := range checkers {
+			wg.Go(func() {
+				<-start
+
+				statuses[i] = get(t, pathFirstRun, "")
+			})
+		}
+
+		close(start)
+		wg.Wait()
+
+		finish.expect(t, "racing finish", http.StatusCreated, "")
+
+		mix := map[string]int{}
+
+		for _, got := range statuses {
+			mix[got.body]++
+
+			if got.status != http.StatusOK || (got.body != frPending && got.body != frAccepted) {
+				t.Errorf("round %d: racing check = %d %q, want 200 pending|accepted", round, got.status, got.body)
+			}
+		}
+
+		t.Logf("round %d: %v", round, mix)
+
+		expectCount(t, "invitations", "1")
+		expectCount(t, "users", "1")
+		expectCount(t, "credentials", "1")
+		frExpectStatus(t, "after the race", frAccepted)
+	}
+}
+
+// TestFirstRunSingleUseThroughRegistration proves the first-run invitation
+// closes the hole: after the first account exists the same code cannot create a
+// second one, and the status stays accepted whatever is then done.
+//
+//nolint:paralleltest // shares one database
+func TestFirstRunSingleUseThroughRegistration(t *testing.T) {
+	reset(t)
+	frExpectStatus(t, "setup", frPending)
+
+	// Two ceremonies begin while the invitation is open.
+	first := mustBeginRegistration(t, firstRunSecret, "First")
+	second := mustBeginRegistration(t, firstRunSecret, "Second")
+
+	post(t, pathRegisterEnd, newAuthenticator().finishBody(t, first, firstRunSecret, "First"), "").
+		expect(t, "first finish", http.StatusCreated, "")
+	frExpectStatus(t, "after the first account", frAccepted)
+
+	// The second ceremony's challenge is validly signed, but the invitation is
+	// spent and first run needs an empty system: refused, nothing written.
+	post(t, pathRegisterEnd, newAuthenticator().finishBody(t, second, firstRunSecret, "Second"), "").
+		expect(t, "second finish", http.StatusForbidden, "invalid_invitation")
+	beginRegistration(t, firstRunSecret, "Third").
+		expect(t, "begin after first run", http.StatusForbidden, "invalid_invitation")
+
+	expectCount(t, "users", "1")
+	expectCount(t, "credentials", "1")
+	expectCount(t, "invitations", "1")
+	frExpectStatus(t, "still accepted", frAccepted)
+	expectCount(t, "invitations", "1")
 }

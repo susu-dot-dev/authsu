@@ -5,133 +5,113 @@
 //
 // Begin writes nothing. It checks the invitation as a courtesy (so a wrong code
 // fails before the user's biometric prompt) and returns the WebAuthn creation
-// options, with a challenge that is signed rather than stored. Finish is the
-// one point of acceptance: it verifies the challenge and the passkey, then
-// creates the account and credential in a single database batch whose
-// conditions enforce the invitation.
+// options, with a challenge that is signed rather than stored: the invitation
+// code and the account name are bound into it, and its nonce is the user
+// handle. Finish is the one point of acceptance: it verifies the passkey and
+// the challenge, then creates the account and credential in one store
+// operation whose conditions enforce the invitation.
+//
+// Both routes are open (auth.None): the caller has no session yet.
 package registration
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/json"
-	"errors"
 	"io"
+	"net/http"
 	"time"
 
-	"github.com/susu-dot-dev/authsu/internal/atomic"
-	"github.com/susu-dot-dev/authsu/internal/deploy"
+	"github.com/susu-dot-dev/authsu/internal/auth"
+	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// Environment names read by the handlers. They are defined in internal/deploy,
-// which registration and login share; they are repeated here so callers that
-// configure registration keep a name for what they set.
+// The routes.
 const (
-	// SecretHMAC is the Worker secret that is the root key material.
-	SecretHMAC = deploy.SecretHMAC
-	// VarAPIOrigin is the origin this Worker is served from.
-	VarAPIOrigin = deploy.VarAPIOrigin
-	// VarUIOrigin is the origin the UI is served from: the one origin
-	// ceremonies are accepted from, whose host is the relying party ID.
-	VarUIOrigin = deploy.VarUIOrigin
+	// PathBegin is the route that starts a registration.
+	PathBegin = "/api/register/begin"
+	// PathFinish is the route that completes one.
+	PathFinish = "/api/register/finish"
 )
 
-// MinSecretLen is the shortest AUTH_HMAC_SECRET accepted.
-const MinSecretLen = deploy.MinSecretLen
-
-// ChallengeTTL is how long a begin response stays valid. It is also the
-// timeout sent in the creation options. WebAuthn recommends 5 to 10 minutes.
-const ChallengeTTL = 5 * time.Minute
-
-// derivationContext separates the registration challenge key from any other
-// key derived from the root secret.
-const derivationContext = "authsu/registration-challenge/v1"
-
-// Roles. An invitation type maps to a role here, in Go, because the schema
-// deliberately has no CHECK on either (see "Database" in docs/devops.md).
 const (
-	// RoleAdmin may administer the deployment.
-	RoleAdmin = "admin"
+	// ChallengeTTL is how long a begin response stays valid. It is also the
+	// timeout sent in the creation options. WebAuthn recommends 5 to 10
+	// minutes.
+	ChallengeTTL = 5 * time.Minute
+
+	// MaxBeginBody caps the begin request, which is two short strings (a real
+	// one is about 100 bytes). A name is escaped in JSON, at worst six bytes
+	// per byte, so this leaves room for the longest valid one.
+	MaxBeginBody = 4 << 10
+
+	// MaxFinishBody caps the finish request, so the server never parses more
+	// than a legitimate one could hold (a real one is under 1 KiB). It is the
+	// sum of what the members may legally be, with room for JSON syntax and
+	// escaping: id and rawId (1023 bytes each, base64url), clientDataJSON
+	// (2048) and attestationObject (4096) as base64url, the name and code, and
+	// the transports. Anything larger fails a member's own bound anyway, so
+	// refusing it here costs no honest client.
+	MaxFinishBody = 32 << 10
 )
 
-// RoleFor maps an invitation type to the role its accounts get, and reports
-// whether the type is known. An unknown type has no role: registration
-// refuses it rather than inventing one.
-func RoleFor(invitationType string) (string, bool) {
-	if invitationType == firstRunType {
-		return RoleAdmin, true
-	}
+// Store is the part of the store registration uses. *store.Store satisfies it.
+type Store interface {
+	// RedeemableInvitationType returns the type of the invitation code names
+	// when it is redeemable at now, and false when it is not. It is advisory:
+	// CreateAccount decides.
+	RedeemableInvitationType(ctx context.Context, code input.InvitationCode, now time.Time) (string, bool, error)
 
-	return "", false
+	// CreateAccount creates the account and its first passkey, and reports
+	// store.ErrConflict when the registration cannot stand.
+	CreateAccount(ctx context.Context, account store.NewAccount) error
 }
 
-// firstRunType is invitations.type of the first-run invitation. It is repeated
-// from internal/firstrun, which owns it, so this package need not import that
-// one; a test pins the two together.
-const firstRunType = "first_run"
-
-// Reader answers the read-only question begin and finish ask.
-//
-// It is separate from the batch function so that begin, which must have no side effects,
-// holds only a type that cannot write.
-type Reader interface {
-	// RedeemableInvitationType returns the type of the invitation with this
-	// code hash if it is currently redeemable (not revoked, not expired, under
-	// its cap, and for first run no account yet), and false if there is no such
-	// invitation. It is advisory: the write at finish decides authoritatively.
-	RedeemableInvitationType(ctx context.Context, codeHash []byte, now time.Time) (string, bool, error)
-}
-
-// Service is the registration service.
-type Service struct {
-	reader  Reader
-	batch   atomic.Batch
-	now     func() time.Time
-	entropy io.Reader
-	newID   func() string
-	// marshal encodes the JSON columns. It is json.Marshal; it is a field so
-	// that its failure, which no value of the types we pass can cause, is
-	// reachable from a test.
-	marshal func(any) ([]byte, error)
-}
-
-// Deps are the service's collaborators. Time, randomness and identifiers are
-// injected so every branch is reachable from a test.
+// Deps are the collaborators of the routes. All are required. Time,
+// randomness and identifiers are injected so every branch is reachable from a
+// test.
 type Deps struct {
-	Reader Reader
-	// Batch performs the atomic write finish ends with. Nil disables finish.
-	Batch atomic.Batch
+	// Store reads and writes the database.
+	Store Store
 	// Now is the clock.
 	Now func() time.Time
-	// Entropy supplies random bytes (crypto/rand.Reader in production).
+	// Entropy supplies random bytes (crypto/rand.Reader in production). It
+	// is where the challenge's nonce, which is the user handle, comes from.
 	Entropy io.Reader
-	// NewID returns a fresh UUIDv7 in canonical text form.
+	// NewID returns a fresh UUIDv7 in canonical text form, for the user and
+	// the credential row.
 	NewID func() string
 }
 
-// NewService returns a Service.
-func NewService(deps Deps) *Service {
-	return &Service{
-		reader:  deps.Reader,
-		batch:   deps.Batch,
-		now:     deps.Now,
-		entropy: deps.Entropy,
-		newID:   deps.NewID,
-		marshal: json.Marshal,
+// handlers carries the dependencies the two handlers share.
+type handlers struct {
+	store   Store
+	now     func() time.Time
+	entropy io.Reader
+	newID   func() string
+}
+
+// Routes returns the registration routes. It panics when a dependency is
+// missing: the wiring is fixed in code, so the mistake is found by the first
+// test or start, never by a request.
+func Routes(deps Deps) []auth.Route {
+	for name, missing := range map[string]bool{
+		"Store": deps.Store == nil, "Now": deps.Now == nil, "Entropy": deps.Entropy == nil, "NewID": deps.NewID == nil,
+	} {
+		if missing {
+			panic("registration: Deps." + name + " is required")
+		}
 	}
-}
 
-var errNoDatabase = errors.New("no database is configured")
+	handle := &handlers{store: deps.Store, now: deps.Now, entropy: deps.Entropy, newID: deps.NewID}
 
-// deriveKey derives the challenge-signing key from the root secret.
-func deriveKey(root string) []byte {
-	return deploy.DeriveKey(root, derivationContext)
-}
-
-// codeHash is how invitation codes are looked up: the SHA-256 of the code,
-// matching what internal/firstrun stores.
-func codeHash(code string) []byte {
-	sum := sha256.Sum256([]byte(code))
-
-	return sum[:]
+	return []auth.Route{
+		{
+			Method: http.MethodPost, Path: PathBegin, MaxBody: MaxBeginBody,
+			Credential: auth.None, Require: nil, Handle: handle.begin,
+		},
+		{
+			Method: http.MethodPost, Path: PathFinish, MaxBody: MaxFinishBody,
+			Credential: auth.None, Require: nil, Handle: handle.finish,
+		},
+	}
 }

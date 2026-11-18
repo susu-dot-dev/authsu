@@ -10,8 +10,11 @@
 //
 // An agent is not an account. It is something a user has, so every route acts
 // for the signed-in user and only on that user's agents: nobody, an admin
-// included, creates, reads or changes an agent for someone else. An agent that
-// belongs to another user is answered exactly as one that does not exist.
+// included, creates, reads or changes an agent for someone else. Every route
+// therefore declares no requirement beyond a session, and passes the session's
+// user to the store as the owner of whatever it touches. No request value ever
+// names an owner, so an agent that belongs to another user is answered, by the
+// store's own owner condition, exactly as one that does not exist.
 //
 // Creating an agent hands out authority, so it needs a passkey-backed session:
 // this API does not accept an API key yet, and nothing verifies one. The
@@ -26,43 +29,66 @@ package agents
 
 import (
 	"context"
-	"errors"
 	"time"
 
-	"github.com/susu-dot-dev/authsu/internal/atomic"
-	"github.com/susu-dot-dev/authsu/internal/httpapi"
-	"github.com/susu-dot-dev/authsu/internal/session"
+	"github.com/susu-dot-dev/authsu/internal/auth"
+	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// Limits on what a client may ask for and on what a user may have. The schema
-// caps the name at 256 characters; these are the limits Go refuses first, so a
-// client gets a proper error rather than a database rejection.
+// Limits on what a user may have.
 const (
-	// MaxNameChars is the longest agent name, in characters (the schema counts
-	// characters for TEXT).
-	MaxNameChars = 256
 	// MaxAgentsPerUser is how many agents one user may have, revoked ones
 	// excluded. docs/agents_design.md calls for a per-user limit and leaves its
 	// value open; this is a starting value.
 	MaxAgentsPerUser = 25
+
 	// KeyLifetime is how long an agent's key lasts. Like a session it is fixed
 	// and never extended: an agent that outlives it is replaced.
 	KeyLifetime = 90 * 24 * time.Hour
-	// DefaultPageSize is how many agents a list returns when it is not asked
-	// for a number.
-	DefaultPageSize = 25
-	// MaxPageSize is the most agents one list returns, whatever it is asked.
-	MaxPageSize = 100
 )
-
-// FirstPage is the cursor of the first page. Ids are lowercase hex and dashes,
-// and 'g' sorts above both, so every id is below it.
-const FirstPage = "g"
 
 // DefaultScopes is the scope list every agent and every agent key is created
 // with. It names the default agent bundle. It is stored and signed into the
 // key's token but nothing interprets it yet (docs/permissions_design.md).
 const DefaultScopes = "default:agent"
+
+// Store is the part of the database the agent routes use. Every method is
+// scoped to one owner, the signed-in user: an agent of another user is not
+// found. *store.Store satisfies it. A failure must come back classified (the
+// store does), because it is sent as is.
+type Store interface {
+	// ListAgents returns a page of the owner's agents, newest first.
+	ListAgents(ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit) (store.AgentPage, error)
+	// GetAgent returns one of the owner's agents, or store.ErrNotFound.
+	GetAgent(ctx context.Context, owner string, id input.ID) (store.Agent, error)
+	// CreateAgent writes an agent and its first key as one batch, or returns
+	// store.ErrConflict when the owner is at the limit or was revoked.
+	CreateAgent(ctx context.Context, agent store.NewAgent) error
+	// RenameAgent renames one of the owner's agents and returns it as the
+	// write left it (a revoked agent keeps its name), or store.ErrNotFound.
+	RenameAgent(ctx context.Context, owner string, id input.ID, name input.AgentName) (store.Agent, error)
+	// RevokeAgent revokes one of the owner's agents and its keys and returns
+	// the agent as the write left it, or store.ErrNotFound.
+	RevokeAgent(ctx context.Context, owner string, id input.ID, now time.Time) (store.Agent, error)
+}
+
+// Deps are the collaborators of Routes. All are required: Routes panics on a
+// missing one, so a handler never meets a nil dependency.
+type Deps struct {
+	// Store holds the agents.
+	Store Store
+
+	// Now is the clock.
+	Now func() time.Time
+
+	// NewID returns a fresh UUIDv7 in canonical text form.
+	NewID func() string
+
+	// CreateKey creates an API key (auth.CreateKey in production). It is a
+	// dependency so a test can make creation fail, which no valid request does.
+	CreateKey func(auth.Issuer, auth.KeySpec) (auth.Key, error)
+}
 
 // Status is where an agent stands. It is derived from the row, never stored.
 type Status string
@@ -78,97 +104,31 @@ const (
 // Agent is one agent as its user sees it.
 type Agent struct {
 	ID string `json:"id"`
+
 	// Name is the label its user gave it.
 	Name string `json:"name"`
+
 	// Scopes is the agent's scope list as stored.
 	Scopes string `json:"scopes"`
 	Status Status `json:"status"`
+
 	// RevokedAt is absent when the agent is not revoked.
 	RevokedAt *int64 `json:"revokedAt,omitempty"`
+
 	// CreatedAt is in Unix seconds.
 	CreatedAt int64 `json:"createdAt"`
 }
 
-// Row is an agent as stored. The owner is not part of it: every query is
-// scoped to one, so a row is always the caller's.
-type Row struct {
-	ID        string
-	Name      string
-	Scopes    string
-	RevokedAt *int64
-	CreatedAt int64
-}
-
-// StatusOf returns the status of r. Any revoked_at at all revokes, as for users.
-func StatusOf(r Row) Status {
-	if r.RevokedAt != nil {
-		return StatusRevoked
+// present is the client's view of a stored agent. Any revoked_at at all
+// revokes, as for users.
+func present(stored store.Agent) Agent {
+	status := StatusActive
+	if stored.RevokedAt != nil {
+		status = StatusRevoked
 	}
 
-	return StatusActive
-}
-
-// Reader is the read side of the agent store. Every method is scoped to one
-// owner: an agent of another user is not found.
-type Reader interface {
-	// List returns up to limit of the user's agents with an id below before,
-	// revoked ones included, newest first. FirstPage starts at the newest.
-	List(ctx context.Context, userID, before string, limit int) ([]Row, error)
-	// Get returns one of the user's agents, or an error wrapping ErrNotFound if
-	// the user has none with this id.
-	Get(ctx context.Context, userID, id string) (Row, error)
-}
-
-// Authenticator verifies a request's session. *session.Service is one.
-type Authenticator interface {
-	Authenticate(ctx context.Context, getenv func(string) string, req httpapi.Request) (session.Principal, error)
-}
-
-// Minter creates an API key. session.MintKey is one; it is a dependency so a
-// test can make minting fail, which no valid request does.
-type Minter func(issuer session.Issuer, spec session.Spec) (session.Key, error)
-
-// Service is the agent API.
-type Service struct {
-	sessions Authenticator
-	reader   Reader
-	batch    atomic.Batch
-	now      func() time.Time
-	newID    func() string
-	mint     Minter
-}
-
-// Deps are the service's collaborators. Time, identifiers and minting are
-// injected so every branch is reachable from a test.
-type Deps struct {
-	Sessions Authenticator
-	Reader   Reader
-	// Batch performs the writes. Nil disables the routes that write.
-	Batch atomic.Batch
-	// Now is the clock.
-	Now func() time.Time
-	// NewID returns a fresh UUIDv7 in canonical text form.
-	NewID func() string
-	// Mint creates an API key (session.MintKey in production).
-	Mint Minter
-}
-
-// NewService returns a Service. A Deps without Now, NewID or Mint cannot
-// create an agent, so Batch is dropped and the routes that write answer 503,
-// rather than a create panicking on a nil function.
-func NewService(deps Deps) *Service {
-	batch := deps.Batch
-	if deps.Now == nil || deps.NewID == nil || deps.Mint == nil {
-		batch = nil
-	}
-
-	return &Service{
-		sessions: deps.Sessions, reader: deps.Reader, batch: batch,
-		now: deps.Now, newID: deps.NewID, mint: deps.Mint,
+	return Agent{
+		ID: stored.ID, Name: stored.Name, Scopes: stored.Scopes, Status: status,
+		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt,
 	}
 }
-
-// ErrNotFound is what Reader.Get reports for an id the user has no agent with.
-var ErrNotFound = errors.New("no such agent")
-
-var errNoStore = errors.New("no database is configured")

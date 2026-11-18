@@ -21,7 +21,7 @@ const (
 // corsTarget is a POST route behind CORS, as app.NewHandler builds one.
 func corsTarget(allowed string) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/x", httpapi.Serve(http.MethodPost, func(httpapi.Request, *apierr.Error) {},
+	mux.Handle("/x", serve(http.MethodPost, func(httpapi.Request, *apierr.Error) {},
 		respond(httpapi.JSON(http.StatusOK, 1))))
 
 	return httpapi.CORS(func() string { return allowed }, mux)

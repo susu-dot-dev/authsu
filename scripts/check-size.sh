@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reports where the bytes of the production Worker wasm go, and fails if it is
-# over budget or links a forbidden package. See docs/devops.md ("Lint, size
+# over budget or links a forbidden package. See docs/CI.md ("Lint, size
 # and dependencies").
 #
 # It does not build anything: `make size` builds build/app.wasm and the

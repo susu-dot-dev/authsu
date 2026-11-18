@@ -55,6 +55,45 @@ func TestVerifyAccepts(t *testing.T) {
 	}
 }
 
+// TestVerifiedCredentialFitsTheSchema is the seam between what registration
+// verifies and the credentials table that stores it: the longest credential id
+// Verify accepts is exactly what the schema allows (one byte more is refused
+// here and would be refused there), and the stored public key is within its
+// column. The limits are read from the migrations' text, so a changed CHECK is
+// noticed here and not by a failing insert.
+func TestVerifiedCredentialFitsTheSchema(t *testing.T) {
+	t.Parallel()
+
+	id := migrationLimits(t, `length\(credential_id\) BETWEEN (\d+) AND (\d+)`)
+	key := migrationLimits(t, `length\(public_key\) BETWEEN (\d+) AND (\d+)`)
+
+	if id[1] != maxCredentialIDLen {
+		t.Errorf("the schema allows credential ids up to %d bytes, Verify up to %d", id[1], maxCredentialIDLen)
+	}
+
+	for _, size := range id {
+		resp := validResponse(t)
+		resp.credID = bytes.Repeat([]byte{7}, size)
+
+		got, err := Verify(resp.build(t), testRP())
+		if err != nil {
+			t.Fatalf("a credential id of %d bytes: %v", size, err)
+		}
+
+		if stored := len(got.Credential.PublicKey); stored < key[0] || stored > key[1] {
+			t.Errorf("the stored public key is %d bytes; the schema allows %d to %d", stored, key[0], key[1])
+		}
+	}
+
+	resp := validResponse(t)
+	resp.credID = nil
+
+	_, err := Verify(resp.build(t), testRP())
+	if err == nil {
+		t.Error("an empty credential id was accepted; the schema refuses it")
+	}
+}
+
 func TestVerifyKeepsBackupBits(t *testing.T) {
 	t.Parallel()
 

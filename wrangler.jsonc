@@ -1,7 +1,7 @@
 /**
  * Wrangler configuration: https://developers.cloudflare.com/workers/wrangler/configuration/
  *
- * The Worker is built by `build.command` below. See docs/devops.md.
+ * The Worker is built by `build.command` below. See docs/CONTRIBUTING.md.
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
