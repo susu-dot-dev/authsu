@@ -369,6 +369,8 @@ func bndSnapshot(t *testing.T) string {
 		"revoked_users="+count(t, "users WHERE revoked_at IS NOT NULL"),
 		"revoked_invitations="+count(t, "invitations WHERE revoked_at IS NOT NULL"),
 		"agent_names="+scalar(t, "SELECT group_concat(name) FROM (SELECT name FROM agents ORDER BY id)"),
+		"agent_labels="+scalar(t, "SELECT group_concat(agent_id||':'||label) "+
+			"FROM (SELECT agent_id, label FROM agent_labels ORDER BY agent_id, label)"),
 		"invite_caps="+scalar(t, "SELECT group_concat(num_invites) FROM (SELECT num_invites FROM invitations ORDER BY id)"),
 	)
 

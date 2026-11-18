@@ -3,10 +3,12 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +23,10 @@ import (
 // cannot collide with the helpers of another area's test file.
 
 const (
+	// agentLabelsColumn is the labels column every agent statement returns.
+	agentLabelsColumn = "(SELECT json_group_array(label) FROM (SELECT label FROM agent_labels " +
+		"WHERE agent_id = agents.id ORDER BY label)) AS labels"
+
 	agentsUnavailable = "agents are temporarily unavailable"
 	agentOwner        = "user-1"
 	agentTarget       = "01900000-0000-7000-8000-000000000042"
@@ -35,14 +41,15 @@ const (
 // agent and sorts higher.
 func agentIDAt(n int) string { return fmt.Sprintf("01900000-0000-7000-8000-%012d", n) }
 
-// agentRowAt is a returned agent row: id, name, scopes, revoked_at, created_at.
+// agentRowAt is a returned agent row: id, name, scopes, revoked_at, created_at,
+// labels (the JSON text of an array, as json_group_array returns it).
 func agentRowAt(n int) []any {
-	return row(agentIDAt(n), "agent "+strconv.Itoa(n), `["default:agent"]`, nil, int64(1_700_000_000+n))
+	return row(agentIDAt(n), "agent "+strconv.Itoa(n), `["default:agent"]`, nil, int64(1_700_000_000+n), "[]")
 }
 
 // agentRow is the row of the agent agentTarget.
 func agentRow() []any {
-	return row(agentTarget, "build bot", `["default:agent"]`, nil, int64(1_700_000_000))
+	return row(agentTarget, "build bot", `["default:agent"]`, nil, int64(1_700_000_000), "[]")
 }
 
 // agentRevokedRow is agentRow once it is revoked.
@@ -79,6 +86,39 @@ func mustAgentCursor(tb testing.TB, values ...string) input.Cursor {
 	}
 
 	return cursor
+}
+
+func mustAgentFilter(tb testing.TB, values ...string) input.LabelFilter {
+	tb.Helper()
+
+	filter, err := input.ParseLabelFilter(values)
+	if err != nil {
+		tb.Fatalf("parse label filter %q: %v", values, err)
+	}
+
+	return filter
+}
+
+func mustAgentLabelPatch(tb testing.TB, add, remove []string) input.LabelPatch {
+	tb.Helper()
+
+	patch, err := input.ParseLabelPatch(add, remove)
+	if err != nil {
+		tb.Fatalf("parse label patch %q %q: %v", add, remove, err)
+	}
+
+	return patch
+}
+
+func mustAgentLabelSet(tb testing.TB, labels ...string) input.LabelSet {
+	tb.Helper()
+
+	set, err := input.ParseLabelSet(labels)
+	if err != nil {
+		tb.Fatalf("parse label set %q: %v", labels, err)
+	}
+
+	return set
 }
 
 func mustAgentLimit(tb testing.TB, values ...string) input.PageLimit {
@@ -247,7 +287,7 @@ type agentOp struct {
 	call func(*store.Store) ([]store.Agent, error)
 }
 
-// agentReadOps are the four operations that decode agent rows.
+// agentReadOps are the operations that decode agent rows.
 func agentReadOps(t *testing.T) []agentOp {
 	t.Helper()
 
@@ -263,7 +303,7 @@ func agentReadOps(t *testing.T) []agentOp {
 		{
 			name: "list", rejected: store.CodeAgentListRejected, one: false, outcome: returning,
 			call: func(s *store.Store) ([]store.Agent, error) {
-				page, err := s.ListAgents(ctx, agentOwner, cursor, limit)
+				page, err := s.ListAgents(ctx, agentOwner, cursor, limit, mustAgentFilter(t))
 
 				return page.Agents, passErr(err)
 			},
@@ -273,9 +313,15 @@ func agentReadOps(t *testing.T) []agentOp {
 			call: func(s *store.Store) ([]store.Agent, error) { return single(s.GetAgent(ctx, agentOwner, id)) },
 		},
 		{
-			name: "rename", rejected: store.CodeAgentUpdateRejected, one: true, outcome: returning,
+			name: "patch", rejected: store.CodeAgentUpdateRejected, one: true,
+			// A patch of a name and no labels: the rename, then the read.
+			outcome: func(rows ...[]any) outcome {
+				return outcome{results: []store.Result{{Changes: 1, Rows: nil}, {Changes: 0, Rows: rows}}, err: nil}
+			},
 			call: func(s *store.Store) ([]store.Agent, error) {
-				return single(s.RenameAgent(ctx, agentOwner, id, name))
+				return single(s.PatchAgent(ctx, agentOwner, id, store.AgentPatch{
+					Name: &name, Labels: mustAgentLabelPatch(t, nil, nil), MaxLabels: input.MaxLabelsPerAgent,
+				}))
 			},
 		},
 		{
@@ -303,12 +349,28 @@ func TestAgentDecoding(t *testing.T) {
 	}{
 		{name: "an active agent", row: agentRow(), want: store.Agent{
 			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{},
 		}},
 		{name: "a revoked agent", row: agentRevokedRow(), want: store.Agent{
 			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+			Labels: []string{},
 		}},
 		{name: "a multibyte name is kept as is", row: with(agentRow(), 1, "ビルド・ボット 🤖"), want: store.Agent{
 			ID: agentTarget, Name: "ビルド・ボット 🤖", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{},
+		}},
+		{name: "one label", row: with(agentRow(), 5, `["prod"]`), want: store.Agent{
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{"prod"},
+		}},
+		{name: "labels are kept in the order the database gave them",
+			row: with(agentRow(), 5, `["a","b.c","d-e","f_g","0"]`), want: store.Agent{
+				ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+				Labels: []string{"a", "b.c", "d-e", "f_g", "0"},
+			}},
+		{name: "labels with whitespace in the JSON", row: with(agentRow(), 5, ` [ "a" , "b" ] `), want: store.Agent{
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{"a", "b"},
 		}},
 	}
 
@@ -323,7 +385,7 @@ func TestAgentDecoding(t *testing.T) {
 				checkErr(t, err, nil)
 
 				if !reflect.DeepEqual(got, []store.Agent{test.want}) {
-					t.Errorf("agents = %+v, want %+v", got, test.want)
+					t.Errorf("agents = %+v (labels %#v), want %+v (labels %#v)", got, got[0].Labels, test.want, test.want.Labels)
 				}
 			})
 		}
@@ -351,7 +413,21 @@ func TestAgentDefects(t *testing.T) {
 		{name: "created_at is a float", row: with(agentRow(), 4, 1.7e9)},
 		{name: "created_at is text", row: with(agentRow(), 4, "now")},
 		{name: "created_at is NULL", row: with(agentRow(), 4, nil)},
-		{name: "a column too few", row: agentRow()[:4]},
+		{name: "labels is NULL", row: with(agentRow(), 5, nil)},
+		{name: "labels is an integer", row: with(agentRow(), 5, int64(1))},
+		{name: "labels is a blob", row: with(agentRow(), 5, []byte("[]"))},
+		{name: "labels is not JSON", row: with(agentRow(), 5, "a,b")},
+		{name: "labels is empty text", row: with(agentRow(), 5, "")},
+		{name: "labels is a JSON object", row: with(agentRow(), 5, `{"a":1}`)},
+		{name: "labels is a JSON string", row: with(agentRow(), 5, `"a"`)},
+		{name: "labels is JSON null", row: with(agentRow(), 5, `null`)},
+		{name: "labels holds a number", row: with(agentRow(), 5, `[1]`)},
+		{name: "labels holds null: not read as an empty label", row: with(agentRow(), 5, `[null]`)},
+		{name: "labels holds null after a label", row: with(agentRow(), 5, `["a",null]`)},
+		{name: "labels holds a nested array", row: with(agentRow(), 5, `[["a"]]`)},
+		{name: "labels is truncated", row: with(agentRow(), 5, `["a"`)},
+		{name: "a column too few", row: agentRow()[:5]},
+		{name: "the labels column is missing", row: agentRow()[:5]},
 		{name: "a column too many", row: append(agentRow(), "extra")},
 		{name: "an empty row", row: row()},
 	}
@@ -453,8 +529,8 @@ func checkAgentPage(t *testing.T, page store.AgentPage, fake *fakeExec, test age
 		t.Errorf("next = %q, want %q", page.Next, wantNext)
 	}
 
-	if args := fake.calls[0][0].Args; len(args) != 3 || args[2] != int64(test.size+1) {
-		t.Errorf("args = %#v, want the page size plus one (%d) last", args, test.size+1)
+	if args := fake.calls[0][0].Args; len(args) != 4 || args[2] != int64(test.size+1) {
+		t.Errorf("args = %#v, want the page size plus one (%d) third", args, test.size+1)
 	}
 }
 
@@ -491,7 +567,8 @@ func TestListAgentsPaging(t *testing.T) {
 
 			fake := newFake(returning(rows...))
 
-			page, err := fake.store().ListAgents(context.Background(), agentOwner, mustAgentCursor(t), test.limit)
+			page, err := fake.store().ListAgents(
+				context.Background(), agentOwner, mustAgentCursor(t), test.limit, mustAgentFilter(t))
 			checkErr(t, err, nil)
 
 			checkAgentPage(t, page, fake, test)
@@ -507,7 +584,8 @@ func TestListAgentsMoreRowsThanAsked(t *testing.T) {
 
 	fake := newFake(returning(agentRowAt(5), agentRowAt(4), agentRowAt(3)))
 
-	page, err := fake.store().ListAgents(context.Background(), agentOwner, mustAgentCursor(t), mustAgentLimit(t, "1"))
+	page, err := fake.store().ListAgents(
+		context.Background(), agentOwner, mustAgentCursor(t), mustAgentLimit(t, "1"), mustAgentFilter(t))
 
 	checkErr(t, err, defectOf(store.CodeAgentListRejected))
 
@@ -527,13 +605,23 @@ func TestListAgentsStatement(t *testing.T) {
 		cursor input.Cursor
 		limit  input.PageLimit
 
+		filter input.LabelFilter
+
 		// before is the cursor argument, or "" for the first page's bound.
 		before string
 		rows   int64
+
+		// label is the filter argument: nil for none.
+		label any
 	}{
-		{name: "first page", cursor: mustAgentCursor(t), limit: mustAgentLimit(t), before: "", rows: 26},
+		{name: "first page", cursor: mustAgentCursor(t), limit: mustAgentLimit(t), filter: mustAgentFilter(t),
+			before: "", rows: 26, label: nil},
 		{name: "after a cursor", cursor: mustAgentCursor(t, agentCursorID), limit: mustAgentLimit(t, "7"),
-			before: agentCursorID, rows: 8},
+			filter: mustAgentFilter(t), before: agentCursorID, rows: 8, label: nil},
+		{name: "filtered by a label", cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"),
+			filter: mustAgentFilter(t, "prod"), before: "", rows: 4, label: "prod"},
+		{name: "filtered, after a cursor", cursor: mustAgentCursor(t, agentCursorID), limit: mustAgentLimit(t, "3"),
+			filter: mustAgentFilter(t, "a.b_c-1"), before: agentCursorID, rows: 4, label: "a.b_c-1"},
 	}
 
 	for _, test := range tests {
@@ -542,7 +630,7 @@ func TestListAgentsStatement(t *testing.T) {
 
 			fake := newFake(returning())
 
-			_, err := fake.store().ListAgents(context.Background(), agentOwner, test.cursor, test.limit)
+			_, err := fake.store().ListAgents(context.Background(), agentOwner, test.cursor, test.limit, test.filter)
 			checkErr(t, err, nil)
 
 			before := test.before
@@ -559,10 +647,13 @@ func TestListAgentsStatement(t *testing.T) {
 				fragments: []string{
 					"FROM agents",
 					"WHERE user_id = ?1 AND id < ?2",
+					// The filter is a semi-join on the labels' primary key: one row
+					// per agent however many labels it has, and NULL is no filter.
+					"AND (?4 IS NULL OR EXISTS (SELECT 1 FROM agent_labels f WHERE f.agent_id = agents.id AND f.label = ?4))",
 					"ORDER BY id DESC",
 					"LIMIT ?3",
 				},
-				args: []any{agentOwner, before, test.rows},
+				args: []any{agentOwner, before, test.rows, test.label},
 			})
 		})
 	}
@@ -574,7 +665,8 @@ func TestListAgentsFailures(t *testing.T) {
 
 	runFailures(t, 1, store.CodeAgentListFailed, store.CodeAgentListRejected, agentsUnavailable,
 		func(s *store.Store) error {
-			return lastErr(s.ListAgents(context.Background(), agentOwner, mustAgentCursor(t), mustAgentLimit(t)))
+			return lastErr(s.ListAgents(
+				context.Background(), agentOwner, mustAgentCursor(t), mustAgentLimit(t), mustAgentFilter(t)))
 		})
 }
 
@@ -590,7 +682,8 @@ func TestGetAgentStatement(t *testing.T) {
 
 	checkAgentBatch(t, fake, wantStatement{
 		fragments: []string{
-			"SELECT id, name, scopes, revoked_at, created_at FROM agents",
+			"SELECT id, name, scopes, revoked_at, created_at,",
+			"FROM agents",
 			"WHERE id = ? AND user_id = ?",
 		},
 		args: []any{agentTarget, agentOwner},
@@ -611,6 +704,9 @@ func TestGetAgentFailures(t *testing.T) {
 type createAgentCase struct {
 	name  string
 	agent store.NewAgent
+	// labels are the labels the agent is created with, in the order they are
+	// written.
+	labels []string
 }
 
 // createAgentCases are the creates TestCreateAgentStatements pins.
@@ -630,6 +726,57 @@ func createAgentCases(t *testing.T) []createAgentCase {
 			KeyScope: `[]`, MaxActive: 1, KeyID: "kid-2", KeyJWK: `{"keys":[]}`, KeyExpiresAt: expires.Add(time.Hour),
 			CreatedAt: now.Add(time.Minute),
 		}},
+		{name: "one label", labels: []string{"prod"}, agent: store.NewAgent{
+			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
+			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+			KeyExpiresAt: expires, CreatedAt: now, Labels: mustAgentLabelSet(t, "prod"),
+		}},
+		{name: "labels are written in the order sent, not sorted", labels: []string{"zeta", "alpha", "mid"},
+			agent: store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
+				KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+				KeyExpiresAt: expires, CreatedAt: now, Labels: mustAgentLabelSet(t, "zeta", "alpha", "mid"),
+			}},
+		{name: "the most labels, each the longest", labels: longestLabelSet(), agent: store.NewAgent{
+			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
+			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+			KeyExpiresAt: expires, CreatedAt: now, Labels: mustAgentLabelSet(t, longestLabelSet()...),
+		}},
+	}
+}
+
+// longestLabelSet is the most labels a create may carry, each the longest there
+// is.
+func longestLabelSet() []string {
+	labels := make([]string, input.MaxLabelsPerCreate)
+	for i := range labels {
+		labels[i] = longestLabelOf("label-" + strconv.Itoa(i) + "-")
+	}
+
+	return labels
+}
+
+// labelStatements are the statements that give the new agent each of labels, in
+// order.
+func labelStatements(agent string, labels []string) []wantStatement {
+	statements := make([]wantStatement, len(labels))
+	for i, label := range labels {
+		statements[i] = createLabelStatement(agent, label)
+	}
+
+	return statements
+}
+
+// createLabelStatement is the statement that gives the new agent label.
+func createLabelStatement(agent, label string) wantStatement {
+	return wantStatement{
+		fragments: []string{
+			"INSERT INTO agent_labels (agent_id, label)",
+			// The agent id is read from the agent's row: no agent, no id, and the
+			// batch fails as a conflict instead of on the foreign key.
+			"VALUES ((SELECT id FROM agents WHERE id = ?1), ?2)",
+		},
+		args: []any{agent, label},
 	}
 }
 
@@ -645,7 +792,7 @@ func TestCreateAgentStatements(t *testing.T) {
 
 			// The agent insert returns the scopes it stored, which is what the
 			// caller reports. Here the row holds what was offered.
-			fake := newFake(createdAgent(test.agent.Scopes))
+			fake := newFake(createdAgent(test.agent.Scopes, test.labels...))
 
 			stored, err := fake.store().CreateAgent(context.Background(), test.agent)
 			checkErr(t, err, nil)
@@ -656,8 +803,10 @@ func TestCreateAgentStatements(t *testing.T) {
 
 			agent := test.agent
 
-			checkAgentBatch(t, fake,
-				wantStatement{
+			// The agent, its key, then each label in order: the agent is first
+			// because the others read its row.
+			fixed := []wantStatement{
+				{
 					fragments: []string{
 						"INSERT INTO agents (id, user_id, name, scopes, created_at)",
 						"SELECT ?1, u.id, ?2, ?3, ?4 FROM users u",
@@ -673,7 +822,7 @@ func TestCreateAgentStatements(t *testing.T) {
 						agent.Owner, int64(agent.MaxActive),
 					},
 				},
-				wantStatement{
+				{
 					fragments: []string{
 						"INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, agent_id, scope, created_at)",
 						// The key's owner is the agent row's, not an argument.
@@ -684,7 +833,9 @@ func TestCreateAgentStatements(t *testing.T) {
 						agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
 					},
 				},
-			)
+			}
+
+			checkAgentBatch(t, fake, slices.Concat(fixed, labelStatements(agent.ID, test.labels))...)
 
 			if strings.Contains(squash(fake.calls[0][1].Query), "'api_key'") {
 				t.Error("the key insert writes the kind as a literal; bind store.KindAPIKey")
@@ -703,6 +854,24 @@ func TestCreateAgentFailures(t *testing.T) {
 			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
 				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
 				MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+			}))
+		})
+}
+
+// TestCreateAgentWithLabelsFailures: the same failures, for a batch that also
+// writes labels. The batch has a result for each statement, so one too few or
+// too many is a defect whatever the labels, and a NOT NULL failure (the agent
+// was not created, so no statement after it had an agent to name) is still the
+// conflict the feature answers as the limit.
+func TestCreateAgentWithLabelsFailures(t *testing.T) {
+	t.Parallel()
+
+	runFailures(t, 4, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
+		func(s *store.Store) error {
+			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
+				MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+				Labels: mustAgentLabelSet(t, "a", "b"),
 			}))
 		})
 }
@@ -784,9 +953,19 @@ func TestCreateAgentByAgentFailures(t *testing.T) {
 }
 
 // createdAgent is the outcome of a create batch whose agent insert returned the
-// scopes it stored and whose key insert returned nothing.
-func createdAgent(scopes string) outcome {
-	return outcome{results: []store.Result{{Changes: 1, Rows: [][]any{row(scopes)}}, {Changes: 1, Rows: nil}}, err: nil}
+// scopes it stored and whose key insert returned nothing, followed by one result
+// for each label the batch wrote.
+func createdAgent(scopes string, labels ...string) outcome {
+	// The agent insert returns its row; every later statement (the key, then
+	// each label) changes one row and returns none.
+	results := make([]store.Result, 1+1+len(labels))
+	results[0] = store.Result{Changes: 1, Rows: [][]any{row(scopes)}}
+
+	for i := 1; i < len(results); i++ {
+		results[i] = store.Result{Changes: 1, Rows: nil}
+	}
+
+	return outcome{results: results, err: nil}
 }
 
 // TestCreateAgentResultShape holds that a batch which succeeded without the
@@ -832,13 +1011,33 @@ func TestCreateAgentResultShape(t *testing.T) {
 	}
 }
 
-// TestRenameAgent holds the outcomes of a rename: the row is whatever the one
-// statement left, so a revoked agent comes back unchanged for the caller to
+// labelsJSON is the labels column as json_group_array returns it.
+func labelsJSON(labels ...string) string {
+	encoded, err := json.Marshal(labels)
+	if err != nil {
+		panic(err)
+	}
+
+	return string(encoded)
+}
+
+// patchRead is the one batch of a patch: writes statements that change rows,
+// then the read, whose rows are what the patch returns.
+func patchRead(writes int, rows ...[]any) outcome {
+	results := make([]store.Result, writes+1)
+	results[writes] = store.Result{Changes: 0, Rows: rows}
+
+	return outcome{results: results, err: nil}
+}
+
+// TestPatchAgentOutcomes holds the outcomes of a patch: the row is whatever the
+// closing read saw, so a revoked agent comes back unchanged for the caller to
 // refuse, and no row is a missing agent.
-func TestRenameAgent(t *testing.T) {
+func TestPatchAgentOutcomes(t *testing.T) {
 	t.Parallel()
 
 	revokedAt := int64(1_700_000_100)
+	name := mustAgentName(t, "renamed")
 
 	tests := []struct {
 		name string
@@ -846,11 +1045,17 @@ func TestRenameAgent(t *testing.T) {
 		want store.Agent
 		err  error
 	}{
-		{name: "renamed", rows: [][]any{with(agentRow(), 1, "renamed")}, want: store.Agent{
+		{name: "patched, no labels", rows: [][]any{with(agentRow(), 1, "renamed")}, want: store.Agent{
 			ID: agentTarget, Name: "renamed", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{},
 		}},
-		{name: "revoked keeps its name and says so", rows: [][]any{agentRevokedRow()}, want: store.Agent{
+		{name: "patched, with labels", rows: [][]any{with(agentRow(), 5, labelsJSON("a", "b"))}, want: store.Agent{
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{"a", "b"},
+		}},
+		{name: "revoked comes back as it is and says so", rows: [][]any{agentRevokedRow()}, want: store.Agent{
 			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+			Labels: []string{},
 		}},
 		{name: "no such agent", rows: nil, err: store.ErrNotFound},
 	}
@@ -859,10 +1064,11 @@ func TestRenameAgent(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := newFake(returning(test.rows...))
+			fake := newFake(patchRead(1, test.rows...))
 
-			got, err := fake.store().RenameAgent(context.Background(), agentOwner, mustAgentID(t),
-				mustAgentName(t, "renamed"))
+			got, err := fake.store().PatchAgent(context.Background(), agentOwner, mustAgentID(t), store.AgentPatch{
+				Name: &name, Labels: mustAgentLabelPatch(t, nil, nil), MaxLabels: 20,
+			})
 
 			if !errors.Is(err, test.err) {
 				t.Fatalf("error = %v, want %v", err, test.err)
@@ -871,35 +1077,165 @@ func TestRenameAgent(t *testing.T) {
 			if !reflect.DeepEqual(got, test.want) {
 				t.Errorf("agent = %+v, want %+v", got, test.want)
 			}
-
-			// A revoked agent is final: the CASE leaves its name, and the owner
-			// is part of the match.
-			checkAgentBatch(t, fake, wantStatement{
-				fragments: []string{
-					"UPDATE agents",
-					"SET name = CASE WHEN revoked_at IS NULL THEN ?1 ELSE name END",
-					"WHERE id = ?2 AND user_id = ?3",
-					"RETURNING id, name, scopes, revoked_at, created_at",
-				},
-				args: []any{"renamed", agentTarget, agentOwner},
-			})
 		})
 	}
 }
 
-// TestRenameAgentFailures holds that a conflict is as much a defect as a
-// schema rule: a rename sets nothing the data could collide with.
-func TestRenameAgentFailures(t *testing.T) {
+// patchRename is the statement a patch's rename must be.
+func patchRename(name input.AgentName) wantStatement {
+	return wantStatement{
+		fragments: []string{
+			"UPDATE agents",
+			"SET name = ?1",
+			// A revoked agent is final.
+			"WHERE id = ?2 AND user_id = ?3 AND revoked_at IS NULL",
+		},
+		args: []any{name.String(), agentTarget, agentOwner},
+	}
+}
+
+// patchReadStatement is the closing read of every patch.
+func patchReadStatement() wantStatement {
+	return wantStatement{
+		fragments: []string{
+			"SELECT id, name, scopes, revoked_at, created_at,",
+			agentLabelsColumn,
+			"FROM agents WHERE id = ?1 AND user_id = ?2",
+		},
+		args: []any{agentTarget, agentOwner},
+	}
+}
+
+// patchRemoval is the statement that removes label.
+func patchRemoval(label string) wantStatement {
+	return wantStatement{
+		fragments: []string{
+			"DELETE FROM agent_labels",
+			"WHERE agent_id = ?1 AND label = ?2",
+			// The guard is in the delete: the owner's, and not revoked.
+			"AND EXISTS (SELECT 1 FROM agents a WHERE a.id = ?1 AND a.user_id = ?3 AND a.revoked_at IS NULL)",
+		},
+		args: []any{agentTarget, label, agentOwner},
+	}
+}
+
+// patchAddition is the statement that adds label, for agents of at most limit.
+func patchAddition(label string, limit int64) wantStatement {
+	return wantStatement{
+		fragments: []string{
+			"INSERT INTO agent_labels (agent_id, label)",
+			// A NULL agent_id at the cap is a NOT NULL failure of the batch;
+			// having the label already is never over the cap.
+			"SELECT CASE WHEN (SELECT count(*) FROM agent_labels l WHERE l.agent_id = a.id) < ?4",
+			"OR EXISTS (SELECT 1 FROM agent_labels l WHERE l.agent_id = a.id AND l.label = ?2) THEN a.id END, ?2",
+			// Only the owner's active agent: otherwise no row, and no insert.
+			"FROM agents a WHERE a.id = ?1 AND a.user_id = ?3 AND a.revoked_at IS NULL",
+			"ON CONFLICT DO NOTHING",
+		},
+		args: []any{agentTarget, label, agentOwner, limit},
+	}
+}
+
+// TestPatchAgentStatements pins the batch a patch writes, in order: the rename,
+// each removal, each addition, then the read. Every write names the owner and
+// skips a revoked agent in its own text, and the arguments are in placeholder
+// order.
+func TestPatchAgentStatements(t *testing.T) {
 	t.Parallel()
 
-	for _, f := range agentWriteFailures(1, store.CodeAgentUpdateFailed, store.CodeAgentUpdateRejected) {
+	name := mustAgentName(t, "ボット 🤖")
+	none := mustAgentLabelPatch(t, nil, nil)
+	read := patchReadStatement()
+
+	tests := []struct {
+		name  string
+		patch store.AgentPatch
+		want  []wantStatement
+	}{
+		{
+			name:  "nothing but the read",
+			patch: store.AgentPatch{Name: nil, Labels: none, MaxLabels: 20},
+			want:  []wantStatement{read},
+		},
+		{
+			name:  "a rename",
+			patch: store.AgentPatch{Name: &name, Labels: none, MaxLabels: 20},
+			want:  []wantStatement{patchRename(name), read},
+		},
+		{
+			name:  "one addition",
+			patch: store.AgentPatch{Name: nil, Labels: mustAgentLabelPatch(t, []string{"a"}, nil), MaxLabels: 20},
+			want:  []wantStatement{patchAddition("a", 20), read},
+		},
+		{
+			name:  "one removal",
+			patch: store.AgentPatch{Name: nil, Labels: mustAgentLabelPatch(t, nil, []string{"a"}), MaxLabels: 20},
+			want:  []wantStatement{patchRemoval("a"), read},
+		},
+		{
+			name: "everything: rename, removals in order, additions in order, read",
+			patch: store.AgentPatch{
+				Name: &name, Labels: mustAgentLabelPatch(t, []string{"z", "b"}, []string{"y", "c"}), MaxLabels: 7,
+			},
+			want: []wantStatement{
+				patchRename(name), patchRemoval("y"), patchRemoval("c"),
+				patchAddition("z", 7), patchAddition("b", 7), read,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(patchRead(len(test.want)-1, agentRow()))
+
+			_, err := fake.store().PatchAgent(context.Background(), agentOwner, mustAgentID(t), test.patch)
+			checkErr(t, err, nil)
+
+			checkAgentBatch(t, fake, test.want...)
+		})
+	}
+}
+
+// TestPatchAgentTheLabelCapIsTheCallers: a conflict is the batch refusing a
+// patch that would leave the agent over the limit, and it is returned as the
+// bare sentinel for the feature to name, not classified.
+func TestPatchAgentTheLabelCapIsTheCallers(t *testing.T) {
+	t.Parallel()
+
+	notNull := store.Classify(dbError(
+		"D1_ERROR: NOT NULL constraint failed: agent_labels.agent_id: SQLITE_CONSTRAINT_NOTNULL"))
+	fake := newFake(failing(notNull))
+
+	_, err := fake.store().PatchAgent(context.Background(), agentOwner, mustAgentID(t), store.AgentPatch{
+		Name: nil, Labels: mustAgentLabelPatch(t, []string{"a"}, nil), MaxLabels: 20,
+	})
+
+	if !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("error = %v, want ErrConflict", err)
+	}
+
+	if _, isAPI := errors.AsType[*apierr.Error](err); isAPI {
+		t.Errorf("the label cap %v is classified; the feature must decide that", err)
+	}
+}
+
+// TestPatchAgentFailures holds how the rest of the failures are reported. A
+// patch of only labels is two statements here (one addition and the read).
+func TestPatchAgentFailures(t *testing.T) {
+	t.Parallel()
+
+	patch := store.AgentPatch{Name: nil, Labels: mustAgentLabelPatch(t, []string{"a"}, nil), MaxLabels: 20}
+
+	for _, f := range infraFailures(2, store.CodeAgentUpdateFailed, store.CodeAgentUpdateRejected, agentsUnavailable) {
+		// A conflict is the label cap, which is the feature's to name.
 		t.Run(f.name, func(t *testing.T) {
 			t.Parallel()
 
 			fake := newFake(f.outcome)
 
-			_, err := fake.store().RenameAgent(context.Background(), agentOwner, mustAgentID(t),
-				mustAgentName(t, "renamed"))
+			_, err := fake.store().PatchAgent(context.Background(), agentOwner, mustAgentID(t), patch)
 
 			checkFailure(t, err, f)
 
@@ -910,12 +1246,88 @@ func TestRenameAgentFailures(t *testing.T) {
 	}
 }
 
+// TestPatchAgentDefects holds that a closing read that is not exactly one agent
+// is a defect.
+func TestPatchAgentDefects(t *testing.T) {
+	t.Parallel()
+
+	patch := store.AgentPatch{Name: nil, Labels: mustAgentLabelPatch(t, nil, nil), MaxLabels: 20}
+
+	tests := []struct {
+		name string
+		rows [][]any
+	}{
+		{name: "two rows", rows: [][]any{agentRow(), agentRow()}},
+		{name: "labels is not text", rows: [][]any{with(agentRow(), 5, int64(1))}},
+		{name: "labels is NULL", rows: [][]any{with(agentRow(), 5, nil)}},
+		{name: "labels is not JSON", rows: [][]any{with(agentRow(), 5, "a,b")}},
+		{name: "labels is a JSON object", rows: [][]any{with(agentRow(), 5, `{"a":1}`)}},
+		{name: "labels is a JSON string", rows: [][]any{with(agentRow(), 5, `"a"`)}},
+		{name: "labels is JSON null", rows: [][]any{with(agentRow(), 5, `null`)}},
+		{name: "labels holds a number", rows: [][]any{with(agentRow(), 5, `[1]`)}},
+		{name: "labels holds null", rows: [][]any{with(agentRow(), 5, `[null]`)}},
+		{name: "labels holds an array", rows: [][]any{with(agentRow(), 5, `[["a"]]`)}},
+		{name: "labels is empty text", rows: [][]any{with(agentRow(), 5, "")}},
+		{name: "labels is truncated JSON", rows: [][]any{with(agentRow(), 5, `["a"`)}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(patchRead(0, test.rows...))
+
+			got, err := fake.store().PatchAgent(context.Background(), agentOwner, mustAgentID(t), patch)
+
+			checkErr(t, err, defectOf(store.CodeAgentUpdateRejected))
+
+			if got.ID != "" {
+				t.Errorf("a defective result returned %+v", got)
+			}
+		})
+	}
+}
+
+// revokeStatements are the two statements a revoke runs, in order.
+func revokeStatements() []wantStatement {
+	return []wantStatement{
+		{
+			fragments: []string{
+				"UPDATE agents",
+				// An agent already revoked keeps its earlier time.
+				"SET revoked_at = COALESCE(revoked_at, ?1)",
+				"WHERE id = ?2 AND user_id = ?3",
+				"RETURNING id, name, scopes, revoked_at, created_at,",
+				agentLabelsColumn,
+			},
+			args: []any{now.Unix(), agentTarget, agentOwner},
+		},
+		{
+			fragments: []string{
+				"UPDATE japikeys",
+				"SET revoked_at = ?1",
+				"WHERE agent_id = ?2",
+				"AND user_id = ?3",
+				// A due revocation keeps its time; a later one is brought forward.
+				"AND (revoked_at IS NULL OR revoked_at > ?1)",
+				// Only once the agent is revoked, and only the owner's agent.
+				"AND EXISTS (SELECT 1 FROM agents WHERE id = ?2 AND user_id = ?3 AND revoked_at IS NOT NULL)",
+			},
+			args: []any{now.Unix(), agentTarget, agentOwner},
+		},
+	}
+}
+
 // TestRevokeAgent holds the outcomes of a revoke: the row is whatever the first
 // statement left, and the key update that follows is part of the same batch.
 func TestRevokeAgent(t *testing.T) {
 	t.Parallel()
 
 	revokedAt := int64(1_700_000_100)
+	revoked := store.Agent{
+		ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+		Labels: []string{},
+	}
 
 	tests := []struct {
 		name    string
@@ -923,12 +1335,8 @@ func TestRevokeAgent(t *testing.T) {
 		want    store.Agent
 		err     error
 	}{
-		{name: "revoked with two keys", outcome: agentRevoked(2, agentRevokedRow()), want: store.Agent{
-			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
-		}},
-		{name: "revoked with no key left to revoke", outcome: agentRevoked(0, agentRevokedRow()), want: store.Agent{
-			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
-		}},
+		{name: "revoked with two keys", outcome: agentRevoked(2, agentRevokedRow()), want: revoked},
+		{name: "revoked with no key left to revoke", outcome: agentRevoked(0, agentRevokedRow()), want: revoked},
 		{name: "no such agent", outcome: agentRevoked(0), err: store.ErrNotFound},
 	}
 
@@ -948,31 +1356,7 @@ func TestRevokeAgent(t *testing.T) {
 				t.Errorf("agent = %+v, want %+v", got, test.want)
 			}
 
-			checkAgentBatch(t, fake,
-				wantStatement{
-					fragments: []string{
-						"UPDATE agents",
-						// An agent already revoked keeps its earlier time.
-						"SET revoked_at = COALESCE(revoked_at, ?1)",
-						"WHERE id = ?2 AND user_id = ?3",
-						"RETURNING id, name, scopes, revoked_at, created_at",
-					},
-					args: []any{now.Unix(), agentTarget, agentOwner},
-				},
-				wantStatement{
-					fragments: []string{
-						"UPDATE japikeys",
-						"SET revoked_at = ?1",
-						"WHERE agent_id = ?2",
-						"AND user_id = ?3",
-						// A due revocation keeps its time; a later one is brought forward.
-						"AND (revoked_at IS NULL OR revoked_at > ?1)",
-						// Only once the agent is revoked, and only the owner's agent.
-						"AND EXISTS (SELECT 1 FROM agents WHERE id = ?2 AND user_id = ?3 AND revoked_at IS NOT NULL)",
-					},
-					args: []any{now.Unix(), agentTarget, agentOwner},
-				},
-			)
+			checkAgentBatch(t, fake, revokeStatements()...)
 		})
 	}
 }
@@ -1007,8 +1391,9 @@ func TestAgentQueriesAreChecked(t *testing.T) {
 	queries := packageQueries(t)
 
 	for _, name := range []string{
-		"agentListQuery", "agentGetQuery", "insertAgentQuery", "insertAgentKeyQuery",
-		"agentRenameQuery", "agentRevokeQuery", "agentRevokeKeysQuery",
+		"agentListQuery", "agentGetQuery", "insertAgentQuery", "insertAgentKeyQuery", "insertAgentLabelQuery",
+		"agentPatchRenameQuery", "agentPatchReadQuery", "agentLabelAddQuery", "agentLabelRemoveQuery",
+		"agentRevokeQuery", "agentRevokeKeysQuery",
 	} {
 		if _, ok := queries[name]; !ok {
 			t.Errorf("query %s was not found", name)
@@ -1026,7 +1411,8 @@ func TestAgentQueriesScopeToTheOwner(t *testing.T) {
 	queries := packageQueries(t)
 
 	for _, name := range []string{
-		"agentListQuery", "agentGetQuery", "agentRenameQuery", "agentRevokeQuery", "agentRevokeKeysQuery",
+		"agentListQuery", "agentGetQuery", "agentPatchRenameQuery", "agentPatchReadQuery",
+		"agentLabelAddQuery", "agentLabelRemoveQuery", "agentRevokeQuery", "agentRevokeKeysQuery",
 	} {
 		if !strings.Contains(squash(queries[name]), "user_id = ?") {
 			t.Errorf("%s does not match on the owner:\n%s", name, queries[name])

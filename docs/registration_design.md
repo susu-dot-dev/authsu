@@ -1,6 +1,6 @@
 # Registration: design rationale
 
-> This document explains *why* registration is shaped the way it is. It is not a spec. Request shapes, byte layouts, and SQL fragments below illustrate an idea; the code is authoritative for what actually exists.
+> This document explains *why* registration is shaped the way it is. It is not a spec. Request shapes, byte layouts, and SQL fragments below illustrate an idea; the code is authoritative for what actually exists. Do not add details of features to this document, only descrcibe overall intent if it changes
 
 Related: [invitations_design.md](invitations_design.md), [first_run_design.md](first_run_design.md), [login_design.md](login_design.md)
 

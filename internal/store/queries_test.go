@@ -119,17 +119,50 @@ func TestQueriesAreFound(t *testing.T) {
 	}
 }
 
-// TestNoQueryDeletes holds that nothing is ever deleted: accounts, invitations,
-// agents and keys are revoked and stay, because the audit trail and the
-// single-use guarantees depend on the rows existing (see the migrations).
+// mayDelete is the one place a row is deleted for real, and the table it may
+// delete from. Accounts, invitations, agents and keys are revoked and stay,
+// because the audit trail and the single-use guarantees depend on the rows
+// existing (see the migrations). An agent's labels are different: they are
+// mutable metadata its owner edits, with no authority to record (migration
+// 0006), and removing one deletes its row.
+//
+//nolint:gochecknoglobals // a fixed table shared by the tests below
+var mayDelete = map[string]string{"agentLabelRemoveQuery": "agent_labels"}
+
+// TestNoQueryDeletes holds that nothing is ever deleted, except the labels of an
+// agent: and those only by the query named in mayDelete, only from the table it
+// names, and from nothing else in the same statement.
 func TestNoQueryDeletes(t *testing.T) {
 	t.Parallel()
 
 	deletes := regexp.MustCompile(`(?i)\bDELETE\b`)
 
 	for name, query := range packageQueries(t) {
-		if deletes.MatchString(query) {
+		if !deletes.MatchString(query) {
+			continue
+		}
+
+		table, allowed := mayDelete[name]
+		if !allowed {
 			t.Errorf("%s deletes:\n%s", name, query)
+
+			continue
+		}
+
+		if got := squash(query); !strings.HasPrefix(got, "DELETE FROM "+table+" ") {
+			t.Errorf("%s may delete only from %s:\n%s", name, table, query)
+		}
+
+		if strings.Count(strings.ToUpper(query), "DELETE") != 1 {
+			t.Errorf("%s deletes more than once:\n%s", name, query)
+		}
+	}
+
+	// The allowance names a query that exists, so it cannot go stale and
+	// silently permit a future query of the same name.
+	for name := range mayDelete {
+		if _, found := packageQueries(t)[name]; !found {
+			t.Errorf("mayDelete names %s, which is not a query", name)
 		}
 	}
 }
@@ -400,6 +433,28 @@ func lastTopLevelAs(item string) int {
 // errStopRecording ends an operation after the fake has recorded its statements.
 var errStopRecording = errors.New("stop after recording")
 
+// longestLabelOf pads prefix with 'z' to exactly the longest label there is.
+func longestLabelOf(prefix string) string {
+	return prefix + strings.Repeat("z", input.MaxLabelBytes-len(prefix))
+}
+
+// largestPatch is the largest patch a request can carry: a name, and the most
+// labels to remove and to add, each of the longest length.
+func largestPatch(t *testing.T) store.AgentPatch {
+	t.Helper()
+
+	name := mustAgentName(t, "agent")
+	added := make([]string, input.MaxLabelsPerPatch)
+	removed := make([]string, input.MaxLabelsPerPatch)
+
+	for i := range added {
+		added[i] = longestLabelOf("add-" + strconv.Itoa(i) + "-")
+		removed[i] = longestLabelOf("remove-" + strconv.Itoa(i) + "-")
+	}
+
+	return store.AgentPatch{Name: &name, Labels: mustAgentLabelPatch(t, added, removed), MaxLabels: 1 << 30}
+}
+
 // operations is every exported method of the Store, each called with the
 // largest values its inputs can carry. The fake it runs over fails the call
 // after recording its statements, which is all the tests below read.
@@ -449,16 +504,18 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 			_, _ = s.RevokeUser(ctx, mustUserID(t, userID1), userAdminRole, farthest)
 		},
 		"ListAgents": func(s *store.Store) {
-			_, _ = s.ListAgents(ctx, "owner", mustAgentCursor(t, agentIDAt(1)), mustAgentLimit(t, "100"))
+			_, _ = s.ListAgents(ctx, "owner", mustAgentCursor(t, agentIDAt(1)), mustAgentLimit(t, "100"),
+				mustAgentFilter(t, strings.Repeat("z", input.MaxLabelBytes)))
 		},
 		"GetAgent": func(s *store.Store) { _, _ = s.GetAgent(ctx, "owner", agentID) },
 		"CreateAgent": func(s *store.Store) {
 			_, _ = s.CreateAgent(ctx, store.NewAgent{
 				ID: "id", Owner: "owner", Name: mustAgentName(t, "agent"), Scopes: "[]", KeyScope: "[]", MaxActive: 1 << 30,
 				KeyID: "kid", KeyJWK: "{}", KeyExpiresAt: farthest, CreatedAt: farthest,
+				Labels: mustAgentLabelSet(t, longestLabelSet()...),
 			})
 		},
-		"RenameAgent": func(s *store.Store) { _, _ = s.RenameAgent(ctx, "owner", agentID, mustAgentName(t, "agent")) },
+		"PatchAgent":  func(s *store.Store) { _, _ = s.PatchAgent(ctx, "owner", agentID, largestPatch(t)) },
 		"RevokeAgent": func(s *store.Store) { _, _ = s.RevokeAgent(ctx, "owner", agentID, farthest) },
 	}
 }

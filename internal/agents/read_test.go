@@ -61,7 +61,7 @@ func TestAnIdThatIsNotAnAgentIdNeverReachesTheStore(t *testing.T) {
 		id   string
 	}{
 		{name: "words", id: "nope"},
-		{name: "upper case", id: "00000000-0000-7000-8000-0000000000A1"},
+		{name: caseUpper, id: "00000000-0000-7000-8000-0000000000A1"},
 		{name: "too long", id: agentA1 + "0"},
 		{name: "too short", id: agentA1[:35]},
 		{name: "no dashes", id: "000000000000700080000000000000a1"},
@@ -71,16 +71,16 @@ func TestAnIdThatIsNotAnAgentIdNeverReachesTheStore(t *testing.T) {
 		{name: "not hex", id: "00000000-0000-7000-8000-0000000000g1"},
 		{name: "a sql comment", id: "00000000-0000-7000-8000-0000000000--"},
 		{name: "a sql injection", id: "%27%20OR%20%271%27%3D%271"},
-		{name: "a wildcard", id: "%25"},
-		{name: "a newline", id: "00000000-0000-7000-8000-0000000000a%0a"},
-		{name: "a NUL", id: "00000000-0000-7000-8000-0000000000a%00"},
+		{name: caseWildcard, id: "%25"},
+		{name: "a line feed id", id: "00000000-0000-7000-8000-0000000000a%0a"},
+		{name: caseNUL, id: "00000000-0000-7000-8000-0000000000a%00"},
 		{name: "an arabic-indic digit", id: "00000000-0000-7000-8000-0000000000%D9%A0%D9%A0"},
 		{name: "the first-page sentinel", id: "g"},
 	}
 
 	routes := []agentRoute{
 		{name: routeGet, method: http.MethodGet, target: "", body: ""},
-		{name: routeRename, method: http.MethodPatch, target: "", body: bodyX},
+		{name: routePatch, method: http.MethodPatch, target: "", body: bodyX},
 		{name: routeRevoke, method: http.MethodDelete, target: "", body: ""},
 	}
 

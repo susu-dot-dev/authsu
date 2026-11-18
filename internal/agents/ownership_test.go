@@ -16,7 +16,7 @@ func TestAnotherUsersAgentIsNotFound(t *testing.T) {
 
 	routes := []agentRoute{
 		{name: routeGet, method: http.MethodGet, target: itemPrefix + agentA1, body: ""},
-		{name: routeRename, method: http.MethodPatch, target: itemPrefix + agentA1, body: `{"name":"hijacked"}`},
+		{name: routePatch, method: http.MethodPatch, target: itemPrefix + agentA1, body: `{"name":"hijacked"}`},
 		{name: routeRevoke, method: http.MethodDelete, target: itemPrefix + agentA1, body: ""},
 	}
 
@@ -49,7 +49,7 @@ func TestAnotherUsersAgentIsNotFound(t *testing.T) {
 				}
 
 				// Nothing of A's changed.
-				if got := rg.store.agent(t, agentA1); got != stored(agentA1, nameAlpha, 1, nil) {
+				if got := rg.store.agent(t, agentA1); !sameAgent(got, stored(agentA1, nameAlpha, 1, nil)) {
 					t.Errorf("A's agent became %+v", got)
 				}
 
@@ -78,7 +78,7 @@ func TestTheOwnerIsAlwaysTheSession(t *testing.T) {
 		{name: routeList, method: http.MethodGet, target: collection + noise, body: ""},
 		{name: routeCreate, method: http.MethodPost, target: collection + noise, body: bodyAssistant},
 		{name: routeGet, method: http.MethodGet, target: itemPrefix + agentA1 + noise, body: ""},
-		{name: routeRename, method: http.MethodPatch, target: itemPrefix + agentA1 + noise, body: bodyX},
+		{name: routePatch, method: http.MethodPatch, target: itemPrefix + agentA1 + noise, body: bodyX},
 		{name: routeRevoke, method: http.MethodDelete, target: itemPrefix + agentA1 + noise, body: ""},
 	}
 
@@ -107,7 +107,7 @@ func TestTheOwnerIsAlwaysTheSession(t *testing.T) {
 				}
 			}
 
-			if got := rg.store.agent(t, agentA1); got != stored(agentA1, nameAlpha, 1, nil) {
+			if got := rg.store.agent(t, agentA1); !sameAgent(got, stored(agentA1, nameAlpha, 1, nil)) {
 				t.Errorf("A's agent became %+v", got)
 			}
 		})
@@ -128,7 +128,7 @@ func TestABodyCannotNameAnOwner(t *testing.T) {
 
 	targets := []agentRoute{
 		{name: routeCreate, method: http.MethodPost, target: collection, body: ""},
-		{name: routeRename, method: http.MethodPatch, target: itemPrefix + agentB1, body: ""},
+		{name: routePatch, method: http.MethodPatch, target: itemPrefix + agentB1, body: ""},
 	}
 
 	for _, route := range targets {
@@ -173,7 +173,7 @@ func TestListsHoldOnlyTheCallersAgents(t *testing.T) {
 			name: "B with a cursor that is A's agent", who: userB, target: collection + "?cursor=" + agentA2,
 			want: `{"agents":[` + agentJSON(agentB0, "zero", 4, nil) + `]}`,
 		},
-		{name: "a user with none", who: "00000000-0000-7000-8000-0000000000dd", target: collection, want: `{"agents":[]}`},
+		{name: "a user with none", who: "00000000-0000-7000-8000-0000000000dd", target: collection, want: bodyNoAgents},
 	}
 
 	for _, tt := range tests {

@@ -478,6 +478,44 @@ func (r *row) blob() []byte {
 	return bytes
 }
 
+// labels reads a column that holds a JSON array of strings, as
+// json_group_array produces it. Anything else (not text, not JSON, not an array,
+// an element that is not a string) is a defect and returns nil. On success the
+// result is never nil: no labels is an empty slice.
+//
+// Elements are decoded as pointers because encoding/json turns a JSON null
+// element of a []string into "" without an error, which would read a corrupt
+// column as an empty label.
+func (r *row) labels() []string {
+	text := r.text()
+	if r.err != nil {
+		return nil
+	}
+
+	var elements []*string
+
+	err := json.Unmarshal([]byte(text), &elements)
+	if err != nil || elements == nil {
+		r.failf("column %d is not a JSON array of strings", r.at-1)
+
+		return nil
+	}
+
+	labels := make([]string, len(elements))
+
+	for i, element := range elements {
+		if element == nil {
+			r.failf("column %d has a null element", r.at-1)
+
+			return nil
+		}
+
+		labels[i] = *element
+	}
+
+	return labels
+}
+
 // octet reads an integer column the schema checks to 0..255 (credential flags).
 // A value outside it is a defect and not a truncation.
 func (r *row) octet() uint8 {
