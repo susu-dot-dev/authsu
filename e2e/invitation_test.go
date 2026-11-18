@@ -128,8 +128,8 @@ func TestInvitationList(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		`"id":"` + invA + `"`, `"uses":1`, `"numInvites":2`, `"status":"active"`,
-		`"id":"` + invB + `"`, `"status":"revoked"`, `"revokedAt":`,
+		`"id":"` + invA + `"`, `"uses":1`, `"numInvites":2`, statusActiveJSON,
+		`"id":"` + invB + `"`, statusRevokedJSON, `"revokedAt":`,
 		`"type":"first_run"`, // the first-run invitation registerPasskey made is listed too
 	} {
 		if !strings.Contains(got.body, want) {
@@ -255,7 +255,7 @@ func TestInvitationRevoke(t *testing.T) {
 	revoke := func(id string) reply { return call(t, http.MethodDelete, invitationPath+"/"+id, nil, token) }
 
 	got := revoke(invA)
-	if got.status != http.StatusOK || !strings.Contains(got.body, `"status":"revoked"`) {
+	if got.status != http.StatusOK || !strings.Contains(got.body, statusRevokedJSON) {
 		t.Fatalf("DELETE = %d %s, want 200 and revoked", got.status, got.body)
 	}
 
@@ -289,27 +289,15 @@ func TestInvitationRoutingUnderTinyGo(t *testing.T) {
 	token := login(t, registerPasskey(t))
 	itemPath := invitationPath + "/" + invA
 
-	tests := map[string]struct {
-		method, path string
-		want         int
-		allow        string
-	}{
-		"collection rejects PATCH":  {http.MethodPatch, invitationPath, http.StatusMethodNotAllowed, "GET, POST"},
-		"collection rejects PUT":    {http.MethodPut, invitationPath, http.StatusMethodNotAllowed, "GET, POST"},
-		"item rejects GET":          {http.MethodGet, itemPath, http.StatusMethodNotAllowed, "DELETE, PATCH"},
-		"item rejects POST":         {http.MethodPost, itemPath, http.StatusMethodNotAllowed, "DELETE, PATCH"},
-		"two segments are no route": {http.MethodDelete, itemPath + "/x", http.StatusNotFound, ""},
-	}
+	m := http.StatusMethodNotAllowed
 
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			got := call(t, tt.method, tt.path, nil, token)
-			if got.status != tt.want || got.header.Get("Allow") != tt.allow {
-				t.Errorf("%s %s = %d (Allow %q) %s, want %d (Allow %q)",
-					tt.method, tt.path, got.status, got.header.Get("Allow"), got.body, tt.want, tt.allow)
-			}
-		})
-	}
+	expectRouting(t, token, map[string]routingCase{
+		"collection rejects PATCH": {http.MethodPatch, invitationPath, m, allowGetPost},
+		"collection rejects PUT":   {http.MethodPut, invitationPath, m, allowGetPost},
+		"item rejects GET":         {http.MethodGet, itemPath, m, "DELETE, PATCH"},
+		"item rejects POST":        {http.MethodPost, itemPath, m, "DELETE, PATCH"},
+		nameNoRouteForPath:         {http.MethodDelete, itemPath + "/x", http.StatusNotFound, ""},
+	})
 }
 
 // TestInvitationCORS: the UI's origin may preflight PATCH and DELETE, which are

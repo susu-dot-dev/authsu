@@ -57,6 +57,7 @@ func TestRevokeRevokesTheAccountAndItsKeys(t *testing.T) {
 	want := []atomic.Statement{
 		{Query: revokeQuery, Args: []any{now, testUserID, roleAdmin}},
 		{Query: revokeKeysQuery, Args: []any{now, testUserID}},
+		{Query: revokeAgentsQuery, Args: []any{now, testUserID}},
 	}
 
 	if !reflect.DeepEqual(batch, want) {

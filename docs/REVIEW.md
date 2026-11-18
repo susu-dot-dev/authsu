@@ -1,0 +1,6 @@
+AI agents may NEVER edit this file.
+
+* The default code-flow style should be [Result](../internal/result.result.go) based where feasible. Fall back to if err != nil return err when the semantics cause more complications than control flow saved. Unit tests are exempt from this requirement
+* Sql queries must be atomic. Never check-and-set, or set-then-get with non-atomic queries. Queries can be made atomic with WHEN predicates, or by using batch() and checking the rows modified or return value
+* This is a security, auth service and tests must exhaustively guarantee the correctness of the behavior. Things that must be verified include: All input edge cases, interleaving and timing conditions, too large payloads (especially that lead to database inserts), permission confusion etc. Pay attention to type and bound confusion between different layers - JSON & rest API's, golang types, wasm JS types, and database types.
+* To avoid unmaintainable tests, given the heightened test requirements, tests should be data-driven where possible

@@ -23,6 +23,8 @@ func corsRoutes() []corsRoute {
 		{invitationPath, http.MethodGet}, {invitationPath, http.MethodPost},
 		{invitationItem, http.MethodPatch}, {invitationItem, http.MethodDelete},
 		{userPath, http.MethodGet}, {userItem, http.MethodGet}, {userItem, http.MethodDelete},
+		{agentPath, http.MethodGet}, {agentPath, http.MethodPost},
+		{agentItem, http.MethodGet}, {agentItem, http.MethodPatch}, {agentItem, http.MethodDelete},
 	}
 }
 

@@ -103,8 +103,8 @@ func TestUserListAndGet(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		`"id":"` + adminID(t) + `"`, `"role":"admin"`, `"profile":{"name":"Login Tester"}`, `"status":"active"`,
-		`"id":"` + userB + `"`, `"status":"revoked"`, `"revokedAt":12345`,
+		`"id":"` + adminID(t) + `"`, `"role":"admin"`, `"profile":{"name":"Login Tester"}`, statusActiveJSON,
+		`"id":"` + userB + `"`, statusRevokedJSON, `"revokedAt":12345`,
 	} {
 		if !strings.Contains(list.body, want) {
 			t.Errorf("list lacks %s:\n%s", want, list.body)
@@ -139,7 +139,7 @@ func TestUserRevoke(t *testing.T) {
 	seedSession(t, "00000000-0000-7000-8000-00000000c001", userB)
 
 	got := revokeUser(t, token, userB)
-	if got.status != http.StatusOK || !strings.Contains(got.body, `"status":"revoked"`) {
+	if got.status != http.StatusOK || !strings.Contains(got.body, statusRevokedJSON) {
 		t.Fatalf("DELETE = %d %s, want 200 and revoked", got.status, got.body)
 	}
 
@@ -243,24 +243,12 @@ func TestUserRoutingUnderTinyGo(t *testing.T) {
 	token := login(t, registerPasskey(t))
 	itemPath := userPath + "/" + userB
 
-	tests := map[string]struct {
-		method, path string
-		want         int
-		allow        string
-	}{
-		"collection rejects DELETE": {http.MethodDelete, userPath, http.StatusMethodNotAllowed, "GET"},
-		"collection rejects POST":   {http.MethodPost, userPath, http.StatusMethodNotAllowed, "GET"},
-		"item rejects PATCH":        {http.MethodPatch, itemPath, http.StatusMethodNotAllowed, "DELETE, GET"},
-		"two segments are no route": {http.MethodGet, itemPath + "/x", http.StatusNotFound, ""},
-	}
+	m := http.StatusMethodNotAllowed
 
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			got := call(t, tt.method, tt.path, nil, token)
-			if got.status != tt.want || got.header.Get("Allow") != tt.allow {
-				t.Errorf("%s %s = %d (Allow %q) %s, want %d (Allow %q)",
-					tt.method, tt.path, got.status, got.header.Get("Allow"), got.body, tt.want, tt.allow)
-			}
-		})
-	}
+	expectRouting(t, token, map[string]routingCase{
+		"collection rejects DELETE": {http.MethodDelete, userPath, m, "GET"},
+		"collection rejects POST":   {http.MethodPost, userPath, m, "GET"},
+		"item rejects PATCH":        {http.MethodPatch, itemPath, m, "DELETE, GET"},
+		nameNoRouteForPath:          {http.MethodGet, itemPath + "/x", http.StatusNotFound, ""},
+	})
 }

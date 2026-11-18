@@ -34,8 +34,8 @@ func TestUserRoutesAnswerTheirMethods(t *testing.T) {
 		allowed []string
 		allow   string
 	}{
-		"collection": {path: userPath, allowed: []string{http.MethodGet}, allow: "GET"},
-		"item":       {path: userItem, allowed: []string{http.MethodGet, http.MethodDelete}, allow: "DELETE, GET"},
+		caseCollection: {path: userPath, allowed: []string{http.MethodGet}, allow: "GET"},
+		caseItem:       {path: userItem, allowed: []string{http.MethodGet, http.MethodDelete}, allow: "DELETE, GET"},
 	}
 
 	for name, tt := range tests {

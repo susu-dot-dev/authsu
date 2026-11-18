@@ -27,8 +27,10 @@ func TestInvitationRoutesAnswerTheirMethods(t *testing.T) {
 		allowed []string
 		allow   string
 	}{
-		"collection": {path: invitationPath, allowed: []string{http.MethodGet, http.MethodPost}, allow: "GET, POST"},
-		"item":       {path: invitationItem, allowed: []string{http.MethodPatch, http.MethodDelete}, allow: "DELETE, PATCH"},
+		caseCollection: {path: invitationPath, allowed: []string{http.MethodGet, http.MethodPost}, allow: "GET, POST"},
+		caseItem: {
+			path: invitationItem, allowed: []string{http.MethodPatch, http.MethodDelete}, allow: "DELETE, PATCH",
+		},
 	}
 
 	for name, tt := range tests {
@@ -67,10 +69,10 @@ func TestInvitationRoutesWithoutADatabaseAreUnavailable(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct{ method, path string }{
-		"list":   {http.MethodGet, invitationPath},
-		"create": {http.MethodPost, invitationPath},
-		"update": {http.MethodPatch, invitationItem},
-		"revoke": {http.MethodDelete, invitationItem},
+		caseList:   {http.MethodGet, invitationPath},
+		"create":   {http.MethodPost, invitationPath},
+		"update":   {http.MethodPatch, invitationItem},
+		caseRevoke: {http.MethodDelete, invitationItem},
 	}
 
 	for name, tt := range tests {
@@ -110,9 +112,9 @@ func TestInvitationRoutesRequireASession(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct{ method, path, body string }{
-		"list":   {http.MethodGet, invitationPath, ""},
-		"update": {http.MethodPatch, invitationItem, `{"numInvites":2}`},
-		"revoke": {http.MethodDelete, invitationItem, ""},
+		caseList:   {http.MethodGet, invitationPath, ""},
+		"update":   {http.MethodPatch, invitationItem, `{"numInvites":2}`},
+		caseRevoke: {http.MethodDelete, invitationItem, ""},
 	}
 
 	for name, tt := range tests {

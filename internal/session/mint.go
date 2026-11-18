@@ -37,22 +37,44 @@ func IssuerFor(api deploy.Origin) Issuer {
 // pair, one signed JWT, and the public key as a JWK document. The private key is
 // not returned and not kept.
 func Mint(issuer Issuer, userID string, expires time.Time) (Key, error) {
-	return mintWith(json.Marshal, issuer, userID, expires)
+	return mintWith(json.Marshal, issuer, Spec{
+		Kind: KindSession, Subject: userID, Expires: expires, Claims: nil,
+	})
 }
 
-// mintWith is Mint with the JSON encoder injected, so that its failure, which
+// Spec describes a key to mint.
+type Spec struct {
+	// Kind is the kind of key, which decides the token's audience.
+	Kind string
+	// Subject is the token's sub: the user, always, even for an agent's key.
+	Subject string
+	// Expires is the token's exp.
+	Expires time.Time
+	// Claims are extra claims to sign into the token, such as act and scope.
+	// japikey writes its own claims (sub, iss, aud, exp, iat, ver) after
+	// these, so none of them can be overridden from here.
+	Claims map[string]any
+}
+
+// MintKey creates a key as Spec describes: a fresh key pair, one signed JWT, and
+// the public key as a JWK document. The private key is not returned and not kept.
+func MintKey(issuer Issuer, spec Spec) (Key, error) {
+	return mintWith(json.Marshal, issuer, spec)
+}
+
+// mintWith is MintKey with the JSON encoder injected, so that its failure, which
 // no valid key causes, is reachable from a test.
-func mintWith(marshal func(any) ([]byte, error), issuer Issuer, userID string, expires time.Time) (Key, error) {
+func mintWith(marshal func(any) ([]byte, error), issuer Issuer, spec Spec) (Key, error) {
 	minted, err := japikey.NewJAPIKey(japikey.Config{
-		Subject:           userID,
+		Subject:           spec.Subject,
 		Issuer:            issuer.Base,
-		Audience:          Audience(KindSession),
-		ExpiresAt:         expires,
-		Claims:            nil,
+		Audience:          Audience(spec.Kind),
+		ExpiresAt:         spec.Expires,
+		Claims:            spec.Claims, // a map[string]any is assignable to jwt.MapClaims
 		AllowInsecureHTTP: issuer.Insecure,
 	})
 	if err != nil {
-		return Key{}, fmt.Errorf("mint session key: %w", err)
+		return Key{}, fmt.Errorf("mint %s key: %w", spec.Kind, err)
 	}
 
 	document, err := minted.ToJWKS()
@@ -70,7 +92,7 @@ func mintWith(marshal func(any) ([]byte, error), issuer Issuer, userID string, e
 		ID:        minted.KeyID,
 		JWT:       minted.JWT,
 		JWK:       jwk,
-		ExpiresAt: expires,
+		ExpiresAt: spec.Expires,
 		PublicKey: minted.PublicKey,
 	}, nil
 }

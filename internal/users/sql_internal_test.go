@@ -31,8 +31,13 @@ func TestQueriesKeepTheirConditions(t *testing.T) {
 			"AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)",
 		}},
 		"keys never move a revocation later": {revokeKeysQuery, []string{"AND (revoked_at IS NULL OR revoked_at > ?1)"}},
-		"list orders newest first":           {listQuery, []string{"ORDER BY created_at DESC, id DESC"}},
-		"get is by id":                       {getQuery, []string{"WHERE id = ?"}},
+		"agents follow only a revoked account": {revokeAgentsQuery, []string{
+			"WHERE user_id = ?2",
+			"AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)",
+		}},
+		"agents keep an earlier revocation": {revokeAgentsQuery, []string{"AND revoked_at IS NULL"}},
+		"list orders newest first":          {listQuery, []string{"ORDER BY created_at DESC, id DESC"}},
+		"get is by id":                      {getQuery, []string{"WHERE id = ?"}},
 	}
 
 	for name, tt := range tests {
@@ -54,7 +59,9 @@ func TestQueriesKeepTheirConditions(t *testing.T) {
 func TestRevocationNeverDeletes(t *testing.T) {
 	t.Parallel()
 
-	for name, query := range map[string]string{"account": revokeQuery, "keys": revokeKeysQuery} {
+	queries := map[string]string{"account": revokeQuery, "keys": revokeKeysQuery, "agents": revokeAgentsQuery}
+
+	for name, query := range queries {
 		if strings.Contains(strings.ToUpper(query), "DELETE") {
 			t.Errorf("%s query deletes:\n%s", name, query)
 		}

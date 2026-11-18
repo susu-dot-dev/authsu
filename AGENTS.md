@@ -37,7 +37,7 @@ The `Makefile` is the only entrypoint; CI runs the same targets. `make help` lis
 | `make dev` | Run the Worker locally on :8787 with a local D1 |
 | `make fmt` | Format Go code |
 
-Run the Worker with `make dev`. Bare `npx wrangler dev` skips the migrations and the localhost relying party overrides.
+The e2e, and size checks are expensive to run. Minimize the times it must be run by focusing on make check for the dev cycle, and only running make e2e at the end. Save the e2e results to a log file, so you can immediately get logs upon error, rather than having to retry
 
 ## Conventions
 
@@ -49,6 +49,6 @@ The full rules, and the reasons, are in `docs/devops.md`. The ones that are easy
 - **There is one build.** No dev/prod variants, build tags for behaviour, or build-time dependency injection. The only build tags are `e2e` (for `e2e/`) and the `js && wasm` split of `cmd/worker`. Do not add a feature that exists only in some builds.
 - **TinyGo's `net/http` differs from Go's.** `http.ServeMux` never matches method-qualified patterns such as `"GET /x"`; register plain paths and dispatch on `r.Method`. Host tests cannot catch this, so e2e tests are how you find out.
 - **The linter is strict (nearly every linter enabled).** Fix the code rather than adding `//nolint`; when a suppression is genuinely needed it must name the linter and give a reason.
-- **Binary size is gated.** Linking a heavy package such as `encoding/json` can add hundreds of KB under TinyGo and will fail `make size`. Raise the budget deliberately, in the PR that justifies it.
 - **Migrations are append-only.** Never edit a migration that has landed on `main`; add a new one. Production migrations are applied by hand (see `docs/runbook.md`).
 - **Do not add third-party GitHub Actions** without maintainer approval, and pin any action to a full commit SHA.
+- **Code reviews must follow [./docs/REVIEW.md](REVIEW.md). Before starting on tasks, agents should also read the file to shape their behavior
