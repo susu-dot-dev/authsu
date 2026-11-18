@@ -112,7 +112,7 @@ type healthBody struct {
 // the service is misconfigured or its database is down.
 func healthRoute() auth.Route {
 	return auth.Route{
-		Method: http.MethodGet, Path: PathHealth, MaxBody: 0, Credential: auth.None, Require: nil,
+		Method: http.MethodGet, Path: PathHealth, MaxBody: 0, Credential: auth.None,
 		Handle: func(*auth.Call) result.Result[httpapi.Response] {
 			return result.Ok(httpapi.JSON(http.StatusOK, healthBody{Status: "ok"}))
 		},

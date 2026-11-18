@@ -4,6 +4,7 @@ package store_test
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,9 +17,9 @@ const (
 )
 
 // keyRow is the row ActiveKey reads: jwk, user_id, credential_id, role,
-// expires_at.
+// expires_at, agent_id, agent_scopes.
 func keyRow() []any {
-	return row(`{"keys":[]}`, "user-1", "cred-row-1", "admin", int64(1_700_000_600))
+	return row(`{"keys":[]}`, "user-1", "cred-row-1", "admin", int64(1_700_000_600), "", "")
 }
 
 // TestActiveKeyDecoding holds how the key row becomes an ActiveKey, and that
@@ -32,6 +33,8 @@ func TestActiveKeyDecoding(t *testing.T) {
 	}
 	noPasskey := active
 	noPasskey.CredentialID = ""
+	agentKey := active
+	agentKey.CredentialID, agentKey.AgentID, agentKey.AgentScopes = "", "agent-1", `["agent:read"]`
 
 	tests := []struct {
 		name  string
@@ -42,6 +45,8 @@ func TestActiveKeyDecoding(t *testing.T) {
 		{name: "an active session key", rows: [][]any{keyRow()}, want: active, found: true},
 		{name: "a key with no passkey reads an empty credential id",
 			rows: [][]any{with(keyRow(), 2, "")}, want: noPasskey, found: true},
+		{name: "an agent's key reads the agent's id and current scopes",
+			rows: [][]any{with(with(with(keyRow(), 2, ""), 5, "agent-1"), 6, `["agent:read"]`)}, want: agentKey, found: true},
 		{name: "no key", rows: nil},
 		{name: "an empty result", rows: [][]any{}},
 	}
@@ -62,6 +67,7 @@ func TestActiveKeyDecoding(t *testing.T) {
 
 			if !reflect.DeepEqual(got.JWK, test.want.JWK) || got.UserID != test.want.UserID ||
 				got.CredentialID != test.want.CredentialID || got.Role != test.want.Role ||
+				got.AgentID != test.want.AgentID || got.AgentScopes != test.want.AgentScopes ||
 				!got.ExpiresAt.Equal(test.want.ExpiresAt) {
 				t.Errorf("key = %+v, want %+v", got, test.want)
 			}
@@ -88,7 +94,12 @@ func TestActiveKeyDefects(t *testing.T) {
 		{name: "expires_at is a float", rows: [][]any{with(keyRow(), 4, 1.7e9)}},
 		{name: "expires_at is text", rows: [][]any{with(keyRow(), 4, "soon")}},
 		{name: "expires_at is NULL", rows: [][]any{with(keyRow(), 4, nil)}},
-		{name: "a column too few", rows: [][]any{keyRow()[:4]}},
+		{name: "agent id is NULL", rows: [][]any{with(keyRow(), 5, nil)}},
+		{name: "agent id is an integer", rows: [][]any{with(keyRow(), 5, int64(1))}},
+		{name: "agent scopes is NULL", rows: [][]any{with(keyRow(), 6, nil)}},
+		{name: "agent scopes is a blob", rows: [][]any{with(keyRow(), 6, []byte("[]"))}},
+		{name: "a column too few", rows: [][]any{keyRow()[:6]}},
+		{name: "four columns", rows: [][]any{keyRow()[:4]}},
 		{name: "a column too many", rows: [][]any{append(keyRow(), "extra")}},
 		{name: "an empty row", rows: [][]any{row()}},
 	}
@@ -136,6 +147,12 @@ func TestActiveKeyStatement(t *testing.T) {
 					"AND k.expires_at > ?",
 					"AND u.revoked_at IS NULL",
 					"COALESCE(k.credential_id, '') AS credential_id",
+					// The agent's scopes are read now, from its row, and a key of a
+					// revoked agent is not active whether or not its own row was
+					// revoked with it.
+					"LEFT JOIN agents a ON a.id = k.agent_id",
+					"COALESCE(a.scopes, '') AS agent_scopes",
+					"AND (k.agent_id IS NULL OR (a.id IS NOT NULL AND a.revoked_at IS NULL))",
 				},
 				args: []any{"kid-1", kind, now.Unix(), now.Unix()},
 			})
@@ -178,7 +195,7 @@ func TestCreateSession(t *testing.T) {
 
 			err := fake.store().CreateSession(context.Background(), store.NewSession{
 				KeyID: "kid-1", CredentialRowID: "cred-row-1", JWK: `{"keys":[{}]}`, ExpiresAt: expires,
-				GrantedFrom: granted, Flags: test.flags, CreatedAt: now,
+				GrantedFrom: granted, Scope: `["default:session"]`, Flags: test.flags, CreatedAt: now,
 			})
 			checkErr(t, err, nil)
 
@@ -189,13 +206,13 @@ func TestCreateSession(t *testing.T) {
 				},
 				wantStatement{
 					fragments: []string{
-						"INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, granted_from, credential_id, created_at)",
+						"INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, granted_from, credential_id, scope, created_at)",
 						"(SELECT c.user_id FROM credentials c JOIN users u ON u.id = c.user_id " +
 							"WHERE c.id = ? AND u.revoked_at IS NULL)",
 					},
 					args: []any{
 						"kid-1", "cred-row-1", store.KindSession, `{"keys":[{}]}`, expires.Unix(),
-						granted, "cred-row-1", now.Unix(),
+						granted, "cred-row-1", `["default:session"]`, now.Unix(),
 					},
 				},
 			)
@@ -217,9 +234,9 @@ func TestCreateSessionFailures(t *testing.T) {
 		})
 }
 
-// TestRevokeSession holds the outcome of a logout: the number of rows the write
+// TestRevokeKey holds the outcome of a logout: the number of rows the write
 // changed says whether this request ended the session.
-func TestRevokeSession(t *testing.T) {
+func TestRevokeKey(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -229,7 +246,7 @@ func TestRevokeSession(t *testing.T) {
 		err     *wantErr
 	}{
 		{name: "this request ended the session", changes: 1, revoked: true},
-		{name: "already revoked, or not a session", changes: 0},
+		{name: "already revoked, or unknown", changes: 0},
 		{name: "more than one row is impossible for a key id", changes: 2, err: defectOf(store.CodeSessionLogoutRejected)},
 	}
 
@@ -239,7 +256,7 @@ func TestRevokeSession(t *testing.T) {
 
 			fake := newFake(changed(test.changes))
 
-			revoked, err := fake.store().RevokeSession(context.Background(), "kid-1", now)
+			revoked, err := fake.store().RevokeKey(context.Background(), "user-1", "kid-1", now)
 
 			checkErr(t, err, test.err)
 
@@ -247,27 +264,34 @@ func TestRevokeSession(t *testing.T) {
 				t.Errorf("revoked = %v, want %v", revoked, test.revoked)
 			}
 
-			// A key that is already revoked keeps its earlier time: logging out
-			// twice cannot move a revocation later. Only sessions are touched.
+			// A key that is already revoked keeps its earlier time: revoking twice
+			// cannot move a revocation later. The kind is not a condition: the key
+			// a request presented is the one that ends, session or API key. The
+			// owner is: the write itself, and not a read before it, guarantees
+			// the key is the user's.
 			checkStatements(t, fake, wantStatement{
 				fragments: []string{
 					"UPDATE japikeys SET revoked_at = ?",
 					"WHERE kid = ?",
-					"AND kind = ?",
+					"AND user_id = ?",
 					"AND revoked_at IS NULL",
 				},
-				args: []any{now.Unix(), "kid-1", store.KindSession},
+				args: []any{now.Unix(), "kid-1", "user-1"},
 			})
+
+			if strings.Contains(squash(fake.calls[0][0].Query), "kind") {
+				t.Error("the revoke names a kind: it must end whichever key was presented")
+			}
 		})
 	}
 }
 
-// TestRevokeSessionFailures holds how a failed or malformed batch is reported.
-func TestRevokeSessionFailures(t *testing.T) {
+// TestRevokeKeyFailures holds how a failed or malformed batch is reported.
+func TestRevokeKeyFailures(t *testing.T) {
 	t.Parallel()
 
 	runFailures(t, 1, store.CodeSessionLogoutFailed, store.CodeSessionLogoutRejected, sessionsDescription,
-		func(s *store.Store) error { return lastErr(s.RevokeSession(context.Background(), "kid-1", now)) })
+		func(s *store.Store) error { return lastErr(s.RevokeKey(context.Background(), "user-1", "kid-1", now)) })
 }
 
 // TestKeyCodes pins the wire codes the operations report. Clients and

@@ -1,14 +1,17 @@
+//nolint:goconst // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
 package auth_test
 
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -25,23 +28,46 @@ func TestPrincipalIsTheStoredRow(t *testing.T) {
 		t.Fatalf("status = %d, ran %d times", rec.Code, len(r.handled))
 	}
 
-	want := auth.Principal{
-		UserID: userID, Role: roleMember, KeyID: key.ID.String(), CredentialID: credentialID,
-		Kind: auth.KindSession, ExpiresAt: key.ExpiresAt,
-	}
-	if got := r.handled[0].Principal; got != want {
-		t.Errorf("principal = %+v, want %+v", got, want)
-	}
+	checkSessionPrincipal(t, r.handled[0].Principal, key)
 
 	if len(r.keys.calls) != 1 || r.keys.calls[0].kid != key.ID.String() {
 		t.Errorf("store read = %v, want one read of %s", r.keys.calls, key.ID)
 	}
 }
 
+// checkSessionPrincipal checks who a member's session speaks for.
+func checkSessionPrincipal(t *testing.T, got auth.Principal, key auth.Key) {
+	t.Helper()
+
+	if got.UserID != userID || got.Role != roleMember || got.KeyID != key.ID.String() ||
+		got.CredentialID != credentialID || got.Kind != auth.KindSession || !got.ExpiresAt.Equal(key.ExpiresAt) ||
+		got.AgentID != "" {
+		t.Errorf("principal = %+v", got)
+	}
+
+	checkSessionScopes(t, got)
+}
+
+// checkSessionScopes checks that a session is signed with default:session and
+// has no agent, so its effective scopes are all of them.
+func checkSessionScopes(t *testing.T, got auth.Principal) {
+	t.Helper()
+
+	if !slices.Equal([]string(got.KeyScope), []string{scope.DefaultSession}) || len(got.AgentScope) != 0 {
+		t.Errorf("scope lists = key %v, agent %v", got.KeyScope, got.AgentScope)
+	}
+
+	if want := len(scope.Scopes()); got.Effective.Len() != want {
+		t.Errorf("effective scopes = %v, want all %d", got.Effective.Sorted(), want)
+	}
+}
+
 // TestRoleIsNeverATokenClaim: a token that claims to be an administrator, even
-// a correctly signed one, has the role of its account's row. The role is read
-// from the database on every request, so a demotion takes effect at once and
-// no token can promote itself.
+// a correctly signed one that names every scope, has the role of its account's
+// row. The role is read from the database on every request, so a demotion takes
+// effect at once and no token can promote itself: an admin scope on a member's
+// token grants nothing, and the same token works the moment the account is
+// promoted.
 func TestRoleIsNeverATokenClaim(t *testing.T) {
 	t.Parallel()
 
@@ -49,7 +75,8 @@ func TestRoleIsNeverATokenClaim(t *testing.T) {
 
 	key, err := auth.CreateKey(r.issuer, auth.KeySpec{
 		Kind: auth.KindSession, Subject: userID, Expires: r.now.Add(time.Hour),
-		Claims: map[string]any{"role": auth.RoleAdmin, "is_admin": true, claimScope: auth.RoleAdmin},
+		Scope:  scope.List{scope.DefaultSession},
+		Claims: map[string]any{"role": auth.RoleAdmin, "is_admin": true},
 	})
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
@@ -86,7 +113,8 @@ func TestNoneRoutesNeverTouchTheSession(t *testing.T) {
 		t.Errorf("store read %d times and configuration %d times, want neither", len(r.keys.calls), r.envReads)
 	}
 
-	if got := r.handled[0].Principal; got != (auth.Principal{}) {
+	got := r.handled[0].Principal
+	if got.UserID != "" || got.KeyID != "" || got.Effective.Len() != 0 || got.KeyScope != nil {
 		t.Errorf("principal = %+v, want none", got)
 	}
 }

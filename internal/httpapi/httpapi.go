@@ -77,6 +77,11 @@ type Request struct {
 	Body []byte
 	// Cookies are the request's cookies.
 	Cookies []*http.Cookie
+	// Authorization holds every value of the Authorization header, in order. It
+	// is the one header a handler's boundary reads, so it is the only one
+	// carried: a request that sent the header twice is visible as two values,
+	// which a single string could not show.
+	Authorization []string
 }
 
 // Response is what a successful handler returns.
@@ -228,13 +233,14 @@ func serveWith(
 		writer.Header().Set("Cache-Control", "no-store")
 
 		request := Request{
-			Method:     req.Method,
-			Path:       req.URL.Path,
-			Context:    req.Context(),
-			Query:      req.URL.Query(),
-			PathValues: pathValues(req, wildcards),
-			Body:       nil,
-			Cookies:    req.Cookies(),
+			Method:        req.Method,
+			Path:          req.URL.Path,
+			Context:       req.Context(),
+			Query:         req.URL.Query(),
+			PathValues:    pathValues(req, wildcards),
+			Body:          nil,
+			Cookies:       req.Cookies(),
+			Authorization: req.Header.Values("Authorization"),
 		}
 
 		if len(methods) > 0 && !slices.Contains(methods, req.Method) {

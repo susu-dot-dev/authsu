@@ -112,11 +112,11 @@ func Routes(deps Deps) []auth.Route {
 	return []auth.Route{
 		{
 			Method: http.MethodPost, Path: PathBegin, MaxBody: MaxBeginBody,
-			Credential: auth.None, Require: nil, Handle: handle.begin,
+			Credential: auth.None, Handle: handle.begin,
 		},
 		{
 			Method: http.MethodPost, Path: PathFinish, MaxBody: MaxFinishBody,
-			Credential: auth.None, Require: nil, Handle: handle.finish,
+			Credential: auth.None, Handle: handle.finish,
 		},
 	}
 }

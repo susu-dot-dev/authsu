@@ -32,7 +32,7 @@ func TestCallIDOfARouteWithoutAnIDIsAProgrammingError(t *testing.T) {
 
 			r := newRig(t)
 			routes := []auth.Route{{
-				Method: http.MethodGet, Path: tt.path, MaxBody: 0, Credential: auth.None, Require: nil,
+				Method: http.MethodGet, Path: tt.path, MaxBody: 0, Credential: auth.None, Access: accessFor(auth.None),
 				Handle: func(call *auth.Call) result.Result[httpapi.Response] {
 					_ = call.ID()
 
@@ -92,12 +92,12 @@ func TestCallConfigIsLoadedOncePerRequest(t *testing.T) {
 	}{
 		"a none route that asks twice":    {credential: auth.None, asks: true, cookies: nil, wantLoads: 1},
 		"a none route that never asks":    {credential: auth.None, asks: false, cookies: nil, wantLoads: 0},
-		"a session route that asks twice": {credential: auth.Session, asks: true, cookies: valid, wantLoads: 1},
-		"a session route that never asks": {credential: auth.Session, asks: false, cookies: valid, wantLoads: 1},
+		"a session route that asks twice": {credential: auth.Authenticated, asks: true, cookies: valid, wantLoads: 1},
+		"a session route that never asks": {credential: auth.Authenticated, asks: false, cookies: valid, wantLoads: 1},
 		"a session route that is refused": {
-			credential: auth.Session, asks: true, cookies: sessionValue("garbage"), wantLoads: 1,
+			credential: auth.Authenticated, asks: true, cookies: sessionValue("garbage"), wantLoads: 1,
 		},
-		"a session route without a session": {credential: auth.Session, asks: true, cookies: nil, wantLoads: 1},
+		"a session route without a session": {credential: auth.Authenticated, asks: true, cookies: nil, wantLoads: 1},
 	}
 
 	for name, tt := range tests {
@@ -114,7 +114,8 @@ func TestCallConfigIsLoadedOncePerRequest(t *testing.T) {
 			}
 
 			routes := []auth.Route{{
-				Method: http.MethodGet, Path: "/c", MaxBody: 0, Credential: tt.credential, Require: nil, Handle: handle,
+				Method: http.MethodGet, Path: "/c", MaxBody: 0,
+				Credential: tt.credential, Access: accessFor(tt.credential), Handle: handle,
 			}}
 
 			var cookies []*http.Cookie
@@ -141,7 +142,8 @@ func TestCallConfigValues(t *testing.T) {
 	var answers configAnswers
 
 	routes := []auth.Route{{
-		Method: http.MethodGet, Path: "/c", MaxBody: 0, Credential: auth.None, Require: nil, Handle: asksTwice(&answers),
+		Method: http.MethodGet, Path: "/c", MaxBody: 0,
+		Credential: auth.None, Access: accessFor(auth.None), Handle: asksTwice(&answers),
 	}}
 
 	r.serve(routes, request{target: "/c"})
@@ -172,7 +174,8 @@ func TestCallConfigFailureIsRemembered(t *testing.T) {
 	var answers configAnswers
 
 	routes := []auth.Route{{
-		Method: http.MethodGet, Path: "/c", MaxBody: 0, Credential: auth.None, Require: nil, Handle: asksTwice(&answers),
+		Method: http.MethodGet, Path: "/c", MaxBody: 0,
+		Credential: auth.None, Access: accessFor(auth.None), Handle: asksTwice(&answers),
 	}}
 
 	r.serve(routes, request{target: "/c"})
@@ -233,8 +236,8 @@ func TestCallCarriesTheRequest(t *testing.T) {
 
 	r := newRig(t)
 	routes := []auth.Route{{
-		Method: http.MethodPost, Path: "/things/{id}", MaxBody: 0, Credential: auth.Session, Require: nil,
-		Handle: r.capture,
+		Method: http.MethodPost, Path: "/things/{id}", MaxBody: 0, Credential: auth.Authenticated,
+		Access: accessFor(auth.Authenticated), Handle: r.capture,
 	}}
 
 	key := r.session()

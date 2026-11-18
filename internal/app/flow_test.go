@@ -481,7 +481,7 @@ func TestLoginAndSessionFollowRegistration(t *testing.T) {
 	// The boundary accepts the session from exactly what login wrote, typed as
 	// D1 returns it, and names the same account.
 	keyRow := []any{
-		login.args[sessionArgJWK], login.UserID, login.args[sessionArgCredentialRow], "admin", login.ExpiresAt,
+		login.args[sessionArgJWK], login.UserID, login.args[sessionArgCredentialRow], "admin", login.ExpiresAt, "", "",
 	}
 	stored := step{match: readKey, results: rows(keyRow), err: nil}
 
@@ -504,8 +504,18 @@ func TestLoginAndSessionFollowRegistration(t *testing.T) {
 		t.Errorf("logout = %d %v, want 204 clearing the cookie", rec.Code, rec.Result().Cookies())
 	}
 
-	if revoke := h.lastCall()[0].Args; revoke[1] != login.args[sessionArgKid] || revoke[2] != store.KindSession {
-		t.Errorf("revoke args = %v, want the session's kid and kind", revoke)
+	// The write binds the time, the kid and the key's owner, and no kind: it ends
+	// the key that was presented, whichever it is, and only if it is the user's.
+	checkRevokeArgs(t, h.lastCall()[0].Args, login.args[sessionArgKid], login.UserID)
+}
+
+// checkRevokeArgs holds the arguments of the logout write: the time, the key
+// that was presented and the user who owns it.
+func checkRevokeArgs(t *testing.T, args []any, kid, owner any) {
+	t.Helper()
+
+	if len(args) != 3 || args[1] != kid || args[2] != owner {
+		t.Errorf("revoke args = %v, want the time, the presented key's kid %v and its owner %v", args, kid, owner)
 	}
 }
 
@@ -780,7 +790,7 @@ func TestAgentCreateWritesWhatTheSchemaAccepts(t *testing.T) {
 
 	signedIn := newSession(t, memberID)
 	h := newHarness(t, fullEnv(), signedIn.activeKeyStep(roleMember),
-		step{match: "INSERT INTO agents", results: batchOf(2), err: nil})
+		step{match: "INSERT INTO agents", results: createdAgentBatch(`["default:agent"]`), err: nil})
 
 	rec := h.do(request{
 		method: http.MethodPost, path: "/api/agent", body: `{"name":"assistant"}`, cookies: []*http.Cookie{signedIn.cookie},
@@ -807,9 +817,9 @@ func TestAgentCreateWritesWhatTheSchemaAccepts(t *testing.T) {
 	key := batch[1].Args
 
 	// The agent's token is not a session, whatever the database answers.
-	agentKeyRow := []any{key[3], memberID, "", roleMember, key[4]}
+	agentRow := []any{key[3], memberID, "", roleMember, key[4], batch[0].Args[0], batch[0].Args[2]}
 
-	h.expect(step{match: readKey, results: rows(agentKeyRow), err: nil})
+	h.expect(step{match: readKey, results: rows(agentRow), err: nil})
 
 	rec = h.do(request{
 		method: http.MethodGet, path: pathSession, cookies: []*http.Cookie{requestCookie(auth.CookieName, created.Key.Token)},
@@ -817,4 +827,146 @@ func TestAgentCreateWritesWhatTheSchemaAccepts(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
 		t.Errorf("an api key as a session = %d %s, want the one 401", rec.Code, rec.Body)
 	}
+}
+
+// bearerCreated is what the app returned for an agent create, as far as the
+// bearer test reads it.
+type bearerCreated struct {
+	Agent struct {
+		Scopes []string `json:"scopes"`
+	} `json:"agent"`
+	Key struct {
+		Token  string   `json:"token"`
+		Scopes []string `json:"scopes"`
+	} `json:"key"`
+}
+
+// createAgentForBearer creates an agent as the signed-in member and returns the
+// response and the two statements of the batch the app wrote.
+func createAgentForBearer(t *testing.T) (*harness, bearerCreated, store.Statement, store.Statement) {
+	t.Helper()
+
+	signedIn := newSession(t, memberID)
+	h := newHarness(t, fullEnv(), signedIn.activeKeyStep(roleMember),
+		step{match: "INSERT INTO agents", results: createdAgentBatch(`["default:agent"]`), err: nil})
+
+	rec := h.do(request{
+		method: http.MethodPost, path: "/api/agent", body: `{"name":"assistant"}`, cookies: []*http.Cookie{signedIn.cookie},
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create agent = %d %s", rec.Code, rec.Body)
+	}
+
+	var created bearerCreated
+
+	err := json.Unmarshal(rec.Body.Bytes(), &created)
+	if err != nil {
+		t.Fatalf("body %q: %v", rec.Body, err)
+	}
+
+	batch := h.lastCall()
+
+	return h, created, batch[0], batch[1]
+}
+
+// TestAgentKeyIsAcceptedAsABearerWithTheScopesItWasGiven crosses the whole of
+// scopes with the real store SQL's types: the agent's key, created and written by
+// a create, is presented as a bearer token to a database that answers a read of
+// that key with the agent's stored scopes. It reads agents (the default agent
+// bundle) and cannot create them, and what the key's row stores as its scope is
+// the claim that was signed.
+func TestAgentKeyIsAcceptedAsABearerWithTheScopesItWasGiven(t *testing.T) {
+	t.Parallel()
+
+	h, created, agent, key := createAgentForBearer(t)
+
+	// The columns hold the JSON text of the lists that were returned and signed.
+	if agent.Args[2] != `["default:agent"]` || key.Args[6] != `["default:agent"]` {
+		t.Errorf("stored scopes = %v and %v, want the default agent bundle as JSON", agent.Args[2], key.Args[6])
+	}
+
+	if !slices.Equal(created.Agent.Scopes, []string{"default:agent"}) ||
+		!slices.Equal(created.Key.Scopes, []string{"default:agent"}) {
+		t.Errorf("returned scopes = %v and %v", created.Agent.Scopes, created.Key.Scopes)
+	}
+
+	// What D1 returns for the key's read: its owner, the agent's id and the
+	// agent's stored scopes, as text.
+	row := []any{key.Args[3], memberID, "", roleMember, key.Args[4], agent.Args[0], agent.Args[2]}
+	headers := map[string]string{"Authorization": "Bearer " + created.Key.Token}
+
+	// Reading agents: the key is read as an api_key, then the list runs.
+	h.expect(step{match: readKey, results: rows(row), err: nil}, step{match: "FROM agents", results: rows(), err: nil})
+	wantBearer(t, h, request{method: http.MethodGet, path: "/api/agent", headers: headers}, http.StatusOK, "")
+
+	// Creating needs agent:create and renaming agent:update, which the default
+	// agent bundle lacks: both are refused at the boundary, so the only database
+	// call is the key's own read. (An agent that held agent:update would still be
+	// refused renaming, as agents are peers: that is a different code, and is
+	// pinned by the agents package.)
+	h.expect(step{match: readKey, results: rows(row), err: nil})
+	wantBearer(t, h, request{method: http.MethodPost, path: "/api/agent", body: `{"name":"child"}`, headers: headers},
+		http.StatusForbidden, "insufficient_scope")
+
+	h.expect(step{match: readKey, results: rows(row), err: nil})
+	wantBearer(t, h, request{
+		method: http.MethodPatch, path: "/api/agent/" + asText(agent.Args[0]), body: `{"name":"x"}`, headers: headers,
+	}, http.StatusForbidden, "insufficient_scope")
+
+	if got := apiKeyReads(h); got != 3 {
+		t.Errorf("api_key reads = %d, want 3 (list, create, rename): the bearer is never read as a session", got)
+	}
+}
+
+// TestAnAPIKeyEndsItself: logout is key:revoke_self, so the API key a request
+// presented can end itself, with no scope at all, through the real SQL: the
+// write binds the time, the key's own kid and its owner, and nothing about its kind. The
+// default agent bundle cannot revoke agents, and still can sign itself out.
+func TestAnAPIKeyEndsItself(t *testing.T) {
+	t.Parallel()
+
+	h, created, agent, key := createAgentForBearer(t)
+
+	row := []any{key.Args[3], memberID, "", roleMember, key.Args[4], agent.Args[0], agent.Args[2]}
+	headers := map[string]string{"Authorization": "Bearer " + created.Key.Token}
+
+	h.expect(step{match: readKey, results: rows(row), err: nil}, step{match: revokeKey, results: changes(1), err: nil})
+
+	rec := h.do(request{method: http.MethodPost, path: pathLogout, headers: headers})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("an API key logging out = %d %s, want 204", rec.Code, rec.Body)
+	}
+
+	revoke := h.lastCall()[0]
+	if len(revoke.Args) != 3 || revoke.Args[1] != key.Args[0] || revoke.Args[2] != memberID ||
+		strings.Contains(revoke.Query, "kind") {
+		t.Errorf("revoke = %q %v, want the key's own kid and its owner, and no kind", revoke.Query, revoke.Args)
+	}
+}
+
+// wantBearer sends req and checks its status and, when given, that the body
+// carries code.
+func wantBearer(t *testing.T, h *harness, req request, status int, code string) {
+	t.Helper()
+
+	rec := h.do(req)
+	if rec.Code != status || !strings.Contains(rec.Body.String(), code) {
+		t.Errorf("%s %s = %d %s, want %d containing %q", req.method, req.path, rec.Code, rec.Body, status, code)
+	}
+}
+
+// apiKeyReads counts the reads of an api_key the app has made.
+func apiKeyReads(h *harness) int {
+	h.exec.mu.Lock()
+	defer h.exec.mu.Unlock()
+
+	reads := 0
+
+	for _, call := range h.exec.calls {
+		if strings.Contains(call[0].Query, readKey) && call[0].Args[1] == store.KindAPIKey {
+			reads++
+		}
+	}
+
+	return reads
 }

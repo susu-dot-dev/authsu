@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
 // KindAPIKey is japikeys.kind of an API key, such as an agent's. CreateAgent
@@ -168,6 +169,9 @@ func (s *Store) GetAgent(ctx context.Context, owner string, id input.ID) (Agent,
 // key insert that follows in the same batch depends on this row existing (see
 // insertAgentKeyQuery), which turns "no agent was created" into a failed batch.
 //
+// RETURNING gives the scopes the row was written with, so a caller reports what
+// is stored and not what it offered.
+//
 // Arguments, by number: ?1 id, ?2 name, ?3 scopes, ?4 created_at, ?5 user id,
 // ?6 the maximum active agents a user may have.
 const insertAgentQuery = `
@@ -176,15 +180,42 @@ SELECT ?1, u.id, ?2, ?3, ?4
 FROM users u
 WHERE u.id = ?5
   AND u.revoked_at IS NULL
-  AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6`
+  AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6
+RETURNING scopes`
+
+// insertAgentByAgentQuery creates an agent on behalf of another agent of the
+// same user. It is insertAgentQuery with two differences, both part of the
+// write for the same reason as its other conditions:
+//
+//   - the new agent's scopes are the creating agent's, read from that agent's
+//     row here and never taken from the request. An agent cannot give a new
+//     agent more than it has, and a request cannot misstate what it has;
+//   - the creating agent must belong to the owner and still be active, so an
+//     agent revoked after the request was authenticated creates nothing.
+//
+// RETURNING gives the scopes the row was written with, which here are the
+// creating agent's as the write read them: the only place they are known, since
+// they are not an argument.
+//
+// Arguments, by number: ?1 id, ?2 name, ?3 the creating agent's id, ?4
+// created_at, ?5 user id, ?6 the maximum active agents a user may have.
+const insertAgentByAgentQuery = `
+INSERT INTO agents (id, user_id, name, scopes, created_at)
+SELECT ?1, u.id, ?2, c.scopes, ?4
+FROM users u
+JOIN agents c ON c.user_id = u.id AND c.id = ?3 AND c.revoked_at IS NULL
+WHERE u.id = ?5
+  AND u.revoked_at IS NULL
+  AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6
+RETURNING scopes`
 
 // insertAgentKeyQuery stores an agent's API key. The key's owner and the agent
 // it belongs to are read from the agent's row, in the write, so the key's
 // subject is the agent's owner by construction. If the agent was not created
-// (the user was at the limit, or was revoked in the meantime) the subselect is
-// NULL, user_id is NOT NULL, and the whole batch fails as a conflict, which
-// rolls the agent insert back with it. Without this the batch would commit with
-// no key.
+// (the user was at the limit, or was revoked in the meantime, or the creating
+// agent was revoked) the subselect is NULL, user_id is NOT NULL, and the whole
+// batch fails as a conflict, which rolls the agent insert back with it. Without
+// this the batch would commit with no key.
 //
 // granted_from and credential_id stay NULL: only a login grants those, and the
 // table's CHECK requires an API key to have neither.
@@ -205,9 +236,21 @@ type NewAgent struct {
 	// Name is the label the user gave it.
 	Name input.AgentName
 
-	// Scopes is the agent's scope list, and the one written to the key's scope
-	// column, which is a copy of the scope claim signed into its token.
+	// Scopes is the agent's scope list as JSON. When CreatedBy is empty it is
+	// written to the agent's row as it is. When CreatedBy is set it is not used:
+	// the row gets the creating agent's scopes, read in the write. Either way
+	// CreateAgent returns what the row holds.
 	Scopes string
+
+	// KeyScope is the key's scope list as JSON: the scope claim signed into its
+	// token, copied to the key's row.
+	KeyScope string
+
+	// CreatedBy is the id of the agent that is creating this one, or "" when its
+	// user is. The new agent is an ordinary agent of the same owner either way,
+	// and nothing records who created it: the id only chooses where the scopes
+	// come from and what must still be active (see insertAgentByAgentQuery).
+	CreatedBy string
 
 	// MaxActive is how many active agents a user may have: the create is
 	// refused when the owner already has that many.
@@ -228,25 +271,56 @@ type NewAgent struct {
 // owner being revoked or at the limit fails the batch and not just the first
 // statement.
 //
+// It returns the scope list the agent's row was written with, as the write
+// left it. For an agent created by another agent that is the creating agent's
+// list as the write read it, so the caller reports what is stored even if the
+// creating agent's scopes changed after the request was verified.
+//
 // It returns ErrConflict in that case: the owner already has MaxActive active
-// agents, or the account was revoked after the request was authenticated. The
-// write cannot tell which, and a revoked account has no session to be told on.
+// agents, the account was revoked after the request was authenticated, or the
+// creating agent was revoked. The write cannot tell which, and a revoked
+// account has no session to be told on.
 // The id and the kid are fresh UUIDv7s, so no other constraint can conflict.
-func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) error {
+func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (string, error) {
 	o := op{failed: CodeAgentCreateFailed, rejected: CodeAgentCreateRejected, description: agentsDescription}
 
-	_, err := s.run(ctx, o,
-		Statement{Query: insertAgentQuery, Args: []any{
-			agent.ID, agent.Name.String(), agent.Scopes, agent.CreatedAt.Unix(), agent.Owner, int64(agent.MaxActive),
-		}},
+	insert := Statement{Query: insertAgentQuery, Args: []any{
+		agent.ID, agent.Name.String(), agent.Scopes, agent.CreatedAt.Unix(), agent.Owner, int64(agent.MaxActive),
+	}}
+
+	if agent.CreatedBy != "" {
+		insert = Statement{Query: insertAgentByAgentQuery, Args: []any{
+			agent.ID, agent.Name.String(), agent.CreatedBy, agent.CreatedAt.Unix(), agent.Owner, int64(agent.MaxActive),
+		}}
+	}
+
+	stored, err := result.Of(s.run(ctx, o, insert,
 		Statement{Query: insertAgentKeyQuery, Args: []any{
 			agent.KeyID, agent.ID, KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
-			agent.ID, agent.Scopes, agent.CreatedAt.Unix(),
+			agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
 		}},
-	)
+	)).
+		Then(func(results []Result) (string, error) { return one(results[0].Rows, o, readScopes) }).
+		MapErr(func(err error) error { return agentInsertShape(o, err) }).
+		Get()
+
+	return stored, err //nolint:wrapcheck // every error in the chain is already classified by run, one or agentInsertShape
+}
+
+// agentInsertShape classifies a failure to read the row an agent insert
+// returns. The key insert names the agent's row, so a batch that succeeded
+// without it is not a conflict or a missing agent: the database did not do what
+// the statements say, which is a defect. Any other error is returned as it is.
+func agentInsertShape(o op, err error) error {
+	if errors.Is(err, ErrNotFound) {
+		return o.defect(fmt.Errorf("%w: the insert returned no row", errRowCount))
+	}
 
 	return err
 }
+
+// readScopes reads the one column an agent insert returns.
+func readScopes(r *row) string { return r.text() }
 
 // agentRenameQuery renames an agent, unless it is revoked. A revoked agent is
 // final, as for invitations: changing it would suggest it could be revived.

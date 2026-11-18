@@ -24,6 +24,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -85,6 +86,12 @@ const (
 	codeCursor       = "invalid_cursor"
 	codeNoRoute      = "not_found"
 	codeNotAllowed   = "method_not_allowed"
+
+	// fieldName is the member of a body that names an agent.
+	fieldName = "name"
+
+	// defaultAgentJSON is the stored form of the default agent bundle.
+	defaultAgentJSON = `["default:agent"]`
 
 	// Claims of an agent's key, and bodies several tables send.
 	claimSub      = "sub"
@@ -205,19 +212,35 @@ func (f *fakeStore) GetAgent(_ context.Context, owner string, id input.ID) (stor
 
 // CreateAgent is the contract of store.CreateAgent. A programmed failure is
 // returned before anything is written.
-func (f *fakeStore) CreateAgent(_ context.Context, agent store.NewAgent) error {
+func (f *fakeStore) CreateAgent(_ context.Context, agent store.NewAgent) (string, error) {
 	f.calls = append(f.calls, storeCall{method: methodCreate, owner: agent.Owner, agent: agent})
 
 	err := f.fail(methodCreate)
 	if err != nil {
-		return err
+		return "", err
+	}
+
+	scopes := agent.Scopes
+
+	// The contract of store.CreateAgent for an agent's create: the new agent's
+	// scopes are the creating agent's, read from its row, and the list the
+	// caller offered is not used. A creating agent that is not the owner's, or
+	// is revoked, makes the write fail as a conflict.
+	if agent.CreatedBy != "" {
+		at, ok := f.find(agent.Owner, agent.CreatedBy)
+		if !ok || f.rows[at].agent.RevokedAt != nil {
+			return "", store.ErrConflict
+		}
+
+		scopes = f.rows[at].agent.Scopes
 	}
 
 	f.rows = append(f.rows, ownedAgent{owner: agent.Owner, agent: store.Agent{
-		ID: agent.ID, Name: agent.Name.String(), Scopes: agent.Scopes, RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(),
+		ID: agent.ID, Name: agent.Name.String(), Scopes: scopes, RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(),
 	}})
 
-	return nil
+	// The contract: what the row holds is what is returned.
+	return scopes, nil
 }
 
 // RenameAgent is the contract of store.RenameAgent: a revoked agent keeps its
@@ -291,21 +314,28 @@ func (f *fakeStore) agent(t *testing.T, id string) store.Agent {
 
 // stored is a stored agent with the fixture's name and scopes.
 func stored(id, name string, createdAt int64, revokedAt *int64) store.Agent {
-	return store.Agent{ID: id, Name: name, Scopes: agents.DefaultScopes, RevokedAt: revokedAt, CreatedAt: createdAt}
+	return store.Agent{
+		ID: id, Name: name, Scopes: agents.DefaultScopes().JSON(), RevokedAt: revokedAt, CreatedAt: createdAt,
+	}
 }
 
-// fakeKeys is the key store the boundary reads sessions from: rows by kid, as
-// the database holds them for the kind session.
+// fakeKeys is the key store the boundary reads keys from: rows by kid and kind,
+// as the database holds them.
 type fakeKeys struct {
 	rows map[string]store.ActiveKey
+	// apiRows are the rows of API keys.
+	apiRows map[string]store.ActiveKey
 }
 
 func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, _ time.Time) (store.ActiveKey, bool, error) {
-	if kind != auth.KindSession {
+	rows := f.rows
+	if kind == auth.KindAPIKey {
+		rows = f.apiRows
+	} else if kind != auth.KindSession {
 		return store.ActiveKey{}, false, nil
 	}
 
-	row, ok := f.rows[kid]
+	row, ok := rows[kid]
 
 	return row, ok, nil
 }
@@ -341,7 +371,7 @@ func newRig(t *testing.T) *rig {
 	rg := &rig{
 		t:     t,
 		store: &fakeStore{rows: nil, failures: map[string]error{}, calls: nil},
-		keys:  &fakeKeys{rows: map[string]store.ActiveKey{}},
+		keys:  &fakeKeys{rows: map[string]store.ActiveKey{}, apiRows: map[string]store.ActiveKey{}},
 		env: map[string]string{
 			config.SecretHMAC: secret, config.VarAPIOrigin: apiOrigin, config.VarUIOrigin: uiOrigin,
 		},
@@ -427,6 +457,8 @@ type request struct {
 	// contentType defaults to application/json; "-" sends none.
 	contentType string
 	cookies     []*http.Cookie
+	// authorization is sent as the Authorization header when set.
+	authorization string
 }
 
 // serve sends req and returns the response.
@@ -451,6 +483,10 @@ func (r *rig) serve(req request) *httptest.ResponseRecorder {
 
 	for _, cookie := range req.cookies {
 		httpReq.AddCookie(cookie)
+	}
+
+	if req.authorization != "" {
+		httpReq.Header.Set("Authorization", req.authorization)
 	}
 
 	rec := httptest.NewRecorder()
@@ -551,11 +587,11 @@ func wantOK(t *testing.T, r *rig, rec *httptest.ResponseRecorder, status int, bo
 // agentJSON is the exact JSON of an agent in a response.
 func agentJSON(id, name string, createdAt int64, revokedAt *int64) string {
 	if revokedAt != nil {
-		return fmt.Sprintf(`{"id":%q,"name":%q,"scopes":"default:agent","status":"revoked","revokedAt":%d,"createdAt":%d}`,
+		return fmt.Sprintf(`{"id":%q,"name":%q,"scopes":["default:agent"],"status":"revoked","revokedAt":%d,"createdAt":%d}`,
 			id, name, *revokedAt, createdAt)
 	}
 
-	return fmt.Sprintf(`{"id":%q,"name":%q,"scopes":"default:agent","status":"active","createdAt":%d}`,
+	return fmt.Sprintf(`{"id":%q,"name":%q,"scopes":["default:agent"],"status":"active","createdAt":%d}`,
 		id, name, createdAt)
 }
 
@@ -625,4 +661,73 @@ func wantCode(t *testing.T, r *rig, rec *httptest.ResponseRecorder, status int, 
 	if len(r.logged) != 1 || r.logged[0].Code != code {
 		t.Errorf("logged %v, want one %q", r.logged, code)
 	}
+}
+
+// keySpec describes an API key of a user, or of one of their agents.
+type keySpec struct {
+	// owner and role are the account's, as the row holds them.
+	owner, role string
+	// scope is the key's own list, signed into its token.
+	scope scope.List
+	// agent is the agent the key acts for, or "" for the user's own key; and
+	// agentScopes is that agent's stored list (JSON), read now.
+	agent, agentScopes string
+}
+
+// signInKey creates an API key as spec describes, stores its row, and returns
+// the Authorization header value a client would send. The key lives in real
+// time, as signIn's does.
+func (r *rig) signInKey(spec keySpec) string {
+	r.t.Helper()
+
+	origin, err := config.ParseOrigin(apiOrigin)
+	if err != nil {
+		r.t.Fatalf("origin: %v", err)
+	}
+
+	claims := map[string]any{}
+	if spec.agent != "" {
+		claims["act"] = map[string]any{"sub": spec.agent}
+	}
+
+	key, err := auth.CreateKey(auth.IssuerFor(origin), auth.KeySpec{
+		Kind: auth.KindAPIKey, Subject: spec.owner, Expires: time.Now().Add(time.Hour), Scope: spec.scope, Claims: claims,
+	})
+	if err != nil {
+		r.t.Fatalf("CreateKey: %v", err)
+	}
+
+	r.keys.apiRows[key.ID.String()] = store.ActiveKey{
+		JWK: []byte(key.JWK), UserID: spec.owner, CredentialID: "", Role: spec.role, ExpiresAt: key.ExpiresAt,
+		AgentID: spec.agent, AgentScopes: spec.agentScopes,
+	}
+
+	return "Bearer " + key.JWT
+}
+
+// withKey sends method target with body, authorized by header (an API key).
+func (r *rig) withKey(header, method, target, body string) *httptest.ResponseRecorder {
+	r.t.Helper()
+
+	return r.serve(request{method: method, target: target, body: body, authorization: header})
+}
+
+// storeKeyRow is the row the database would hold for the key a create wrote: the
+// owner's, the agent's id, and that agent's stored scopes, read from its row.
+func storeKeyRow(written store.NewAgent, rg *rig) store.ActiveKey {
+	return store.ActiveKey{
+		JWK: []byte(written.KeyJWK), UserID: written.Owner, CredentialID: "", Role: roleMember,
+		ExpiresAt: written.KeyExpiresAt, AgentID: written.ID, AgentScopes: rg.store.agent2(written.ID).Scopes,
+	}
+}
+
+// agent2 returns the stored agent with id, or the zero agent.
+func (f *fakeStore) agent2(id string) store.Agent {
+	for _, row := range f.rows {
+		if row.agent.ID == id {
+			return row.agent
+		}
+	}
+
+	return store.Agent{ID: "", Name: "", Scopes: "", RevokedAt: nil, CreatedAt: 0}
 }

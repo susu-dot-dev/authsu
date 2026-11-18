@@ -250,10 +250,13 @@ func newSession(t *testing.T, userID string) session {
 	return session{key: key, userID: userID, cookie: requestCookie(auth.CookieName, key.JWT)}
 }
 
+// agentRowID is an agent id for rows that name one.
+const agentRowID = "00000000-0000-7000-8000-0000000000a1"
+
 // activeKeyStep is the answer to the key lookup of the session boundary, with
 // the row exactly as D1 returns it: text as string, integers as int64.
 func (s session) activeKeyStep(role string) step {
-	return s.activeKeyRow([]any{s.key.JWK, s.userID, "", role, s.key.ExpiresAt.Unix()})
+	return s.activeKeyRow([]any{s.key.JWK, s.userID, "", role, s.key.ExpiresAt.Unix(), "", ""})
 }
 
 // activeKeyRow is activeKeyStep with a row of the test's own making, to feed
@@ -297,6 +300,13 @@ func (h *harness) lastCall() []store.Statement {
 
 // batchOf is the answer of a batch of n statements that all took effect.
 func batchOf(n int) []store.Result { return make([]store.Result, n) }
+
+// createdAgentBatch is the answer of an agent create's batch: the agent insert
+// returns the scope list it stored (RETURNING scopes, as D1 sends text), and the
+// key insert returns nothing.
+func createdAgentBatch(scopes string) []store.Result {
+	return []store.Result{{Changes: 1, Rows: [][]any{{scopes}}}, {Changes: 1, Rows: nil}}
+}
 
 // passkey is a software authenticator: a fresh ES256 key and the credential id
 // it registers under. It builds the requests a browser would send, so a test

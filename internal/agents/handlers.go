@@ -11,6 +11,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -31,6 +32,12 @@ const (
 	CodeMissingName = "missing_agent_name"
 	// CodeRevoked is a rename of an agent that is revoked.
 	CodeRevoked = "agent_revoked"
+	// CodeScopesInherited is an agent that tried to choose the scopes of the
+	// agent it creates: they are always its own.
+	CodeScopesInherited = "agent_scopes_inherited"
+	// CodeKeyScopesExceeded is an agent that asked for a key holding a scope its
+	// own key does not list.
+	CodeKeyScopesExceeded = "key_scopes_exceeded"
 )
 
 // Paths. The collection takes GET and POST; one agent takes GET, PATCH and
@@ -47,9 +54,17 @@ const (
 // read more before a name is refused.
 const MaxBody = 8 << 10
 
-// Routes returns the agent routes. Every one needs a session and nothing more:
-// an agent is something every user has, and each route acts only on the
-// caller's own, so no role is required. It panics when a dependency is nil.
+// Routes returns the agent routes. Each needs its own scope and no role: an
+// agent is something every user has, and each route acts only on the caller's
+// own.
+//
+// Renaming and revoking refuse agents whatever their scopes. Agents are flat
+// under their user, so an agent holding those scopes could act on its siblings,
+// and nothing about "an agent may manage agents" is meant to include that.
+// Creating is the one route an agent may use, when it is given agent:create, and
+// it is bounded by the rules in create.
+//
+// It panics when a dependency is nil.
 func Routes(deps Deps) []auth.Route {
 	for name, missing := range map[string]bool{
 		"Store": deps.Store == nil, "Now": deps.Now == nil, "NewID": deps.NewID == nil, "CreateKey": deps.CreateKey == nil,
@@ -60,18 +75,20 @@ func Routes(deps Deps) []auth.Route {
 	}
 
 	return []auth.Route{
-		session(http.MethodGet, collectionPath, deps.list),
-		session(http.MethodPost, collectionPath, deps.create),
-		session(http.MethodGet, itemPath, deps.get),
-		session(http.MethodPatch, itemPath, deps.rename),
-		session(http.MethodDelete, itemPath, deps.revoke),
+		declare(http.MethodGet, collectionPath, auth.Needs(scope.AgentRead), deps.list),
+		declare(http.MethodPost, collectionPath, auth.Needs(scope.AgentCreate), deps.create),
+		declare(http.MethodGet, itemPath, auth.Needs(scope.AgentRead), deps.get),
+		declare(http.MethodPatch, itemPath, auth.Needs(scope.AgentUpdate).WithoutAgents(), deps.rename),
+		declare(http.MethodDelete, itemPath, auth.Needs(scope.AgentRevoke).WithoutAgents(), deps.revoke),
 	}
 }
 
-// session declares a route that needs a session and no requirement.
-func session(method, path string, handle func(*auth.Call) result.Result[httpapi.Response]) auth.Route {
+// declare declares an authenticated route with its access.
+func declare(
+	method, path string, access auth.Access, handle func(*auth.Call) result.Result[httpapi.Response],
+) auth.Route {
 	return auth.Route{
-		Method: method, Path: path, MaxBody: MaxBody, Credential: auth.Session, Require: nil, Handle: handle,
+		Method: method, Path: path, MaxBody: MaxBody, Credential: auth.Authenticated, Access: access, Handle: handle,
 	}
 }
 
@@ -93,22 +110,18 @@ type page struct {
 // parsePage reads the limit and cursor from the query. Each may appear at most
 // once: a repeated parameter is ambiguous, and which value wins differs between
 // layers, so it is refused rather than guessed.
-func parsePage(query map[string][]string) (page, error) {
-	limit, err := input.ParsePageLimit(query["limit"])
-	if err != nil {
-		return page{}, err //nolint:wrapcheck // the parser's error is already the classified client error
-	}
-
-	cursor, err := input.ParseCursor(query["cursor"])
-	if err != nil {
-		return page{}, err //nolint:wrapcheck // the parser's error is already the classified client error
-	}
-
-	return page{cursor: cursor, limit: limit}, nil
+func parsePage(query map[string][]string) result.Result[page] {
+	return result.Of(input.ParsePageLimit(query["limit"])).
+		Map(func(limit input.PageLimit) page { return page{limit: limit} }).
+		Then(func(p page) (page, error) {
+			return result.Of(input.ParseCursor(query["cursor"])).
+				Map(func(cursor input.Cursor) page { p.cursor = cursor; return p }).
+				Get()
+		})
 }
 
 func (d Deps) list(call *auth.Call) result.Result[httpapi.Response] {
-	return result.Of(parsePage(call.Request.Query)).
+	return parsePage(call.Request.Query).
 		Then(func(p page) (store.AgentPage, error) {
 			return d.Store.ListAgents(call.Request.Context, call.Principal.UserID, p.cursor, p.limit)
 		}).
@@ -152,6 +165,14 @@ func noSuchAgent(cause error) *apierr.Error {
 type createBody struct {
 	// Name is a label for the agent.
 	Name string `json:"name"`
+
+	// Scopes is the new agent's scope list, and KeyScopes its first key's.
+	// Absent means the default (DefaultScopes); an empty list is a credential
+	// that can use only the routes that need no scope. An agent creating an
+	// agent may not set Scopes (they are copied from the creator) and may set
+	// KeyScopes only to entries of its own key's list.
+	Scopes    *[]string `json:"scopes"`
+	KeyScopes *[]string `json:"keyScopes"`
 }
 
 // CreateResponse is the body of a created agent. Key is the only time the
@@ -169,43 +190,163 @@ type Key struct {
 	// Token is the bearer token. It is not stored and cannot be shown again.
 	Token string `json:"token"`
 
-	// Scope is the scope list signed into the token.
-	Scope string `json:"scope"`
+	// Scopes is the scope list signed into the token.
+	Scopes []string `json:"scopes"`
 
 	// ExpiresAt is when the key stops working, in Unix seconds.
 	ExpiresAt int64 `json:"expiresAt"`
 }
 
-// parseCreate parses the new agent's name.
-func parseCreate(body createBody) (input.AgentName, error) {
-	return input.ParseAgentName(body.Name) //nolint:wrapcheck // the parser's error is already the classified client error
+// request is a create request that has been parsed: the name and the scope
+// lists the new agent and its key are to have.
+type request struct {
+	name      input.AgentName
+	scopes    scope.List
+	keyScopes scope.List
+}
+
+// parseCreate parses the new agent's name and scope lists. A list that is
+// absent is the default; one that is present is parsed strictly, so a typo or an
+// unknown name is a 400 and not a credential that silently can do nothing.
+//
+// The caller decides what an absent list means (an agent creating an agent
+// inherits), so absence is reported and not resolved here.
+func parseCreate(body createBody) result.Result[request] {
+	return result.Of(input.ParseAgentName(body.Name)).
+		Map(func(name input.AgentName) request { return request{name: name} }).
+		Then(func(req request) (request, error) {
+			return parseOptionalScopes(body.Scopes).
+				Map(func(scopes scope.List) request { req.scopes = scopes; return req }).
+				Get()
+		}).
+		Then(func(req request) (request, error) {
+			return parseOptionalScopes(body.KeyScopes).
+				Map(func(scopes scope.List) request { req.keyScopes = scopes; return req }).
+				Get()
+		})
+}
+
+// parseOptionalScopes parses a scope list that may be absent. Absent is nil and
+// present, even empty, is a non-nil list, which is how "not given" and "given
+// as nothing" stay different.
+func parseOptionalScopes(raw *[]string) result.Result[scope.List] {
+	if raw == nil {
+		return result.Ok(scope.List(nil))
+	}
+
+	return result.Of(input.ParseScopeList(*raw)).
+		Map(func(parsed input.ScopeList) scope.List { return parsed.List() })
 }
 
 // creation is a create request that has been planned: the agent and its key
-// exactly as they will be written, and the key's token.
+// exactly as they will be written, and the key's token. Once written it also
+// holds the agent's scopes as the write stored them.
 type creation struct {
 	agent store.NewAgent
 	token string
+	// keyScopes is what the response reports for the key: it is the list signed
+	// into the token, which is the one stored on the key's row.
+	keyScopes scope.List
+	// scopes is what the response reports for the agent. It is set from the
+	// write's own result, never from the plan, because an agent's create copies
+	// the creating agent's scopes from its row in the write.
+	scopes scope.List
 }
 
 func (d Deps) create(call *auth.Call) result.Result[httpapi.Response] {
 	return httpapi.Decode[createBody](call.Request).
-		Then(parseCreate).
-		Then(func(name input.AgentName) (creation, error) { return d.plan(call, name).Get() }).
-		Then(func(plan creation) (creation, error) {
-			return plan, d.Store.CreateAgent(call.Request.Context, plan.agent)
-		}).
+		Then(func(body createBody) (request, error) { return parseCreate(body).Get() }).
+		Then(func(req request) (request, error) { return resolveScopes(call.Principal, req).Get() }).
+		Then(func(req request) (creation, error) { return d.plan(call, req).Get() }).
+		Then(func(plan creation) (creation, error) { return d.write(call, plan).Get() }).
 		MapErr(limitReached).
 		Map(respondCreated).
 		Map(func(out CreateResponse) httpapi.Response { return httpapi.JSON(http.StatusCreated, out) })
 }
 
+// write stores the plan and records the scopes the write returned on it, which
+// are what the response reports for the agent.
+func (d Deps) write(call *auth.Call, plan creation) result.Result[creation] {
+	return result.Of(d.Store.CreateAgent(call.Request.Context, plan.agent)).
+		Map(func(stored string) creation {
+			plan.scopes = scope.Read(stored)
+
+			return plan
+		})
+}
+
+// resolveScopes decides the scope lists of the new agent and its key, from who
+// is asking.
+//
+// A user (a session or one of their own keys) chooses both freely, with the
+// default for an absent list. Neither can exceed what the user may do: every
+// request is bounded by the user's role, and an admin scope is refused to a
+// member whatever a credential names, so there is nothing to compare here.
+//
+// An agent is bounded by itself. The new agent's scopes are a copy of its own,
+// so they may not be set; its key's scopes must be entries of the creating key's
+// list as written, and default to that list. The literal comparison is what
+// makes it sound: a list contained in another has an expansion contained in the
+// other's however the bundles change later, so the new agent can never do more
+// than the key that created it (docs/permissions_design.md).
+func resolveScopes(who auth.Principal, req request) result.Result[request] {
+	if who.AgentID == "" {
+		return result.Ok(userScopes(req))
+	}
+
+	if req.scopes != nil {
+		return result.Fail[request](scopesInherited())
+	}
+
+	req.scopes = who.AgentScope
+
+	if req.keyScopes == nil {
+		req.keyScopes = who.KeyScope
+
+		return result.Ok(req)
+	}
+
+	if !req.keyScopes.SubsetOf(who.KeyScope) {
+		return result.Fail[request](keyScopesExceeded())
+	}
+
+	return result.Ok(req)
+}
+
+// scopesInherited is the client's 403 for an agent that tried to choose the
+// scopes of the agent it creates.
+func scopesInherited() *apierr.Error {
+	return apierr.New(apierr.Forbidden, CodeScopesInherited,
+		"an agent creates agents with its own scopes and may not choose them")
+}
+
+// keyScopesExceeded is the client's 403 for an agent that asked for a key
+// holding more than the key it is using.
+func keyScopesExceeded() *apierr.Error {
+	return apierr.New(apierr.Forbidden, CodeKeyScopesExceeded,
+		"the new key may only hold scopes the creating key holds")
+}
+
+// userScopes applies the default to a user's request: an absent list is
+// DefaultScopes.
+func userScopes(req request) request {
+	if req.scopes == nil {
+		req.scopes = DefaultScopes()
+	}
+
+	if req.keyScopes == nil {
+		req.keyScopes = DefaultScopes()
+	}
+
+	return req
+}
+
 // limitReached is the client's answer to a create the store refused as a
-// conflict: the user already has MaxAgentsPerUser active agents, or their
-// account was revoked after the request was authenticated (the write cannot
-// tell which, and a revoked account has no session to be told on). The id and
-// the kid are fresh UUIDv7s, so no other constraint can conflict. Any other
-// failure is returned as it is.
+// conflict: the user already has MaxAgentsPerUser active agents, their account
+// was revoked after the request was authenticated, or the creating agent was
+// revoked (the write cannot tell which, and a revoked account has no session
+// to be told on). The id and the kid are fresh UUIDv7s, so no other constraint
+// can conflict. Any other failure is returned as it is.
 func limitReached(err error) error {
 	if errors.Is(err, store.ErrConflict) {
 		return atLimit(err)
@@ -221,15 +362,21 @@ func atLimit(cause error) *apierr.Error {
 }
 
 // plan decides everything about the new agent that does not need the database:
-// its id, its default scopes, and its first key. The key is created here,
-// before the write, so a failure to create it writes nothing.
+// its id and its first key. The key is created here, before the write, so a
+// failure to create it writes nothing.
 //
 // The token's subject is the user, and its actor names the agent
 // (docs/agents_design.md): a service that knows nothing about agents sees the
 // user, and one that does can tell the agent apart. The scopes are signed in as
-// a claim that nothing reads yet. The user is the session's, never the
+// the claim the boundary reads back. The user is the caller's, never the
 // request's.
-func (d Deps) plan(call *auth.Call, name input.AgentName) result.Result[creation] {
+//
+// When an agent is creating, its id goes to the store, which reads the new
+// agent's scopes from that agent's row in the write and ignores any list given
+// here. The response reports the list the write returns, so it is the row's
+// even if the creating agent's scopes changed between the request being
+// verified and the write.
+func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
 	return result.Of(call.Config()).
 		Then(func(cfg config.Config) (creation, error) {
 			now := d.Now()
@@ -238,11 +385,8 @@ func (d Deps) plan(call *auth.Call, name input.AgentName) result.Result[creation
 			expires := now.Add(KeyLifetime)
 
 			key, err := d.CreateKey(auth.IssuerFor(cfg.API), auth.KeySpec{
-				Kind: auth.KindAPIKey, Subject: owner, Expires: expires,
-				Claims: map[string]any{
-					"act":   map[string]any{"sub": id},
-					"scope": DefaultScopes,
-				},
+				Kind: auth.KindAPIKey, Subject: owner, Expires: expires, Scope: req.keyScopes,
+				Claims: map[string]any{"act": map[string]any{"sub": id}},
 			})
 			if err != nil {
 				return creation{}, apierr.Wrap(err, apierr.Internal, CodeKeyFailed, "internal error")
@@ -250,25 +394,27 @@ func (d Deps) plan(call *auth.Call, name input.AgentName) result.Result[creation
 
 			return creation{
 				agent: store.NewAgent{
-					ID: id, Owner: owner, Name: name, Scopes: DefaultScopes, MaxActive: MaxAgentsPerUser,
+					ID: id, Owner: owner, Name: req.name, Scopes: req.scopes.JSON(), KeyScope: key.Scope,
+					CreatedBy: call.Principal.AgentID, MaxActive: MaxAgentsPerUser,
 					KeyID: key.ID.String(), KeyJWK: key.JWK, KeyExpiresAt: key.ExpiresAt, CreatedAt: now,
 				},
-				token: key.JWT,
+				token:     key.JWT,
+				keyScopes: req.keyScopes,
 			}, nil
 		})
 }
 
 // respondCreated is the response to a create, built from what was written: the
-// row is never read back.
+// agent's scopes are the ones the write returned, and the row is not read back.
 func respondCreated(plan creation) CreateResponse {
 	agent := plan.agent
 
 	return CreateResponse{
 		Agent: Agent{
-			ID: agent.ID, Name: agent.Name.String(), Scopes: agent.Scopes, Status: StatusActive,
+			ID: agent.ID, Name: agent.Name.String(), Scopes: plan.scopes.Claim(), Status: StatusActive,
 			RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(),
 		},
-		Key: Key{ID: agent.KeyID, Token: plan.token, Scope: agent.Scopes, ExpiresAt: agent.KeyExpiresAt.Unix()},
+		Key: Key{ID: agent.KeyID, Token: plan.token, Scopes: plan.keyScopes.Claim(), ExpiresAt: agent.KeyExpiresAt.Unix()},
 	}
 }
 

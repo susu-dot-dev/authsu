@@ -57,19 +57,20 @@ const (
 	bodyInternal = `{"error":{"code":"internal","message":"internal error"}}` + "\n"
 )
 
-// revokeCall is one call of RevokeSession.
+// revokeCall is one call of RevokeKey.
 type revokeCall struct {
-	kid string
-	now time.Time
+	userID string
+	kid    string
+	now    time.Time
 }
 
 // fakeStore is the session store: it records every revocation and answers as it
 // is programmed to.
 type fakeStore struct {
-	// revoked is what RevokeSession reports; false is a session another
+	// revoked is what RevokeKey reports; false is a session another
 	// request revoked first.
 	revoked bool
-	// err, when set, is returned by RevokeSession.
+	// err, when set, is returned by RevokeKey.
 	err error
 	// onRevoked runs when a revocation took effect, so the rest of the
 	// fake database can follow: a revoked session is no longer active.
@@ -78,8 +79,8 @@ type fakeStore struct {
 	calls []revokeCall
 }
 
-func (f *fakeStore) RevokeSession(_ context.Context, kid string, now time.Time) (bool, error) {
-	f.calls = append(f.calls, revokeCall{kid: kid, now: now})
+func (f *fakeStore) RevokeKey(_ context.Context, userID, kid string, now time.Time) (bool, error) {
+	f.calls = append(f.calls, revokeCall{userID: userID, kid: kid, now: now})
 
 	if f.err != nil {
 		return false, f.err

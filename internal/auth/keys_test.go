@@ -1,3 +1,4 @@
+//nolint:goconst // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
 package auth_test
 
 import (
@@ -7,6 +8,7 @@ import (
 	"encoding/json"
 	"maps"
 	"net/http"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -143,29 +146,39 @@ func TestIssuerFor(t *testing.T) {
 // keyCase is a key to create and the claims it must carry beyond the
 // registered ones.
 type keyCase struct {
-	spec     auth.KeySpec
-	wantAud  string
-	wantPick map[string]any
+	spec    auth.KeySpec
+	wantAud string
+	// wantScope is the scope claim: always present, an array, empty when the
+	// key has no scopes.
+	wantScope []any
+	wantPick  map[string]any
 }
 
 func keyCases(expires time.Time) map[string]keyCase {
-	spec := func(kind string, claims map[string]any) auth.KeySpec {
-		return auth.KeySpec{Kind: kind, Subject: userID, Expires: expires, Claims: claims}
+	spec := func(kind string, list scope.List, claims map[string]any) auth.KeySpec {
+		return auth.KeySpec{Kind: kind, Subject: userID, Expires: expires, Scope: list, Claims: claims}
 	}
 
 	return map[string]keyCase{
-		"a session key": {spec(auth.KindSession, nil), audSession, nil},
-		"an api key":    {spec(auth.KindAPIKey, nil), audForAPI, nil},
-		"an api key with claims": {
-			spec(auth.KindAPIKey, map[string]any{"act": map[string]any{claimSub: "agent-1"}, claimScope: agentScope}),
-			audForAPI, map[string]any{claimScope: agentScope},
+		"a session key with no scopes": {spec(auth.KindSession, nil, nil), audSession, []any{}, nil},
+		"an api key with empty scopes": {spec(auth.KindAPIKey, scope.List{}, nil), audForAPI, []any{}, nil},
+		"an api key with one scope": {
+			spec(auth.KindAPIKey, scope.List{"agent:read"}, nil), audForAPI, []any{"agent:read"}, nil,
 		},
-		"claims cannot override the reserved ones": {
-			spec(auth.KindSession, map[string]any{
+		"an api key with a bundle": {
+			spec(auth.KindAPIKey, scope.List{scope.DefaultAgent, "agent:create"}, nil),
+			audForAPI, []any{scope.DefaultAgent, "agent:create"}, nil,
+		},
+		"an api key with an act claim": {
+			spec(auth.KindAPIKey, scope.List{scope.DefaultAgent}, map[string]any{"act": map[string]any{claimSub: "agent-1"}}),
+			audForAPI, []any{scope.DefaultAgent}, map[string]any{"act": map[string]any{claimSub: "agent-1"}},
+		},
+		"claims cannot override the reserved ones or the scope": {
+			spec(auth.KindSession, scope.List{"agent:read"}, map[string]any{
 				claimSub: otherUserID, claimIss: "https://evil.example.com/keys/x", claimAud: audForAPI,
-				claimExp: 1, claimIat: 1, claimVer: "japikey-v1", claimScope: "kept",
+				claimExp: 1, claimIat: 1, claimVer: "japikey-v1", claimScope: []any{"user:revoke"},
 			}),
-			audSession, map[string]any{claimScope: "kept"},
+			audSession, []any{"agent:read"}, nil,
 		},
 	}
 }
@@ -182,9 +195,18 @@ func claimProblems(key auth.Key, claims map[string]any, issuer auth.Issuer, tt k
 	var problems []string
 
 	for name, value := range want {
-		if claims[name] != value {
+		if !reflect.DeepEqual(claims[name], value) {
 			problems = append(problems, name)
 		}
+	}
+
+	if !reflect.DeepEqual(claims[claimScope], tt.wantScope) {
+		problems = append(problems, claimScope)
+	}
+
+	// The row's copy is the claim by construction: it is the same list.
+	if key.Scope != tt.spec.Scope.JSON() {
+		problems = append(problems, "Key.Scope")
 	}
 
 	return problems
@@ -302,17 +324,24 @@ func TestCreateSession(t *testing.T) {
 	want := map[string]any{
 		claimSub: userID, claimAud: audSession, claimIss: issuer.Base + "/" + key.ID.String(),
 		claimExp: float64(expires.Unix()), claimVer: versionV2,
+		// A session is every scope: the default:session bundle, signed as an array.
+		claimScope: []any{"default:session"},
 	}
 
 	for name, value := range want {
-		if claims[name] != value {
+		if !reflect.DeepEqual(claims[name], value) {
 			t.Errorf("claim %q = %v, want %v", name, claims[name], value)
 		}
 	}
 
-	// The registered claims and iat: no role and nothing else is in the token.
+	// The registered claims, the scope and iat: no role and nothing else is in
+	// the token.
 	if len(claims) != len(want)+1 {
-		t.Errorf("claims = %v, want only %d registered ones and iat", claims, len(want))
+		t.Errorf("claims = %v, want only %d claims and iat", claims, len(want))
+	}
+
+	if key.Scope != `["default:session"]` {
+		t.Errorf("Key.Scope = %q, want the stored copy of the claim", key.Scope)
 	}
 }
 
@@ -616,9 +645,6 @@ func TestCreatedKeysFitTheSchema(t *testing.T) {
 	}
 }
 
-// agentScope is the scope claim of an agent's key.
-const agentScope = "default:agent"
-
 // TestCreatedTokensAreAcceptedAsTokens is the seam between the tokens auth
 // creates and the input.Token the boundary parses every cookie into: a token
 // that parser refuses could be issued, set as a cookie, and never accepted. It
@@ -633,23 +659,32 @@ func TestCreatedTokensAreAcceptedAsTokens(t *testing.T) {
 	longest := auth.Issuer{Base: "https://" + host + "/keys", Insecure: false}
 
 	issuers := map[string]auth.Issuer{"the test issuer": newRig(t).issuer, "the longest issuer": longest}
-	claims := map[string]map[string]any{
-		"no extra claims": nil,
-		"an agent's claims": {
-			"act":   map[string]any{"sub": "01234567-89ab-7def-8123-456789abcdef"},
-			"scope": agentScope,
-		},
+	// The largest scope list a client can have accepted: every scope and every
+	// bundle, each once (input.ParseScopeList refuses a repeat).
+	largest := append(allScopeNames(), scope.DefaultSession, scope.DefaultUser, scope.DefaultAgent)
+
+	type spec struct {
+		scopes scope.List
+		claims map[string]any
+	}
+
+	actorClaim := map[string]any{claimAct: map[string]any{claimSub: "01234567-89ab-7def-8123-456789abcdef"}}
+
+	specs := map[string]spec{
+		"no scopes":                           {scopes: nil, claims: nil},
+		"an agent's claims":                   {scopes: scope.List{scope.DefaultAgent}, claims: actorClaim},
+		"the largest scope list and an actor": {scopes: largest, claims: actorClaim},
 	}
 
 	for issuerName, issuer := range issuers {
-		for claimsName, extra := range claims {
+		for specName, extra := range specs {
 			for _, kind := range []string{auth.KindSession, auth.KindAPIKey} {
-				t.Run(issuerName+"/"+claimsName+"/"+kind, func(t *testing.T) {
+				t.Run(issuerName+"/"+specName+"/"+kind, func(t *testing.T) {
 					t.Parallel()
 
 					key, err := auth.CreateKey(issuer, auth.KeySpec{
 						Kind: kind, Subject: "01234567-89ab-7def-8123-456789abcdef",
-						Expires: time.Now().Add(time.Hour), Claims: extra,
+						Expires: time.Now().Add(time.Hour), Scope: extra.scopes, Claims: extra.claims,
 					})
 					if err != nil {
 						t.Fatalf("CreateKey: %v", err)
@@ -667,4 +702,15 @@ func TestCreatedTokensAreAcceptedAsTokens(t *testing.T) {
 			}
 		}
 	}
+}
+
+// allScopeNames is every scope's name.
+func allScopeNames() []string {
+	names := make([]string, 0, len(scope.Scopes()))
+
+	for _, s := range scope.Scopes() {
+		names = append(names, string(s))
+	}
+
+	return names
 }

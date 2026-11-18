@@ -34,6 +34,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,7 +44,9 @@ import (
 )
 
 const (
-	agScopes      = "default:agent"
+	// agScopes is the default agent bundle as stored and signed: a JSON array.
+	agScopes      = `["default:agent"]`
+	agBundleName  = "default:agent"
 	agAudience    = "authsu/api_key"
 	agCodeLimit   = "agent_limit_reached"
 	agCodeMissing = "agent_not_found"
@@ -68,20 +71,20 @@ const (
 
 // agView is the JSON view of an agent.
 type agView struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Scopes    string `json:"scopes"`
-	Status    string `json:"status"`
-	RevokedAt *int64 `json:"revokedAt"`
-	CreatedAt int64  `json:"createdAt"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Scopes    []string `json:"scopes"`
+	Status    string   `json:"status"`
+	RevokedAt *int64   `json:"revokedAt"`
+	CreatedAt int64    `json:"createdAt"`
 }
 
 // agKey is the JSON view of a created key.
 type agKey struct {
-	ID        string `json:"id"`
-	Token     string `json:"token"`
-	Scope     string `json:"scope"`
-	ExpiresAt int64  `json:"expiresAt"`
+	ID        string   `json:"id"`
+	Token     string   `json:"token"`
+	Scopes    []string `json:"scopes"`
+	ExpiresAt int64    `json:"expiresAt"`
 }
 
 // agCreated is the body of a successful create.
@@ -95,6 +98,9 @@ type agPage struct {
 	Agents []agView `json:"agents"`
 	Next   string   `json:"next"`
 }
+
+// agIsDefault reports whether scopes is exactly the default agent bundle.
+func agIsDefault(scopes []string) bool { return len(scopes) == 1 && scopes[0] == agBundleName }
 
 func agDecode[T any](t *testing.T, r reply) T {
 	t.Helper()
@@ -334,7 +340,7 @@ func TestAgentCreateStoresExactlyWhatItReturns(t *testing.T) {
 	}
 
 	wantAgentKeys := []string{"createdAt", "id", "name", "scopes", "status"}
-	wantKeyKeys := []string{"expiresAt", "id", "scope", "token"}
+	wantKeyKeys := []string{"expiresAt", "id", "scopes", "token"}
 
 	if slices.Sorted(mapKeys(generic["agent"])) == nil || !slices.Equal(slices.Sorted(mapKeys(generic["agent"])), wantAgentKeys) {
 		t.Errorf("agent members = %v, want %v", slices.Sorted(mapKeys(generic["agent"])), wantAgentKeys)
@@ -351,7 +357,7 @@ func TestAgentCreateStoresExactlyWhatItReturns(t *testing.T) {
 	created := agDecode[agCreated](t, raw)
 	agent, key := created.Agent, created.Key
 
-	if agent.Name != "assistant" || agent.Scopes != agScopes || agent.Status != "active" || agent.RevokedAt != nil {
+	if agent.Name != "assistant" || !agIsDefault(agent.Scopes) || agent.Status != "active" || agent.RevokedAt != nil {
 		t.Errorf("agent = %+v, want an active assistant with %s and no revokedAt", agent, agScopes)
 	}
 
@@ -359,9 +365,9 @@ func TestAgentCreateStoresExactlyWhatItReturns(t *testing.T) {
 		t.Errorf("createdAt = %d, want within [%d, %d]", agent.CreatedAt, before, after)
 	}
 
-	if key.Scope != agScopes || key.ExpiresAt != agent.CreatedAt+agKeyLifetime {
-		t.Errorf("key = {scope %q, expiresAt %d}, want %s and createdAt+90d = %d",
-			key.Scope, key.ExpiresAt, agScopes, agent.CreatedAt+agKeyLifetime)
+	if !agIsDefault(key.Scopes) || key.ExpiresAt != agent.CreatedAt+agKeyLifetime {
+		t.Errorf("key = {scopes %q, expiresAt %d}, want %s and createdAt+90d = %d",
+			key.Scopes, key.ExpiresAt, agScopes, agent.CreatedAt+agKeyLifetime)
 	}
 
 	if idErr := agWellFormedID(agent.ID); idErr != "" || agWellFormedID(key.ID) != "" {
@@ -498,8 +504,9 @@ func agVerifyClaims(t *testing.T, owner string, created agCreated) {
 		t.Errorf("act = %v, want {sub: the agent %s}", claims["act"], created.Agent.ID)
 	}
 
-	if claims["scope"] != agScopes || claims["aud"] != agAudience {
-		t.Errorf("scope/aud = %v / %v, want %s / %s", claims["scope"], claims["aud"], agScopes, agAudience)
+	// The claim is the array that is stored, signed as an array of strings.
+	if scopeClaim := string(mustJSON(t, claims["scope"])); scopeClaim != agScopes || claims["aud"] != agAudience {
+		t.Errorf("scope/aud = %s / %v, want %s / %s", scopeClaim, claims["aud"], agScopes, agAudience)
 	}
 
 	if want := target.apiOrigin + "/keys/" + created.Key.ID; claims["iss"] != want {
@@ -578,9 +585,10 @@ func agKeyIsNotACredential(t *testing.T, session, key string) {
 		}
 	}
 
-	// Presented as a bearer header it is not read either.
-	got := send(t, request{method: http.MethodGet, path: pathAgent, headers: map[string]string{"Authorization": "Bearer " + key}})
-	got.expect(t, "key as bearer", http.StatusUnauthorized, codeUnauthenticated)
+	// The carriers are not interchangeable the other way either: a session
+	// token presented as a bearer is not an API key.
+	got := send(t, request{method: http.MethodGet, path: pathAgent, bearer: session})
+	got.expect(t, "session as bearer", http.StatusUnauthorized, codeUnauthenticated)
 
 	get(t, pathSession, session).expect(t, "real session still works", http.StatusOK, "")
 }
@@ -725,8 +733,7 @@ func agNameCases() []agNameCase {
 		agBadRaw("upper case key", `{"NAME":"a"}`, "unknown_field"),
 		agBadRaw("unknown userId", `{"name":"a","userId":"`+idUserB+`"}`, "unknown_field"),
 		agBadRaw("unknown user_id", `{"name":"a","user_id":"x"}`, "unknown_field"),
-		agBadRaw("unknown scopes", `{"name":"a","scopes":"admin:all"}`, "unknown_field"),
-		agBadRaw("unknown scope", `{"name":"a","scope":"admin:all"}`, "unknown_field"),
+		agBadRaw("the singular is not a member", `{"name":"a","scope":["agent:read"]}`, "unknown_field"),
 		agBadRaw("unknown id", `{"name":"a","id":"`+idAgentA+`"}`, "unknown_field"),
 		agBadRaw("unknown role", `{"name":"a","role":"admin"}`, "unknown_field"),
 		agBadRaw("unknown status", `{"name":"a","status":"revoked"}`, "unknown_field"),
@@ -1219,7 +1226,7 @@ func TestAgentListShapes(t *testing.T) {
 
 	second := page.Agents[1]
 	if second.Status != "revoked" || second.RevokedAt == nil || *second.RevokedAt != 12345 || second.CreatedAt != 777 ||
-		second.Name != "second" || second.Scopes != agScopes {
+		second.Name != "second" || !agIsDefault(second.Scopes) {
 		t.Errorf("revoked agent = %+v", second)
 	}
 
@@ -1244,7 +1251,7 @@ func TestAgentListShapes(t *testing.T) {
 		one := get(t, agItem(a.ID), world.tokenB)
 		one.expect(t, "get", http.StatusOK, "")
 
-		if got := agDecode[agView](t, one); got != a && (got.RevokedAt == nil) == (a.RevokedAt == nil) && got.ID != a.ID {
+		if got := agDecode[agView](t, one); !reflect.DeepEqual(got, a) {
 			t.Errorf("GET %s = %+v, list had %+v", a.ID, got, a)
 		}
 
@@ -1778,7 +1785,7 @@ func TestAgentRename(t *testing.T) {
 	got.expect(t, "rename", http.StatusOK, "")
 
 	view := agDecode[agView](t, got)
-	if view.ID != idAgentA || view.Name != "after" || view.Scopes != agScopes || view.Status != "active" ||
+	if view.ID != idAgentA || view.Name != "after" || !agIsDefault(view.Scopes) || view.Status != "active" ||
 		view.RevokedAt != nil || strconv.FormatInt(view.CreatedAt, 10) != created {
 		t.Errorf("rename response = %+v", view)
 	}
@@ -1841,7 +1848,7 @@ func TestAgentRename(t *testing.T) {
 		{"name null", `{"name":null}`, agCodeNoName},
 		{"body null", `null`, agCodeNoName},
 		{"empty string", `{"name":""}`, agCodeBadName},
-		{"unknown field", `{"name":"x","scopes":"y"}`, "unknown_field"},
+		{"scopes are not a member of a rename", `{"name":"x","scopes":["agent:read"]}`, "unknown_field"},
 		{"array", `[]`, "invalid_field_type"},
 		{"trailing data", `{"name":"x"} {}`, "trailing_data"},
 		{"duplicate", `{"name":"x","name":"y"}`, "duplicate_field"},
@@ -1979,13 +1986,17 @@ func TestAgentRevokedKeyIsNotAccepted(t *testing.T) {
 	world := agNewPair(t, roleMember)
 	created := agMustCreate(t, world.tokenB, "key holder")
 
-	// Active: no route accepts it (there is no API-key credential yet).
+	// Active: it is accepted as a bearer, and only as a bearer: never as the
+	// session cookie.
 	agKeyIsNotACredential(t, world.tokenB, created.Key.Token)
+	scBearer(t, http.MethodGet, pathAgent, nil, created.Key.Token).expect(t, "active key as bearer", http.StatusOK, "")
 
 	del(t, agItem(created.Agent.ID), world.tokenB).expect(t, "revoke", http.StatusOK, "")
 	expectCount(t, "japikeys WHERE kid = ? AND revoked_at IS NOT NULL", "1", created.Key.ID)
 
-	// Revoked: its claims still decode, and it is still refused.
+	// Revoked: its claims still decode, and it is refused as a bearer too.
+	scBearer(t, http.MethodGet, pathAgent, nil, created.Key.Token).
+		expect(t, "revoked key as bearer", http.StatusUnauthorized, codeUnauthenticated)
 	if sub := claimsOf(t, created.Key.Token)["sub"]; sub != world.b.userID {
 		t.Errorf("sub = %v after revocation", sub)
 	}

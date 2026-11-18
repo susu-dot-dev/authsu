@@ -234,6 +234,7 @@ func (h *handlers) accept(ctx context.Context, in proved, now time.Time) (finish
 		JWK:             key.JWK,
 		ExpiresAt:       key.ExpiresAt,
 		GrantedFrom:     auth.LoginGrant(in.parsed.Challenge),
+		Scope:           key.Scope,
 		Flags:           in.asserted.Flags.Stored(),
 		CreatedAt:       now,
 	})

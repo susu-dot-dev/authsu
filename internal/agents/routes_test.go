@@ -10,23 +10,26 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/agents"
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 )
 
 // TestRouteDeclarations is the permission-confusion test of the route table:
-// every route of the API, and for each the credential it needs and the
-// requirement it adds. Every agent route is the caller's own business, so each
-// needs a session and nothing more; in particular none is an administrator's.
+// every route of the API, and for each the credential and the exact access it
+// declares. Every agent route is the caller's own business, so none is an admin
+// scope; renaming and revoking refuse agents (siblings are peers), and creating
+// is the one write an agent may do, with agent:create.
 func TestRouteDeclarations(t *testing.T) {
 	t.Parallel()
 
 	want := []struct {
 		method, path string
+		access       auth.Access
 	}{
-		{http.MethodGet, "/api/agent"},
-		{http.MethodPost, "/api/agent"},
-		{http.MethodGet, itemPattern},
-		{http.MethodPatch, itemPattern},
-		{http.MethodDelete, itemPattern},
+		{http.MethodGet, "/api/agent", auth.Needs(scope.AgentRead)},
+		{http.MethodPost, "/api/agent", auth.Needs(scope.AgentCreate)},
+		{http.MethodGet, itemPattern, auth.Needs(scope.AgentRead)},
+		{http.MethodPatch, itemPattern, auth.Needs(scope.AgentUpdate).WithoutAgents()},
+		{http.MethodDelete, itemPattern, auth.Needs(scope.AgentRevoke).WithoutAgents()},
 	}
 
 	routes := agents.Routes(newRig(t).deps())
@@ -46,24 +49,33 @@ func TestRouteDeclarations(t *testing.T) {
 				t.Fatalf("no route %s %s in %+v", expected.method, expected.path, routes)
 			}
 
-			route := routes[at]
-
-			if route.Credential != auth.Session {
-				t.Errorf("Credential = %v, want Session", route.Credential)
-			}
-
-			if route.Require != nil {
-				t.Error("Require is set; every agent route is open to any signed-in user, for their own agents")
-			}
-
-			if route.MaxBody != agents.MaxBody {
-				t.Errorf("MaxBody = %d, want %d", route.MaxBody, agents.MaxBody)
-			}
-
-			if route.Handle == nil {
-				t.Error("Handle is nil")
-			}
+			checkDeclared(t, routes[at], expected.access)
 		})
+	}
+}
+
+// checkDeclared checks one agent route's credential, access, cap and handler.
+func checkDeclared(t *testing.T, route auth.Route, access auth.Access) {
+	t.Helper()
+
+	if route.Credential != auth.Authenticated {
+		t.Errorf("Credential = %v, want Authenticated", route.Credential)
+	}
+
+	if route.Access != access {
+		t.Errorf("Access = %+v, want %+v", route.Access, access)
+	}
+
+	if scope.IsAdmin(route.Access.Scope) {
+		t.Errorf("%s is an admin scope; an agent route is for the caller's own agents", route.Access.Scope)
+	}
+
+	if route.Access.SessionOnly {
+		t.Error("a route is session-only; the agents API is for keys too, so software can manage agents")
+	}
+
+	if route.MaxBody != agents.MaxBody || route.Handle == nil {
+		t.Errorf("MaxBody = %d (want %d), Handle nil = %t", route.MaxBody, agents.MaxBody, route.Handle == nil)
 	}
 }
 
@@ -115,8 +127,8 @@ func TestLimits(t *testing.T) {
 		t.Errorf("KeyLifetime = %v, want 90 days", agents.KeyLifetime)
 	}
 
-	if agents.DefaultScopes != "default:agent" {
-		t.Errorf("DefaultScopes = %q, want default:agent", agents.DefaultScopes)
+	if got := agents.DefaultScopes().JSON(); got != `["default:agent"]` {
+		t.Errorf("DefaultScopes = %s, want the default:agent bundle", got)
 	}
 }
 
@@ -178,7 +190,8 @@ func withoutAValidSession() []situation {
 
 			key, err := auth.CreateKey(auth.IssuerFor(origin), auth.KeySpec{
 				Kind: auth.KindAPIKey, Subject: userA, Expires: time.Now().Add(time.Hour),
-				Claims: map[string]any{claimAct: map[string]any{claimSub: agentA1}, claimScope: agents.DefaultScopes},
+				Scope:  agents.DefaultScopes(),
+				Claims: map[string]any{claimAct: map[string]any{claimSub: agentA1}},
 			})
 			if err != nil {
 				rg.t.Fatal(err)

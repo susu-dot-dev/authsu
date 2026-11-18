@@ -278,7 +278,7 @@ func nothingSet() map[string]string {
 
 // Reasons that are in the log.
 const (
-	logNoCookie  = "no session cookie"
+	logNoCookie  = "no credential"
 	logTwo       = "more than one session cookie"
 	logNoKey     = "no active key"
 	logNotOwner  = "subject is not the key's owner"
@@ -457,7 +457,7 @@ func issuerCases() []boundaryCase {
 // it.
 func forgedClaims(mutate func(map[string]any)) cookieFn {
 	return func(r *rig) []*http.Cookie {
-		token := forge(r.t, r.issuer, userID, r.now, mutate)
+		token := forge(r.t, r.issuer, r.now, mutate)
 		r.storeForged(token, userID, auth.RoleAdmin)
 
 		return []*http.Cookie{requestCookie(auth.CookieName, token.JWT)}

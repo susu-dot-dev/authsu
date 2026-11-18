@@ -598,10 +598,16 @@ func (l lgAccepted) checkJWT(t *testing.T) {
 	}
 
 	// The role is read per request and never signed into the token.
-	for _, forbidden := range []string{"role", "roles", "scope", "act", "admin"} {
+	for _, forbidden := range []string{"role", "roles", "act", "admin"} {
 		if _, ok := claims[forbidden]; ok {
 			t.Errorf("claims carry %q: %v", forbidden, claims)
 		}
+	}
+
+	// A session is signed with every scope, as the default:session bundle: the
+	// one thing besides the registered claims that a token carries.
+	if list, _ := claims["scope"].([]any); len(list) != 1 || list[0] != "default:session" {
+		t.Errorf("scope claim = %v, want [default:session]", claims["scope"])
 	}
 }
 

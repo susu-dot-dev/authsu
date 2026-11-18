@@ -16,15 +16,19 @@
 // names an owner, so an agent that belongs to another user is answered, by the
 // store's own owner condition, exactly as one that does not exist.
 //
-// Creating an agent hands out authority, so it needs a passkey-backed session:
-// this API does not accept an API key yet, and nothing verifies one. The
-// response to a create carries the agent's first key, once: only the public half
-// is stored, so a lost key cannot be shown again. Agents are short-lived, and
-// there is no rotation: replace an agent by revoking it and creating another.
+// Every route declares the scope it needs (docs/permissions_design.md). A user
+// may call them with a session or an API key; an agent may use only the routes
+// its scopes allow, and never rename or revoke (agents are peers under their
+// user, so those refuse agents whatever they hold).
 //
-// The scope lists in docs/permissions_design.md are not implemented. Every
-// agent and key is written with the default agent bundle and nothing reads
-// them back; the lists will be validated and enforced in a later change.
+// Creating an agent hands out authority. A user chooses the new agent's scopes
+// and its first key's freely: the user's role bounds every request, so neither
+// can exceed what the user may do. An agent that holds agent:create is bounded
+// by itself: the new agent has the creating agent's scopes, and its key may hold
+// only entries of the creating key's own list. The response to a create carries
+// the agent's first key, once: only the public half is stored, so a lost key
+// cannot be shown again. Agents are short-lived, and there is no rotation:
+// replace an agent by revoking it and creating another.
 package agents
 
 import (
@@ -33,6 +37,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -48,10 +53,10 @@ const (
 	KeyLifetime = 90 * 24 * time.Hour
 )
 
-// DefaultScopes is the scope list every agent and every agent key is created
-// with. It names the default agent bundle. It is stored and signed into the
-// key's token but nothing interprets it yet (docs/permissions_design.md).
-const DefaultScopes = "default:agent"
+// DefaultScopes is the scope list a user's create gives an agent and its key
+// when the request names none: the default agent bundle. It is written out in
+// full, and never read as "none means default" (docs/permissions_design.md).
+func DefaultScopes() scope.List { return scope.List{scope.DefaultAgent} }
 
 // Store is the part of the database the agent routes use. Every method is
 // scoped to one owner, the signed-in user: an agent of another user is not
@@ -62,9 +67,10 @@ type Store interface {
 	ListAgents(ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit) (store.AgentPage, error)
 	// GetAgent returns one of the owner's agents, or store.ErrNotFound.
 	GetAgent(ctx context.Context, owner string, id input.ID) (store.Agent, error)
-	// CreateAgent writes an agent and its first key as one batch, or returns
+	// CreateAgent writes an agent and its first key as one batch and returns the
+	// agent's scope list as the write stored it (JSON), or returns
 	// store.ErrConflict when the owner is at the limit or was revoked.
-	CreateAgent(ctx context.Context, agent store.NewAgent) error
+	CreateAgent(ctx context.Context, agent store.NewAgent) (string, error)
 	// RenameAgent renames one of the owner's agents and returns it as the
 	// write left it (a revoked agent keeps its name), or store.ErrNotFound.
 	RenameAgent(ctx context.Context, owner string, id input.ID, name input.AgentName) (store.Agent, error)
@@ -108,9 +114,9 @@ type Agent struct {
 	// Name is the label its user gave it.
 	Name string `json:"name"`
 
-	// Scopes is the agent's scope list as stored.
-	Scopes string `json:"scopes"`
-	Status Status `json:"status"`
+	// Scopes is the agent's scope list as stored, as written.
+	Scopes []string `json:"scopes"`
+	Status Status   `json:"status"`
 
 	// RevokedAt is absent when the agent is not revoked.
 	RevokedAt *int64 `json:"revokedAt,omitempty"`
@@ -128,7 +134,7 @@ func present(stored store.Agent) Agent {
 	}
 
 	return Agent{
-		ID: stored.ID, Name: stored.Name, Scopes: stored.Scopes, Status: status,
+		ID: stored.ID, Name: stored.Name, Scopes: scope.Read(stored.Scopes).Claim(), Status: status,
 		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt,
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"time"
 	"uuid"
@@ -12,6 +13,8 @@ import (
 	"github.com/susu-dot-dev/japikey_go"
 
 	"github.com/susu-dot-dev/authsu/internal/config"
+	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -78,6 +81,10 @@ type Key struct {
 	ExpiresAt time.Time
 	// PublicKey is the public half, for tests and callers that verify at once.
 	PublicKey crypto.PublicKey
+	// Scope is the scope list signed into the token, as the JSON array stored
+	// on the key's row. Callers store this and never rebuild it, so the row's
+	// copy is the claim by construction.
+	Scope string
 }
 
 // KeySpec describes a key to create.
@@ -88,15 +95,27 @@ type KeySpec struct {
 	Subject string
 	// Expires is the token's exp.
 	Expires time.Time
-	// Claims are extra claims to sign into the token, such as act and scope.
-	// japikey writes its own claims (sub, iss, aud, exp, iat, ver) after
-	// these, so none of them can be overridden from here.
+	// Scope is the key's scope list. It is signed into the token as the scope
+	// claim, an array of strings: always present, and empty for a key that may
+	// use only the routes that need no scope.
+	Scope scope.List
+	// Claims are extra claims to sign into the token, such as act. japikey
+	// writes its own claims (sub, iss, aud, exp, iat, ver) after these, and
+	// the scope claim is written after them too, so none can be overridden
+	// from here.
 	Claims map[string]any
 }
 
+// SessionScope is the scope list every session is created with: the
+// default:session bundle, which is every scope. A session is the user acting in
+// person, so it is limited only by the user's role (admin scopes need the
+// administrator role whatever a token says). A session is not narrowed at
+// login: a stronger step-up would be its own mechanism, not a smaller session.
+func SessionScope() scope.List { return scope.List{scope.DefaultSession} }
+
 // CreateSession creates a session key for userID that expires at expires: a
 // fresh key pair, one signed JWT, and the public key as a JWK document. The
-// private key is not returned and not kept.
+// private key is not returned and not kept. It carries SessionScope.
 //
 // The token carries no role. The role is read from the account on every
 // request (store.ActiveKey joins it in the same primary-key read that finds the
@@ -104,7 +123,7 @@ type KeySpec struct {
 // a claim could only be stale (docs/users_design.md).
 func CreateSession(issuer Issuer, userID string, expires time.Time) (Key, error) {
 	return createKey(json.Marshal, issuer, KeySpec{
-		Kind: KindSession, Subject: userID, Expires: expires, Claims: nil,
+		Kind: KindSession, Subject: userID, Expires: expires, Scope: SessionScope(), Claims: nil,
 	})
 }
 
@@ -118,36 +137,52 @@ func CreateKey(issuer Issuer, spec KeySpec) (Key, error) {
 // createKey is CreateKey with the JSON encoder injected, so that its failure,
 // which no valid key causes, is reachable from a test.
 func createKey(marshal func(any) ([]byte, error), issuer Issuer, spec KeySpec) (Key, error) {
-	created, err := japikey.NewJAPIKey(japikey.Config{
+	claims := make(map[string]any, len(spec.Claims)+1)
+	maps.Copy(claims, spec.Claims)
+
+	// The scope claim is written last, from the one list that is also returned
+	// for storage, so a caller's Claims cannot override it and the row's copy
+	// cannot differ from it.
+	claims["scope"] = spec.Scope.Claim()
+
+	created := result.Of(japikey.NewJAPIKey(japikey.Config{
 		Subject:           spec.Subject,
 		Issuer:            issuer.Base,
 		Audience:          Audience(spec.Kind),
 		ExpiresAt:         spec.Expires,
-		Claims:            spec.Claims, // a map[string]any is assignable to jwt.MapClaims
+		Claims:            claims, // a map[string]any is assignable to jwt.MapClaims
 		AllowInsecureHTTP: issuer.Insecure,
-	})
-	if err != nil {
-		return Key{}, fmt.Errorf("create %s key: %w", spec.Kind, err)
-	}
+	})).
+		MapErr(func(err error) error { return fmt.Errorf("create %s key: %w", spec.Kind, err) }).
+		Then(func(created *japikey.JAPIKey) (Key, error) {
+			return encodeKey(marshal, created, spec).Get()
+		})
 
-	document, err := created.ToJWKS()
-	// coverage:ignore: ToJWKS only fails for a nil key or a nil id, which NewJAPIKey never returns
-	if err != nil {
-		return Key{}, fmt.Errorf("build JWKS: %w", err)
-	}
+	return created.Get() //nolint:wrapcheck // every error in the chain is wrapped with what failed
+}
 
-	jwk, err := marshal(document)
-	if err != nil {
-		return Key{}, fmt.Errorf("encode JWKS: %w", err)
-	}
-
-	return Key{
-		ID:        created.KeyID,
-		JWT:       created.JWT,
-		JWK:       string(jwk),
-		ExpiresAt: spec.Expires,
-		PublicKey: created.PublicKey,
-	}, nil
+// encodeKey builds the Key for a created japikey: its public key as a JWKS
+// document, encoded as JSON, beside the token and the scope list that was signed
+// into it.
+func encodeKey(marshal func(any) ([]byte, error), created *japikey.JAPIKey, spec KeySpec) result.Result[Key] {
+	return result.Of(created.ToJWKS()).
+		// coverage:ignore: ToJWKS only fails for a nil key or a nil id, which NewJAPIKey never returns
+		MapErr(func(err error) error { return fmt.Errorf("build JWKS: %w", err) }).
+		Then(func(document *japikey.JWKS) ([]byte, error) {
+			return result.Of(marshal(document)).
+				MapErr(func(err error) error { return fmt.Errorf("encode JWKS: %w", err) }).
+				Get()
+		}).
+		Map(func(jwk []byte) Key {
+			return Key{
+				ID:        created.KeyID,
+				JWT:       created.JWT,
+				JWK:       string(jwk),
+				ExpiresAt: spec.Expires,
+				PublicKey: created.PublicKey,
+				Scope:     spec.Scope.JSON(),
+			}
+		})
 }
 
 // LoginGrant is the granted_from value for the session a login challenge

@@ -12,8 +12,8 @@ How tests are written and what gates them. Generic scaffolding: how a specific t
 - **Each layer has its own focus:**
   - *parsers*: exhaustive edge cases per primitive, plus a fuzz test per parser asserting that an accepted value round-trips unchanged and a refused one always carries the type's code;
   - *data access*: per operation, the SQL fragments that carry the guards, the exact argument order, decoding of every column type including the defect cases, the mapping of every outcome and error class, and a test that reads `migrations/` and asserts each parser bound fits inside its schema constraint (the real SQL runs only in e2e);
-  - *route boundary*: a matrix of credential, requirement and outcome, asserting that the handler is never called and nothing is written when any check fails;
-  - *features*: a table per handler (request to status, code, body and store calls), and a route-declaration table asserting each route's method, path, credential and requirement, which is the permission-confusion test.
+  - *route boundary*: a matrix of credential (session, user key, agent key), role, route and outcome, asserting that the handler is never called and nothing is written when any check fails;
+  - *features*: a table per handler (request to status, code, body and store calls), and a route-declaration table asserting each route's method, path, credential and exact access, which is the permission-confusion test.
 - **Time, randomness and I/O are injected**, so every branch is reachable from a test.
 
 ## Coverage

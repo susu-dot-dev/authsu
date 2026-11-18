@@ -96,7 +96,7 @@ func Routes(deps Deps) []auth.Route {
 
 	return []auth.Route{{
 		Method: http.MethodGet, Path: Path, MaxBody: 0,
-		Credential: auth.None, Require: nil, Handle: deps.status,
+		Credential: auth.None, Handle: deps.status,
 	}}
 }
 

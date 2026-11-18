@@ -1840,7 +1840,13 @@ func bndHeaderCredentialCases(token, apiKey string) []bndCookieCase {
 		header("Authorization raw token", "Authorization: "+token),
 		header("bearer in a custom header", "X-Session: "+token, "X-Auth-Token: "+token),
 		header("token in a forwarded url", "X-Original-Url: /?"+cookieName+"="+token),
-		header("bearer and the agent key", "Authorization: Bearer "+apiKey),
+		// A genuine API key as a bearer is a credential now and is not a case
+		// here (see TestBndCredentialConfusion). Both carriers at once are not:
+		// the request is ambiguous, whichever is valid.
+		header("a session cookie and an agent key as a bearer", "Cookie: "+cookieName+"="+token,
+			"Authorization: Bearer "+apiKey),
+		header("a session as a bearer and the agent key beside it",
+			"Authorization: Bearer "+token, "Authorization: Bearer "+apiKey),
 	}
 }
 
@@ -2277,6 +2283,18 @@ func TestBndRoleChangeTakesEffectOnTheNextRequest(t *testing.T) {
 	}
 }
 
+// bndKeyMayNot reports whether a default-agent key may not use the route:
+// everything but reading agents and the open routes (whoami, logout), by scope
+// or by the rule that agents are refused.
+func bndKeyMayNot(route string) bool {
+	switch route {
+	case "session", "logout", "agent list", "agent get":
+		return false
+	default:
+		return true
+	}
+}
+
 // TestBndCredentialConfusion: tokens that are genuine, correctly signed and
 // stored, but not a session for this caller, do not authenticate: another
 // user's session does not act as the owner, an agent API key (a different
@@ -2311,9 +2329,9 @@ func TestBndCredentialConfusion(t *testing.T) {
 	// as a session even though the user is an admin and the signature is good.
 	expectCount(t, "japikeys WHERE kind = 'api_key' AND kid = '"+parsed.Key.ID+"'", "1")
 
-	before := bndSnapshot(t)
+	routes := bndSessionRoutes()
 
-	for _, route := range bndSessionRoutes() {
+	for _, route := range routes {
 		t.Run(route.name+"/api key as cookie", func(t *testing.T) {
 			got := send(t, request{method: route.method, path: route.path(idMissing), token: apiKey, body: bndBodyOf(route)})
 			if got.status != http.StatusUnauthorized || got.body != bndErrUnauth {
@@ -2321,13 +2339,24 @@ func TestBndCredentialConfusion(t *testing.T) {
 			}
 		})
 
+		// An API key is a credential as a bearer: it is verified, never refused
+		// as a bad token, and then judged by its scope. The admin's agent holds
+		// the default agent bundle, so it can read agents and nothing else, and
+		// the admin routes need the role AND an admin scope the bundle lacks.
+		// Each route gets its own key: logout ends the key it presents.
 		t.Run(route.name+"/api key as bearer", func(t *testing.T) {
+			own := bndAgentKey(t, world.adminToken)
+
 			got := send(t, request{
 				method: route.method, path: route.path(idMissing), body: bndBodyOf(route),
-				headers: map[string]string{"Authorization": "Bearer " + apiKey},
+				headers: map[string]string{"Authorization": "Bearer " + own},
 			})
-			if got.status != http.StatusUnauthorized || got.body != bndErrUnauth {
-				t.Errorf("%s with an API key bearer = %d %q, want the opaque 401", route.name, got.status, got.body)
+			if got.status == http.StatusUnauthorized {
+				t.Errorf("%s: a genuine API key as a bearer was refused as unauthenticated: %q", route.name, got.body)
+			}
+
+			if bndKeyMayNot(route.name) && got.status != http.StatusForbidden {
+				t.Errorf("%s with the default agent bundle = %d %q, want 403", route.name, got.status, got.body)
 			}
 		})
 
@@ -2342,10 +2371,13 @@ func TestBndCredentialConfusion(t *testing.T) {
 		})
 	}
 
-	// Creating the agent above is the only write.
-	_ = before
-
+	// The agents this test created are the only writes: the first, and one per
+	// route for its own key. No refused request created, renamed or revoked
+	// anything, and no key was revoked except by logout ending its own key.
 	expectCount(t, "agents WHERE name = 'key'", "1")
+	expectCount(t, "agents WHERE name = 'audience'", strconv.Itoa(len(routes)))
+	expectCount(t, "agents WHERE revoked_at IS NOT NULL", "0")
+	expectCount(t, "agents WHERE name = 'renamed'", "0")
 }
 
 // TestBndLogoutBoundary: logout is the one unsafe route whose credential is

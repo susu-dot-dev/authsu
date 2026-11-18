@@ -114,15 +114,16 @@ func TestTheOwnerIsAlwaysTheSession(t *testing.T) {
 	}
 }
 
-// TestABodyCannotNameAnOwnerOrChooseScopes: the bodies of the writes have no
-// member that could say who owns an agent, which key it gets, or what it may
-// do, and a request that tries is refused whole.
-func TestABodyCannotNameAnOwnerOrChooseScopes(t *testing.T) {
+// TestABodyCannotNameAnOwner: the bodies of the writes have no member that could
+// say who owns an agent, which key it gets, or what state it is in, and a
+// request that tries is refused whole. (A create does take scopes and keyScopes,
+// and a rename takes neither: see TestRenameTakesNoScopes.)
+func TestABodyCannotNameAnOwner(t *testing.T) {
 	t.Parallel()
 
 	members := []string{
-		"userId", "user_id", "owner", "ownerId", claimSub, claimAct, "scopes", claimScope,
-		"id", "kind", "status", "revokedAt",
+		"userId", "user_id", "owner", "ownerId", claimSub, claimAct, claimScope,
+		"id", "kind", "status", "revokedAt", "scope", "keyScope", "createdBy", "agentId",
 	}
 
 	targets := []agentRoute{
@@ -186,6 +187,28 @@ func TestListsHoldOnlyTheCallersAgents(t *testing.T) {
 			rec := rg.as(rg.signIn(tt.who, roleMember), http.MethodGet, tt.target, "")
 
 			wantOK(t, rg, rec, http.StatusOK, tt.want+"\n")
+		})
+	}
+}
+
+// TestRenameTakesNoScopes: a rename changes the name and nothing else, so scopes
+// are not a member of its body. An agent's scopes are fixed when it is created.
+func TestRenameTakesNoScopes(t *testing.T) {
+	t.Parallel()
+
+	for _, member := range []string{"scopes", "keyScopes"} {
+		t.Run(member, func(t *testing.T) {
+			t.Parallel()
+
+			rg := newRig(t)
+			rg.seed(userA, stored(agentA1, nameAlpha, 1, nil))
+
+			body := `{"name":"x","` + member + `":["user:read"]}`
+			rec := rg.as(rg.signIn(userA, roleMember), http.MethodPatch, itemPrefix+agentA1, body)
+
+			wantFailure(t, rg, rec, http.StatusBadRequest,
+				errorBody(codeUnknownField, "request body has an unknown field"), codeUnknownField)
+			rg.untouched()
 		})
 	}
 }

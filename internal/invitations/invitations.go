@@ -32,6 +32,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -88,19 +89,20 @@ func Routes(deps Deps) []auth.Route {
 	handlers := newHandlers(deps)
 
 	return []auth.Route{
-		route(http.MethodGet, CollectionPath, handlers.list),
-		route(http.MethodPost, CollectionPath, handlers.create),
-		route(http.MethodPatch, ItemPath, handlers.update),
-		route(http.MethodDelete, ItemPath, handlers.revoke),
+		route(http.MethodGet, CollectionPath, scope.InvitationRead, handlers.list),
+		route(http.MethodPost, CollectionPath, scope.InvitationCreate, handlers.create),
+		route(http.MethodPatch, ItemPath, scope.InvitationUpdate, handlers.update),
+		route(http.MethodDelete, ItemPath, scope.InvitationRevoke, handlers.revoke),
 	}
 }
 
-// route declares one admin-only route. Every invitation route is the same
-// shape: the declaration is the whole of the access rule.
-func route(method, path string, handle func(*auth.Call) result.Result[httpapi.Response]) auth.Route {
+// route declares one admin route: it needs the scope, which is an admin scope,
+// so the boundary requires the administrator role as well. Every invitation
+// route is the same shape: the declaration is the whole of the access rule.
+func route(method, path string, needs scope.Scope, handle func(*auth.Call) result.Result[httpapi.Response]) auth.Route {
 	return auth.Route{
 		Method: method, Path: path, MaxBody: MaxBody,
-		Credential: auth.Session, Require: auth.Admin, Handle: handle,
+		Credential: auth.Authenticated, Access: auth.Needs(needs), Handle: handle,
 	}
 }
 

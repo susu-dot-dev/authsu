@@ -1,30 +1,12 @@
 package auth
 
 import (
-	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
 // RoleAdmin is the role of an administrator. A role is the account's, read from
 // the database on every request; it is never a claim in a token.
 const RoleAdmin = "admin"
-
-// Admin is the requirement of a route only an administrator may use: 403
-// forbidden for any other signed-in caller. An unauthenticated caller never
-// gets this far: the credential check comes first, so a request without a
-// session is 401, not 403, and learns nothing about the route's requirement.
-func Admin(principal Principal) error {
-	if principal.Role != RoleAdmin {
-		return forbidden()
-	}
-
-	return nil
-}
-
-// forbidden is the classified 403, with a fixed, client-safe description.
-func forbidden() *apierr.Error {
-	return apierr.New(apierr.Forbidden, CodeForbidden, "administrator access is required")
-}
 
 // RoleMember is the role of an ordinary account: a signed-in user with no
 // administrative authority.
