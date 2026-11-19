@@ -158,6 +158,10 @@ config-set-vars: ## Write the origins into wrangler.jsonc: API_ORIGIN=... UI_ORI
 	  echo 'usage: make config-set-vars API_ORIGIN=https://auth.example.com UI_ORIGIN=https://example.com'; exit 2; }
 	@./scripts/config.sh set-vars "$(API_ORIGIN)" "$(UI_ORIGIN)"
 
+.PHONY: setup-local
+setup-local: ## Create .dev.vars with AUTH_HMAC_SECRET and FIRST_RUN_SECRET if it is missing
+	@./scripts/config.sh setup-local
+
 .PHONY: config-set-secret
 config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for .dev.vars, ARGS=--stdin to supply one)
 	@./scripts/config.sh set-secret $(ARGS)

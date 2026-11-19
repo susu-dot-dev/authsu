@@ -89,11 +89,13 @@ A route declares all of this as data, so reviewing permissions is reading a tabl
 
 ## Issuing keys
 
-*Not yet built.* Issuing keys requires a session and always refuses when an agent is acting, whatever the scopes. A leaked key cannot be used to issue more keys, and an agent cannot issue keys for itself or for other agents. The user issues and rotates their agents' keys.
+Issuing a user's own key requires a session and always refuses when an agent is acting, whatever the scopes. A leaked key cannot be used to issue more keys, and an agent cannot issue keys for itself or for other agents. *Not yet built:* the user issuing and rotating their agents' keys; today an agent's first key is issued only with the agent ([agents_design.md](agents_design.md)).
 
-The scopes requested are checked only against the known names, not against the user's own: the intersection on every request bounds them.
+The scopes requested are checked only against the known names, not against the user's own: the intersection on every request bounds them. A request that names no scopes gets the default user bundle, written out in full.
 
 A key lives 90 days unless its lifetime is chosen. A user's own key may be given up to a year. An agent's keys never live longer than 90 days: an agent's credential is the one most likely to sit in software, so it is the one most worth renewing.
+
+A user's own keys are listed, read, renamed and revoked by the same routes, and only their own: another user's key, and any agent's key, are answered as a key that does not exist. A key's name is the only thing about it that changes; its scopes and expiry are fixed when it is issued. The token is shown once, in the response that issued it.
 
 ## Creating agents
 
@@ -123,6 +125,7 @@ The new agent's scopes are copied from the creating agent *inside the write*, no
 ## Revocation
 
 - **Revoking the credential making the request** needs no scope. Logout is this, for a session or a key alike, and the write itself requires the credential to be the user's.
+- **Revoking one of the user's own other keys** needs `key:revoke`, which agents may never use. The write refuses the presented credential, so the route cannot become a second logout.
 - **Revoking the user's other credentials**, their agents' included, is a scope that agents may never use: agents are flat under their user, so an agent holding it could revoke its siblings'. *Not yet built.*
 
 Revoking all of a user's credentials is the simple recovery from a leak. Every credential, an agent's included, belongs to the user, so one revocation ends the user's sessions, their keys and every agent's credentials. Those agents remain, but with no credentials they cannot act. The design insists on one thing here: authorization sits in the write itself, so nothing revoked between being resolved and acting can act.

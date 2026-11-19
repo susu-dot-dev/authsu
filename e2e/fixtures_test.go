@@ -996,7 +996,8 @@ func seedAPIKey(t *testing.T, id, owner, agent string) string {
 		agentID = agent
 	}
 
-	seed(t, "INSERT INTO api_keys (id, user_id, agent_id, scope) VALUES (?, ?, ?, ?)", id, owner, agentID, agentScope)
+	seed(t, "INSERT INTO api_keys (id, user_id, agent_id, name, scope) VALUES (?, ?, ?, 'seeded', ?)",
+		id, owner, agentID, agentScope)
 
 	return token
 }

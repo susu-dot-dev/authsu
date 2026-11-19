@@ -28,6 +28,7 @@ Which names exist, what each is for and what happens when one is missing is part
 | `make config-set-vars API_ORIGIN=https://auth.example.com UI_ORIGIN=https://example.com` | Validates and writes the two origins into `wrangler.jsonc`, keeping its comments. Takes effect on the next `npx wrangler deploy` |
 | `make config-set-secret` | Generates 32 random bytes (43 base64url characters) and uploads them as `AUTH_HMAC_SECRET` with `wrangler secret put`, which deploys a new version |
 | `make config-set-secret ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev` |
+| `make setup-local` | Creates `.dev.vars` (mode 0600) with a generated `AUTH_HMAC_SECRET` and a `FIRST_RUN_SECRET` in the invitation token shape (`susu_inv_` and 43 base64url characters), only if the file does not exist. An existing file is never read or changed: delete it to regenerate |
 | `make config-set-secret ARGS=--stdin` | Uploads a secret you supply on stdin instead of generating one |
 
 The secret is passed to Wrangler on stdin, so it is never on a command line, never printed and never written to disk (except by `--local`, which is the point).
@@ -59,7 +60,7 @@ Conventions for writing migrations are in [DATABASE.md](DATABASE.md). Applying t
 - **Always pass `--local`** for anything that is not a deliberate remote migration. Local and e2e use the same `DB` binding name as production but are simulated.
 - **Remote migrations are applied by hand.** Neither CI nor Workers Builds applies them, so apply a new migration to the target database before deploying code that needs it.
   - **Production:** `npx wrangler d1 migrations apply DB --remote`.
-- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. Once a migration is on `main`, the append-only rule applies and the fix is a new migration.
+- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. Once we ship to production, a migration on `main` is append-only and the fix is a new migration. Until the first production release nothing has been applied to a remote database, so schema changes are edited into `0001_schema.sql` in place (see the README).
 - The `database_id` in `wrangler.jsonc` is an identifier, not a secret.
 
 ## Deploying

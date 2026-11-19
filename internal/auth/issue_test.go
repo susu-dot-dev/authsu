@@ -87,6 +87,7 @@ func TestConstants(t *testing.T) {
 		{"SessionLifetime", auth.SessionLifetime, 14 * 24 * time.Hour},
 		{"AgentKeyLifetime", auth.AgentKeyLifetime, 90 * 24 * time.Hour},
 		{"MaxAgentKeyLifetime", auth.MaxAgentKeyLifetime, 90 * 24 * time.Hour},
+		{"MaxUserKeyLifetime", auth.MaxUserKeyLifetime, 365 * 24 * time.Hour},
 	} {
 		if lifetime.got != lifetime.want {
 			t.Errorf("%s = %v, want %v", lifetime.name, lifetime.got, lifetime.want)
@@ -95,6 +96,10 @@ func TestConstants(t *testing.T) {
 
 	if auth.AgentKeyLifetime > auth.MaxAgentKeyLifetime {
 		t.Error("the default agent key lifetime is longer than the most IssueAPIKey allows")
+	}
+
+	if auth.MaxAgentKeyLifetime > auth.MaxUserKeyLifetime {
+		t.Error("the user's key lifetimes are not within, and above, an agent's")
 	}
 
 	if auth.CookieName != "__Host-session" {
@@ -130,12 +135,19 @@ func issueCases() []issueCase {
 		}
 	}
 
+	userKey := func(lifetime time.Duration) func(io.Reader, func() string, time.Time) (auth.Issued, error) {
+		return func(r io.Reader, newID func() string, now time.Time) (auth.Issued, error) {
+			return auth.IssueUserAPIKey(r, newID, now, lifetime)
+		}
+	}
+
 	return []issueCase{
 		{"a session", auth.IssueSession, auth.SessionLifetime, secret.TagSession, vectorSession, vectorSessionHash},
 		keyCase("a key of the agent lifetime", key, auth.AgentKeyLifetime),
 		keyCase("a key of the longest lifetime", key, auth.MaxAgentKeyLifetime),
 		keyCase("a key of one nanosecond", key, time.Nanosecond),
 		keyCase("a key of a day", key, 24*time.Hour),
+		keyCase("a user's key of the longest lifetime", userKey, auth.MaxUserKeyLifetime),
 	}
 }
 
@@ -318,61 +330,98 @@ func TestIssueTakesExactlyTheBodyOnce(t *testing.T) {
 	}
 }
 
+// keyIssuer is one of the two ways to issue an API key, with the longest
+// lifetime it accepts: an agent's key is capped at 90 days, a user's at a year.
+type keyIssuer struct {
+	name    string
+	issue   func(r io.Reader, newID func() string, now time.Time, lifetime time.Duration) (auth.Issued, error)
+	longest time.Duration
+}
+
+func keyIssuers() []keyIssuer {
+	return []keyIssuer{
+		{"an agent's key", auth.IssueAPIKey, auth.MaxAgentKeyLifetime},
+		{"a user's key", auth.IssueUserAPIKey, auth.MaxUserKeyLifetime},
+	}
+}
+
 // TestIssueAPIKeyLifetimeBounds: a key lives for a positive time that is at
-// most MaxAgentKeyLifetime, to the nanosecond, and anything else is refused
-// before any entropy is read or id taken.
+// most its issuer's longest, to the nanosecond, and anything else is refused
+// before any entropy is read or id taken. The same lifetimes are asked of both
+// issuers, so the one that is allowed a year and the one that is not differ in
+// exactly that.
 func TestIssueAPIKeyLifetimeBounds(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name     string
-		lifetime time.Duration
-		allowed  bool
-	}{
-		{"zero", 0, false},
-		{"minus one nanosecond", -time.Nanosecond, false},
-		{"minus a second", -time.Second, false},
-		{"minus the longest", -auth.MaxAgentKeyLifetime, false},
-		{"the smallest negative", math.MinInt64, false},
-		{"one nanosecond", time.Nanosecond, true},
-		{"one second", time.Second, true},
-		{"a day", 24 * time.Hour, true},
-		{"the agent lifetime", auth.AgentKeyLifetime, true},
-		{"one nanosecond under the longest", auth.MaxAgentKeyLifetime - time.Nanosecond, true},
-		{"exactly the longest", auth.MaxAgentKeyLifetime, true},
-		{"one nanosecond over the longest", auth.MaxAgentKeyLifetime + time.Nanosecond, false},
-		{"one second over the longest", auth.MaxAgentKeyLifetime + time.Second, false},
-		{"a year", 365 * 24 * time.Hour, false},
-		{"the largest duration", math.MaxInt64, false},
-	}
-
 	now := time.Date(2031, time.February, 3, 4, 5, 6, 0, time.UTC)
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
+	for _, issuer := range keyIssuers() {
+		for _, test := range lifetimeCases(issuer.longest) {
+			t.Run(issuer.name+"/"+test.name, func(t *testing.T) {
+				t.Parallel()
 
-			reader := &counted{reader: bytes.NewReader(firstBytes()), asked: 0}
-			ids := &counting{taken: 0}
+				checkLifetime(t, issuer, test.lifetime, now)
+			})
+		}
+	}
+}
 
-			issued, err := auth.IssueAPIKey(reader, ids.newID, now, test.lifetime)
+// lifetimeCase is a lifetime asked of an issuer.
+type lifetimeCase struct {
+	name     string
+	lifetime time.Duration
+}
 
-			if test.allowed {
-				if err != nil || !issued.ExpiresAt.Equal(now.Add(test.lifetime)) {
-					t.Errorf("IssueAPIKey = %+v, %v, want a key ending at %v", issued, err, now.Add(test.lifetime))
-				}
+// lifetimeCases are the lifetimes asked of an issuer whose longest is longest:
+// the edges of its range and of the other issuer's.
+func lifetimeCases(longest time.Duration) []lifetimeCase {
+	return []lifetimeCase{
+		{"zero", 0},
+		{"minus one nanosecond", -time.Nanosecond},
+		{"minus a second", -time.Second},
+		{"minus the longest", -longest},
+		{"the smallest negative", math.MinInt64},
+		{"one nanosecond", time.Nanosecond},
+		{"one second", time.Second},
+		{"a day", 24 * time.Hour},
+		{"the agent lifetime", auth.AgentKeyLifetime},
+		{"one nanosecond under the longest", longest - time.Nanosecond},
+		{"exactly the longest", longest},
+		{"one nanosecond over the longest", longest + time.Nanosecond},
+		{"one second over the longest", longest + time.Second},
+		{"the other issuer's longest", auth.MaxUserKeyLifetime},
+		{"a year", 365 * 24 * time.Hour},
+		{"a year and a day", 366 * 24 * time.Hour},
+		{"the largest duration", math.MaxInt64},
+	}
+}
 
-				return
-			}
+// checkLifetime asks issuer for a key of lifetime: it is issued, ending at now
+// plus the lifetime, when the lifetime is positive and at most the issuer's
+// longest, and otherwise refused with ErrKeyLifetime before any entropy is read
+// or id taken.
+func checkLifetime(t *testing.T, issuer keyIssuer, lifetime time.Duration, now time.Time) {
+	t.Helper()
 
-			if !errors.Is(err, auth.ErrKeyLifetime) {
-				t.Errorf("error = %v, want ErrKeyLifetime", err)
-			}
+	reader := &counted{reader: bytes.NewReader(firstBytes()), asked: 0}
+	ids := &counting{taken: 0}
 
-			if issued.Token != "" || reader.asked != 0 || ids.taken != 0 {
-				t.Errorf("issued = %+v, read %d bytes, took %d id(s): a refusal does nothing", issued, reader.asked, ids.taken)
-			}
-		})
+	issued, err := issuer.issue(reader, ids.newID, now, lifetime)
+
+	if lifetime > 0 && lifetime <= issuer.longest {
+		if err != nil || !issued.ExpiresAt.Equal(now.Add(lifetime)) {
+			t.Errorf("issue = %+v, %v, want a key ending at %v", issued, err, now.Add(lifetime))
+		}
+
+		return
+	}
+
+	if !errors.Is(err, auth.ErrKeyLifetime) {
+		t.Errorf("error = %v, want ErrKeyLifetime", err)
+	}
+
+	if issued.Token != "" || reader.asked != 0 || ids.taken != 0 {
+		t.Errorf("issued = %+v, read %d bytes, took %d id(s): a refusal does nothing", issued, reader.asked, ids.taken)
 	}
 }
 

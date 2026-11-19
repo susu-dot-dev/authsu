@@ -38,10 +38,13 @@ const (
 
 	// MaxAgentKeyLifetime is the longest an agent's key may live. An agent's
 	// credential is the one most likely to sit in software, so it is the one
-	// most worth renewing. IssueAPIKey refuses anything longer. A key that
-	// belongs to a user may be given longer; that limit arrives with the API
-	// that issues such keys, and widens what IssueAPIKey accepts.
+	// most worth renewing. IssueAPIKey refuses anything longer.
 	MaxAgentKeyLifetime = 90 * 24 * time.Hour
+
+	// MaxUserKeyLifetime is the longest a user may give one of their own keys:
+	// a year. IssueUserAPIKey refuses anything longer, so the API's parser
+	// (input.ParseKeyLifetime) and this limit are two checks of one rule.
+	MaxUserKeyLifetime = 365 * 24 * time.Hour
 )
 
 // CookieName is the session cookie. The __Host- prefix makes browsers refuse
@@ -49,9 +52,9 @@ const (
 // subdomain cannot set or shadow it.
 const CookieName = "__Host-session"
 
-// ErrKeyLifetime is why IssueAPIKey refused a lifetime: it is not positive or
-// is longer than MaxAgentKeyLifetime. It is a defect of the caller, never of a
-// client's input, which is parsed before it gets this far.
+// ErrKeyLifetime is why IssueAPIKey or IssueUserAPIKey refused a lifetime: it is
+// not positive or is longer than the issuer's maximum. It is a defect of the
+// caller, never of a client's input, which is parsed before it gets this far.
 var ErrKeyLifetime = errors.New("API key lifetime is out of range")
 
 // Issued is a secret that has just been issued: what is shown to the client
@@ -78,13 +81,28 @@ func IssueSession(r io.Reader, newID func() string, now time.Time) (Issued, erro
 	return issue(r, newID, secret.TagSession, now.Add(SessionLifetime)).Get() //nolint:wrapcheck // issue wraps its error
 }
 
-// IssueAPIKey issues an API key token that expires lifetime after now. It
-// refuses a lifetime that is not positive or is longer than MaxAgentKeyLifetime
-// with ErrKeyLifetime. Randomness comes from r and the id from newID, as for
-// IssueSession. Nothing is stored: the caller writes the Hash and the ID.
+// IssueAPIKey issues an API key token for an agent that expires lifetime after
+// now. It refuses a lifetime that is not positive or is longer than
+// MaxAgentKeyLifetime with ErrKeyLifetime. Randomness comes from r and the id
+// from newID, as for IssueSession. Nothing is stored: the caller writes the Hash
+// and the ID.
 func IssueAPIKey(r io.Reader, newID func() string, now time.Time, lifetime time.Duration) (Issued, error) {
-	if lifetime <= 0 || lifetime > MaxAgentKeyLifetime {
-		return Issued{}, fmt.Errorf("%w: %v is not in (0, %v]", ErrKeyLifetime, lifetime, MaxAgentKeyLifetime)
+	return issueKey(r, newID, now, lifetime, MaxAgentKeyLifetime)
+}
+
+// IssueUserAPIKey is IssueAPIKey for a key that belongs to a user and not to an
+// agent: it allows a lifetime up to MaxUserKeyLifetime. It is a separate issuer,
+// and not a parameter of the agent's, so that the code that issues an agent's
+// key cannot be handed a longer ceiling by mistake.
+func IssueUserAPIKey(r io.Reader, newID func() string, now time.Time, lifetime time.Duration) (Issued, error) {
+	return issueKey(r, newID, now, lifetime, MaxUserKeyLifetime)
+}
+
+// issueKey issues an API key token that lives lifetime, which must be positive
+// and at most longest.
+func issueKey(r io.Reader, newID func() string, now time.Time, lifetime, longest time.Duration) (Issued, error) {
+	if lifetime <= 0 || lifetime > longest {
+		return Issued{}, fmt.Errorf("%w: %v is not in (0, %v]", ErrKeyLifetime, lifetime, longest)
 	}
 
 	return issue(r, newID, secret.TagAPIKey, now.Add(lifetime)).Get() //nolint:wrapcheck // issue wraps its error

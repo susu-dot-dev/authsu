@@ -109,3 +109,6 @@ var ErrRowShape = errRowShape
 
 // AgentsFirstPage exposes the first page's cursor bound.
 const AgentsFirstPage = agentsFirstPage
+
+// KeysFirstPage exposes the keys list's first page cursor bound.
+const KeysFirstPage = keysFirstPage

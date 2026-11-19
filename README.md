@@ -22,6 +22,7 @@ It is written in Go, compiled to WebAssembly with [TinyGo](https://tinygo.org), 
 
 ```console
 make setup   # npm ci, go mod download, verify tool versions
+make setup-local  # once: create .dev.vars with the local secrets, if missing
 make dev     # migrate the local database and serve the Worker on :8787
 curl http://localhost:8787/healthz
 make check   # fast gate: format, tidy, vet, lint, tests, coverage
@@ -30,6 +31,8 @@ make help    # every target
 ```
 
 Run the Worker through `make dev`, not `npx wrangler dev`: the Makefile applies migrations and overrides the relying party with `localhost` values, which Wrangler on its own does not.
+
+**Schema changes before the first production release:** nothing has shipped yet, so every schema change goes into the existing `migrations/0001_schema.sql`, edited in place (run `make db-reset` to pick it up locally). Do not add `0002` and later migrations until we start shipping to production; the append-only migration rules in [docs/DATABASE.md](docs/DATABASE.md) and [docs/runbook.md](docs/runbook.md) apply from that point on.
 
 ## Documentation
 

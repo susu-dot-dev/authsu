@@ -710,6 +710,20 @@ func TestAgentCreateNames(t *testing.T) {
 
 			expectCount(t, "agents WHERE user_id = ?", "1", world.b.userID)
 			expectCount(t, "api_keys WHERE agent_id = ?", "1", created.Agent.ID)
+
+			// The agent's first key is named after the agent, byte for byte.
+			keyName := scalar(t, "SELECT hex(CAST(name AS BLOB)) FROM api_keys WHERE agent_id = ?", created.Agent.ID)
+			if keyName != agHex(c.name) {
+				t.Errorf("the agent key's stored name bytes = %s, want %s", keyName, agHex(c.name))
+			}
+
+			// A later rename of the agent leaves the key's own name alone.
+			patch(t, agItem(created.Agent.ID), []byte(`{"name":"renamed afterwards"}`), world.tokenB).
+				expect(t, "rename the agent", http.StatusOK, "")
+
+			if got := scalar(t, "SELECT hex(CAST(name AS BLOB)) FROM api_keys WHERE agent_id = ?", created.Agent.ID); got != agHex(c.name) {
+				t.Errorf("renaming the agent changed its key's name to %s", got)
+			}
 		})
 	}
 }

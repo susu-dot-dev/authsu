@@ -9,6 +9,8 @@
 #   config.sh set-secret               generate AUTH_HMAC_SECRET and upload it
 #   config.sh set-secret --stdin       upload the secret read from stdin instead
 #   config.sh set-secret --local       write it to .dev.vars instead of Cloudflare
+#   config.sh setup-local              create .dev.vars with AUTH_HMAC_SECRET and
+#                                      FIRST_RUN_SECRET, unless it already exists
 #
 # A secret is never printed, never put on a command line (where `ps` shows it)
 # and never written to disk unless --local says so. Cloudflare cannot return a
@@ -229,6 +231,26 @@ set_local() {
   echo "$SECRET written to $DEV_VARS (git-ignored)."
 }
 
+# cmd_setup_local creates $DEV_VARS with every variable `make dev` needs, when
+# the file does not exist. An existing file is left alone, whatever it holds:
+# delete it to start over.
+cmd_setup_local() {
+  if [ -f "$DEV_VARS" ]; then
+    echo "$DEV_VARS already exists; leaving it alone (delete it to regenerate)."
+    return
+  fi
+
+  # FIRST_RUN_SECRET is a complete invitation token: "susu_inv_" and the same
+  # 43 base64url characters a secret has (input.ParseInvitationToken).
+  local hmac first
+  hmac="$(generate_secret)"
+  first="susu_inv_$(generate_secret)"
+
+  umask 077
+  printf '%s=%s\n%s=%s\n' "$SECRET" "$hmac" FIRST_RUN_SECRET "$first" >"$DEV_VARS"
+  echo "$DEV_VARS created (git-ignored) with $SECRET and FIRST_RUN_SECRET."
+}
+
 main() {
   local cmd=${1:-}
   [ $# -gt 0 ] && shift
@@ -236,6 +258,7 @@ main() {
     get) cmd_get "$@" ;;
     set-vars) cmd_set_vars "$@" ;;
     set-secret) cmd_set_secret "$@" ;;
+    setup-local) cmd_setup_local ;;
     -h | --help | help) usage 0 ;;
     *) usage ;;
   esac
