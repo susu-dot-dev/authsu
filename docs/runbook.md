@@ -28,6 +28,7 @@ Which names exist, what each is for and what happens when one is missing is part
 | `make config-set-vars API_ORIGIN=https://auth.example.com UI_ORIGIN=https://example.com` | Validates and writes the two origins into `wrangler.jsonc`, keeping its comments. Takes effect on the next `npx wrangler deploy` |
 | `make config-set-secret` | Generates 32 random bytes (43 base64url characters) and uploads them as `AUTH_HMAC_SECRET` with `wrangler secret put`, which deploys a new version |
 | `make config-set-secret ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev` |
+| `make setup-local` | Creates `.dev.vars` (mode 0600) with a generated `AUTH_HMAC_SECRET` and a `FIRST_RUN_SECRET` in the invitation token shape (`susu_inv_` and 43 base64url characters), only if the file does not exist. An existing file is never read or changed: delete it to regenerate |
 | `make config-set-secret ARGS=--stdin` | Uploads a secret you supply on stdin instead of generating one |
 
 The secret is passed to Wrangler on stdin, so it is never on a command line, never printed and never written to disk (except by `--local`, which is the point).

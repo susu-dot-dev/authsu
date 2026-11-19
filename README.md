@@ -22,6 +22,7 @@ It is written in Go, compiled to WebAssembly with [TinyGo](https://tinygo.org), 
 
 ```console
 make setup   # npm ci, go mod download, verify tool versions
+make setup-local  # once: create .dev.vars with the local secrets, if missing
 make dev     # migrate the local database and serve the Worker on :8787
 curl http://localhost:8787/healthz
 make check   # fast gate: format, tidy, vet, lint, tests, coverage
