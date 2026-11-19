@@ -60,10 +60,37 @@ func tokenSpecs() []tokenSpec {
 				return v.Hash(), err
 			},
 		},
+		{
+			name: "AuthorizationCode", tag: secret.TagOAuthCode, code: input.CodeInvalidAuthorizationCode,
+			parse: strAdapter(input.ParseAuthorizationCode, input.AuthorizationCode.String),
+			hash: func(raw string) ([]byte, error) {
+				v, err := input.ParseAuthorizationCode(raw)
+
+				return v.Hash(), err
+			},
+		},
+		{
+			name: "RefreshToken", tag: secret.TagOAuthRefresh, code: input.CodeInvalidRefreshToken,
+			parse: strAdapter(input.ParseRefreshToken, input.RefreshToken.String),
+			hash: func(raw string) ([]byte, error) {
+				v, err := input.ParseRefreshToken(raw)
+
+				return v.Hash(), err
+			},
+		},
+		{
+			name: "AccessToken", tag: secret.TagOAuthAccess, code: input.CodeInvalidAccessToken,
+			parse: strAdapter(input.ParseAccessToken, input.AccessToken.String),
+			hash: func(raw string) ([]byte, error) {
+				v, err := input.ParseAccessToken(raw)
+
+				return v.Hash(), err
+			},
+		},
 	}
 }
 
-// otherTags returns the tags of the two other token types.
+// otherTags returns the tags of the other token types.
 func otherTags(tag secret.Tag) []secret.Tag {
 	var others []secret.Tag
 
@@ -104,7 +131,7 @@ func tokenCases(tag secret.Tag) []parseCase {
 		{"prefix only", prefix, false},
 		{"unknown tag", "susu_xyz_" + body, false},
 		{"empty tag", "susu__" + body, false},
-		{"tag is a prefix of the right one", "susu_" + string(tag)[:2] + "_" + body, false},
+		{"tag is a prefix of the right one", "susu_" + string(tag)[:len(tag)-1] + "_" + body, false},
 		{"tag with a suffix", "susu_" + string(tag) + "x_" + body, false},
 		{"missing _ after the tag", "susu_" + string(tag) + body, false},
 		{"missing _ after susu", "susu" + string(tag) + "_" + body, false},
@@ -250,6 +277,9 @@ func TestTokenCodes(t *testing.T) {
 		{input.CodeInvalidInvitation, "invalid_invitation"},
 		{input.CodeInvalidSessionToken, "invalid_session_token"},
 		{input.CodeInvalidAPIKey, "invalid_api_key"},
+		{input.CodeInvalidAuthorizationCode, "invalid_authorization_code"},
+		{input.CodeInvalidRefreshToken, "invalid_refresh_token"},
+		{input.CodeInvalidAccessToken, "invalid_access_token"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("code = %q, want %q", tc.got, tc.want)
@@ -308,6 +338,10 @@ func TestTokenHash(t *testing.T) {
 		secret.TagInvitation: "deea0b66bbe6ae2fc63809b6da5b8609b545d2ea1ea89f1711b098f91301371f",
 		secret.TagSession:    "2301fbf509e56daaa1975f1f2070d1e780085d46eb2218610165ef75aef440eb",
 		secret.TagAPIKey:     "60ae433c89f4b65105cd713a3e69e9754de9d5cb13aa7e1b3eb15cda5a433c3d",
+
+		secret.TagOAuthCode:    "fa5b993631fb1ea27e2e12f74b444a53dce57e5d0296f22dbb5a99323c920d61",
+		secret.TagOAuthRefresh: "6a7013c4985fc81eab54bb3b0707b6142afcc81895a86f43a1f7171d0f075330",
+		secret.TagOAuthAccess:  "b351e871adc9475656c1ea789be3effa0d91e167627b9da9fb71ce10eb3655ff",
 	}
 
 	for _, spec := range tokenSpecs() {
@@ -543,4 +577,81 @@ func FuzzParseSessionToken(f *testing.F) {
 func FuzzParseAPIKeyToken(f *testing.F) {
 	fuzzToken(f, secret.TagAPIKey, input.CodeInvalidAPIKey, input.ParseAPIKeyToken,
 		input.APIKeyToken.String, input.APIKeyToken.Hash)
+}
+
+func FuzzParseAuthorizationCode(f *testing.F) {
+	fuzzToken(f, secret.TagOAuthCode, input.CodeInvalidAuthorizationCode, input.ParseAuthorizationCode,
+		input.AuthorizationCode.String, input.AuthorizationCode.Hash)
+}
+
+func FuzzParseRefreshToken(f *testing.F) {
+	fuzzToken(f, secret.TagOAuthRefresh, input.CodeInvalidRefreshToken, input.ParseRefreshToken,
+		input.RefreshToken.String, input.RefreshToken.Hash)
+}
+
+func FuzzParseAccessToken(f *testing.F) {
+	fuzzToken(f, secret.TagOAuthAccess, input.CodeInvalidAccessToken, input.ParseAccessToken,
+		input.AccessToken.String, input.AccessToken.Hash)
+}
+
+// TestOAuthTokensAreNotCredentialsOfTheAPI: an OAuth code, refresh token or
+// access token presented where a key or a session is expected is refused by the
+// parser of that place with its own code, which the route boundary reports as
+// 401 (docs/oauth_design.md: grants carry no authsu scopes, and the API does not
+// accept an access token). The refusal is by prefix, so it holds for every body,
+// and the other way too: a key or a session is no OAuth token.
+func TestOAuthTokensAreNotCredentialsOfTheAPI(t *testing.T) {
+	t.Parallel()
+
+	bodies := []string{
+		strings.Repeat("A", secret.BodyLen),
+		strings.Repeat("-_", 21) + "A",
+		strings.Repeat("A", secret.BodyLen-1) + "Q",
+	}
+
+	oauth := []secret.Tag{secret.TagOAuthCode, secret.TagOAuthRefresh, secret.TagOAuthAccess}
+	api := []secret.Tag{secret.TagAPIKey, secret.TagSession, secret.TagInvitation}
+
+	byTag := map[secret.Tag]tokenSpec{}
+	for _, spec := range tokenSpecs() {
+		byTag[spec.tag] = spec
+	}
+
+	for _, issued := range oauth {
+		for _, wanted := range api {
+			for _, body := range bodies {
+				token := secret.Prefix(issued) + body
+
+				_, err := byTag[wanted].parse(token)
+				requireRefusal(t, err, byTag[wanted].code)
+
+				// The same body under the right prefix is accepted: only the prefix differs.
+				_, err = byTag[wanted].parse(secret.Prefix(wanted) + body)
+				if err != nil {
+					t.Errorf("%s refused its own prefix with the body %q: %v", byTag[wanted].name, body, err)
+				}
+
+				// And the other direction.
+				_, err = byTag[issued].parse(secret.Prefix(wanted) + body)
+				requireRefusal(t, err, byTag[issued].code)
+			}
+		}
+	}
+
+	// A generated token, whatever its entropy, is refused the same way.
+	for _, issued := range oauth {
+		token, err := secret.Generate(rand.Reader, issued)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = input.ParseAPIKeyToken(token)
+		requireRefusal(t, err, input.CodeInvalidAPIKey)
+
+		_, err = input.ParseAPIKeyToken("Bearer " + token)
+		requireRefusal(t, err, input.CodeInvalidAPIKey)
+
+		_, err = input.ParseSessionToken(token)
+		requireRefusal(t, err, input.CodeInvalidSessionToken)
+	}
 }

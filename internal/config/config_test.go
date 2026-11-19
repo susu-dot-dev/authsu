@@ -211,6 +211,16 @@ func TestLoadDerivesTheChallengeKeys(t *testing.T) {
 			context: "authsu/login-challenge/v1",
 			key:     func(c config.Config) []byte { return c.LoginKey },
 		},
+		"oauth request": {
+			secret:  testSecret,
+			context: "authsu/oauth-request/v1",
+			key:     func(c config.Config) []byte { return c.OAuthRequestKey },
+		},
+		"oauth request, another secret": {
+			secret:  strings.Repeat("z", config.MinSecretLen),
+			context: "authsu/oauth-request/v1",
+			key:     func(c config.Config) []byte { return c.OAuthRequestKey },
+		},
 		"registration, another secret": {
 			secret:  strings.Repeat("z", config.MinSecretLen),
 			context: "authsu/registration-challenge/v1",
@@ -261,12 +271,14 @@ func TestChallengeKeysAreIndependent(t *testing.T) {
 	}
 
 	keys := map[string][]byte{
-		"registration":               first.RegistrationKey,
-		"login":                      first.LoginKey,
-		"registration, another root": second.RegistrationKey,
-		"login, another root":        second.LoginKey,
-		"the root itself":            []byte(testSecret),
-		"the root with another tail": []byte(testSecret + "x"),
+		"registration":                first.RegistrationKey,
+		"login":                       first.LoginKey,
+		"oauth request":               first.OAuthRequestKey,
+		"registration, another root":  second.RegistrationKey,
+		"login, another root":         second.LoginKey,
+		"oauth request, another root": second.OAuthRequestKey,
+		"the root itself":             []byte(testSecret),
+		"the root with another tail":  []byte(testSecret + "x"),
 	}
 
 	seen := map[string]string{}
@@ -337,4 +349,81 @@ func hmacSHA256(root, context string) []byte {
 	mac.Write([]byte(context))
 
 	return mac.Sum(nil)
+}
+
+// TestLocalHTTP: the one localhost rule, shared by ParseOrigin and by what
+// selects the development resource table.
+func TestLocalHTTP(t *testing.T) {
+	t.Parallel()
+
+	const (
+		schemeHTTP  = "http"
+		schemeHTTPS = "https"
+	)
+
+	tests := map[string]struct {
+		scheme, host string
+		want         bool
+	}{
+		"http localhost":            {scheme: schemeHTTP, host: hostLocalhost, want: true},
+		"https localhost":           {scheme: schemeHTTPS, host: hostLocalhost},
+		"http elsewhere":            {scheme: schemeHTTP, host: hostAPI},
+		"http subdomain lookalike":  {scheme: schemeHTTP, host: "localhost.evil.com"},
+		"http suffix lookalike":     {scheme: schemeHTTP, host: "localhostx"},
+		"http prefix lookalike":     {scheme: schemeHTTP, host: "xlocalhost"},
+		"http 127.0.0.1":            {scheme: schemeHTTP, host: "127.0.0.1"},
+		"http upper-case host":      {scheme: schemeHTTP, host: "LOCALHOST"},
+		"upper-case scheme":         {scheme: "HTTP", host: hostLocalhost},
+		"nothing":                   {},
+		"ws localhost":              {scheme: "ws", host: hostLocalhost},
+		"http localhost, a trailer": {scheme: schemeHTTP, host: "localhost."},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := config.LocalHTTP(tt.scheme, tt.host); got != tt.want {
+				t.Errorf("LocalHTTP(%q, %q) = %v, want %v", tt.scheme, tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOriginLocal: of the origins ParseOrigin accepts, exactly the http ones are
+// local, and they agree with LocalHTTP.
+func TestOriginLocal(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]bool{
+		"http://" + hostLocalhost:                   true,
+		"http://" + hostLocalhost + ":8787":         true,
+		"https://" + hostLocalhost:                  false,
+		"https://" + hostLocalhost + ":8443":        false,
+		testUIOrigin:                                false,
+		"https://" + hostLocalhost + ".example.com": false,
+	}
+
+	for value, want := range tests {
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+
+			origin, err := config.ParseOrigin(value)
+			if err != nil {
+				t.Fatalf("ParseOrigin: %v", err)
+			}
+
+			if got := origin.Local(); got != want {
+				t.Errorf("Local = %v, want %v", got, want)
+			}
+		})
+	}
+
+	t.Run("the zero Origin is not local", func(t *testing.T) {
+		t.Parallel()
+
+		if (config.Origin{}).Local() {
+			t.Error("the zero Origin is local")
+		}
+	})
 }

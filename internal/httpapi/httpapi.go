@@ -10,14 +10,23 @@
 // They are the only places that do this, so the contract holds for every route:
 //
 //   - A route whose method is not GET or HEAD requires the request's
-//     Content-Type to be application/json, even when the body is empty (415
-//     unsupported_media_type, checked after the method and before the body is
-//     read). That type forces a CORS preflight, which fails for every origin
-//     but the one CORS allows, so another site cannot make a browser deliver
-//     such a request: this is the CSRF defence for every unsafe route (see
-//     isJSON and CORS).
+//     Content-Type to be its declared media type (MethodRoute.Media), even when
+//     the body is empty (415 unsupported_media_type, checked after the method
+//     and before the body is read). The default is application/json. That type
+//     forces a CORS preflight, which fails for every origin but the one CORS
+//     allows, so another site cannot make a browser deliver such a request:
+//     this is the CSRF defence for every unsafe route (see hasMediaType and
+//     CORS).
+//   - The one other media type is application/x-www-form-urlencoded
+//     (MediaForm), for the standard OAuth endpoints. It is CORS-safelisted, so
+//     it gives no CSRF defence: a route may declare it only because a
+//     browser's ambient credentials do not authenticate it (auth.Handler
+//     refuses it on an Authenticated route). Parameters are read with
+//     Request.FormParams, whose rules are in ParseParams.
 //   - A request body is capped at 1 MiB (413 body_too_large), or at a smaller
-//     limit a route asks for (MethodRoute.MaxBody).
+//     limit a route asks for (MethodRoute.MaxBody). The same limit bounds the
+//     request's query string (413 query_too_large), so a route that parses it
+//     (Request.QueryParams) reads no more than it does a body.
 //   - A handler runs inside a recover, so a panic still gets the JSON error
 //     contract and a log line, as Internal handler_panic.
 //   - Responses carry Content-Type and Cache-Control: no-store, and the status
@@ -26,7 +35,12 @@
 //   - A failure is sent as {"error":{"code","message","data?"}}. The logger gets
 //     the request and the full error, cause included. An error that was never
 //     classified, or is Internal, is sent as a bare "internal" with no data, so
-//     causes, SQL and table names never reach a client.
+//     causes, SQL and table names never reach a client. A route may declare
+//     the RFC 6749 section 5.2 format instead (MethodRoute.Errors,
+//     ErrorsOAuth): see OAuthError for how a failure maps to it. Failures of
+//     the boundary itself (405, 415, 413) are rendered in the route's format.
+//   - A response is a status and an optional JSON body, or a redirect: a 302 or
+//     303 with a Location and no other 3xx (Response.Location).
 //   - Unknown paths are answered by NotFound registered on "/", so they too use
 //     the JSON envelope.
 //
@@ -67,8 +81,14 @@ type Request struct {
 	Path   string
 	// Context is cancelled when the client goes away.
 	Context context.Context //nolint:containedctx // a request value is the unit that carries its context
-	// Query holds the URL query parameters.
+	// Query holds the URL query parameters, as net/http parses them: leniently,
+	// dropping what it cannot decode. A handler that must be strict reads
+	// RawQuery through QueryParams instead.
 	Query map[string][]string
+	// RawQuery is the URL's query string exactly as it was sent, still
+	// encoded and without the leading "?". It is at most the route's body
+	// limit long.
+	RawQuery string
 	// PathValues holds the values of the route's path wildcards, by name: for
 	// a route registered as "/x/{id}", PathValues["id"]. It is empty for a route
 	// with none.
@@ -90,6 +110,14 @@ type Response struct {
 	Status int
 	// Body is marshalled to JSON. Nil means no body.
 	Body any
+	// Location is where a redirect points. It is set exactly when Status is
+	// 302 or 303: any other 3xx, a 302 or 303 without a Location and a
+	// Location on any other status are programming errors, answered as an
+	// Internal invalid_status. It must be printable ASCII with no spaces
+	// (Internal invalid_redirect otherwise), so a value that came from a
+	// client cannot split the header. The handler builds the whole URL: the
+	// boundary neither parses nor rewrites it.
+	Location string
 	// Cookies are sent as Set-Cookie headers. A handler builds each one in
 	// full (name, attributes, expiry), so what a cookie allows is decided in
 	// one place, beside the code that issues it.
@@ -107,7 +135,15 @@ type Logger func(Request, *apierr.Error)
 
 // JSON returns a successful Response carrying body.
 func JSON(status int, body any) Response {
-	return Response{Status: status, Body: body, Cookies: nil}
+	return Response{Status: status, Body: body, Cookies: nil, Location: ""}
+}
+
+// Redirect returns a redirect Response. status must be 302 (Found) or 303 (See
+// Other), which is what an authorization server answers with: the client
+// follows it with a GET whatever it sent. It is checked when the response is
+// sent, not here.
+func Redirect(status int, location string) Response {
+	return Response{Status: status, Body: nil, Cookies: nil, Location: location}
 }
 
 // WithCookies returns r that also sets cookies.
@@ -175,59 +211,140 @@ func decodeError(err error) *apierr.Error {
 	return apierr.New(apierr.BadRequest, "invalid_json", "request body is not valid JSON").WithCause(err)
 }
 
+// Media is the Content-Type an unsafe request to a route must carry.
+type Media uint8
+
+// The media types a route may declare. The zero value is JSON, so a route that
+// says nothing keeps the CSRF defence in the package doc.
+const (
+	// MediaJSON is application/json, optionally with charset=utf-8.
+	MediaJSON Media = iota
+	// MediaForm is application/x-www-form-urlencoded, optionally with
+	// charset=utf-8 and with no other parameter. It is for the standard OAuth
+	// endpoints and carries no CSRF defence of its own (see the package doc).
+	MediaForm
+)
+
+// mediaType is the Content-Type value a route of media requires.
+func (m Media) mediaType() string {
+	if m == MediaForm {
+		return formMediaType
+	}
+
+	return jsonMediaType
+}
+
+// ErrorFormat is how a route's failures are written.
+type ErrorFormat uint8
+
+// The error formats a route may declare. The zero value is the API's own, so a
+// route that says nothing keeps {"error":{"code","message"}}.
+const (
+	// ErrorsAPI is {"error":{"code","message","data?"}}.
+	ErrorsAPI ErrorFormat = iota
+	// ErrorsOAuth is RFC 6749 section 5.2: {"error","error_description"},
+	// with the standard status. See OAuthError.
+	ErrorsOAuth
+)
+
 // MethodRoute is how ServeRoutes answers one method of a path.
 type MethodRoute struct {
 	// Handler answers the method.
 	Handler Handler
 	// MaxBody caps this method's request body, in bytes. Zero or less means
 	// DefaultMaxBody, and a larger value is clamped to it: a route can only
-	// tighten the cap, never raise it.
+	// tighten the cap, never raise it. It also caps the query string.
 	MaxBody int64
+	// Media is the Content-Type an unsafe request must carry. The zero value
+	// is MediaJSON. A GET or HEAD route has no body type, so it is ignored
+	// there.
+	Media Media
+	// Errors is the format of this method's failures. The zero value is
+	// ErrorsAPI.
+	Errors ErrorFormat
+}
+
+// policy is what the boundary enforces for one method of a path.
+type policy struct {
+	limit  int64
+	media  Media
+	errors ErrorFormat
+	// checkMedia is whether an unsafe request must carry media: true for a
+	// route, false for the catch-all, which accepts every method as it comes.
+	checkMedia bool
+}
+
+// defaultPolicy is the policy of a request no route declared anything for.
+func defaultPolicy(format ErrorFormat) policy {
+	return policy{limit: maxBodyBytes, media: MediaJSON, errors: format, checkMedia: false}
 }
 
 // ServeRoutes returns the http.Handler for one path that answers several
-// methods, each with its own handler and body limit. The routes map is keyed by
-// method; any other method gets 405 with an Allow header listing the keys,
-// sorted. Every rule in the package doc applies per method, so a method that is
-// not GET or HEAD still requires Content-Type: application/json. A request is
-// measured against the body limit of the method it used, so a tight limit on
-// one method does not constrain another. A panic in a handler is recovered and
-// reported as an Internal error.
+// methods, each with its own handler, body limit, media type and error format.
+// The routes map is keyed by method; any other method gets 405 with an Allow
+// header listing the keys, sorted. Every rule in the package doc applies per
+// method, so a method that is not GET or HEAD still requires its route's
+// Content-Type (application/json unless the route declares a form). A request
+// is measured against the body limit of the method it used, so a tight limit
+// on one method does not constrain another. A panic in a handler is recovered
+// and reported as an Internal error.
+//
+// A failure that belongs to the path and not to a method (405, which is
+// answered for a method no route has) is written in the format every method of
+// the path declares, and in the API's format when they differ.
 //
 // wildcards names the {name} wildcards in the path the handler is registered
 // for. net/http can only look a wildcard up by name, not list them, so the
 // caller says which to copy into Request.PathValues.
 //
+// It panics when a route declares a Media or ErrorFormat that does not exist:
+// a route table is fixed in code, so the mistake is found at construction.
+//
 // It exists because TinyGo's http.ServeMux cannot route by method: a path is
 // registered once, and the method is chosen here.
 func ServeRoutes(logger Logger, wildcards []string, routes map[string]MethodRoute) http.Handler {
 	methods := slices.Sorted(maps.Keys(routes))
+	policies := make(map[string]policy, len(routes))
+	pathFormat, agreed := ErrorsAPI, false
 
-	limit := func(method string) int64 {
-		if own := routes[method].MaxBody; own > 0 {
-			return min(own, maxBodyBytes)
+	for _, method := range methods {
+		route := routes[method]
+		if route.Media > MediaForm || route.Errors > ErrorsOAuth {
+			panic(fmt.Sprintf("httpapi: route %s has an unknown Media or ErrorFormat", method))
 		}
 
-		return maxBodyBytes
+		limit := int64(maxBodyBytes)
+		if route.MaxBody > 0 {
+			limit = min(route.MaxBody, maxBodyBytes)
+		}
+
+		policies[method] = policy{limit: limit, media: route.Media, errors: route.Errors, checkMedia: true}
+
+		if !agreed {
+			pathFormat, agreed = route.Errors, true
+		} else if pathFormat != route.Errors {
+			pathFormat = ErrorsAPI
+		}
 	}
 
-	return serveWith(methods, wildcards, limit, logger, func(req Request) result.Result[Response] {
-		return routes[req.Method].Handler(req)
-	})
+	return serveWith(methods, wildcards, pathFormat, func(method string) policy { return policies[method] }, logger,
+		func(req Request) result.Result[Response] { return routes[req.Method].Handler(req) })
 }
 
 // ServeAny is ServeRoutes for a handler that accepts every method: the
 // catch-all, whose answer to an unknown path does not depend on how it was
 // asked. It has no wildcards, and so no method check and no Content-Type rule.
 func ServeAny(logger Logger, handler Handler) http.Handler {
-	return serveWith(nil, nil, func(string) int64 { return maxBodyBytes }, logger, handler)
+	return serveWith(nil, nil, ErrorsAPI, func(string) policy { return defaultPolicy(ErrorsAPI) }, logger, handler)
 }
 
 // serveWith implements ServeRoutes and ServeAny for a route whose path has the
-// named wildcards and whose body limit may depend on the method: limit returns
-// the cap for a method. No methods accepts every method.
+// named wildcards: policyOf returns what is enforced for a method, and
+// pathFormat is the error format of a failure that no method owns. No methods
+// accepts every method.
 func serveWith(
-	methods, wildcards []string, limit func(method string) int64, logger Logger, handler Handler,
+	methods, wildcards []string, pathFormat ErrorFormat, policyOf func(method string) policy, logger Logger,
+	handler Handler,
 ) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
@@ -237,39 +354,72 @@ func serveWith(
 			Path:          req.URL.Path,
 			Context:       req.Context(),
 			Query:         req.URL.Query(),
+			RawQuery:      req.URL.RawQuery,
 			PathValues:    pathValues(req, wildcards),
 			Body:          nil,
 			Cookies:       req.Cookies(),
 			Authorization: req.Header.Values("Authorization"),
 		}
 
-		if len(methods) > 0 && !slices.Contains(methods, req.Method) {
-			writer.Header().Set("Allow", strings.Join(methods, ", "))
-			write(writer, logger, request, result.Fail[Response](
-				apierr.New(apierr.MethodNotAllowed, "method_not_allowed", "method not allowed")))
+		known := len(methods) == 0 || slices.Contains(methods, req.Method)
+
+		rule := defaultPolicy(pathFormat)
+		if known {
+			rule = policyOf(req.Method)
+		}
+
+		if rule.errors == ErrorsOAuth {
+			// RFC 6749 section 5.1: a response that carries a token must not be
+			// cached. no-store is already set; Pragma is for HTTP/1.0 caches.
+			writer.Header().Set("Pragma", "no-cache")
+		}
+
+		failure := precheck(request, req.Header.Values("Content-Type"), rule, known)
+		if failure != nil {
+			if !known {
+				writer.Header().Set("Allow", strings.Join(methods, ", "))
+			}
+
+			refuse(writer, logger, request, rule.errors, failure)
 
 			return
 		}
 
-		if len(methods) > 0 && !safeMethod(req.Method) && !isJSON(req.Header.Values("Content-Type")) {
-			write(writer, logger, request, result.Fail[Response](
-				apierr.New(apierr.UnsupportedMediaType, "unsupported_media_type",
-					"request Content-Type must be application/json")))
-
-			return
-		}
-
-		body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, limit(req.Method)))
+		body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, rule.limit))
 		if err != nil {
-			write(writer, logger, request, result.Fail[Response](bodyReadError(err)))
+			refuse(writer, logger, request, rule.errors, bodyReadError(err))
 
 			return
 		}
 
 		request.Body = body
 
-		write(writer, logger, request, safely(handler, request))
+		write(writer, logger, request, rule.errors, safely(handler, request))
 	})
+}
+
+// precheck is what the boundary refuses before it reads the body: a method no
+// route answers (405), an unsafe request whose Content-Type is not the route's
+// (415) and a query string over the route's limit (413). It returns nil when
+// the request may go on. The catch-all (ServeAny) has no Content-Type rule,
+// which rule.checkMedia says.
+func precheck(request Request, contentType []string, rule policy, known bool) *apierr.Error {
+	switch {
+	case !known:
+		return apierr.New(apierr.MethodNotAllowed, "method_not_allowed", "method not allowed")
+	case rule.checkMedia && !safeMethod(request.Method) && !hasMediaType(contentType, rule.media):
+		return apierr.New(apierr.UnsupportedMediaType, "unsupported_media_type",
+			"request Content-Type must be "+rule.media.mediaType())
+	case int64(len(request.RawQuery)) > rule.limit:
+		return apierr.New(apierr.PayloadTooLarge, "query_too_large", "request query string is too large")
+	}
+
+	return nil
+}
+
+// refuse answers the request with failure, in format.
+func refuse(writer http.ResponseWriter, logger Logger, req Request, format ErrorFormat, failure *apierr.Error) {
+	write(writer, logger, req, format, result.Fail[Response](failure))
 }
 
 // pathValues returns the value the mux matched for each named wildcard.
@@ -325,8 +475,8 @@ func panicError(recovered any) *apierr.Error {
 		WithCause(fmt.Errorf("%w: %v", errPanic, recovered))
 }
 
-// write sends res, converting a failure into its error response.
-func write(writer http.ResponseWriter, logger Logger, req Request, res result.Result[Response]) {
+// write sends res, converting a failure into its error response in format.
+func write(writer http.ResponseWriter, logger Logger, req Request, format ErrorFormat, res result.Result[Response]) {
 	resp, err := res.Get()
 	if err == nil {
 		err = send(writer, resp)
@@ -341,7 +491,7 @@ func write(writer http.ResponseWriter, logger Logger, req Request, res result.Re
 	// A failure while encoding the success body can only be reported as an
 	// Internal error, and nothing has been written yet because send encodes
 	// before it writes.
-	data, marshalErr := marshalError(failure)
+	data, marshalErr := marshalFailure(failure, format)
 	if marshalErr != nil {
 		// Unreachable for real values; keep the contract that something valid
 		// is always written.
@@ -353,12 +503,21 @@ func write(writer http.ResponseWriter, logger Logger, req Request, res result.Re
 	_, _ = writer.Write(data)
 }
 
+// marshalFailure builds the body of an error response in format.
+func marshalFailure(failure *apierr.Error, format ErrorFormat) ([]byte, error) {
+	if format == ErrorsOAuth {
+		return marshalOAuthError(failure), nil
+	}
+
+	return marshalError(failure)
+}
+
 // send encodes and writes a successful response. It writes nothing when
 // encoding fails, so the caller can still send an error response.
 func send(writer http.ResponseWriter, resp Response) error {
-	if resp.Status < http.StatusOK || resp.Status > 599 {
-		return apierr.Wrap(fmt.Errorf("%w: %d", errInvalidStatus, resp.Status),
-			apierr.Internal, "invalid_status", "internal error")
+	err := checkStatus(resp)
+	if err != nil {
+		return err
 	}
 
 	var data []byte
@@ -375,12 +534,40 @@ func send(writer http.ResponseWriter, resp Response) error {
 		writer.Header().Set("Content-Type", "application/json")
 	}
 
+	if resp.Location != "" {
+		writer.Header().Set("Location", resp.Location)
+	}
+
 	for _, cookie := range resp.Cookies {
 		http.SetCookie(writer, cookie)
 	}
 
 	writer.WriteHeader(resp.Status)
 	_, _ = writer.Write(data)
+
+	return nil
+}
+
+// errInvalidRedirect is the cause when a handler returns a Location that is not
+// printable ASCII without spaces.
+var errInvalidRedirect = errors.New("handler returned an invalid redirect location")
+
+// checkStatus refuses a response whose status and Location do not agree: a
+// status outside 200-599, a 3xx other than a 302 or 303, a 302 or 303 without a
+// Location, a Location on any other status, and a Location that is not
+// printable ASCII without spaces. A handler's mistake is Internal, not a panic
+// in net/http.
+func checkStatus(resp Response) error {
+	redirect := resp.Status == http.StatusFound || resp.Status == http.StatusSeeOther
+	threeXX := resp.Status >= http.StatusMultipleChoices && resp.Status < http.StatusBadRequest
+
+	switch {
+	case resp.Status < http.StatusOK || resp.Status > 599 || (threeXX && !redirect) || redirect != (resp.Location != ""):
+		return apierr.Wrap(fmt.Errorf("%w: %d, has Location %t", errInvalidStatus, resp.Status, resp.Location != ""),
+			apierr.Internal, "invalid_status", "internal error")
+	case strings.ContainsFunc(resp.Location, func(r rune) bool { return r <= ' ' || r >= 0x7f }):
+		return apierr.Wrap(errInvalidRedirect, apierr.Internal, "invalid_redirect", "internal error")
+	}
 
 	return nil
 }
@@ -425,28 +612,35 @@ func safeMethod(method string) bool {
 	return method == http.MethodGet || method == http.MethodHead
 }
 
-// jsonMediaType is the only Content-Type an unsafe request may carry.
-const jsonMediaType = "application/json"
+// The Content-Types a route may require of an unsafe request.
+const (
+	jsonMediaType = "application/json"
+	formMediaType = "application/x-www-form-urlencoded"
+)
 
-// isJSON reports whether values, a request's Content-Type header lines, are
-// exactly one application/json, optionally with charset=utf-8 (JSON is UTF-8,
-// RFC 8259). Anything else is refused: a missing header, a second line, any
-// other type, any other parameter.
+// hasMediaType reports whether values, a request's Content-Type header lines,
+// are exactly one line naming media's type, optionally with charset=utf-8
+// (JSON is UTF-8, RFC 8259, and a form body is UTF-8 by RFC 6749 appendix B).
+// Anything else is refused: a missing header, a second line, any other type,
+// any other parameter. The two types share this one rule, so a charset another
+// parser would read differently is never accepted for either.
 //
-// This is the CSRF defence. application/json is not a CORS-safelisted type, so
-// a browser cannot send it cross-origin without a preflight, and the
+// For JSON this is the CSRF defence. application/json is not a CORS-safelisted
+// type, so a browser cannot send it cross-origin without a preflight, and the
 // preflight fails because CORS answers it only for the one allowed origin
 // (the UI), never for another site. HTML forms
 // cannot send it at all. Requiring it on every unsafe request, even one with
 // an empty body, means no other site can make a browser deliver a request this
 // boundary will hand to a handler, whatever the handler does with the body.
-func isJSON(values []string) bool {
+// The form type gives none of that, which is why a route that declares it must
+// not rely on a cookie.
+func hasMediaType(values []string, media Media) bool {
 	if len(values) != 1 {
 		return false
 	}
 
-	media, params, hasParams := strings.Cut(values[0], ";")
-	if !strings.EqualFold(strings.TrimSpace(media), jsonMediaType) {
+	mediaType, params, hasParams := strings.Cut(values[0], ";")
+	if !strings.EqualFold(strings.TrimSpace(mediaType), media.mediaType()) {
 		return false
 	}
 

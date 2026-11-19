@@ -537,7 +537,7 @@ func TestBndUnknownPathsAreNotFound(t *testing.T) {
 		{"login unknown step", "/api/login/other"},
 		{"refresh does not exist", "/api/refresh"},
 		{"keys root", "/keys"},
-		{"well-known", "/.well-known/openid-configuration"},
+		{"well-known", "/.well-known/security.txt"},
 		{"static", "/index.html"},
 		{"favicon", "/favicon.ico"},
 	}
@@ -2474,9 +2474,23 @@ func bndLeakPatterns() []*regexp.Regexp {
 		regexp.MustCompile(`/home/|/usr/|/tmp/|node_modules|file://`),
 		regexp.MustCompile(`goroutine|panic:|runtime\.|syscall/js|wasm_exec|at .*\(.*:\d+:\d+\)`),
 		regexp.MustCompile(`(?i)stack`),
-		regexp.MustCompile(`AUTH_HMAC_SECRET|FIRST_RUN_SECRET|` +
+		regexp.MustCompile(`AUTH_HMAC_SECRET|FIRST_RUN_SECRET|OAUTH_SIGNING_KEY|` +
 			regexp.QuoteMeta(authHMACSecret) + `|` + regexp.QuoteMeta(firstRunSecret)),
+		// The signing key's value, as the variable holds it and as the PEM a
+		// careless dump of the key would be. Never empty in a run with a Worker.
+		regexp.MustCompile(regexp.QuoteMeta(signingKeyValue()) + `|PRIVATE KEY`),
 	}
+}
+
+// signingKeyValue is the Worker's OAUTH_SIGNING_KEY, which fails the test run if
+// it is missing: an empty value would make a leak pattern match everything, or
+// nothing, and either would hide a leak.
+func signingKeyValue() string {
+	if signingKey == "" {
+		panic("e2e: the Worker's OAUTH_SIGNING_KEY is not set")
+	}
+
+	return signingKey
 }
 
 // bndLeaks returns the patterns that match body.

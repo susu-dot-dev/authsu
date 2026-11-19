@@ -37,8 +37,37 @@ import (
 // the session cookie the tests create is the one a deployment issues.
 const (
 	testSecret = "app-test-secret-0123456789ABCDEFGHIJKLMNOPQRS"
-	apiOrigin  = "https://auth.example.com"
-	uiOrigin   = "https://example.com"
+
+	// testSigningKey is a throwaway RSA 2048 private key in the form
+	// OAUTH_SIGNING_KEY holds: PKCS#8 DER, base64url without padding, one line.
+	testSigningKey = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC6ahvNJu31g6Bs" +
+		"JC2aVJBrcyCubvwgl8wYMHW0yV__jUIzhjaDK4h5HDuUPkJV3pF842ynmC0XIawe" +
+		"FiivW6uI-kpesoc2DUWHCoUte81nKEKOjFeu2TvbR7dLZlVt3F4fTsyn2sXfUsHm" +
+		"UXiTvuWNV2mQVrfmnaCMihLkGCoCNP7wJ2jAkeTAbgcL61foSxhAdygXDIgLUxzR" +
+		"47N0nv4G02Z0eWIFPb8rar3ppSt3UX1Cl569iFb6wk3_7QVYNCodhjYm5IPioW6B" +
+		"FJsts6-FbGkC_7RIATwNeGiJezxb_ClO_6ZxEMeVcadhy0FWL8wp4iO15zELJ1o-" +
+		"tX0i-FmBAgMBAAECggEABIJBFVHITV2ghNiET5GVMTr9WahzRUjUWlhIktW1Nv7d" +
+		"9VWmR1FZqosZ_KrJaRpKLNn8fsysCoad-NfAXU-7cvptGO1D8RmaOFaFX9MdnLtr" +
+		"adc9cNU3INfKE7w5VwkzL-M9v_q-FVVMPZuYknEfAx1P2p8HeokOoQ5xUfVRYRVj" +
+		"VfpBBrJbbqUvqN_q8VQImWZTNkmcE1Y1LE0XZIevj9im9ZjwbDnwhPv3ST0jmPoH" +
+		"K97oxEAF36bT71uNeizgcPCtJaV6L3HXayNIo-IxFMtjOW9wcXHtTQDSh8FEsx_G" +
+		"aVYNqdbwCL3FtDFauA3GBNTDw6HBBXXxo-4VDFQHoQKBgQDN5bFE2YVPdlWb1kMj" +
+		"C3zGrZrFZ59n-hoPxU9iaM-8oobPsTy7Zr9UzSSawhfIPOHTJr69SQfiIV23iBJo" +
+		"6k_X1BKAti1oFZ0_Ir-oiskMyH39LEyFoR4OxzzCtCxz03MOY0CQYofF3tCF-Glp" +
+		"bz1d6r06J5Xjw7atNaC-AJJjfwKBgQDnxr536dM0907Fl-rGGm70CqL6Nh9oiwpF" +
+		"rSjaeWi2HcIrQX_4ScNqugUIShc4KIwQhBIWSS9Fd4ydOKD7eyuDLoI6yXBx8Ft8" +
+		"dAs_Xir8ya7s_23Za_7hZ2PGaLhgdtUVwgzzvm0z9_PihlPOoXgAj1ooPvvVEMon" +
+		"SbnHmr_C_wKBgGFR_V0-t51coJBdUTSCXIMIUcyW8yjRdXoY2DH6up498BzBeKRX" +
+		"p34szO19aoJSDKeie6u6lkhTXxm97n26quyoJ-rAsWuuM7pA8Xh3yRoKtkpxouXS" +
+		"xwNTNywMv6oruwmE7mKQv_5OGCAKz8BvPQFkT_bp-RZETtdGLulAGfF_AoGBAJMT" +
+		"T7wiGY9Lu6WxQB6TmYKs2TyzaXzadhs-xWTVk_e0rIjsWHtCu4mXHyhic5eES1UT" +
+		"qbKQoDmRoh4GWEkcoMDum18Ygo0au8MelCCS7e5ZQPJNJ_THDgcUp4C45P75iT_0" +
+		"Umm9lehbWFyPZtEBL3gTf194kC9lJxKFOymJblQbAoGAZYVraT4JOj1G400k9UFw" +
+		"1lJRMpjKZ8NWMOLNHIE60GRAxm49exY0hVip4gOrHOZjLqxor6sdU5OS_G3O1UE0" +
+		"dEqAmP3FiJcYqf-8W9qUPc1KulMqnuGndE6ZFpXHlVkhRwWD1ZebATTXh9EzmuDS" +
+		"SVOw37zoh_COkszjZ24btDs"
+	apiOrigin = "https://auth.example.com"
+	uiOrigin  = "https://example.com"
 
 	// someID is a canonical id for the {id} wildcard of a route.
 	someID = "01234567-89ab-7def-8123-456789abcdef"
@@ -83,9 +112,10 @@ var errUnscripted = errors.New("unscripted Exec call")
 // fullEnv is a complete, valid deployment configuration.
 func fullEnv() map[string]string {
 	return map[string]string{
-		config.SecretHMAC:   testSecret,
-		config.VarAPIOrigin: apiOrigin,
-		config.VarUIOrigin:  uiOrigin,
+		config.SecretHMAC:            testSecret,
+		config.SecretOAuthSigningKey: testSigningKey,
+		config.VarAPIOrigin:          apiOrigin,
+		config.VarUIOrigin:           uiOrigin,
 	}
 }
 
@@ -183,6 +213,10 @@ func newHarness(t *testing.T, env map[string]string, script ...step) *harness {
 
 			harness.logged = append(harness.logged, failure)
 		},
+		// The outbound fetch is the authorization endpoint's alone, and these
+		// tests reach it only with a request that is refused before the fetch, so
+		// a call to it is a test bug.
+		Fetch: func(*http.Request) (*http.Response, error) { return nil, errUnscripted },
 	})
 
 	return harness

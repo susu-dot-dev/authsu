@@ -512,13 +512,13 @@ func TestRevokeUserStatements(t *testing.T) {
 				},
 				wantStatement{
 					fragments: []string{
-						// The user's sessions and API keys, which include
-						// those of its agents (a key's user_id is its agent's
-						// owner), by their secrets: one already due keeps its
-						// time, one scheduled for later is brought forward.
+						// The user's sessions, keys and OAuth grants with their access
+						// tokens, those of its agents included: a due time is kept.
 						"UPDATE secrets SET revoked_at = ?1",
-						"WHERE id IN (SELECT id FROM sessions WHERE user_id = ?2 " +
-							"UNION ALL SELECT id FROM api_keys WHERE user_id = ?2)",
+						"WHERE id IN (SELECT id FROM sessions WHERE user_id = ?2 UNION ALL SELECT id FROM api_keys " +
+							"WHERE user_id = ?2 UNION ALL SELECT id FROM oauth_grants WHERE user_id = ?2 " +
+							"UNION ALL SELECT t.id FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id " +
+							"WHERE g.user_id = ?2)",
 						"AND (revoked_at IS NULL OR revoked_at > ?1)",
 						followsRevocation,
 					},

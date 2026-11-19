@@ -24,6 +24,9 @@ func allTags() []taggedPrefix {
 		{secret.TagInvitation, "susu_inv_"},
 		{secret.TagSession, "susu_ses_"},
 		{secret.TagAPIKey, "susu_key_"},
+		{secret.TagOAuthCode, "susu_code_"},
+		{secret.TagOAuthRefresh, "susu_rt_"},
+		{secret.TagOAuthAccess, "susu_at_"},
 	}
 }
 
@@ -37,6 +40,9 @@ func TestPrefix(t *testing.T) {
 		{secret.TagInvitation, "susu_inv_"},
 		{secret.TagSession, "susu_ses_"},
 		{secret.TagAPIKey, "susu_key_"},
+		{secret.TagOAuthCode, "susu_code_"},
+		{secret.TagOAuthRefresh, "susu_rt_"},
+		{secret.TagOAuthAccess, "susu_at_"},
 		{"x", "susu_x_"},
 		{"", "susu__"},
 	}
@@ -241,6 +247,20 @@ func TestHashCoversThePrefix(t *testing.T) {
 
 		if hash == secret.Hash(body) {
 			t.Errorf("tag %q: the hash ignores the prefix", tc.tag)
+		}
+	}
+}
+
+// TestNoPrefixStartsAnother: a reader that expects one kind refuses every other
+// by its prefix, which only holds if no kind's prefix begins with another's.
+func TestNoPrefixStartsAnother(t *testing.T) {
+	t.Parallel()
+
+	for _, first := range allTags() {
+		for _, second := range allTags() {
+			if first.tag != second.tag && strings.HasPrefix(first.prefix, second.prefix) {
+				t.Errorf("%q starts with %q", first.prefix, second.prefix)
+			}
 		}
 	}
 }

@@ -443,7 +443,10 @@ func TestSecretCodes(t *testing.T) {
 // TestRevokeSecretStaysWithinTheUsersSecrets holds that no revoke statement
 // writes a bare secret id without scoping it: the only write to secrets whose
 // rows are not selected by the user's own tables is the invitation revoke,
-// which is matched by the invitation kind, bound as an argument.
+// which is matched by the invitation kind, bound as an argument. A write to an
+// OAuth secret is scoped through the grant or access token row it belongs to,
+// which in turn names the owner (user_id), the presenting client (client_id) or
+// the grant the rotation just rotated (the new refresh hash).
 func TestRevokeSecretStaysWithinTheUsersSecrets(t *testing.T) {
 	t.Parallel()
 
@@ -455,6 +458,8 @@ func TestRevokeSecretStaysWithinTheUsersSecrets(t *testing.T) {
 
 		scoped := strings.Contains(text, "id IN (SELECT id FROM sessions") ||
 			strings.Contains(text, "id IN (SELECT id FROM api_keys") ||
+			strings.Contains(text, "id IN (SELECT g.id FROM oauth_grants g") ||
+			strings.Contains(text, "id IN (SELECT t.id FROM oauth_access_tokens t") ||
 			strings.Contains(text, "WHERE id = ?2 AND kind = ?3")
 		if !scoped {
 			t.Errorf("%s updates secrets without scoping them to an owner or a kind:\n%s", name, text)

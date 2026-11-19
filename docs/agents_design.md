@@ -2,7 +2,7 @@
 
 > This document sets out the intended direction for agents and *why*. It is not a spec. Do not add details of features to this document, only describe overall intent if it changes.
 
-Related: [permissions_design.md](permissions_design.md), [secrets_design.md](secrets_design.md), [invitations_design.md](invitations_design.md), [users_design.md](users_design.md), [login_design.md](login_design.md)
+Related: [permissions_design.md](permissions_design.md), [secrets_design.md](secrets_design.md), [invitations_design.md](invitations_design.md), [users_design.md](users_design.md), [login_design.md](login_design.md), [oauth_design.md](oauth_design.md)
 
 ## The problem
 
@@ -54,7 +54,7 @@ Some authority is never delegated at all. Managing principals (inviting users, a
 An agent has a stable identity and any number of credentials that let it act:
 
 - **API keys scoped to the agent**, which are [secrets](secrets_design.md) like every other credential.
-- **OAuth grants**, for agents that live in other services and fit a standard authorization flow better than a pasted key.
+- **OAuth grants**, for agents that live in other services and fit a standard authorization flow better than a pasted key. Every grant binds to an agent, and how a person's consent creates or picks that agent is in [oauth_design.md](oauth_design.md#grants-belong-to-agents).
 
 As with invitations, the credential is not the identity. A key can be rotated or revoked without touching the agent. Revoking the agent ends all of its credentials, and the audit trail names a stable agent rather than whichever credential was in use.
 
@@ -94,5 +94,4 @@ These scopes only ever subtract from the user's access. They never stand alone, 
 
 ## Open questions
 
-- How OAuth agents and user consent fit together.
 - Whether a user may issue further keys for an existing agent.

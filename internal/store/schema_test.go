@@ -149,6 +149,12 @@ func schemaBounds(t *testing.T) []bound {
 			lowest: len(mustSessionToken(t, 1).Hash()), highest: len(mustSessionToken(t, 1).Hash()), exact: true},
 		{name: "API key token hash", pattern: secretHashCheck,
 			lowest: len(mustAPIKeyToken(t, 1).Hash()), highest: len(mustAPIKeyToken(t, 1).Hash()), exact: true},
+		{name: "authorization code hash", pattern: secretHashCheck,
+			lowest: len(mustAuthorizationCode(t, 1).Hash()), highest: len(mustAuthorizationCode(t, 1).Hash()), exact: true},
+		{name: "refresh token hash", pattern: secretHashCheck,
+			lowest: len(mustRefreshToken(t, 1).Hash()), highest: len(mustRefreshToken(t, 1).Hash()), exact: true},
+		{name: "access token hash", pattern: secretHashCheck,
+			lowest: len(mustAccessToken(t, 1).Hash()), highest: len(mustAccessToken(t, 1).Hash()), exact: true},
 
 		// What the authenticator reports. 1023 is webauthn's maxCredentialIDLen
 		// (WebAuthn section 4); the user handle is the registration challenge's
@@ -166,11 +172,15 @@ func schemaBounds(t *testing.T) []bound {
 
 		// The kind of a secret is one of the constants the store writes.
 		{name: "secret kind", pattern: `typeof\(kind\) = 'text' AND length\(kind\) BETWEEN (\d+) AND (\d+)`,
-			lowest:  min(len(store.KindInvitation), len(store.KindSession), len(store.KindAPIKey)),
-			highest: max(len(store.KindInvitation), len(store.KindSession), len(store.KindAPIKey)), exact: false},
+			lowest: min(len(store.KindInvitation), len(store.KindSession), len(store.KindAPIKey),
+				len(store.KindOAuthGrant), len(store.KindOAuthAccess)),
+			highest: max(len(store.KindInvitation), len(store.KindSession), len(store.KindAPIKey),
+				len(store.KindOAuthGrant), len(store.KindOAuthAccess)), exact: false},
 
 		// The session's grant is the hash of the login challenge: SHA-256, as
-		// auth.LoginGrant computes it.
+		// auth.LoginGrant computes it. The pattern also matches the column of an
+		// OAuth grant, which is the hash of the sealed pending request, also
+		// SHA-256 (oauthSchemaBounds names it).
 		{name: "login grant hash", pattern: `typeof\(granted_from\) = 'blob' AND length\(granted_from\) = (\d+)`,
 			lowest: sha256.Size, highest: sha256.Size, exact: true},
 	}

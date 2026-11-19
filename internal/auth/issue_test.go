@@ -64,6 +64,13 @@ const (
 	vectorSessionHash = "2dfa62136d8cac5aa3b8ef60572d06305e12a72a1c03206448cda367d32a1063"
 	vectorKey         = "susu_key_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 	vectorKeyHash     = "7b2c1f86aaee50b871fe0c2f49dd213517a39a4b21650ad96505f539a5d2ffe4"
+
+	vectorCode        = "susu_code_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+	vectorCodeHash    = "52b3f355dab5b9eb02b79ff0ee228a3357e8fb427cac5eaffa7090fc2d5cd7cb"
+	vectorRefresh     = "susu_rt_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+	vectorRefreshHash = "a6665c25701f99df7b5523351a23bff6573281004593a4f0ec087079c0e368ee"
+	vectorAccess      = "susu_at_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+	vectorAccessHash  = "c5dea4b0493dfc178c3dc663fa5b1f6da56b245c8f7b4bb4d4632cdefe9651ea"
 )
 
 func TestConstants(t *testing.T) {
@@ -80,19 +87,7 @@ func TestConstants(t *testing.T) {
 		}
 	}
 
-	for _, lifetime := range []struct {
-		name      string
-		got, want time.Duration
-	}{
-		{"SessionLifetime", auth.SessionLifetime, 14 * 24 * time.Hour},
-		{"AgentKeyLifetime", auth.AgentKeyLifetime, 90 * 24 * time.Hour},
-		{"MaxAgentKeyLifetime", auth.MaxAgentKeyLifetime, 90 * 24 * time.Hour},
-		{"MaxUserKeyLifetime", auth.MaxUserKeyLifetime, 365 * 24 * time.Hour},
-	} {
-		if lifetime.got != lifetime.want {
-			t.Errorf("%s = %v, want %v", lifetime.name, lifetime.got, lifetime.want)
-		}
-	}
+	checkLifetimes(t)
 
 	if auth.AgentKeyLifetime > auth.MaxAgentKeyLifetime {
 		t.Error("the default agent key lifetime is longer than the most IssueAPIKey allows")
@@ -102,8 +97,35 @@ func TestConstants(t *testing.T) {
 		t.Error("the user's key lifetimes are not within, and above, an agent's")
 	}
 
+	if auth.CodeLifetime >= auth.AccessTokenLifetime || auth.AccessTokenLifetime >= auth.RefreshTokenLifetime {
+		t.Error("an OAuth code must be the shortest-lived secret and a refresh token the longest")
+	}
+
 	if auth.CookieName != "__Host-session" {
 		t.Errorf("CookieName = %q", auth.CookieName)
+	}
+}
+
+// checkLifetimes pins every lifetime auth sets: they are policy, so a change is
+// a deliberate edit of this table.
+func checkLifetimes(t *testing.T) {
+	t.Helper()
+
+	for _, lifetime := range []struct {
+		name      string
+		got, want time.Duration
+	}{
+		{"SessionLifetime", auth.SessionLifetime, 14 * 24 * time.Hour},
+		{"AgentKeyLifetime", auth.AgentKeyLifetime, 90 * 24 * time.Hour},
+		{"MaxAgentKeyLifetime", auth.MaxAgentKeyLifetime, 90 * 24 * time.Hour},
+		{"MaxUserKeyLifetime", auth.MaxUserKeyLifetime, 365 * 24 * time.Hour},
+		{"CodeLifetime", auth.CodeLifetime, time.Minute},
+		{"RefreshTokenLifetime", auth.RefreshTokenLifetime, 30 * 24 * time.Hour},
+		{"AccessTokenLifetime", auth.AccessTokenLifetime, 15 * time.Minute},
+	} {
+		if lifetime.got != lifetime.want {
+			t.Errorf("%s = %v, want %v", lifetime.name, lifetime.got, lifetime.want)
+		}
 	}
 }
 
@@ -118,6 +140,9 @@ type issueCase struct {
 	tag secret.Tag
 	// vector and vectorHash are the token and hash for firstBytes.
 	vector, vectorHash string
+	// idless is true for a secret that is stored under an id it already has,
+	// so no id is taken and Issued.ID is empty.
+	idless bool
 }
 
 // keyCase is an API key issued with a lifetime.
@@ -125,7 +150,7 @@ func keyCase(
 	name string, key func(time.Duration) func(io.Reader, func() string, time.Time) (auth.Issued, error),
 	lifetime time.Duration,
 ) issueCase {
-	return issueCase{name, key(lifetime), lifetime, secret.TagAPIKey, vectorKey, vectorKeyHash}
+	return issueCase{name, key(lifetime), lifetime, secret.TagAPIKey, vectorKey, vectorKeyHash, false}
 }
 
 func issueCases() []issueCase {
@@ -142,12 +167,26 @@ func issueCases() []issueCase {
 	}
 
 	return []issueCase{
-		{"a session", auth.IssueSession, auth.SessionLifetime, secret.TagSession, vectorSession, vectorSessionHash},
+		{"a session", auth.IssueSession, auth.SessionLifetime, secret.TagSession, vectorSession, vectorSessionHash, false},
 		keyCase("a key of the agent lifetime", key, auth.AgentKeyLifetime),
 		keyCase("a key of the longest lifetime", key, auth.MaxAgentKeyLifetime),
 		keyCase("a key of one nanosecond", key, time.Nanosecond),
 		keyCase("a key of a day", key, 24*time.Hour),
 		keyCase("a user's key of the longest lifetime", userKey, auth.MaxUserKeyLifetime),
+		{
+			"an OAuth code", auth.IssueGrantCode, auth.CodeLifetime, secret.TagOAuthCode,
+			vectorCode, vectorCodeHash, false,
+		},
+		{
+			"an OAuth refresh token", func(r io.Reader, _ func() string, now time.Time) (auth.Issued, error) {
+				return auth.IssueRefreshToken(r, now)
+			},
+			auth.RefreshTokenLifetime, secret.TagOAuthRefresh, vectorRefresh, vectorRefreshHash, true,
+		},
+		{
+			"an OAuth access token", auth.IssueAccessToken, auth.AccessTokenLifetime, secret.TagOAuthAccess,
+			vectorAccess, vectorAccessHash, false,
+		},
 	}
 }
 
@@ -183,9 +222,7 @@ func TestIssue(t *testing.T) {
 				t.Errorf("Hash = %x, want secret.Hash(Token) = %x", issued.Hash, want)
 			}
 
-			if issued.ID != "00000000-0000-7000-8000-00000000c0de" || ids.taken != 1 {
-				t.Errorf("ID = %q after %d id(s), want the one id from newID", issued.ID, ids.taken)
-			}
+			checkIssuedID(t, issued, ids, test.idless)
 
 			if !issued.ExpiresAt.Equal(now.Add(test.lifetime)) {
 				t.Errorf("ExpiresAt = %v, want %v", issued.ExpiresAt, now.Add(test.lifetime))
@@ -193,6 +230,21 @@ func TestIssue(t *testing.T) {
 
 			checkParsesAs(t, issued.Token, test.tag)
 		})
+	}
+}
+
+// checkIssuedID checks the id of an issued secret: the one id from newID, or
+// none at all for a secret that keeps the id it already has.
+func checkIssuedID(t *testing.T, issued auth.Issued, ids *counting, idless bool) {
+	t.Helper()
+
+	wantID, wantTaken := "00000000-0000-7000-8000-00000000c0de", 1
+	if idless {
+		wantID, wantTaken = "", 0
+	}
+
+	if issued.ID != wantID || ids.taken != wantTaken {
+		t.Errorf("ID = %q after %d id(s), want %q after %d", issued.ID, ids.taken, wantID, wantTaken)
 	}
 }
 
@@ -224,7 +276,10 @@ func checkParsesAs(t *testing.T, token string, tag secret.Tag) {
 		hash = sessionToken.Hash()
 	case secret.TagAPIKey:
 		hash = keyToken.Hash()
-	case secret.TagInvitation:
+	case secret.TagInvitation, secret.TagOAuthCode, secret.TagOAuthRefresh, secret.TagOAuthAccess:
+		// No parser of these is in the table above: that every parser there
+		// refuses them is the check. Their own parsers are internal/input's.
+		return
 	}
 
 	if !bytes.Equal(hash, want[:]) {

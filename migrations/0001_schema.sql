@@ -1,9 +1,9 @@
 -- The schema: secrets, invitations, users, passkey credentials, sessions,
--- agents and API keys.
+-- agents, API keys and OAuth grants.
 --
 -- Rationale: docs/secrets_design.md, docs/invitations_design.md,
 -- docs/registration_design.md, docs/login_design.md, docs/users_design.md,
--- docs/agents_design.md and docs/permissions_design.md.
+-- docs/agents_design.md, docs/permissions_design.md and docs/oauth_design.md.
 --
 -- Timestamps are Unix seconds. Identifiers we create are UUIDv7 in canonical
 -- text form; hashes and WebAuthn bytes are BLOB.
@@ -431,6 +431,170 @@ CREATE INDEX api_keys_user_id ON api_keys (user_id, id);
 CREATE INDEX api_keys_agent_id ON api_keys (agent_id) WHERE agent_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- OAuth grants and their access tokens
+-- ---------------------------------------------------------------------------
+
+-- An OAuth grant is what a user approved for a client at consent
+-- (docs/oauth_design.md), and it is one kind of secret: the authorization code
+-- first, then, rotated in place under the same id and the same secret row, the
+-- refresh token. Its expiry and revocation are on its secret row. Until the
+-- code is exchanged the expiry is when the row may be removed, not when the code
+-- stops working: the code's 60 seconds are judged by the secret's created_at in
+-- the exchange write, and the row is kept as long as the consent it records
+-- could be replayed (see granted_from). After the exchange it is the refresh
+-- token's 30 days from its last exchange.
+--
+-- The kind column is fixed to 'oauth_grant' and the foreign key is on
+-- (id, kind), so this row can attach only to a grant's secret.
+--
+-- Everything but the user and the agent is what the user approved, written once
+-- at consent and never updated: a later change to the client's metadata
+-- document, or to the agent, cannot widen it. Which values are valid is Go's to
+-- decide, as with scopes, so each text column has only a size and NUL backstop,
+-- fitted to the bound of its parser in internal/input (a test holds the two
+-- together). Every bound is in BYTES and refuses NUL, as for agents.name; the
+-- values are ASCII except client_name, which Go bounds in bytes too.
+CREATE TABLE oauth_grants (
+    id             TEXT    PRIMARY KEY
+                           CHECK (length(id) = 36 AND id NOT GLOB '*[^0-9a-f-]*'),
+
+    kind           TEXT    NOT NULL DEFAULT 'oauth_grant'
+                           CHECK (kind = 'oauth_grant'),
+
+    -- The subject: whose authority the grant carries. Grants die with the
+    -- account, as keys do.
+    user_id        TEXT    NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+
+    -- The agent that holds the grant: the actor. Every grant has one, either
+    -- created at consent or attached from the user's own, so it is NOT NULL:
+    -- a consent write that finds no agent for it fails as a constraint failure
+    -- and creates nothing (see the store's CreateGrant).
+    agent_id       TEXT    NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+
+    -- The client: the URL of its metadata document, and the name that document
+    -- gave it when the user approved, so the list can say what was approved
+    -- even if the document changes or disappears.
+    client_id      TEXT    NOT NULL
+                           CHECK (typeof(client_id) = 'text'
+                                  AND instr(client_id, char(0)) = 0
+                                  AND length(cast(client_id AS BLOB)) BETWEEN 1 AND 512),
+
+    client_name    TEXT    NOT NULL
+                           CHECK (typeof(client_name) = 'text'
+                                  AND instr(client_name, char(0)) = 0
+                                  AND length(cast(client_name AS BLOB)) BETWEEN 1 AND 128),
+
+    -- The redirect URI the approval was for. The code is exchanged only with the
+    -- same value.
+    redirect_uri   TEXT    NOT NULL
+                           CHECK (typeof(redirect_uri) = 'text'
+                                  AND instr(redirect_uri, char(0)) = 0
+                                  AND length(cast(redirect_uri AS BLOB)) BETWEEN 1 AND 512),
+
+    -- The resource server the grant is for (its URL, an entry of the fixed list
+    -- in code) and the scopes approved at it, space-delimited, as
+    -- input.OAuthScopes stores them. A token is good at this resource alone.
+    resource       TEXT    NOT NULL
+                           CHECK (typeof(resource) = 'text'
+                                  AND instr(resource, char(0)) = 0
+                                  AND length(cast(resource AS BLOB)) BETWEEN 1 AND 128),
+
+    scope          TEXT    NOT NULL
+                           CHECK (typeof(scope) = 'text'
+                                  AND instr(scope, char(0)) = 0
+                                  AND length(cast(scope AS BLOB)) BETWEEN 1 AND 256),
+
+    -- The PKCE S256 challenge of the request: 43 base64url characters. The code
+    -- is exchanged only with the verifier it is the challenge of.
+    code_challenge TEXT    NOT NULL
+                           CHECK (typeof(code_challenge) = 'text'
+                                  AND instr(code_challenge, char(0)) = 0
+                                  AND length(cast(code_challenge AS BLOB)) = 43),
+
+    -- The OpenID Connect nonce the client sent, to echo in the ID token, or
+    -- NULL when it sent none.
+    nonce          TEXT    CHECK (nonce IS NULL
+                                  OR (typeof(nonce) = 'text'
+                                      AND instr(nonce, char(0)) = 0
+                                      AND length(cast(nonce AS BLOB)) BETWEEN 1 AND 128)),
+
+    -- When the user signed in, in Unix seconds: the created_at of the session
+    -- that approved, read from its secret in the consent write and never taken
+    -- from the request. It is the ID token's auth_time.
+    auth_time      INTEGER NOT NULL,
+
+    -- The SHA-256 of the sealed pending request this grant was approved from.
+    -- UNIQUE, so a double-submitted or replayed consent collides on insert and
+    -- creates neither a second grant nor a second agent. Do not remove the
+    -- UNIQUE: it is the replay guard, as sessions.granted_from is. It outlives
+    -- its request because the grant is removed only once it has expired, and the
+    -- consent write gives the code-stage secret an expiry no earlier than the
+    -- sealed request's own (the request's lifetime from consent), not the
+    -- code's 60 seconds: otherwise the row could be removed while the request
+    -- could still be replayed, and the replay would create a second grant.
+    granted_from   BLOB    NOT NULL UNIQUE
+                           CHECK (typeof(granted_from) = 'blob' AND length(granted_from) = 32),
+
+    -- Deleting the secret deletes this row. The reverse is the trigger below.
+    FOREIGN KEY (id, kind) REFERENCES secrets (id, kind) ON DELETE CASCADE
+);
+
+-- A user's grants (listed newest first by id, a UUIDv7, which is the sort key
+-- and the pagination cursor), and to revoke them with the account.
+CREATE INDEX oauth_grants_user_id ON oauth_grants (user_id, id);
+
+-- An agent's grants, to revoke them with it.
+CREATE INDEX oauth_grants_agent_id ON oauth_grants (agent_id);
+
+-- A grant's access token is a kind of secret of its own, so that what a
+-- resource server presents is never the grant's: the refresh token stays with
+-- the client. There is exactly one row per grant (grant_id is UNIQUE): the
+-- first exchange writes it, and every later exchange or refresh replaces the
+-- hash, expiry and creation time of its secret row in place and clears any
+-- revocation, so a grant is two secret rows however often its client refreshes.
+-- A request in flight with the previous token is refused, which is acceptable
+-- because the client that refreshed holds the new one. A grant has an access
+-- token row once it has been exchanged, and not before. The row can also be
+-- removed alone once its secret has expired and been swept, so its absence says
+-- nothing about whether the grant was ever exchanged: the next refresh writes
+-- it again.
+--
+-- The row holds the token's scope and nothing else the grant does not have: the
+-- resource, the client and the owner are the grant's, joined by grant_id. The
+-- kind column is fixed to 'oauth_access' and the foreign key is on (id, kind),
+-- as for the other kinds.
+CREATE TABLE oauth_access_tokens (
+    id       TEXT    PRIMARY KEY
+                     CHECK (length(id) = 36 AND id NOT GLOB '*[^0-9a-f-]*'),
+
+    kind     TEXT    NOT NULL DEFAULT 'oauth_access'
+                     CHECK (kind = 'oauth_access'),
+
+    -- The scopes this token carries, space-delimited, as input.OAuthScopes
+    -- stores them: the grant's scope, or the narrower list a refresh asked for
+    -- (RFC 6749 section 6: never more than the grant holds, which the rotation
+    -- write checks). Introspection and the token response report this, not the
+    -- grant's. Bounded as oauth_grants.scope is.
+    scope    TEXT    NOT NULL
+                     CHECK (typeof(scope) = 'text'
+                            AND instr(scope, char(0)) = 0
+                            AND length(cast(scope AS BLOB)) BETWEEN 1 AND 256),
+
+    -- The grant this token was issued under. UNIQUE: one token per grant. The
+    -- token dies with its grant, but not through this key: it has no ON DELETE
+    -- action, and the grant's delete trigger (below) deletes the token's secret,
+    -- whose own foreign key then deletes this row, before the statement that
+    -- deleted the grant ends and its key is checked. A cascade here and a delete
+    -- trigger on this table would each be correct and together are one trigger
+    -- too many (see "Why only four triggers").
+    grant_id TEXT    NOT NULL UNIQUE REFERENCES oauth_grants (id),
+
+    -- Deleting the secret deletes this row. Deleting this row alone leaves the
+    -- secret, which is inert: it has no row to be an access token with.
+    FOREIGN KEY (id, kind) REFERENCES secrets (id, kind) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------
 -- Deleting a kind's row deletes its secret
 -- ---------------------------------------------------------------------------
 --
@@ -439,8 +603,8 @@ CREATE INDEX api_keys_agent_id ON api_keys (agent_id) WHERE agent_id IS NOT NULL
 -- cascade from the secret down to its kind's row. They cannot cascade the
 -- other way: the secret is referenced by its kind's row and cannot reference
 -- its owner, because an invitation has no user. So a delete that starts above
--- a kind's row, such as a user's or a passkey's, removes the sessions or keys
--- through their ON DELETE CASCADE, and these triggers then remove the secrets
+-- a kind's row, such as a user's or a passkey's, removes the sessions, keys or
+-- grants through their ON DELETE CASCADE, and these triggers then remove the secrets
 -- behind them. Without them such a delete would leave inert secrets that
 -- belong to nothing. Triggers fire for rows deleted by a cascade, which relies
 -- on foreign keys being enforced.
@@ -464,4 +628,21 @@ END;
 CREATE TRIGGER api_keys_delete_secret AFTER DELETE ON api_keys
 BEGIN
     DELETE FROM secrets WHERE id = OLD.id AND kind = 'api_key';
+END;
+
+-- Why only four triggers: D1 (workerd's SQLite) refuses a statement whose
+-- delete triggers nest too deep ("triggers nested too deep"), which the host's
+-- SQLite does not. A delete of a secret cascades to every kind's row, and every
+-- kind's row has a trigger that deletes a secret, so the compiler of such a
+-- statement follows a chain one trigger and one cascade longer for each kind.
+-- With the four triggers here, a hard delete of a user, an agent or a passkey
+-- works on D1; with a fifth it failed (the e2e test TestLoginRacingAStateChange is
+-- the guard). So the access token, which exists
+-- only under a grant, has no trigger of its own: its grant's trigger deletes
+-- both secrets.
+CREATE TRIGGER oauth_grants_delete_secret AFTER DELETE ON oauth_grants
+BEGIN
+    DELETE FROM secrets WHERE id = OLD.id AND kind = 'oauth_grant';
+    DELETE FROM secrets WHERE kind = 'oauth_access'
+        AND id IN (SELECT id FROM oauth_access_tokens WHERE grant_id = OLD.id);
 END;

@@ -24,7 +24,7 @@ func corsTarget(allowed string) http.Handler {
 	mux.Handle("/x", serve(http.MethodPost, func(httpapi.Request, *apierr.Error) {},
 		respond(httpapi.JSON(http.StatusOK, 1))))
 
-	return httpapi.CORS(func() string { return allowed }, mux)
+	return httpapi.CORS(func() string { return allowed }, httpapi.CORSPaths{}, mux)
 }
 
 func corsHeaders(rec *httptest.ResponseRecorder) []string {
@@ -60,11 +60,11 @@ func TestCORSAllowedOriginPreflight(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"Access-Control-Allow-Origin":      uiOrigin,
-		"Access-Control-Allow-Credentials": "true",
-		"Access-Control-Allow-Methods":     http.MethodPost,
-		"Access-Control-Allow-Headers":     contentType,
-		"Access-Control-Max-Age":           "600",
+		allowOrigin:              uiOrigin,
+		allowCreds:               credsTrue,
+		allowMethods:             http.MethodPost,
+		allowHeaders:             contentType,
+		"Access-Control-Max-Age": "600",
 	}
 	for name, value := range want {
 		if got := rec.Header().Get(name); got != value {
@@ -94,11 +94,11 @@ func TestCORSPreflightRefusesWhatTheAPIDoesNotUse(t *testing.T) {
 	}{
 		"get": {method: http.MethodGet, headers: "", wantMethods: http.MethodGet, wantHeader: contentType},
 		"delete": {
-			method: http.MethodDelete, headers: "content-type",
+			method: http.MethodDelete, headers: lowerCT,
 			wantMethods: http.MethodDelete, wantHeader: contentType,
 		},
 		"patch": {
-			method: http.MethodPatch, headers: "content-type",
+			method: http.MethodPatch, headers: lowerCT,
 			wantMethods: http.MethodPatch, wantHeader: contentType,
 		},
 		"put": {method: http.MethodPut, headers: "", wantMethods: "", wantHeader: contentType},
@@ -131,11 +131,11 @@ func TestCORSPreflightRefusesWhatTheAPIDoesNotUse(t *testing.T) {
 			rec := httptest.NewRecorder()
 			corsTarget(uiOrigin).ServeHTTP(rec, req)
 
-			if got := rec.Header().Get("Access-Control-Allow-Methods"); got != tt.wantMethods {
+			if got := rec.Header().Get(allowMethods); got != tt.wantMethods {
 				t.Errorf("Allow-Methods = %q, want %q", got, tt.wantMethods)
 			}
 
-			if got := rec.Header().Get("Access-Control-Allow-Headers"); got != tt.wantHeader {
+			if got := rec.Header().Get(allowHeaders); got != tt.wantHeader {
 				t.Errorf("Allow-Headers = %q, want %q", got, tt.wantHeader)
 			}
 		})
@@ -158,11 +158,11 @@ func TestCORSAllowedOriginResponse(t *testing.T) {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
 
-	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != uiOrigin {
+	if got := rec.Header().Get(allowOrigin); got != uiOrigin {
 		t.Errorf("Allow-Origin = %q, want %q", got, uiOrigin)
 	}
 
-	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+	if got := rec.Header().Get(allowCreds); got != credsTrue {
 		t.Errorf("Allow-Credentials = %q, want true", got)
 	}
 
@@ -188,9 +188,9 @@ func TestCORSRefusesEveryOtherOrigin(t *testing.T) {
 		"subdomain":                {uiOrigin, "https://auth.susu.dev"},
 		"different case":           {uiOrigin, "https://SUSU.dev"},
 		"trailing slash":           {uiOrigin, "https://susu.dev/"},
-		"null origin":              {uiOrigin, "null"},
+		"null origin":              {uiOrigin, nullOrigin},
 		"nothing configured":       {"", uiOrigin},
-		"nothing configured, null": {"", "null"},
+		"nothing configured, null": {"", nullOrigin},
 	}
 
 	for name, tt := range tests {
@@ -200,7 +200,7 @@ func TestCORSRefusesEveryOtherOrigin(t *testing.T) {
 			preflight := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/x", nil)
 			preflight.Header.Set(originName, tt.origin)
 			preflight.Header.Set("Access-Control-Request-Method", http.MethodPost)
-			preflight.Header.Set("Access-Control-Request-Headers", "content-type")
+			preflight.Header.Set("Access-Control-Request-Headers", lowerCT)
 
 			post := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(""))
 			post.Header.Set(originName, tt.origin)
@@ -266,7 +266,7 @@ func TestCORSBareOptionsIsNotAPreflight(t *testing.T) {
 		t.Errorf("status = %d, want 405", rec.Code)
 	}
 
-	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "" {
+	if got := rec.Header().Get(allowMethods); got != "" {
 		t.Errorf("Allow-Methods = %q, want none", got)
 	}
 }

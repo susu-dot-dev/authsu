@@ -27,9 +27,15 @@ import (
 	"encoding/json"
 	"io"
 	"maps"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
@@ -117,6 +123,9 @@ type request struct {
 	headers map[string]string
 	// noType omits the default Content-Type of an unsafe method.
 	noType bool
+	// keepRedirect hands a 3xx back as it is instead of following it, for the
+	// routes whose answer is a redirect (the OAuth authorization endpoint).
+	keepRedirect bool
 }
 
 // build turns r into an http.Request against the Worker.
@@ -170,13 +179,23 @@ func (r request) applyHeaders(req *http.Request) {
 	}
 }
 
+// noRedirectClient returns every 3xx as it is.
+var noRedirectClient = &http.Client{ //nolint:gochecknoglobals // a stateless client shared by all tests
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
 // send performs the request against the Worker.
 func send(t *testing.T, r request) reply {
 	t.Helper()
 
 	req := r.build(t)
 
-	resp, err := http.DefaultClient.Do(req)
+	client := http.DefaultClient
+	if r.keepRedirect {
+		client = noRedirectClient
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", req.Method, r.path, err)
 	}
@@ -723,6 +742,11 @@ const (
 	kindInvitation = "invitation"
 	kindSession    = "session"
 	kindAPIKey     = "api_key"
+
+	// kindOAuthGrant is a grant's secret: the code, then the refresh token under
+	// the same id. kindOAuthAccess is the access token of a grant.
+	kindOAuthGrant  = "oauth_grant"
+	kindOAuthAccess = "oauth_access"
 )
 
 // tokenPrefix is what every token of a tag starts with.
@@ -750,6 +774,10 @@ func kindTable(kind string) string {
 		return tableSessions
 	case kindAPIKey:
 		return tableKeys
+	case kindOAuthGrant:
+		return tableOAuthGrants
+	case kindOAuthAccess:
+		return tableOAuthAccess
 	default:
 		panic("unknown secret kind " + kind)
 	}
@@ -859,11 +887,14 @@ func expectStoredNowhere(t *testing.T, tokens ...string) {
 func expectNoOrphanSecrets(t *testing.T) {
 	t.Helper()
 
-	for _, kind := range []string{kindInvitation, kindSession, kindAPIKey} {
+	kinds := []string{kindInvitation, kindSession, kindAPIKey, kindOAuthGrant, kindOAuthAccess}
+
+	for _, kind := range kinds {
 		expectCount(t, "secrets WHERE kind = ? AND id NOT IN (SELECT id FROM "+kindTable(kind)+")", "0", kind)
 	}
 
-	expectCount(t, "secrets WHERE kind NOT IN (?, ?, ?)", "0", kindInvitation, kindSession, kindAPIKey)
+	expectCount(t, "secrets WHERE kind NOT IN (?, ?, ?, ?, ?)", "0",
+		kindInvitation, kindSession, kindAPIKey, kindOAuthGrant, kindOAuthAccess)
 }
 
 func parseInt(t *testing.T, text string) int64 {
@@ -916,10 +947,13 @@ const (
 	// keyRows is every API key with its secret.
 	keyRows = "api_keys k JOIN secrets s ON s.id = k.id"
 
-	// ownedSecrets is every session and API key secret with its owner's id as
-	// user_id, so a condition can cover "everything this user holds".
-	ownedSecrets = "secrets s JOIN " +
-		"(SELECT id, user_id FROM sessions UNION ALL SELECT id, user_id FROM api_keys) o ON o.id = s.id"
+	// ownedSecrets is every session, API key and OAuth grant secret, and every
+	// grant's access token secret, with its owner's id as user_id, so a condition
+	// can cover "everything this user holds".
+	ownedSecrets = "secrets s JOIN (SELECT id, user_id FROM sessions UNION ALL SELECT id, user_id FROM api_keys " +
+		"UNION ALL SELECT id, user_id FROM oauth_grants " +
+		"UNION ALL SELECT t.id, g.user_id FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id) o " +
+		"ON o.id = s.id"
 )
 
 // seedLifetime is how long a seeded secret lasts: long enough that no test
@@ -1024,4 +1058,475 @@ func setRole(t *testing.T, id, role string) {
 	t.Helper()
 
 	seed(t, "UPDATE users SET role = ? WHERE id = ?", role, id)
+}
+
+// ---- OAuth ------------------------------------------------------------------
+
+// Routes of the OAuth server.
+const (
+	pathOAuthAuthorize  = "/oauth/authorize"
+	pathOAuthToken      = "/oauth/token"
+	pathOAuthRevoke     = "/oauth/revoke"
+	pathOAuthIntrospect = "/oauth/introspect"
+	pathOAuthRequest    = "/api/oauth/request"
+	pathOAuthConsent    = "/api/oauth/consent"
+	pathGrant           = "/api/grant"
+	pathJWKS            = "/.well-known/jwks.json"
+	pathOAuthMetadata   = "/.well-known/oauth-authorization-server"
+	pathOpenIDConfig    = "/.well-known/openid-configuration"
+
+	// formType is the media type of the OAuth endpoints' request bodies.
+	formType = "application/x-www-form-urlencoded"
+
+	// oauthResource is the resource server of the development table, which is the
+	// table the Worker under test selects (its API_ORIGIN is http://localhost).
+	oauthResource = "http://localhost:8788/mcp"
+	// oauthScopes is what the tests ask for: both scopes of the resource and an ID
+	// token.
+	oauthScopes = "mcp:read mcp:write openid"
+
+	tagOAuthCode    = "code"
+	tagOAuthRefresh = "rt"
+	tagOAuthAccess  = "at"
+
+	// oauthClientName is the client_name of the metadata document the tests serve.
+	oauthClientName = "E2E Client"
+
+	// Names of the parameters of the OAuth requests, and of two header and
+	// document members the tests repeat.
+	paramClientID     = "client_id"
+	paramCode         = "code"
+	paramNonce        = "nonce"
+	paramResource     = "resource"
+	paramRedirectURI  = "redirect_uri"
+	paramGrantType    = "grant_type"
+	grantTypeCode     = "authorization_code"
+	paramToken        = "token"
+	paramRefreshToken = "refresh_token"
+	hdrContentType    = "Content-Type"
+	authMethodNone    = "none"
+	memberClientName  = "client_name"
+	memberAuthMethod  = "token_endpoint_auth_method"
+	memberRedirects   = "redirect_uris"
+	responseTypeCode  = "code"
+)
+
+// Lifetimes the Worker issues tokens with (internal/auth, docs/oauth_design.md),
+// restated here so a change is a visible test change.
+const (
+	oauthAccessSeconds  = 15 * 60
+	oauthRefreshSeconds = 30 * 24 * 60 * 60
+	oauthCodeSeconds    = 60
+	oauthIDTokenSeconds = 5 * 60
+)
+
+// oauthClient is a public OAuth client: a server that serves its own client
+// metadata document (CIMD) on http://localhost:<port>/client.json, which the
+// development table lets the Worker accept and fetch, and a loopback redirect
+// URI. It counts the requests the Worker made to it.
+type oauthClient struct {
+	// id is the client_id: the URL of the document.
+	id string
+	// redirect is the redirect URI the document lists.
+	redirect string
+	name     string
+
+	server *httptest.Server
+	hits   atomic.Int64
+
+	mu sync.Mutex
+	// serve, when set, answers the document request instead of the default.
+	serve http.HandlerFunc
+	// requests are the requests the Worker made, in order.
+	requests []*http.Request
+}
+
+// newOAuthClient starts a client and stops it when the test ends.
+func newOAuthClient(t *testing.T) *oauthClient {
+	t.Helper()
+
+	client := &oauthClient{name: oauthClientName}
+
+	client.server = httptest.NewServer(http.HandlerFunc(client.handle))
+	t.Cleanup(func() {
+		client.server.CloseClientConnections()
+		client.server.Close()
+	})
+
+	_, port, err := net.SplitHostPort(client.server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("client address: %v", err)
+	}
+
+	client.id = "http://" + rpID + ":" + port + "/client.json"
+	client.redirect = "http://127.0.0.1:" + port + "/callback"
+
+	return client
+}
+
+// handle answers the Worker's fetch of the document.
+func (c *oauthClient) handle(w http.ResponseWriter, r *http.Request) {
+	c.hits.Add(1)
+
+	c.mu.Lock()
+	serve := c.serve
+	c.requests = append(c.requests, r.Clone(r.Context()))
+	c.mu.Unlock()
+
+	if serve != nil {
+		serve(w, r)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", jsonType)
+	_, _ = w.Write(c.document())
+}
+
+// seen returns the requests the Worker made to the client so far.
+func (c *oauthClient) seen() []*http.Request {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return slices.Clone(c.requests)
+}
+
+// servesWith replaces the answer to the document request.
+func (c *oauthClient) servesWith(serve http.HandlerFunc) {
+	c.mu.Lock()
+	c.serve = serve
+	c.mu.Unlock()
+}
+
+// document is the client's metadata document.
+func (c *oauthClient) document() []byte {
+	out, err := json.Marshal(map[string]any{
+		paramClientID: c.id, memberClientName: c.name, memberRedirects: []string{c.redirect},
+		memberAuthMethod: authMethodNone,
+	})
+	if err != nil {
+		panic(err) // a map of strings always encodes
+	}
+
+	return out
+}
+
+// pkce is a code verifier and its S256 challenge.
+type pkce struct {
+	verifier  string
+	challenge string
+}
+
+func newPKCE() pkce {
+	verifier := b64(randomBytes(tokenBodyBytes))
+	sum := sha256.Sum256([]byte(verifier))
+
+	return pkce{verifier: verifier, challenge: b64(sum[:])}
+}
+
+// authorizeQuery is a valid authorization request of the client, for the PKCE
+// pair, with a state and a nonce. A test changes the values it is about.
+func (c *oauthClient) authorizeQuery(p pkce) url.Values {
+	return url.Values{
+		"response_type": {responseTypeCode}, paramClientID: {c.id}, paramRedirectURI: {c.redirect},
+		"code_challenge": {p.challenge}, "code_challenge_method": {"S256"},
+		"state": {"state-" + b64(randomBytes(6))}, paramNonce: {"nonce-" + b64(randomBytes(6))},
+		paramResource: {oauthResource}, "scope": {oauthScopes},
+	}
+}
+
+// authorize sends the authorization request and returns the reply as it is: the
+// endpoint only ever answers a 302.
+func authorize(t *testing.T, query url.Values) reply {
+	t.Helper()
+
+	return send(t, request{path: pathOAuthAuthorize + "?" + query.Encode(), keepRedirect: true})
+}
+
+// location is the Location header of a reply.
+func (r reply) location() string { return r.header.Get("Location") }
+
+// locationQuery parses the Location of a 302 into its URL.
+func (r reply) locationURL(t *testing.T) *url.URL {
+	t.Helper()
+
+	parsed, err := url.Parse(r.location())
+	if err != nil {
+		t.Fatalf("Location %q: %v", r.location(), err)
+	}
+
+	return parsed
+}
+
+// pendingOf returns the sealed request an acceptable authorize reply sends the
+// browser to the UI with, and fails the test if the reply is anything else.
+func pendingOf(t *testing.T, got reply) string {
+	t.Helper()
+
+	if got.status != http.StatusFound || !strings.HasPrefix(got.location(), target.origin+"/oauth/consent?request=") {
+		t.Fatalf("authorize = %d Location %q body %q, want 302 to %s/oauth/consent", got.status, got.location(),
+			got.body, target.origin)
+	}
+
+	return got.locationURL(t).Query().Get("request")
+}
+
+// consentBody is the body of a consent that approves with the agent choice, or
+// refuses when agent is nil and approve false.
+func consentBody(t *testing.T, pending string, approve bool, agent map[string]string) []byte {
+	t.Helper()
+
+	body := map[string]any{"request": pending, "approve": approve}
+	if agent != nil {
+		body["agent"] = agent
+	}
+
+	return mustJSON(t, body)
+}
+
+// consent posts the user's answer to a pending request.
+func consent(t *testing.T, token, pending string, approve bool, agent map[string]string) reply {
+	t.Helper()
+
+	return post(t, pathOAuthConsent, consentBody(t, pending, approve, agent), token)
+}
+
+// newAgentChoice and agentChoiceID are the two ways an approval chooses its agent.
+func newAgentChoice(name string) map[string]string { return map[string]string{"new": name} }
+func agentChoiceID(id string) map[string]string    { return map[string]string{"id": id} }
+
+// consentRedirect returns the URL an approving consent sends the browser to.
+func consentRedirect(t *testing.T, got reply) *url.URL {
+	t.Helper()
+
+	var out struct {
+		Redirect string `json:"redirect"`
+	}
+
+	err := json.Unmarshal([]byte(got.body), &out)
+	if err != nil || out.Redirect == "" {
+		t.Fatalf("consent = %d %s, want 200 with a redirect (%v)", got.status, got.body, err)
+	}
+
+	parsed, err := url.Parse(out.Redirect)
+	if err != nil {
+		t.Fatalf("redirect %q: %v", out.Redirect, err)
+	}
+
+	return parsed
+}
+
+// approved is a completed authorization: the client's code and what it was
+// approved with.
+type approved struct {
+	client *oauthClient
+	pkce   pkce
+	query  url.Values
+	code   string
+}
+
+// approve runs the authorization request and an approval by the session for the
+// agent choice, and returns the code the client would receive.
+func approve(t *testing.T, c *oauthClient, session string, agent map[string]string) approved {
+	t.Helper()
+
+	return approveWith(t, c, session, agent, nil)
+}
+
+// approveWith is approve for a request that mutate has changed.
+func approveWith(
+	t *testing.T, c *oauthClient, session string, agent map[string]string, mutate func(url.Values),
+) approved {
+	t.Helper()
+
+	p := newPKCE()
+	query := c.authorizeQuery(p)
+
+	if mutate != nil {
+		mutate(query)
+	}
+
+	pending := pendingOf(t, authorize(t, query))
+
+	redirect := consentRedirect(t, consent(t, session, pending, true, agent))
+	code := redirect.Query().Get("code")
+	expectToken(t, code, tagOAuthCode)
+
+	return approved{client: c, pkce: p, query: query, code: code}
+}
+
+// postForm posts an application/x-www-form-urlencoded body.
+func postForm(t *testing.T, path string, values url.Values) reply {
+	t.Helper()
+
+	return postRaw(t, path, values.Encode())
+}
+
+// postRaw posts body as it is, as a form.
+func postRaw(t *testing.T, path, body string) reply {
+	t.Helper()
+
+	headers := map[string]string{hdrContentType: formType}
+
+	return send(t, request{method: http.MethodPost, path: path, body: []byte(body), headers: headers})
+}
+
+// codeForm is the token request that exchanges the approval's code.
+func (a approved) codeForm() url.Values {
+	return url.Values{
+		paramGrantType: {grantTypeCode}, paramClientID: {a.client.id}, paramCode: {a.code},
+		paramRedirectURI: {a.client.redirect}, "code_verifier": {a.pkce.verifier},
+	}
+}
+
+// exchange spends the code.
+func (a approved) exchange(t *testing.T) reply {
+	t.Helper()
+
+	return postForm(t, pathOAuthToken, a.codeForm())
+}
+
+// tokens is a successful token response.
+//
+//nolint:tagliatelle // RFC 6749 section 5.1 names these members
+type tokens struct {
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+	RefreshToken string `json:"refresh_token"`
+	Scope        string `json:"scope"`
+	IDToken      string `json:"id_token"`
+}
+
+// mustTokens decodes a 200 token response.
+func mustTokens(t *testing.T, got reply) tokens {
+	t.Helper()
+
+	var out tokens
+
+	if got.status != http.StatusOK {
+		t.Fatalf("token = %d %s, want 200", got.status, got.body)
+	}
+
+	err := json.Unmarshal([]byte(got.body), &out)
+	if err != nil {
+		t.Fatalf("parse token response: %v\n%s", err, got.body)
+	}
+
+	return out
+}
+
+// mustExchange approves nothing: it spends the code and returns the tokens.
+func (a approved) mustExchange(t *testing.T) tokens {
+	t.Helper()
+
+	return mustTokens(t, a.exchange(t))
+}
+
+// refreshForm is the token request that refreshes with the refresh token.
+func (a approved) refreshForm(refresh string) url.Values {
+	return url.Values{paramGrantType: {paramRefreshToken}, paramClientID: {a.client.id}, paramRefreshToken: {refresh}}
+}
+
+// refresh rotates the refresh token.
+func (a approved) refresh(t *testing.T, refresh string) reply {
+	t.Helper()
+
+	return postForm(t, pathOAuthToken, a.refreshForm(refresh))
+}
+
+// introspection is the introspection answer.
+//
+//nolint:tagliatelle // RFC 7662 section 2.2 names these members, and agent_id extends them
+type introspection struct {
+	Active    bool   `json:"active"`
+	Scope     string `json:"scope"`
+	ClientID  string `json:"client_id"`
+	TokenType string `json:"token_type"`
+	Exp       int64  `json:"exp"`
+	Iat       int64  `json:"iat"`
+	Sub       string `json:"sub"`
+	AgentID   string `json:"agent_id"`
+	Aud       string `json:"aud"`
+	Iss       string `json:"iss"`
+}
+
+// introspect asks about token for the resource, expecting a 200, and returns the
+// decoded answer and the raw body.
+func introspect(t *testing.T, token, resource string) (introspection, string) {
+	t.Helper()
+
+	got := postForm(t, pathOAuthIntrospect, url.Values{paramToken: {token}, paramResource: {resource}})
+	if got.status != http.StatusOK {
+		t.Fatalf("introspect = %d %s, want 200", got.status, got.body)
+	}
+
+	var out introspection
+
+	err := json.Unmarshal([]byte(got.body), &out)
+	if err != nil {
+		t.Fatalf("parse introspection: %v\n%s", err, got.body)
+	}
+
+	return out, got.body
+}
+
+// expectInactive fails the test unless the token introspects as exactly
+// {"active":false}, which is all an inactive answer may say.
+func expectInactive(t *testing.T, what, token, resource string) {
+	t.Helper()
+
+	_, body := introspect(t, token, resource)
+	if strings.TrimSpace(body) != `{"active":false}` {
+		t.Errorf("%s: introspection = %s, want {\"active\":false}", what, body)
+	}
+}
+
+// oauthError returns the "error" of an RFC 6749 error body, or "".
+func (r reply) oauthError() string {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+
+	err := json.Unmarshal([]byte(r.body), &parsed)
+	if err != nil {
+		return ""
+	}
+
+	return parsed.Error
+}
+
+// expectOAuth fails the test unless the reply has the status and the OAuth error.
+func (r reply) expectOAuth(t *testing.T, what string, status int, code string) {
+	t.Helper()
+
+	if r.status != status || r.oauthError() != code {
+		t.Errorf("%s = %d %s, want %d %s", what, r.status, r.body, status, code)
+	}
+}
+
+// oauthHolder is a signed-in user, for the tests that need one: the passkey,
+// its session, and the user's id.
+type oauthHolder struct {
+	pk      passkey
+	session string
+	userID  string
+}
+
+// newOAuthHolder starts a fresh deployment with one administrator, signed in.
+func newOAuthHolder(t *testing.T) oauthHolder {
+	t.Helper()
+
+	pk := newAdmin(t)
+
+	return oauthHolder{pk: pk, session: login(t, pk), userID: pk.userID}
+}
+
+// secondUser is another user, signed in by a seeded session, who holds nothing.
+func secondUser(t *testing.T) (string, string) {
+	t.Helper()
+
+	seedUser(t, idUserB, roleMember)
+
+	return idUserB, seedSession(t, idN("5e00", 1), idUserB)
 }

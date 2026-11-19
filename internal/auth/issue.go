@@ -45,6 +45,21 @@ const (
 	// a year. IssueUserAPIKey refuses anything longer, so the API's parser
 	// (input.ParseKeyLifetime) and this limit are two checks of one rule.
 	MaxUserKeyLifetime = 365 * 24 * time.Hour
+
+	// CodeLifetime is how long an OAuth authorization code can be exchanged.
+	// It is single use and the client is waiting for it, so it is short.
+	CodeLifetime = 60 * time.Second
+
+	// RefreshTokenLifetime is how long an OAuth refresh token lasts, counted
+	// from the exchange or refresh that issued it. Each exchange issues a new
+	// token and so a new lifetime: a grant that a client keeps using does not
+	// lapse, and one it abandons does.
+	RefreshTokenLifetime = 30 * 24 * time.Hour
+
+	// AccessTokenLifetime is how long an OAuth access token lasts. A resource
+	// server asks authsu about every request, so this bounds only how long a
+	// token that was never revoked stays usable.
+	AccessTokenLifetime = 15 * time.Minute
 )
 
 // CookieName is the session cookie. The __Host- prefix makes browsers refuse
@@ -61,7 +76,9 @@ var ErrKeyLifetime = errors.New("API key lifetime is out of range")
 // once, and what is stored.
 type Issued struct {
 	// ID is the secret's identifier, from the caller's id source. It is how the
-	// secret is listed, audited and revoked, and it is not secret.
+	// secret is listed, audited and revoked, and it is not secret. It is empty
+	// for a secret that is stored under an id it already has
+	// (IssueRefreshToken).
 	ID string
 	// Token is the value the client presents ("susu_<tag>_..."). It is shown
 	// once and never stored.
@@ -107,6 +124,41 @@ func issueKey(r io.Reader, newID func() string, now time.Time, lifetime, longest
 
 	return issue(r, newID, secret.TagAPIKey, now.Add(lifetime)).Get() //nolint:wrapcheck // issue wraps its error
 }
+
+// IssueGrantCode issues the authorization code of a new OAuth grant, which
+// expires CodeLifetime after now. Randomness and the id come from r and newID
+// as for IssueSession; the id is the grant's, and it stays the grant's for its
+// whole life: the refresh token that replaces the code is stored under it.
+// Nothing is stored: the caller writes the Hash and the ID.
+func IssueGrantCode(r io.Reader, newID func() string, now time.Time) (Issued, error) {
+	return issueToken(r, newID, secret.TagOAuthCode, now.Add(CodeLifetime))
+}
+
+// IssueRefreshToken issues the refresh token that replaces an OAuth grant's
+// code (and its previous refresh token), which expires RefreshTokenLifetime
+// after now. The grant keeps the id it was created with, and the caller
+// rotates the Hash under it, so no id is generated and Issued.ID is empty.
+// Randomness comes from r. Nothing is stored.
+func IssueRefreshToken(r io.Reader, now time.Time) (Issued, error) {
+	return issueToken(r, noID, secret.TagOAuthRefresh, now.Add(RefreshTokenLifetime))
+}
+
+// IssueAccessToken issues an OAuth access token that expires AccessTokenLifetime
+// after now. A grant has one access token, replaced in place at each exchange,
+// so newID's value is used the first time a grant gets one and ignored when the
+// caller replaces the hash and expiry of the secret it already has. Randomness
+// comes from r. Nothing is stored.
+func IssueAccessToken(r io.Reader, newID func() string, now time.Time) (Issued, error) {
+	return issueToken(r, newID, secret.TagOAuthAccess, now.Add(AccessTokenLifetime))
+}
+
+// issueToken is issue as a plain (value, error) pair.
+func issueToken(r io.Reader, newID func() string, tag secret.Tag, expiresAt time.Time) (Issued, error) {
+	return issue(r, newID, tag, expiresAt).Get() //nolint:wrapcheck // issue wraps its error
+}
+
+// noID is the id source of a secret that is stored under an id it already has.
+func noID() string { return "" }
 
 // issue generates a token of tag and builds what is stored and shown for it.
 func issue(r io.Reader, newID func() string, tag secret.Tag, expiresAt time.Time) result.Result[Issued] {

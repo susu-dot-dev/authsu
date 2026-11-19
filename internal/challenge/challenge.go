@@ -69,8 +69,37 @@
 // HMAC would accept any length (padding a short key with zeros, so that an
 // empty key, a one-byte key and a key of zeros of any shorter length are
 // weaker than they look), so a key of any other length is not trusted to have
-// come from a sound derivation, and Create and Open refuse it with ErrKey
-// rather than sign or verify with it.
+// come from a sound derivation, and Create, Open, Seal and OpenSealed refuse it
+// with ErrKey rather than sign or verify with it.
+//
+// # Sealed payloads (version 2)
+//
+// Seal and OpenSealed protect a value the server hands to the browser and
+// receives back unchanged, such as a pending authorization request that
+// waits for the user to approve it. It carries a payload, not a nonce:
+//
+//	state  = version(2) || expires_unix_be(8) || payload(0..MaxPayloadLen)
+//	tag    = HMAC-SHA256(key, state)
+//	sealed = state || tag
+//
+// The payload is opaque bytes: the caller encodes and parses it, and parses it
+// only after OpenSealed has verified it. Its length is not written down: the
+// tag is the last tagLen bytes, so the payload is whatever lies between the
+// expiry and the tag, and no length field can disagree with the real length.
+// The payload is readable by the client (sealed means signed, not encrypted),
+// so it must hold nothing secret.
+//
+// The two layouts cannot be taken for one another. Their version bytes differ
+// (1 and 2), and the version is both checked before the tag and mixed into it,
+// so a challenge never opens as a sealed payload and a sealed payload never
+// opens as a challenge, even under the same key and even when the lengths
+// coincide. Callers should still use a key derived for each purpose.
+//
+// Nothing random is added: a sealed payload is deterministic in its key,
+// expiry and payload, so equal inputs give equal bytes. It is not single use
+// by itself; whoever consumes it records that, as with a challenge. The expiry
+// rules are those of Open: refused at or after the expiry, and refused when
+// further ahead than maxTTL.
 package challenge
 
 import (
@@ -97,17 +126,41 @@ const (
 	// nonce and the tag.
 	Len = stateLen + tagLen
 
+	// MaxPayloadLen is the longest payload Seal accepts, and so the longest
+	// OpenSealed returns. It is a generous bound for the pending authorization
+	// request: a client_id URL, redirect_uri and resource URL, a code_challenge
+	// (43 characters), state, a nonce, the scope list (at most 32 entries),
+	// the client_name and the framing the caller adds around them. 4 KiB
+	// leaves the sealed value, base64url encoded into a query string, at about
+	// 5.5 KiB, within what browsers and Cloudflare accept for a URL. The
+	// caller's own input bounds must keep the encoded payload under it.
+	MaxPayloadLen = 4096
+
+	// MaxSealedLen is the length of the longest sealed payload: the version,
+	// the expiry, MaxPayloadLen bytes of payload and the tag. The shortest,
+	// with an empty payload, is MinSealedLen. A caller bounds an encoded value
+	// by these before decoding it.
+	MaxSealedLen = sealedOverhead + MaxPayloadLen
+
+	// MinSealedLen is the length of a sealed empty payload.
+	MinSealedLen = sealedOverhead
+
 	version byte = 1
 
-	versionLen = 1
-	expiresLen = 8
-	nonceStart = versionLen + expiresLen
-	stateLen   = nonceStart + NonceLen
-	tagLen     = sha256.Size
+	// sealedVersion identifies the payload layout. It differs from version, so
+	// a challenge and a sealed payload are never read as one another.
+	sealedVersion byte = 2
+
+	versionLen     = 1
+	expiresLen     = 8
+	nonceStart     = versionLen + expiresLen
+	stateLen       = nonceStart + NonceLen
+	tagLen         = sha256.Size
+	sealedOverhead = versionLen + expiresLen + tagLen
 )
 
-// ErrInvalid is wrapped by every error Open returns: the challenge is
-// malformed, has an unknown version, was not signed by this key for exactly
+// ErrInvalid is wrapped by every error Open and OpenSealed return: the challenge
+// is malformed, has an unknown version, was not signed by this key for exactly
 // this associated data, has expired, or expires further ahead than allowed.
 // It is a verdict on the caller's input. Callers treat every cause alike; the
 // wrapped specific cause is for logs only.
@@ -121,6 +174,12 @@ var ErrKey = errors.New("challenge key is not 32 bytes")
 // ErrEntropy means Create could not read its nonce. It is a server fault, not
 // invalid input, and so does not wrap ErrInvalid.
 var ErrEntropy = errors.New("read entropy for challenge")
+
+// ErrPayload means Seal was given a payload longer than MaxPayloadLen. It is a
+// server fault, not invalid input: a payload is built from values that were
+// parsed within bounds, so one that is too long is a bound that does not fit.
+// It does not wrap ErrInvalid.
+var ErrPayload = errors.New("sealed payload is too long")
 
 // Specific causes, wrapped beside ErrInvalid so logs can tell them apart.
 var (
@@ -186,17 +245,94 @@ func Open(key, challenge []byte, now time.Time, maxTTL time.Duration, ad ...[]by
 	}
 
 	// The tag matched, so these are bytes Create wrote.
-	expires := expiry(state)
-
-	if !now.Before(expires) {
-		return nil, fmt.Errorf("%w: %w", ErrInvalid, errExpired)
-	}
-
-	if expires.After(now.Add(maxTTL)) {
-		return nil, fmt.Errorf("%w: %w", ErrInvalid, errFuture)
+	err := checkExpiry(expiry(state), now, maxTTL)
+	if err != nil {
+		return nil, err
 	}
 
 	return bytes.Clone(state[nonceStart:]), nil
+}
+
+// Seal signs payload with key, to be opened until expires. The result is a new
+// slice that shares no memory with payload. The expiry is stored as in Create:
+// whole seconds, rounded down, with a time before the epoch stored as zero. A
+// key that is not KeyLen bytes is ErrKey, and a payload longer than
+// MaxPayloadLen is ErrPayload; the payload may be empty.
+func Seal(key []byte, expires time.Time, payload []byte) ([]byte, error) {
+	if len(key) != KeyLen {
+		return nil, fmt.Errorf("%w: got %d", ErrKey, len(key))
+	}
+
+	if len(payload) > MaxPayloadLen {
+		return nil, fmt.Errorf("%w: got %d, at most %d", ErrPayload, len(payload), MaxPayloadLen)
+	}
+
+	buf := make([]byte, nonceStart, sealedOverhead+len(payload))
+	buf[0] = sealedVersion
+
+	putExpiry(buf, expires)
+
+	buf = append(buf, payload...)
+
+	// buf has room for the tag, so this appends in place.
+	return append(buf, sealTag(key, buf)...), nil
+}
+
+// OpenSealed verifies sealed at now and returns the payload it carries. A key
+// that is not KeyLen bytes is ErrKey, not ErrInvalid. It checks, in order, the
+// length, the version and the tag (in constant time); only then is the expiry
+// read, so a payload is never returned, or its expiry acted on, before the tag
+// has verified. It is refused when now is at or after the expiry, and when the
+// expiry is more than maxTTL after now. Every failure about sealed wraps
+// ErrInvalid. A challenge made by Create is refused with an unknown version,
+// whatever the key. The returned payload is a copy, never nil, and may be empty.
+func OpenSealed(key, sealed []byte, now time.Time, maxTTL time.Duration) ([]byte, error) {
+	if len(key) != KeyLen {
+		return nil, fmt.Errorf("%w: got %d", ErrKey, len(key))
+	}
+
+	if len(sealed) < MinSealedLen || len(sealed) > MaxSealedLen {
+		return nil, fmt.Errorf("%w: %w", ErrInvalid, errLength)
+	}
+
+	if sealed[0] != sealedVersion {
+		return nil, fmt.Errorf("%w: %w", ErrInvalid, errVersion)
+	}
+
+	state, tag := sealed[:len(sealed)-tagLen], sealed[len(sealed)-tagLen:]
+
+	if !hmac.Equal(tag, sealTag(key, state)) {
+		return nil, fmt.Errorf("%w: %w", ErrInvalid, errTag)
+	}
+
+	err := checkExpiry(expiry(state), now, maxTTL)
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.Clone(state[nonceStart:]), nil
+}
+
+// checkExpiry applies the validity window shared by every sealed form: now must
+// be before expires, and expires at most maxTTL after now.
+func checkExpiry(expires, now time.Time, maxTTL time.Duration) error {
+	if !now.Before(expires) {
+		return fmt.Errorf("%w: %w", ErrInvalid, errExpired)
+	}
+
+	if expires.After(now.Add(maxTTL)) {
+		return fmt.Errorf("%w: %w", ErrInvalid, errFuture)
+	}
+
+	return nil
+}
+
+// sealTag computes the tag of a sealed payload over its whole state.
+func sealTag(key, state []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(state)
+
+	return mac.Sum(nil)
 }
 
 // putExpiry writes expires into state as whole seconds since the epoch, held

@@ -21,26 +21,39 @@ Which names exist, what each is for and what happens when one is missing is part
 
 ### Helper commands
 
-`scripts/config.sh`, through `make`, manages the deployment's own configuration. `make config-get` shows what is set (secret names only: their values cannot be read back).
+`scripts/config.sh`, through `make`, manages the deployment's own configuration. `make config-get` shows what is set (secret names only: their values cannot be read back), `AUTH_HMAC_SECRET` and `OAUTH_SIGNING_KEY` alike.
 
 | Command | What it does |
 |---|---|
 | `make config-set-vars API_ORIGIN=https://auth.example.com UI_ORIGIN=https://example.com` | Validates and writes the two origins into `wrangler.jsonc`, keeping its comments. Takes effect on the next `npx wrangler deploy` |
 | `make config-set-secret` | Generates 32 random bytes (43 base64url characters) and uploads them as `AUTH_HMAC_SECRET` with `wrangler secret put`, which deploys a new version |
 | `make config-set-secret ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev` |
-| `make setup-local` | Creates `.dev.vars` (mode 0600) with a generated `AUTH_HMAC_SECRET` and a `FIRST_RUN_SECRET` in the invitation token shape (`susu_inv_` and 43 base64url characters), only if the file does not exist. An existing file is never read or changed: delete it to regenerate |
+| `make config-set-signing-key` | Generates an RSA 2048 key with `openssl` and uploads it as `OAUTH_SIGNING_KEY` with `wrangler secret put`, which deploys a new version (see [The OAuth signing key](#the-oauth-signing-key)) |
+| `make config-set-signing-key ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev` |
+| `make setup-local` | Creates `.dev.vars` (mode 0600) with a generated `AUTH_HMAC_SECRET`, a generated `OAUTH_SIGNING_KEY` and a `FIRST_RUN_SECRET` in the invitation token shape (`susu_inv_` and 43 base64url characters), only if the file does not exist. An existing file is never read or changed: delete it to regenerate, or add a missing key with `make config-set-signing-key ARGS=--local` |
 | `make config-set-secret ARGS=--stdin` | Uploads a secret you supply on stdin instead of generating one |
 
-The secret is passed to Wrangler on stdin, so it is never on a command line, never printed and never written to disk (except by `--local`, which is the point).
+A secret is passed to Wrangler on stdin, so it is never on a command line, never printed and never written to disk (except by `--local`, which is the point).
 
-Two changes cannot be undone, so the helpers refuse them unless you opt in:
+Three changes cannot be undone, so the helpers refuse them unless you opt in:
 
-- Replacing an existing `AUTH_HMAC_SECRET` (`CONFIRM_SECRET_ROTATE=1`). Ceremonies begun but not finished are invalidated.
+- Replacing an existing `AUTH_HMAC_SECRET` (`CONFIRM_SECRET_ROTATE=1`). Ceremonies begun but not finished, and authorization requests waiting for approval, are invalidated.
+- Replacing an existing `OAUTH_SIGNING_KEY` (`CONFIRM_SIGNING_KEY_ROTATE=1`, for `--local` too). Every ID token already issued stops verifying.
 - Changing the host of a non-`localhost` `UI_ORIGIN` (`CONFIRM_RP_ID_CHANGE=1`). The relying party ID is that host and a passkey is bound to it, so this invalidates every registered passkey. Changing `API_ORIGIN` invalidates neither passkeys nor credentials.
 
 `set-vars` also checks that both values are bare origins (an `https://` origin with no path, query or user info, lower case; `http` only for localhost). Set them before the first registration, and never leave a value in `wrangler.jsonc` that you do not control.
 
 Local runs never use the committed values: `make dev` overrides them with `localhost` values (`DEV_ORIGIN_VARS` in the Makefile) and the e2e harness writes its own, so a local run cannot register passkeys against the real domain.
+
+### The OAuth signing key
+
+`OAUTH_SIGNING_KEY` is the RSA private key ID tokens are signed with ([oauth_design.md](oauth_design.md#the-id-token-is-the-only-jwt-and-authsu-only-signs-it)). It is a secret of its own and is never derived from `AUTH_HMAC_SECRET`; the public half is served at `/.well-known/jwks.json`.
+
+- **Format.** The base64url encoding, without padding, of the key's PKCS#8 DER, on one line, so it fits a `.dev.vars` line and a stdin pipe. It must be RSA, 2048 to 4096 bits, with public exponent 65537; anything else, including a PKCS#1 key, a trailing newline or trailing data, is refused. `make config-set-signing-key` generates one in this form with `openssl`, piped end to end so the key is in no file and on no command line. To supply your own, produce the same encoding and `wrangler secret put OAUTH_SIGNING_KEY` it on stdin.
+- **Missing or invalid.** Only the token and key-set routes read it, and they answer 503 `not_configured`; the rest of the service works. If sign-in works and a client cannot get a token, check `make config-get`.
+- **Rotating.** There is no overlap: the key set publishes one key, so rotating invalidates every ID token already issued. They are short-lived (five minutes) and clients read them once, so the effect is a client that is mid-flow, and it succeeds when it starts again. Prefer a quiet moment, as for the other secret. Access and refresh tokens are not signed and are not affected.
+- **Locally.** `make setup-local` creates one, so `make dev` works at once. A `.dev.vars` that predates it needs `make config-set-signing-key ARGS=--local`.
+- **Which resource.** The OAuth resource a deployment issues tokens for is chosen by `API_ORIGIN`: an `http://localhost` origin selects the development resource, every other value the production one. No setting is involved beyond the origin.
 
 ### Frontend on another origin
 
@@ -78,7 +91,7 @@ TinyGo's version and checksum come from `tools.env`, so bumping it there updates
 
 ### Ceremonies in flight when the challenge format changes
 
-A deploy that changes how challenges are signed invalidates every challenge issued before it. A registration or login that began on the old version and finishes on the new one fails once (400 `invalid_challenge` or 401 `invalid_login`) and succeeds when retried. Challenges last five minutes, so prefer a quiet moment for such a deploy; nothing needs repairing afterwards. The same is true of rotating `AUTH_HMAC_SECRET`.
+A deploy that changes how challenges are signed invalidates every challenge issued before it. A registration or login that began on the old version and finishes on the new one fails once (400 `invalid_challenge` or 401 `invalid_login`) and succeeds when retried. Challenges last five minutes, so prefer a quiet moment for such a deploy; nothing needs repairing afterwards. The same is true of rotating `AUTH_HMAC_SECRET`, which also invalidates authorization requests waiting for approval (they last ten minutes): the client has to start the request again.
 
 ## Upkeep
 

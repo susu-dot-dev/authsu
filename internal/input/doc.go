@@ -60,5 +60,19 @@
 // coming back from a client: an id in a URL or a cursor is an input and is
 // parsed as an ID, however it was originally generated, and a token in a
 // cookie, a header or a request body is parsed as the one kind of token that
-// place accepts (InvitationToken, SessionToken, APIKeyToken).
+// place accepts (InvitationToken, SessionToken, APIKeyToken, and for OAuth
+// AuthorizationCode, RefreshToken, AccessToken).
+//
+// # The OAuth request
+//
+// The values of an OAuth request are parsed here too, and a few depend on the
+// deployment's resource table (internal/resource), which the caller passes in:
+// ClientID (whether plain http is allowed, for localhost), ResourceID and
+// OAuthScopes. They follow the same rules, with one addition: a URL is never
+// repaired. ClientID and RedirectURI accept only the canonical spelling (what
+// net/url would write, in lower case, with no default port), because the same
+// string is compared byte for byte by every later step. ClientMetadata is the
+// one value that is a whole document, parsed with the strictness of
+// httpapi.Decode except that it ignores members it does not read; see
+// ParseClientMetadata for why.
 package input

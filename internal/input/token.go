@@ -15,6 +15,17 @@ const (
 	CodeInvalidInvitation   = "invalid_invitation"
 	CodeInvalidSessionToken = "invalid_session_token"
 	CodeInvalidAPIKey       = "invalid_api_key"
+
+	// CodeInvalidAuthorizationCode, CodeInvalidRefreshToken and
+	// CodeInvalidAccessToken are the codes of the three OAuth tokens: the
+	// credentials a client presents to the token endpoint (the code and the
+	// refresh token) or to a resource server (the access token). A client sends
+	// them in a request body, so a refusal is a BadRequest here; the OAuth
+	// endpoints report it as invalid_grant, and introspection reports an unknown
+	// token as inactive.
+	CodeInvalidAuthorizationCode = "invalid_authorization_code"
+	CodeInvalidRefreshToken      = "invalid_refresh_token"
+	CodeInvalidAccessToken       = "invalid_access_token"
 )
 
 // The fixed descriptions of the token types. They name the rule, never the
@@ -24,9 +35,13 @@ const (
 	descInvalidInvitation   = "invitation token must be susu_inv_ followed by 43 base64url characters"
 	descInvalidSessionToken = "session token must be susu_ses_ followed by 43 base64url characters"
 	descInvalidKey          = "API key must be susu_key_ followed by 43 base64url characters"
+
+	descInvalidAuthorizationCode = "authorization code must be susu_code_ followed by 43 base64url characters"
+	descInvalidRefreshToken      = "refresh token must be susu_rt_ followed by 43 base64url characters"
+	descInvalidAccessToken       = "access token must be susu_at_ followed by 43 base64url characters"
 )
 
-// The three token types are the bearer secrets a client presents. Each accepts
+// The six token types are the bearer secrets a client presents. Each accepts
 // exactly one kind: the prefix names it (internal/secret), so a token of
 // another kind is refused here, before anything is read from the database. See
 // internal/secret for the shape of a token and for what its hash covers.
@@ -91,6 +106,66 @@ func (t APIKeyToken) String() string { return t.v }
 // Hash returns the SHA-256 of the whole token, prefix included, as the 32
 // bytes stored in secrets.hash. Each call returns a new slice.
 func (t APIKeyToken) Hash() []byte { return hashOf(t.v) }
+
+// AuthorizationCode is the one-time code a client exchanges at the token
+// endpoint.
+type AuthorizationCode struct{ v string }
+
+// ParseAuthorizationCode accepts exactly "susu_code_" followed by a canonical
+// 43-character base64url body, and refuses everything else with
+// CodeInvalidAuthorizationCode.
+func ParseAuthorizationCode(raw string) (AuthorizationCode, error) {
+	v, err := parseToken(raw, secret.TagOAuthCode, CodeInvalidAuthorizationCode, descInvalidAuthorizationCode)
+
+	return AuthorizationCode{v: v}, err
+}
+
+// String returns the code exactly as it was parsed.
+func (t AuthorizationCode) String() string { return t.v }
+
+// Hash returns the SHA-256 of the whole token, prefix included, as the 32
+// bytes stored in secrets.hash. Each call returns a new slice.
+func (t AuthorizationCode) Hash() []byte { return hashOf(t.v) }
+
+// RefreshToken is the secret a client exchanges for a new access token.
+type RefreshToken struct{ v string }
+
+// ParseRefreshToken accepts exactly "susu_rt_" followed by a canonical
+// 43-character base64url body, and refuses everything else with
+// CodeInvalidRefreshToken.
+func ParseRefreshToken(raw string) (RefreshToken, error) {
+	v, err := parseToken(raw, secret.TagOAuthRefresh, CodeInvalidRefreshToken, descInvalidRefreshToken)
+
+	return RefreshToken{v: v}, err
+}
+
+// String returns the token exactly as it was parsed.
+func (t RefreshToken) String() string { return t.v }
+
+// Hash returns the SHA-256 of the whole token, prefix included, as the 32
+// bytes stored in secrets.hash. Each call returns a new slice.
+func (t RefreshToken) Hash() []byte { return hashOf(t.v) }
+
+// AccessToken is the secret a client presents to a resource server, and a
+// resource server presents to introspection. authsu's own API never accepts it:
+// ParseAPIKeyToken refuses its prefix.
+type AccessToken struct{ v string }
+
+// ParseAccessToken accepts exactly "susu_at_" followed by a canonical
+// 43-character base64url body, and refuses everything else with
+// CodeInvalidAccessToken.
+func ParseAccessToken(raw string) (AccessToken, error) {
+	v, err := parseToken(raw, secret.TagOAuthAccess, CodeInvalidAccessToken, descInvalidAccessToken)
+
+	return AccessToken{v: v}, err
+}
+
+// String returns the token exactly as it was parsed.
+func (t AccessToken) String() string { return t.v }
+
+// Hash returns the SHA-256 of the whole token, prefix included, as the 32
+// bytes stored in secrets.hash. Each call returns a new slice.
+func (t AccessToken) Hash() []byte { return hashOf(t.v) }
 
 // parseToken is the one parser behind the token types. raw must be the exact
 // prefix of tag followed by exactly secret.BodyLen characters of the base64url

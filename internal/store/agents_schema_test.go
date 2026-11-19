@@ -63,8 +63,10 @@ func agentSchemaBounds(t *testing.T) []bound {
 		{name: "api_keys.name bytes",
 			pattern: column("name") + `length\(cast\(name AS BLOB\)\) BETWEEN (\d+) AND (\d+)\), scope TEXT`,
 			lowest:  1, highest: len(keyWorstName(t).String()), exact: false},
+		// The pattern ends at the key's foreign key: oauth_grants.scope has a CHECK of
+		// the same shape, with its own bound (oauthSchemaBounds).
 		{name: "api_keys.scope bytes",
-			pattern: column("scope") + `length\(cast\(scope AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)`,
+			pattern: column("scope") + `length\(cast\(scope AS BLOB\)\) BETWEEN (\d+) AND (\d+)\), FOREIGN KEY`,
 			lowest:  len("[]"), highest: input.MaxScopeListJSONBytes, exact: false},
 		// The longest label is exactly the CHECK's upper bound, and the
 		// shortest its lower: a label's alphabet is ASCII, so bytes are

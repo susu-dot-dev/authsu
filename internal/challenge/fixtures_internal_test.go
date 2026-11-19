@@ -95,3 +95,44 @@ func sum256(s string) []byte {
 
 	return sum[:]
 }
+
+// forgeSealed builds a sealed payload by hand from the documented layout,
+// independently of Seal, so tests can produce values Seal never would (any
+// version, any expiry, a payload over the bound). The tag is correct for key.
+func forgeSealed(key []byte, ver byte, seconds uint64, payload []byte) []byte {
+	state := make([]byte, 0, sealedOverhead+len(payload))
+	state = append(state, ver)
+	state = binary.BigEndian.AppendUint64(state, seconds)
+	state = append(state, payload...)
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write(state)
+
+	return mac.Sum(state)
+}
+
+// testPayload is the standard payload: bytes with no structure, as the
+// package must treat every payload.
+func testPayload() []byte { return []byte("client_id=https://app.example/c&state=xyz\x00\xff") }
+
+// validSealed seals the standard payload, expiring one TTL after testNow.
+func validSealed(t *testing.T) []byte {
+	t.Helper()
+
+	sealed, err := Seal(testKey(), testNow().Add(testMaxTTL), testPayload())
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	return sealed
+}
+
+// derivedKey derives a key from a root with a context, the way internal/config
+// does (HMAC-SHA256 of the context under the root), so a test can hold keys
+// from two contexts without importing config.
+func derivedKey(root, context string) []byte {
+	mac := hmac.New(sha256.New, []byte(root))
+	mac.Write([]byte(context))
+
+	return mac.Sum(nil)
+}

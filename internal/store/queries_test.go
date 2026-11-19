@@ -254,6 +254,10 @@ func TestQueriesAreFound(t *testing.T) {
 		"listUsersQuery", "getUserQuery", "revokeUserQuery", "revokeUserSecretsQuery", "revokeUserAgentsQuery",
 		"agentRevokeKeysQuery",
 		"keyListQuery", "keyGetQuery", "insertUserKeyQuery", "keyRenameQuery", "keyRevokeQuery",
+		"insertGrantQuery", "grantListQuery", "grantGetQuery", "grantRevokeQuery", "grantRevokeAccessQuery",
+		"rotateCodeQuery", "rotateRefreshQuery", "replaceAccessQuery", "insertAccessSecretQuery",
+		"insertAccessRowQuery", "introspectQuery", "revokeRefreshTokenQuery", "revokeRefreshAccessQuery",
+		"revokeAccessTokenQuery",
 	} {
 		if _, ok := queries[name]; !ok {
 			t.Errorf("query %s was not found", name)
@@ -321,6 +325,7 @@ func TestQueriesBindValuesTheCodeOwns(t *testing.T) {
 		for _, literal := range []string{
 			"'" + store.InvitationFirstRun + "'", "'" + store.KindInvitation + "'",
 			"'" + store.KindSession + "'", "'" + store.KindAPIKey + "'",
+			"'" + store.KindOAuthGrant + "'", "'" + store.KindOAuthAccess + "'",
 		} {
 			if strings.Contains(query, literal) {
 				t.Errorf("%s contains the literal %s; bind the constant instead", name, literal)
@@ -818,6 +823,35 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 			_, _ = s.RenameKey(ctx, "owner", agentID, worst, farthest)
 		},
 		"RevokeKey": func(s *store.Store) { _, _ = s.RevokeKey(ctx, "owner", agentID, "presented", farthest) },
+		"CreateGrant": func(s *store.Store) {
+			_ = s.CreateGrant(ctx, oauthWorstGrant(t, farthest))
+		},
+		"ListGrants": func(s *store.Store) {
+			_, _ = s.ListGrants(ctx, "owner", mustAgentCursor(t, agentIDAt(1)), mustAgentLimit(t, "100"))
+		},
+		"GetGrant":    func(s *store.Store) { _, _ = s.GetGrant(ctx, "owner", agentID) },
+		"RevokeGrant": func(s *store.Store) { _, _ = s.RevokeGrant(ctx, "owner", agentID, farthest) },
+		"ExchangeCode": func(s *store.Store) {
+			exchange := exchangeCases(t)[0].exchange
+			exchange.Tokens = oauthWorstTokens(farthest)
+
+			_, _ = s.ExchangeCode(ctx, exchange, farthest)
+		},
+		"Refresh": func(s *store.Store) {
+			exchange := refreshCases(t)[0].exchange
+			exchange.Tokens = oauthWorstTokens(farthest)
+
+			_, _ = s.Refresh(ctx, exchange, farthest)
+		},
+		"IntrospectAccessToken": func(s *store.Store) {
+			_, _, _ = s.IntrospectAccessToken(ctx, mustAccessToken(t, 3), mustResourceID(t), farthest)
+		},
+		"RevokeRefreshToken": func(s *store.Store) {
+			_ = s.RevokeRefreshToken(ctx, mustRefreshToken(t, 3), oauthWorstClientID(t), farthest)
+		},
+		"RevokeAccessToken": func(s *store.Store) {
+			_ = s.RevokeAccessToken(ctx, mustAccessToken(t, 3), oauthWorstClientID(t), farthest)
+		},
 	}
 }
 

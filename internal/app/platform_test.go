@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -20,6 +21,7 @@ func completePlatform() app.Platform {
 		},
 		Getenv: func(string) string { return "" },
 		Log:    func(httpapi.Request, *apierr.Error) {},
+		Fetch:  func(*http.Request) (*http.Response, error) { return nil, errUnscripted },
 	}
 }
 
@@ -36,6 +38,7 @@ func TestNewHandlerRequiresEveryResource(t *testing.T) {
 		"Exec":   {without: func(p *app.Platform) { p.Exec = nil }, field: "Exec"},
 		"Getenv": {without: func(p *app.Platform) { p.Getenv = nil }, field: "Getenv"},
 		"Log":    {without: func(p *app.Platform) { p.Log = nil }, field: "Log"},
+		"Fetch":  {without: func(p *app.Platform) { p.Fetch = nil }, field: "Fetch"},
 	}
 
 	for name, tt := range tests {

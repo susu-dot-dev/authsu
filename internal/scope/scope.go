@@ -74,6 +74,11 @@ const (
 	// scope, through logout.
 	KeyRevoke Scope = "key:revoke"
 
+	// GrantRead lists and reads the caller's OAuth grants.
+	GrantRead Scope = "grant:read"
+	// GrantRevoke revokes one of the caller's OAuth grants.
+	GrantRevoke Scope = "grant:revoke"
+
 	// InvitationRead lists invitations. Admin only.
 	InvitationRead Scope = "invitation:read"
 	// InvitationCreate creates an invitation. Admin only.
@@ -112,6 +117,7 @@ func definitions() []definition {
 	return []definition{
 		{AgentRead, false}, {AgentCreate, false}, {AgentUpdate, false}, {AgentRevoke, false},
 		{KeyRead, false}, {KeyCreate, false}, {KeyUpdate, false}, {KeyRevoke, false},
+		{GrantRead, false}, {GrantRevoke, false},
 		{InvitationRead, true}, {InvitationCreate, true}, {InvitationUpdate, true}, {InvitationRevoke, true},
 		{UserRead, true}, {UserRevoke, true},
 	}
@@ -124,9 +130,13 @@ func bundles() map[string][]Scope {
 	return map[string][]Scope{
 		DefaultSession: {
 			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke,
+			GrantRead, GrantRevoke,
 			InvitationRead, InvitationCreate, InvitationUpdate, InvitationRevoke, UserRead, UserRevoke,
 		},
-		DefaultUser:  {AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke},
+		DefaultUser: {
+			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke,
+			GrantRead, GrantRevoke,
+		},
 		DefaultAgent: {AgentRead},
 	}
 }

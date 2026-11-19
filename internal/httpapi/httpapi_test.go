@@ -97,7 +97,7 @@ func check(t *testing.T, in call, handler httpapi.Handler, want want) {
 		t.Errorf("Allow = %q, want %q", got, want.allow)
 	}
 
-	if got := out.rec.Header().Get("Cache-Control"); got != "no-store" {
+	if got := out.rec.Header().Get("Cache-Control"); got != noStore {
 		t.Errorf("Cache-Control = %q, want no-store", got)
 	}
 
@@ -314,7 +314,7 @@ func TestServeBodyReadErrors(t *testing.T) {
 	}{
 		"too large": {
 			body:       strings.NewReader(strings.Repeat("a", 2<<20)),
-			wantStatus: http.StatusRequestEntityTooLarge, wantCode: "body_too_large",
+			wantStatus: http.StatusRequestEntityTooLarge, wantCode: codeTooBig,
 		},
 		"read failed": {
 			body:       iotest.ErrReader(errCause),
@@ -636,7 +636,7 @@ func TestServeRefusesAnUnsafeRequestThatIsNotJSON(t *testing.T) {
 		"form-urlencoded":       {"application/x-www-form-urlencoded"},
 		"multipart":             {"multipart/form-data; boundary=x"},
 		// Near misses, which must not be read as JSON.
-		"empty value":            {""},
+		emptyValue:               {""},
 		"json as a suffix":       {"text/plain; application/json"},
 		"two types in one line":  {"application/json, text/plain"},
 		"two lines":              {jsonType, plainType},
@@ -1033,7 +1033,7 @@ func TestServeRoutesLimitsBodiesPerMethod(t *testing.T) {
 				t.Errorf("handler got %d bytes, want %d", delivered, tt.bodyLen)
 			}
 
-			if tt.wantStatus != http.StatusOK && (delivered != -1 || !strings.Contains(rec.Body.String(), "body_too_large")) {
+			if tt.wantStatus != http.StatusOK && (delivered != -1 || !strings.Contains(rec.Body.String(), codeTooBig)) {
 				t.Errorf("handler ran (%d bytes) or body = %q, want body_too_large without the handler", delivered, rec.Body)
 			}
 		})
@@ -1111,5 +1111,22 @@ func TestServeRoutesKeepsTheContentTypeAndWildcardRules(t *testing.T) {
 				t.Errorf("PathValues = %v", got)
 			}
 		})
+	}
+}
+
+// TestServeAnyHasNoContentTypeRule: the catch-all answers every method as it
+// comes, so an unsafe request with any Content-Type, or none, reaches it.
+func TestServeAnyHasNoContentTypeRule(t *testing.T) {
+	t.Parallel()
+
+	for _, lines := range [][]string{{}, {plainType}, {formType}, {jsonType}} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/anything", strings.NewReader("x"))
+		setContentType(req, lines)
+		httpapi.ServeAny(func(httpapi.Request, *apierr.Error) {}, httpapi.NotFound).ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound || rec.Body.String() != notFoundBody {
+			t.Errorf("POST with %v = %d %q, want the 404 envelope", lines, rec.Code, rec.Body)
+		}
 	}
 }

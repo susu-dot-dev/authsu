@@ -10,13 +10,16 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"log"
+	"net/http"
 
 	"github.com/syumai/workers-go"
 	"github.com/syumai/workers-go/cloudflare"
 	"github.com/syumai/workers-go/cloudflare/d1" // also registers the "d1" database/sql driver
+	workersfetch "github.com/syumai/workers-go/cloudflare/fetch"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/app"
+	"github.com/susu-dot-dev/authsu/internal/fetch"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -29,7 +32,25 @@ func main() {
 		log.Fatalf("open D1 binding: %v", err)
 	}
 
-	workers.Serve(app.NewHandler(app.Platform{Exec: batch(db), Getenv: cloudflare.Getenv, Log: logError}))
+	workers.Serve(app.NewHandler(app.Platform{
+		Exec: batch(db), Getenv: cloudflare.Getenv, Log: logError, Fetch: outbound(),
+	}))
+}
+
+// outbound returns the outbound HTTP port: the platform's fetch with the
+// redirect mode set to manual, so a 3xx comes back to the caller as it is and
+// is never followed. Workers has no "error" mode (it throws), and calling the
+// client directly, not through an http.Client, keeps Go from following the
+// redirect itself. The platform sets no time limit on a subrequest. The
+// request's context does: when it ends the binding aborts the fetch and fails
+// a pending body read, so the timeout and every other bound are internal/fetch's.
+func outbound() fetch.Doer {
+	client := workersfetch.NewClient()
+	options := &workersfetch.RequestInit{Redirect: workersfetch.RedirectModeManual}
+
+	return func(req *http.Request) (*http.Response, error) {
+		return client.Do(&workersfetch.Request{Request: req}, options)
+	}
 }
 
 // logError writes the full detail of a failed request, including the cause the
