@@ -251,11 +251,17 @@ RETURNING scopes`
 // name an agent the owner does not have; a NULL one would make a user's own
 // key, but user_id fails first.
 //
+// The key's name is the agent's name, read from its row here: an agent's first
+// key is not named by the client, and listing it beside the user's own keys
+// should say whose it is. Renaming the agent later does not rename the key (a
+// key's name is its own, changed by PATCH /api/key/{id}).
+//
 // Arguments, by number: ?1 key id, ?2 kind, ?3 agent id (for the subselects),
 // ?4 scope.
 const insertAgentKeyQuery = `
-INSERT INTO api_keys (id, kind, user_id, agent_id, scope)
-VALUES (?1, ?2, (SELECT user_id FROM agents WHERE id = ?3), (SELECT id FROM agents WHERE id = ?3), ?4)`
+INSERT INTO api_keys (id, kind, user_id, agent_id, name, scope)
+VALUES (?1, ?2, (SELECT user_id FROM agents WHERE id = ?3), (SELECT id FROM agents WHERE id = ?3),
+        (SELECT name FROM agents WHERE id = ?3), ?4)`
 
 // insertAgentLabelQuery gives a new agent one label, in the batch that creates
 // it. Like insertAgentKeyQuery it reads the agent's id from the agent's row, in

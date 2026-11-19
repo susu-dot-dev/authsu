@@ -16,6 +16,12 @@ const (
 	// counts bytes; 256 runes of at most 4 bytes each is exactly 1024.
 	MaxAgentNameRunes = 256
 
+	// MaxKeyNameRunes bounds KeyName, in Unicode code points. The schema CHECK
+	// `length(cast(name AS BLOB)) BETWEEN 1 AND 1024` on api_keys.name
+	// (migration 0001) counts bytes; 256 runes of at most 4 bytes each is
+	// exactly 1024.
+	MaxKeyNameRunes = 256
+
 	// MaxInvitationLabelRunes bounds InvitationLabel, in Unicode code points.
 	// The schema CHECK `length(cast(label AS BLOB)) <= 1024` on
 	// invitations.label (migration 0001) counts bytes; 256 runes of at most 4
@@ -28,6 +34,7 @@ const (
 const (
 	CodeInvalidName      = "invalid_name"
 	CodeInvalidAgentName = "invalid_agent_name"
+	CodeInvalidKeyName   = "invalid_key_name"
 	CodeInvalidLabel     = "invalid_label"
 )
 
@@ -36,6 +43,7 @@ const (
 	displayRules         = " of normalised text without control characters or hidden formatting"
 	descInvalidName      = "name must be 1 to 128 bytes" + textRules
 	descInvalidAgentName = "agent name must be 1 to 256 characters" + displayRules
+	descInvalidKeyName   = "key name must be 1 to 256 characters" + displayRules
 	descInvalidLabel     = "label must be at most 256 characters" + displayRules
 )
 
@@ -77,6 +85,21 @@ func ParseAgentName(raw string) (AgentName, error) {
 
 // String returns the name exactly as it was parsed.
 func (n AgentName) String() string { return n.v }
+
+// KeyName is the label a user gives an API key to tell their keys apart.
+type KeyName struct{ v string }
+
+// ParseKeyName accepts display text of 1 to MaxKeyNameRunes runes.
+func ParseKeyName(raw string) (KeyName, error) {
+	if !displayText(raw, textRule{unit: unitRunes, max: MaxKeyNameRunes, allowEmpty: false, identifying: false}) {
+		return KeyName{}, refuse(CodeInvalidKeyName, descInvalidKeyName)
+	}
+
+	return KeyName{v: raw}, nil
+}
+
+// String returns the name exactly as it was parsed.
+func (n KeyName) String() string { return n.v }
 
 // InvitationLabel is the note an administrator attaches to an invitation. It
 // may be empty.

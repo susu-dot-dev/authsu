@@ -48,7 +48,7 @@ var kindRowInserts = map[string]struct{ kind, insert string }{ //nolint:gocheckn
 	tableInvitations: {kindInvitation, "INSERT INTO invitations (id, type, label, num_invites) VALUES (?, 'x', '', 1)"},
 	tableSessions: {kindSession, "INSERT INTO sessions (id, user_id, credential_id, granted_from) " +
 		"VALUES (?, '" + idUserB + "', '" + idN("0f00", 1) + "', randomblob(32))"},
-	tableKeys: {kindAPIKey, "INSERT INTO api_keys (id, user_id, agent_id, scope) VALUES (?, '" + idUserB + "', NULL, '[]')"},
+	tableKeys: {kindAPIKey, "INSERT INTO api_keys (id, user_id, agent_id, name, scope) VALUES (?, '" + idUserB + "', NULL, 'k', '[]')"},
 }
 
 // TestSchemaAKindRowAttachesOnlyToItsOwnKind: each kind's table is bound to its
@@ -110,7 +110,7 @@ func TestSchemaTheKindColumnIsFixed(t *testing.T) {
 	seedSecret(t, idN("0f20", 3), kindInvitation, newToken(tagInvitation))
 
 	// The three statements each write an explicit kind.
-	insertKey := "INSERT INTO api_keys (id, kind, user_id, scope) VALUES (?, ?, '" + idUserB + "', '[]')"
+	insertKey := "INSERT INTO api_keys (id, kind, user_id, name, scope) VALUES (?, ?, '" + idUserB + "', 'k', '[]')"
 	insertSession := "INSERT INTO sessions (id, kind, user_id, credential_id, granted_from) " +
 		"VALUES (?, ?, '" + idUserB + "', '" + idN("0f00", 1) + "', randomblob(32))"
 	insertInvitation := "INSERT INTO invitations (id, kind, type, label, num_invites) VALUES (?, ?, 'x', '', 1)"
@@ -235,7 +235,7 @@ func TestSchemaSecretsAreBounded(t *testing.T) {
 	t.Run("an API key's scope text", func(t *testing.T) {
 		seedSecret(t, idN("0f30", 5), kindAPIKey, newToken(tagAPIKey))
 
-		const insertKey = "INSERT INTO api_keys (id, user_id, scope) VALUES (?, ?, ?)"
+		const insertKey = "INSERT INTO api_keys (id, user_id, name, scope) VALUES (?, ?, 'k', ?)"
 
 		for name, tt := range map[string]struct {
 			scope string

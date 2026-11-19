@@ -27,6 +27,14 @@ func agentWorstName(t *testing.T) input.AgentName {
 	return mustAgentName(t, strings.Repeat("\U00010000", input.MaxAgentNameRunes))
 }
 
+// keyWorstName is the longest KeyName by bytes: the most runes the parser
+// allows, each of the longest UTF-8 form.
+func keyWorstName(t *testing.T) input.KeyName {
+	t.Helper()
+
+	return mustKeyName(t, strings.Repeat("\U00010000", input.MaxKeyNameRunes))
+}
+
 // agentSchemaBounds lists the agent columns' Go values with the CHECK each must
 // fit inside.
 func agentSchemaBounds(t *testing.T) []bound {
@@ -41,13 +49,20 @@ func agentSchemaBounds(t *testing.T) []bound {
 	}
 
 	return []bound{
-		{name: "agents.name bytes", pattern: column("name") + `length\(cast\(name AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)`,
-			lowest: 1, highest: len(name.String()), exact: false},
+		// agents.name and api_keys.name have the same CHECK, so each pattern names the
+		// column that follows it: the agent's scopes, and the key's scope.
+		{name: "agents.name bytes",
+			pattern: column("name") + `length\(cast\(name AS BLOB\)\) BETWEEN (\d+) AND (\d+)\), scopes TEXT`,
+			lowest:  1, highest: len(name.String()), exact: false},
 		// The scope lists are Go's to size: a ScopeList's stored form is at most
 		// input.MaxScopeListJSONBytes, and at least "[]".
 		{name: "agents.scopes bytes",
 			pattern: column("scopes") + `length\(cast\(scopes AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)`,
 			lowest:  len("[]"), highest: input.MaxScopeListJSONBytes, exact: false},
+		// A key's name has the agent name's rule: the most runes, each the longest.
+		{name: "api_keys.name bytes",
+			pattern: column("name") + `length\(cast\(name AS BLOB\)\) BETWEEN (\d+) AND (\d+)\), scope TEXT`,
+			lowest:  1, highest: len(keyWorstName(t).String()), exact: false},
 		{name: "api_keys.scope bytes",
 			pattern: column("scope") + `length\(cast\(scope AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)`,
 			lowest:  len("[]"), highest: input.MaxScopeListJSONBytes, exact: false},

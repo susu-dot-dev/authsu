@@ -400,6 +400,15 @@ CREATE TABLE api_keys (
     -- The agent this key belongs to. NULL is the user's own key.
     agent_id TEXT    REFERENCES agents (id) ON DELETE CASCADE,
 
+    -- A label chosen by the user, to tell their keys apart in a list: the
+    -- token itself is never stored or shown again. Bounded in BYTES and refuses
+    -- NUL, as agents.name is. The key an agent's create issues takes the
+    -- agent's name, read from the agent's row in the same write.
+    name     TEXT    NOT NULL
+                     CHECK (typeof(name) = 'text'
+                            AND instr(name, char(0)) = 0
+                            AND length(cast(name AS BLOB)) BETWEEN 1 AND 1024),
+
     -- What the key may do, as the text of a scope list, so a key can be listed
     -- with its permissions: the token itself is never stored. It is
     -- authoritative and nothing ever updates it. Which names are valid is
@@ -414,8 +423,9 @@ CREATE TABLE api_keys (
     FOREIGN KEY (id, kind) REFERENCES secrets (id, kind) ON DELETE CASCADE
 );
 
--- A user's keys, to revoke them with the account.
-CREATE INDEX api_keys_user_id ON api_keys (user_id);
+-- A user's keys (listed newest first by id, a UUIDv7, which is the sort key and
+-- the pagination cursor), and to revoke them with the account.
+CREATE INDEX api_keys_user_id ON api_keys (user_id, id);
 
 -- An agent's keys, to revoke them with it.
 CREATE INDEX api_keys_agent_id ON api_keys (agent_id) WHERE agent_id IS NOT NULL;

@@ -63,12 +63,15 @@ const (
 	// AgentRevoke revokes an agent and its keys.
 	AgentRevoke Scope = "agent:revoke"
 
-	// KeyRead lists the caller's keys.
+	// KeyRead lists and reads the caller's own keys (those of no agent).
 	KeyRead Scope = "key:read"
-	// KeyCreate creates an API key.
+	// KeyCreate creates an API key for the caller.
 	KeyCreate Scope = "key:create"
-	// KeyRevoke revokes keys other than the one presented, including an agent's.
-	// A caller can always revoke the key it presents, with no scope.
+	// KeyUpdate renames one of the caller's own keys.
+	KeyUpdate Scope = "key:update"
+	// KeyRevoke revokes one of the caller's own keys other than the one
+	// presented. A caller can always revoke the credential it presents, with no
+	// scope, through logout.
 	KeyRevoke Scope = "key:revoke"
 
 	// InvitationRead lists invitations. Admin only.
@@ -108,7 +111,7 @@ type definition struct {
 func definitions() []definition {
 	return []definition{
 		{AgentRead, false}, {AgentCreate, false}, {AgentUpdate, false}, {AgentRevoke, false},
-		{KeyRead, false}, {KeyCreate, false}, {KeyRevoke, false},
+		{KeyRead, false}, {KeyCreate, false}, {KeyUpdate, false}, {KeyRevoke, false},
 		{InvitationRead, true}, {InvitationCreate, true}, {InvitationUpdate, true}, {InvitationRevoke, true},
 		{UserRead, true}, {UserRevoke, true},
 	}
@@ -120,10 +123,10 @@ func definitions() []definition {
 func bundles() map[string][]Scope {
 	return map[string][]Scope{
 		DefaultSession: {
-			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyRevoke,
+			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke,
 			InvitationRead, InvitationCreate, InvitationUpdate, InvitationRevoke, UserRead, UserRevoke,
 		},
-		DefaultUser:  {AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyRevoke},
+		DefaultUser:  {AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke},
 		DefaultAgent: {AgentRead},
 	}
 }

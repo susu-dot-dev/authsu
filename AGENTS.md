@@ -57,6 +57,6 @@ The full rules, and the reasons, are in the documents listed above. The ones tha
 - **There is one build.** No dev/prod variants, build tags for behaviour, or build-time dependency injection. The only build tags are `e2e` (for `e2e/`) and the `js && wasm` split of `cmd/worker`. Do not add a feature that exists only in some builds.
 - **TinyGo's `net/http` differs from Go's.** `http.ServeMux` never matches method-qualified patterns such as `"GET /x"`; register plain paths and dispatch on `r.Method`. Host tests cannot catch this, so e2e tests are how you find out.
 - **The linter is strict (nearly every linter enabled).** Fix the code rather than adding `//nolint`; when a suppression is genuinely needed it must name the linter and give a reason.
-- **Migrations are append-only.** Never edit a migration that has landed on `main`; add a new one. Production migrations are applied by hand (see `docs/runbook.md`).
+- **Migrations are append-only, once we ship to production.** Until the first production release, nothing has shipped: put every schema change into the existing `migrations/0001_schema.sql` and do not add new migration files (see the README). After that release, never edit a migration that has landed on `main`; add a new one. Production migrations are applied by hand (see `docs/runbook.md`).
 - **Do not add third-party GitHub Actions** without maintainer approval, and pin any action to a full commit SHA.
 - **Code reviews must follow [docs/REVIEW.md](docs/REVIEW.md).** Before starting on tasks, agents should also read it to shape their behavior.

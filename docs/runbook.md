@@ -59,7 +59,7 @@ Conventions for writing migrations are in [DATABASE.md](DATABASE.md). Applying t
 - **Always pass `--local`** for anything that is not a deliberate remote migration. Local and e2e use the same `DB` binding name as production but are simulated.
 - **Remote migrations are applied by hand.** Neither CI nor Workers Builds applies them, so apply a new migration to the target database before deploying code that needs it.
   - **Production:** `npx wrangler d1 migrations apply DB --remote`.
-- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. Once a migration is on `main`, the append-only rule applies and the fix is a new migration.
+- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. Once we ship to production, a migration on `main` is append-only and the fix is a new migration. Until the first production release nothing has been applied to a remote database, so schema changes are edited into `0001_schema.sql` in place (see the README).
 - The `database_id` in `wrangler.jsonc` is an identifier, not a secret.
 
 ## Deploying

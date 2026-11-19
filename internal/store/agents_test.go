@@ -393,28 +393,17 @@ type agentPagingCase struct {
 func checkAgentPage(t *testing.T, page store.AgentPage, fake *fakeExec, test agentPagingCase) {
 	t.Helper()
 
-	if page.Agents == nil || len(page.Agents) != test.agents {
-		t.Fatalf("page has %d agents (nil %v), want %d", len(page.Agents), page.Agents == nil, test.agents)
+	if page.Agents == nil {
+		t.Fatalf("page has nil agents, want %d", test.agents)
 	}
 
+	ids := make([]string, len(page.Agents))
 	for i, agent := range page.Agents {
-		if agent.ID != agentIDAt(1000-i) {
-			t.Errorf("agent %d is %s, want %s: order must be the database's", i, agent.ID, agentIDAt(1000-i))
-		}
+		ids[i] = agent.ID
 	}
 
-	wantNext := ""
-	if test.next {
-		wantNext = agentIDAt(1000 - (test.agents - 1))
-	}
-
-	if page.Next != wantNext {
-		t.Errorf("next = %q, want %q", page.Next, wantNext)
-	}
-
-	if args := fake.calls[0][0].Args; len(args) != 4 || args[2] != int64(test.size+1) {
-		t.Errorf("args = %#v, want the page size plus one (%d) third", args, test.size+1)
-	}
+	checkPage(t, pageResult{ids: ids, next: page.Next, args: fake.calls[0][0].Args, argc: 4, idAt: agentIDAt},
+		pageWant{size: test.size, ids: test.agents, next: test.next})
 }
 
 // TestListAgentsPaging holds how the rows of a page become the page: the query
@@ -714,12 +703,13 @@ func TestCreateAgentStatements(t *testing.T) {
 				},
 				{
 					fragments: []string{
-						"INSERT INTO api_keys (id, kind, user_id, agent_id, scope)",
-						// The key's owner and agent are the agent row's, not
+						"INSERT INTO api_keys (id, kind, user_id, agent_id, name, scope)",
+						// The key's owner, agent and name are the agent row's, not
 						// arguments: no agent, no owner, and the batch fails,
 						// secret included.
 						"(SELECT user_id FROM agents WHERE id = ?3)",
 						"(SELECT id FROM agents WHERE id = ?3)",
+						"(SELECT name FROM agents WHERE id = ?3)",
 					},
 					args: []any{agent.KeyID, store.KindAPIKey, agent.ID, agent.KeyScope},
 				},

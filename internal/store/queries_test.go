@@ -253,6 +253,7 @@ func TestQueriesAreFound(t *testing.T) {
 		"revokeInvitationSecretQuery",
 		"listUsersQuery", "getUserQuery", "revokeUserQuery", "revokeUserSecretsQuery", "revokeUserAgentsQuery",
 		"agentRevokeKeysQuery",
+		"keyListQuery", "keyGetQuery", "insertUserKeyQuery", "keyRenameQuery", "keyRevokeQuery",
 	} {
 		if _, ok := queries[name]; !ok {
 			t.Errorf("query %s was not found", name)
@@ -801,6 +802,22 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		},
 		"PatchAgent":  func(s *store.Store) { _, _ = s.PatchAgent(ctx, "owner", agentID, largestPatch(t)) },
 		"RevokeAgent": func(s *store.Store) { _, _ = s.RevokeAgent(ctx, "owner", agentID, farthest) },
+		"ListKeys": func(s *store.Store) {
+			_, _ = s.ListKeys(ctx, "owner", mustAgentCursor(t, agentIDAt(1)), mustAgentLimit(t, "100"))
+		},
+		"GetKey": func(s *store.Store) { _, _ = s.GetKey(ctx, "owner", agentID) },
+		"CreateKey": func(s *store.Store) {
+			_ = s.CreateKey(ctx, store.NewKey{
+				ID: "key-id", Owner: "owner", Name: mustKeyName(t, strings.Repeat("\U00010000", input.MaxKeyNameRunes)),
+				Scope: "[]", Hash: hashOf(1), ExpiresAt: farthest, MaxActive: 1 << 30, CreatedAt: farthest,
+			})
+		},
+		"RenameKey": func(s *store.Store) {
+			worst := mustKeyName(t, strings.Repeat("\U00010000", input.MaxKeyNameRunes))
+
+			_, _ = s.RenameKey(ctx, "owner", agentID, worst, farthest)
+		},
+		"RevokeKey": func(s *store.Store) { _, _ = s.RevokeKey(ctx, "owner", agentID, "presented", farthest) },
 	}
 }
 
