@@ -12,14 +12,15 @@ const (
 	MaxAccountNameBytes = 128
 
 	// MaxAgentNameRunes bounds AgentName, in Unicode code points. The schema
-	// CHECK `length(cast(name AS BLOB)) BETWEEN 1 AND 1024` (migration 0005)
+	// CHECK `length(cast(name AS BLOB)) BETWEEN 1 AND 1024` (migration 0001)
 	// counts bytes; 256 runes of at most 4 bytes each is exactly 1024.
 	MaxAgentNameRunes = 256
 
 	// MaxInvitationLabelRunes bounds InvitationLabel, in Unicode code points.
-	// The schema CHECK `length(label) <= 256` (migration 0001) counts
-	// characters for TEXT, which is the same unit; a label is also refused if
-	// it contains NUL, the one character length() stops at.
+	// The schema CHECK `length(cast(label AS BLOB)) <= 1024` on
+	// invitations.label (migration 0001) counts bytes; 256 runes of at most 4
+	// bytes each is exactly 1024. The CHECK also refuses NUL, which a label
+	// never contains.
 	MaxInvitationLabelRunes = 256
 )
 

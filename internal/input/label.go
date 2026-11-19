@@ -4,7 +4,7 @@ package input
 const (
 	// MaxLabelBytes bounds Label, in bytes. The alphabet is ASCII, so bytes and
 	// characters are the same. The schema CHECK
-	// `length(cast(label AS BLOB)) BETWEEN 1 AND 63` (migration 0006) counts
+	// `length(cast(label AS BLOB)) BETWEEN 1 AND 63` (migration 0001) counts
 	// bytes and allows exactly this.
 	MaxLabelBytes = 63
 

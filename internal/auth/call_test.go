@@ -78,9 +78,9 @@ func (r *rig) loadCost() int {
 	return reads
 }
 
-// TestCallConfigIsLoadedOncePerRequest: the pipeline and the handler share one
-// load, so asking more than once costs nothing, and a route that never asks,
-// and does not need a session, never loads.
+// TestCallConfigIsLoadedOncePerRequest: the handler's asks share one load, so
+// asking more than once costs nothing, and a route that never asks never loads,
+// whatever its credential: verifying a credential reads no configuration.
 func TestCallConfigIsLoadedOncePerRequest(t *testing.T) {
 	t.Parallel()
 
@@ -93,11 +93,12 @@ func TestCallConfigIsLoadedOncePerRequest(t *testing.T) {
 		"a none route that asks twice":    {credential: auth.None, asks: true, cookies: nil, wantLoads: 1},
 		"a none route that never asks":    {credential: auth.None, asks: false, cookies: nil, wantLoads: 0},
 		"a session route that asks twice": {credential: auth.Authenticated, asks: true, cookies: valid, wantLoads: 1},
-		"a session route that never asks": {credential: auth.Authenticated, asks: false, cookies: valid, wantLoads: 1},
+		"a session route that never asks": {credential: auth.Authenticated, asks: false, cookies: valid, wantLoads: 0},
+		// The handler never runs for a refused request, so nothing asks.
 		"a session route that is refused": {
-			credential: auth.Authenticated, asks: true, cookies: sessionValue("garbage"), wantLoads: 1,
+			credential: auth.Authenticated, asks: true, cookies: sessionValue("garbage"), wantLoads: 0,
 		},
-		"a session route without a session": {credential: auth.Authenticated, asks: true, cookies: nil, wantLoads: 1},
+		"a session route without a session": {credential: auth.Authenticated, asks: true, cookies: nil, wantLoads: 0},
 	}
 
 	for name, tt := range tests {
@@ -201,7 +202,7 @@ func TestCallConfigFailureIsRemembered(t *testing.T) {
 }
 
 // problemsWith lists what is wrong with the call a route saw.
-func problemsWith(call *auth.Call, key auth.Key) []string {
+func problemsWith(call *auth.Call, key auth.Issued) []string {
 	var problems []string
 
 	req := call.Request
@@ -216,7 +217,7 @@ func problemsWith(call *auth.Call, key auth.Key) []string {
 		"query a":    slices.Equal(req.Query["a"], []string{"1", "2"}),
 		"query b":    slices.Equal(req.Query["b"], []string{"x"}),
 		"id":         call.ID().String() == itemID,
-		"principal":  call.Principal.KeyID == key.ID.String(),
+		"principal":  call.Principal.SecretID == key.ID,
 		"getenv":     call.Getenv(config.VarAPIOrigin) == apiOrigin,
 	}
 
@@ -252,5 +253,66 @@ func TestCallCarriesTheRequest(t *testing.T) {
 
 	if problems := problemsWith(r.handled[0], key); len(problems) != 0 {
 		t.Errorf("the call is wrong in: %v", problems)
+	}
+}
+
+// TestAuthenticatedRoutesAnswerNotConfiguredThemselves: a credential is
+// verified without the deployment's configuration, so a deployment that lacks
+// it still resolves the session and runs the handler. A handler that needs the
+// configuration asks for it and returns its failure, which is the same 503
+// not_configured a None route gives. A caller with no valid credential is 401
+// whatever the deployment lacks, and never learns it is misconfigured.
+func TestAuthenticatedRoutesAnswerNotConfiguredThemselves(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		cookies    cookieFn
+		wantStatus int
+		wantBody   string
+		wantCode   string
+		wantReads  int
+	}{
+		"a valid session": {
+			cookies: valid, wantStatus: http.StatusServiceUnavailable, wantBody: bodyNotConfigured,
+			wantCode: auth.CodeNotConfigured, wantReads: 1,
+		},
+		nameNoCookie: {
+			cookies: nil, wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+			wantCode: auth.CodeUnauthenticated, wantReads: 0,
+		},
+		"a revoked session": {
+			cookies: afterStoring(revoked), wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+			wantCode: auth.CodeUnauthenticated, wantReads: 1,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRig(t).with(noSecret())
+
+			routes := []auth.Route{{
+				Method: http.MethodGet, Path: "/c", MaxBody: 0, Credential: auth.Authenticated, Access: auth.Open(),
+				Handle: func(call *auth.Call) result.Result[httpapi.Response] {
+					_, err := call.Config()
+
+					return result.Fail[httpapi.Response](err)
+				},
+			}}
+
+			var cookies []*http.Cookie
+			if tt.cookies != nil {
+				cookies = tt.cookies(r)
+			}
+
+			rec := r.serve(routes, request{target: "/c", cookies: cookies})
+
+			wantFailure(t, r, rec, tt.wantStatus, tt.wantBody, tt.wantCode, nil)
+
+			if len(r.creds.calls) != tt.wantReads {
+				t.Errorf("store read %d times, want %d", len(r.creds.calls), tt.wantReads)
+			}
+		})
 	}
 }

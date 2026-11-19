@@ -1,8 +1,12 @@
+//nolint:goconst // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
 package store_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -11,6 +15,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -24,6 +29,12 @@ import (
 //
 //nolint:gochecknoglobals // a fixed clock shared by the table tests
 var now = time.Unix(1_700_000_123, 0)
+
+// activeFragment is the text of the one predicate every query that decides
+// whether a presented secret may be used includes, and that takes now twice.
+// It is written out here on purpose: changing what "active" means is a change
+// to security behaviour, and must change this line with it.
+const activeFragment = "(s.revoked_at IS NULL OR s.revoked_at > ?) AND s.expires_at > ?"
 
 // dbError is an error the platform reports, by its text: D1 gives nothing but
 // text to recognise a constraint failure by.
@@ -110,16 +121,55 @@ func failing(err error) outcome { return outcome{results: nil, err: err} }
 
 // Parsers for the input types, which only their parsers can build.
 
-func mustCode(tb testing.TB, raw string) input.InvitationCode {
+// tokenOf is a valid token of the tag whose random body is the byte seed
+// repeated, so a test can name a distinct token by its seed.
+func tokenOf(tb testing.TB, tag secret.Tag, seed byte) string {
 	tb.Helper()
 
-	code, err := input.ParseInvitationCode(raw)
+	raw, err := secret.Generate(bytes.NewReader(bytes.Repeat([]byte{seed}, secret.BodyBytes)), tag)
 	if err != nil {
-		tb.Fatalf("parse invitation code %q: %v", raw, err)
+		tb.Fatalf("generate a %s token: %v", tag, err)
 	}
 
-	return code
+	return raw
 }
+
+func mustInvitationToken(tb testing.TB, seed byte) input.InvitationToken {
+	tb.Helper()
+
+	token, err := input.ParseInvitationToken(tokenOf(tb, secret.TagInvitation, seed))
+	if err != nil {
+		tb.Fatalf("parse invitation token: %v", err)
+	}
+
+	return token
+}
+
+func mustSessionToken(tb testing.TB, seed byte) input.SessionToken {
+	tb.Helper()
+
+	token, err := input.ParseSessionToken(tokenOf(tb, secret.TagSession, seed))
+	if err != nil {
+		tb.Fatalf("parse session token: %v", err)
+	}
+
+	return token
+}
+
+func mustAPIKeyToken(tb testing.TB, seed byte) input.APIKeyToken {
+	tb.Helper()
+
+	token, err := input.ParseAPIKeyToken(tokenOf(tb, secret.TagAPIKey, seed))
+	if err != nil {
+		tb.Fatalf("parse API key token: %v", err)
+	}
+
+	return token
+}
+
+// hashOf is a 32-byte hash that is not any token's, distinguishable by its
+// seed: what a caller hands the store as secret.Hash(token)[:].
+func hashOf(seed byte) []byte { return bytes.Repeat([]byte{seed}, sha256.Size) }
 
 func mustName(tb testing.TB, raw string) input.AccountName {
 	tb.Helper()
@@ -130,6 +180,41 @@ func mustName(tb testing.TB, raw string) input.AccountName {
 	}
 
 	return name
+}
+
+// defectResults returns every way the rows a statement returned can fail to be
+// the one valid row, by a name for the case: for each column, NULL (unless the
+// column is nullable) and a value of each wrong type; a row cut short at every
+// length, including empty; a row with an extra column; and two rows. kinds names
+// each column: "text", "integer", "optText" or "optInteger". The platform reports
+// an integer column as int64, so a float64 is a defect even when whole.
+func defectResults(valid []any, kinds ...string) map[string][][]any {
+	wrong := map[string][]any{
+		"text":       {int64(1), 1.5, []byte("x")},
+		"optText":    {int64(1), 1.5, []byte("x")},
+		"integer":    {1.5, "1", []byte{1}, true},
+		"optInteger": {1.5, "1", []byte{1}, true},
+	}
+
+	results := map[string][][]any{"two rows": {valid, valid}}
+
+	for at, kind := range kinds {
+		if !strings.HasPrefix(kind, "opt") {
+			results[fmt.Sprintf("column %d (%s) is NULL", at, kind)] = [][]any{with(valid, at, nil)}
+		}
+
+		for _, value := range wrong[kind] {
+			results[fmt.Sprintf("column %d (%s) is a %T", at, kind, value)] = [][]any{with(valid, at, value)}
+		}
+	}
+
+	for length := range valid {
+		results[fmt.Sprintf("a row of %d columns", length)] = [][]any{slices.Clone(valid[:length])}
+	}
+
+	results["a column too many"] = [][]any{append(slices.Clone(valid), "extra")}
+
+	return results
 }
 
 // Assertions.
@@ -270,6 +355,42 @@ func checkFailure(t *testing.T, err error, f failure) {
 	// The database's own error stays in the chain, for the log.
 	if f.outcome.err != nil && !errors.Is(err, f.outcome.err) {
 		t.Errorf("error %v lost its cause %v", err, f.outcome.err)
+	}
+}
+
+// defectConflicts is failures for an operation whose writes can violate no
+// constraint a client could cause: a conflict there is the schema disagreeing
+// with the code, so it comes back as the 500 "_rejected" and never as the bare
+// ErrConflict an operation hands to its feature.
+func defectConflicts(failures []failure, rejected string) []failure {
+	for i := range failures {
+		if failures[i].conflict {
+			failures[i].conflict = false
+			failures[i].want = *defectOf(rejected)
+		}
+	}
+
+	return failures
+}
+
+// runDefectFailures is runFailures for an operation of that kind.
+func runDefectFailures(
+	t *testing.T, statements int, failed, rejected, description string, call func(*store.Store) error,
+) {
+	t.Helper()
+
+	for _, f := range defectConflicts(infraFailures(statements, failed, rejected, description), rejected) {
+		t.Run(f.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(f.outcome)
+
+			checkFailure(t, call(fake.store()), f)
+
+			if len(fake.calls) != 1 {
+				t.Errorf("exec called %d times, want 1", len(fake.calls))
+			}
+		})
 	}
 }
 

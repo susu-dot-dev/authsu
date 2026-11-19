@@ -143,7 +143,7 @@ func FuzzParseLabel(f *testing.F) {
 func TestLabelBoundsFitTheSchema(t *testing.T) {
 	t.Parallel()
 
-	const schemaMaxBytes = 63 // agent_labels.label CHECK, migration 0006
+	const schemaMaxBytes = 63 // agent_labels.label CHECK, migration 0001
 
 	if input.MaxLabelBytes != schemaMaxBytes {
 		t.Errorf("MaxLabelBytes = %d, want the schema's %d", input.MaxLabelBytes, schemaMaxBytes)

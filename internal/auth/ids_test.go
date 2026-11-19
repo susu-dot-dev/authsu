@@ -68,9 +68,11 @@ func idContexts() map[string]idContext {
 			env: nil, cookies: afterStoring(revoked), status: http.StatusUnauthorized, body: bodyUnauthenticated,
 			code: auth.CodeUnauthenticated, cause: nil,
 		},
+		// The credential needs no configuration, so a deployment without it
+		// changes nothing about the answer.
 		"no configuration": {
-			env: noSecret(), cookies: valid, status: http.StatusServiceUnavailable, body: bodyNotConfigured,
-			code: auth.CodeNotConfigured, cause: nil,
+			env: noSecret(), cookies: valid, status: http.StatusBadRequest, body: bodyInvalidID, code: input.CodeInvalidID,
+			cause: nil,
 		},
 		"store failing": {
 			env: nil, cookies: failing(errDB), status: http.StatusServiceUnavailable, body: bodyUnavailable,
@@ -156,8 +158,8 @@ func TestPublicRoutesParseTheID(t *testing.T) {
 
 				wantFailure(t, r, rec, http.StatusBadRequest, bodyInvalidID, input.CodeInvalidID, nil)
 
-				if len(r.handled) != 0 || len(r.keys.calls) != 0 {
-					t.Errorf("route ran %d times and store was read %d times, want neither", len(r.handled), len(r.keys.calls))
+				if len(r.handled) != 0 || len(r.creds.calls) != 0 {
+					t.Errorf("route ran %d times and store was read %d times, want neither", len(r.handled), len(r.creds.calls))
 				}
 			})
 		}

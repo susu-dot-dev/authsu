@@ -1,7 +1,8 @@
-//nolint:goconst // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
 package auth_test
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,12 +14,13 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
 // outcome is everything a request to the boundary may do, so each case states
 // all of it: the response, what was logged, whether the route ran, and how
-// often the store was read.
+// often, and of which kind, the credential store was read.
 type outcome struct {
 	status int
 	// body is the exact response body.
@@ -32,12 +34,30 @@ type outcome struct {
 	logContains string
 	// handled is whether the route's Handle ran.
 	handled bool
-	// storeCalls is how many times the key store was read.
+	// storeCalls is how many times the credential store was read.
 	storeCalls int
+	// kind is the kind of credential every read asks for.
+	kind string
 }
 
-// cookieFn builds a request's cookies after the rig exists, so it may store
-// keys and change them.
+// viaKey is the outcome for a request whose credential is an API key.
+func (o outcome) viaKey() outcome {
+	o.kind = auth.KindAPIKey
+
+	return o
+}
+
+// carried is what a request presents: Authorization header values and cookies.
+type carried struct {
+	headers []string
+	cookies []*http.Cookie
+}
+
+// carryFn builds what a request presents after the rig exists, so it may store
+// credentials and change them.
+type carryFn func(*rig) carried
+
+// cookieFn builds a request's cookies after the rig exists.
 type cookieFn func(*rig) []*http.Cookie
 
 // boundaryCase is one GET to the standard routes.
@@ -47,12 +67,44 @@ type boundaryCase struct {
 	// env overrides deployment settings; "" removes one.
 	env       map[string]string
 	cancelled bool
-	cookies   cookieFn
+	carry     carryFn
 	want      outcome
 }
 
+// rowOf is a case that presents what carry builds.
+func rowOf(name, target string, carry carryFn, want outcome) boundaryCase {
+	return boundaryCase{name: name, target: target, env: nil, cancelled: false, carry: carry, want: want}
+}
+
+// row is a case that presents only cookies.
 func row(name, target string, cookies cookieFn, want outcome) boundaryCase {
-	return boundaryCase{name: name, target: target, env: nil, cancelled: false, cookies: cookies, want: want}
+	return rowOf(name, target, cookiesOnly(cookies), want)
+}
+
+// cookiesOnly presents cookies and nothing else.
+func cookiesOnly(cookies cookieFn) carryFn {
+	return func(r *rig) carried {
+		if cookies == nil {
+			return carried{headers: nil, cookies: nil}
+		}
+
+		return carried{headers: nil, cookies: cookies(r)}
+	}
+}
+
+// headersOnly presents Authorization header values and nothing else.
+func headersOnly(headers func(*rig) []string) carryFn {
+	return func(r *rig) carried { return carried{headers: headers(r), cookies: nil} }
+}
+
+// header presents one Authorization header value.
+func header(value func(*rig) string) carryFn {
+	return headersOnly(func(r *rig) []string { return []string{value(r)} })
+}
+
+// literalHeader presents one fixed Authorization header value.
+func literalHeader(value string) carryFn {
+	return header(func(*rig) string { return value })
 }
 
 // inDeployment is the case in a deployment with these settings.
@@ -85,14 +137,9 @@ func (c boundaryCase) run(t *testing.T) {
 
 	r := newRig(t).with(c.env)
 
-	var cookies []*http.Cookie
-	if c.cookies != nil {
-		cookies = c.cookies(r)
-	}
+	presented := c.presented(r)
 
-	rec := r.serve(r.standardRoutes(), request{
-		method: http.MethodGet, target: c.target, cookies: cookies, cancelled: c.cancelled,
-	})
+	rec := r.serveCtx(r.standardRoutes(), c.target, presented, c.cancelled)
 
 	c.checkResponse(t, r, rec)
 
@@ -100,17 +147,26 @@ func (c boundaryCase) run(t *testing.T) {
 		t.Errorf("route ran %d times, want ran = %v", got, c.want.handled)
 	}
 
-	if len(r.keys.calls) != c.want.storeCalls {
-		t.Errorf("store read %d times, want %d: %v", len(r.keys.calls), c.want.storeCalls, r.keys.calls)
+	if len(r.creds.calls) != c.want.storeCalls {
+		t.Errorf("store read %d times, want %d: %v", len(r.creds.calls), c.want.storeCalls, r.creds.calls)
 	}
 
-	// Whatever a request did, the store is only ever asked about a session
-	// key, at the injected clock.
-	for _, call := range r.keys.calls {
-		if call.kind != auth.KindSession || !call.now.Equal(r.now) {
-			t.Errorf("store read = %+v, want kind %q at %v", call, auth.KindSession, r.now)
+	// Whatever a request did, the store is only ever asked about the kind the
+	// carrier accepts, at the injected clock.
+	for _, call := range r.creds.calls {
+		if call.kind != c.want.kind || !call.now.Equal(r.now) {
+			t.Errorf("store read = %+v, want kind %q at %v", call, c.want.kind, r.now)
 		}
 	}
+}
+
+// presented is what the case sends, built on r.
+func (c boundaryCase) presented(r *rig) carried {
+	if c.carry == nil {
+		return carried{headers: nil, cookies: nil}
+	}
+
+	return c.carry(r)
 }
 
 func boolToInt(b bool) int {
@@ -146,6 +202,11 @@ func (c boundaryCase) checkResponse(t *testing.T, r *rig, rec *httptest.Response
 // valid is a stored session of an administrator.
 func valid(r *rig) []*http.Cookie { return []*http.Cookie{sessionCookie(r.session())} }
 
+// validKey presents a stored API key with no scopes as a bearer token.
+func validKey(r *rig) carried {
+	return carried{headers: []string{bearer(r.apiKey(bearerSpec{scope: list()}))}, cookies: nil}
+}
+
 // sessionValue is a request carrying the session cookie with value.
 func sessionValue(value string) cookieFn {
 	return func(*rig) []*http.Cookie { return []*http.Cookie{requestCookie(auth.CookieName, value)} }
@@ -175,7 +236,7 @@ func twice(part cookieFn) cookieFn {
 
 // named is a valid session sent under another cookie name.
 func named(name string) cookieFn {
-	return func(r *rig) []*http.Cookie { return []*http.Cookie{requestCookie(name, r.session().JWT)} }
+	return func(r *rig) []*http.Cookie { return []*http.Cookie{requestCookie(name, r.session().Token)} }
 }
 
 // plain is one cookie with this name and value.
@@ -185,77 +246,62 @@ func plain(name, value string) cookieFn {
 
 // afterStoring makes a stored session, lets prep change the world, and sends
 // the session's cookie.
-func afterStoring(prep func(r *rig, key auth.Key)) cookieFn {
+func afterStoring(prep func(r *rig, issued auth.Issued)) cookieFn {
 	return func(r *rig) []*http.Cookie {
-		key := r.session()
-		prep(r, key)
+		issued := r.session()
+		prep(r, issued)
 
-		return []*http.Cookie{sessionCookie(key)}
+		return []*http.Cookie{sessionCookie(issued)}
 	}
 }
 
-// revoked is a session whose row is gone: revoked, expired, or its account
-// revoked, which the store reports alike.
-func revoked(r *rig, key auth.Key) { r.unstore(key) }
+// revoked is a session the store no longer reports: revoked, expired, or its
+// account revoked, which the store reports alike.
+func revoked(r *rig, issued auth.Issued) { r.unstore(issued) }
 
 // failing is a session whose store read fails with err.
 func failing(err error) cookieFn {
-	return afterStoring(func(r *rig, _ auth.Key) { r.keys.err = err })
+	return afterStoring(func(r *rig, _ auth.Issued) { r.creds.err = err })
 }
 
-// ownedBy is a session whose row belongs to another account.
-func ownedBy(owner string) cookieFn {
-	return afterStoring(func(r *rig, key auth.Key) { r.setRow(key, func(row *store.ActiveKey) { row.UserID = owner }) })
+// failingKey is an API key whose store read fails with err.
+func failingKey(err error) carryFn {
+	return func(r *rig) carried {
+		presented := validKey(r)
+		r.creds.err = err
+
+		return presented
+	}
 }
 
 // withRole is a stored session whose account has role.
 func withRole(role string) cookieFn {
-	return func(r *rig) []*http.Cookie { return []*http.Cookie{sessionCookie(r.sessionFor(userID, role))} }
+	return func(r *rig) []*http.Cookie { return []*http.Cookie{sessionCookie(r.sessionFor(role))} }
 }
 
-// rowWithJWK is a session whose stored JWK is jwk.
-func rowWithJWK(jwk string) cookieFn {
-	return afterStoring(func(r *rig, key auth.Key) {
-		r.setRow(key, func(row *store.ActiveKey) { row.JWK = []byte(jwk) })
-	})
-}
-
-// tampered is a session whose token is changed by edit.
-func tampered(edit func(r *rig, jwt string) string) cookieFn {
-	return func(r *rig) []*http.Cookie {
-		return []*http.Cookie{requestCookie(auth.CookieName, edit(r, r.session().JWT))}
-	}
-}
-
-// unauthenticated is the outcome of every refusal of a credential.
+// unauthenticated is the outcome of every refusal of a credential, after
+// storeCalls reads of a session.
 func unauthenticated(storeCalls int, logContains string) outcome {
 	return outcome{
 		status: http.StatusUnauthorized, body: bodyUnauthenticated, code: auth.CodeUnauthenticated,
-		cause: nil, logContains: logContains, handled: false, storeCalls: storeCalls,
+		cause: nil, logContains: logContains, handled: false, storeCalls: storeCalls, kind: auth.KindSession,
 	}
 }
 
 // ok is the outcome of a request that reached the route.
 func ok(storeCalls int) outcome {
 	return outcome{
-		status: http.StatusOK, body: bodyOK, code: "", cause: nil, logContains: "", handled: true, storeCalls: storeCalls,
+		status: http.StatusOK, body: bodyOK, code: "", cause: nil, logContains: "", handled: true,
+		storeCalls: storeCalls, kind: auth.KindSession,
 	}
 }
 
-// notConfigured is the outcome of a deployment without configuration.
-func notConfigured() outcome {
-	return outcome{
-		status: http.StatusServiceUnavailable, body: bodyNotConfigured, code: auth.CodeNotConfigured,
-		cause: nil, logContains: "", handled: false, storeCalls: 0,
-	}
-}
-
-// unavailable is the outcome of a failure to verify that says nothing about the
-// token.
-func unavailable(storeCalls int, cause error, logContains string) outcome {
+// unavailable is the outcome of a failure to resolve, after one read, that says
+// nothing about the token.
+func unavailable(cause error, logContains string) outcome {
 	return outcome{
 		status: http.StatusServiceUnavailable, body: bodyUnavailable, code: store.CodeSessionVerifyFailed,
-		cause: cause, logContains: logContains, handled: false, storeCalls: storeCalls,
+		cause: cause, logContains: logContains, handled: false, storeCalls: 1, kind: auth.KindSession,
 	}
 }
 
@@ -263,7 +309,7 @@ func unavailable(storeCalls int, cause error, logContains string) outcome {
 func forbidden() outcome {
 	return outcome{
 		status: http.StatusForbidden, body: bodyForbidden, code: auth.CodeForbidden,
-		cause: nil, logContains: "", handled: false, storeCalls: 1,
+		cause: nil, logContains: "", handled: false, storeCalls: 1, kind: auth.KindSession,
 	}
 }
 
@@ -277,12 +323,15 @@ func nothingSet() map[string]string {
 }
 
 // Reasons that are in the log.
+//
+//nolint:gosec // G101: these name the credential in a log message and are not credentials
 const (
-	logNoCookie  = "no credential"
-	logTwo       = "more than one session cookie"
-	logNoKey     = "no active key"
-	logNotOwner  = "subject is not the key's owner"
-	logBadStored = "not a valid public key"
+	logNoCredential = "no credential"
+	logTwoCookies   = "more than one session cookie"
+	logTwoHeaders   = "more than one Authorization header"
+	logBoth         = "both a session cookie and a bearer token"
+	logNotBearer    = "not a Bearer token"
+	logNotActive    = "no active credential"
 )
 
 func noneCases() []boundaryCase {
@@ -293,6 +342,8 @@ func noneCases() []boundaryCase {
 		row("none: a valid session", pathPublic, valid, ok(0)),
 		row("none: a revoked session", pathPublic, afterStoring(revoked), ok(0)),
 		row("none: the store is failing", pathPublic, failing(errDB), ok(0)),
+		rowOf("none: a valid key", pathPublic, validKey, ok(0)),
+		rowOf("none: a garbage bearer", pathPublic, literalHeader("Bearer garbage"), ok(0)),
 		row("none: configuration is missing", pathPublic, nil, ok(0)).inDeployment(noSecret()),
 		row("none: nothing is configured", pathPublic, valid, ok(0)).inDeployment(nothingSet()),
 	}
@@ -301,204 +352,234 @@ func noneCases() []boundaryCase {
 func cookieCases() []boundaryCase {
 	return []boundaryCase{
 		row("cookie: valid", pathMe, valid, ok(1)),
-		row("cookie: none", pathMe, nil, unauthenticated(0, logNoCookie)),
-		row("cookie: another name only", pathMe, plain("other", "x"), unauthenticated(0, logNoCookie)),
-		row("cookie: name in another case", pathMe, named("__host-session"), unauthenticated(0, logNoCookie)),
-		row("cookie: name without the prefix", pathMe, named("session"), unauthenticated(0, logNoCookie)),
-		row("cookie: name with a suffix", pathMe, named(auth.CookieName+"2"), unauthenticated(0, logNoCookie)),
-		row("cookie: empty", pathMe, sessionValue(""), unauthenticated(0, input.CodeInvalidToken)),
-		row("cookie: same valid one twice", pathMe, twice(valid), unauthenticated(0, logTwo)),
-		row("cookie: valid then bad", pathMe, many(valid, sessionValue("garbage")), unauthenticated(0, logTwo)),
-		row("cookie: bad then valid", pathMe, many(sessionValue("garbage"), valid), unauthenticated(0, logTwo)),
-		row("cookie: empty then valid", pathMe, many(sessionValue(""), valid), unauthenticated(0, logTwo)),
-		row("cookie: two valid sessions", pathMe, many(valid, valid), unauthenticated(0, logTwo)),
+		row("cookie: none", pathMe, nil, unauthenticated(0, logNoCredential)),
+		row("cookie: another name only", pathMe, plain("other", "x"), unauthenticated(0, logNoCredential)),
+		row("cookie: name in another case", pathMe, named("__host-session"), unauthenticated(0, logNoCredential)),
+		row("cookie: name without the prefix", pathMe, named("session"), unauthenticated(0, logNoCredential)),
+		row("cookie: name with a suffix", pathMe, named(auth.CookieName+"2"), unauthenticated(0, logNoCredential)),
+		row("cookie: empty", pathMe, sessionValue(""), unauthenticated(0, input.CodeInvalidSessionToken)),
+		row("cookie: same valid one twice", pathMe, twice(valid), unauthenticated(0, logTwoCookies)),
+		row("cookie: valid then bad", pathMe, many(valid, sessionValue("garbage")), unauthenticated(0, logTwoCookies)),
+		row("cookie: bad then valid", pathMe, many(sessionValue("garbage"), valid), unauthenticated(0, logTwoCookies)),
+		row("cookie: empty then valid", pathMe, many(sessionValue(""), valid), unauthenticated(0, logTwoCookies)),
+		row("cookie: two valid sessions", pathMe, many(valid, valid), unauthenticated(0, logTwoCookies)),
 		row("cookie: unrelated cookie beside it", pathMe, many(plain("theme", "dark"), valid), ok(1)),
 	}
 }
 
-// tokenShapeCases are values that are not a token; none reaches the store.
-func tokenShapeCases() []boundaryCase {
-	cases := make([]boundaryCase, 0, 11)
+// bearerCases are the shapes an Authorization header can take.
+func bearerCases() []boundaryCase {
+	token := func(r *rig) string { return r.apiKey(bearerSpec{scope: list()}).Token }
+	// around is a header that is the token with text before and after it.
+	around := func(before, after string) carryFn {
+		return header(func(r *rig) string { return before + token(r) + after })
+	}
+	same := func(r *rig) []string { h := "Bearer " + token(r); return []string{h, h} }
+	mixed := func(r *rig) []string { return []string{"Bearer " + token(r), "Bearer garbage"} }
+	parse := unauthenticated(0, input.CodeInvalidAPIKey).viaKey()
+	notBearer := unauthenticated(0, logNotBearer).viaKey()
+	failed := unavailable(errDB, "on fire").viaKey()
+	classifiedDown := classified(apierr.Unavailable, store.CodeSessionVerifyFailed)
+	classifiedBug := classified(apierr.Internal, store.CodeSessionVerifyRejected)
 
-	notJWT := map[string]string{
-		"not a jwt":                 "garbage",
-		"two segments":              "a.b",
-		"empty segments":            "..",
-		"three short segments":      "a.b.c",
-		"at the limit, not a token": strings.Repeat("a", input.MaxTokenBytes),
+	return []boundaryCase{
+		rowOf("bearer: valid", pathMe, validKey, ok(1).viaKey()),
+		rowOf("bearer: scheme in lower case", pathMe, around("bearer ", ""), ok(1).viaKey()),
+		rowOf("bearer: scheme in upper case", pathMe, around("BEARER ", ""), ok(1).viaKey()),
+		rowOf("bearer: scheme in mixed case", pathMe, around("bEaReR ", ""), ok(1).viaKey()),
+		rowOf("bearer: no header", pathMe, nil, unauthenticated(0, logNoCredential)),
+		rowOf("bearer: the scheme alone", pathMe, literalHeader("Bearer"), notBearer),
+		rowOf("bearer: the scheme and a space", pathMe, literalHeader("Bearer "), parse),
+		rowOf("bearer: basic auth", pathMe, literalHeader("Basic dXNlcjpwYXNz"), notBearer),
+		rowOf("bearer: a token with no scheme", pathMe, around("", ""), notBearer),
+		rowOf("bearer: another scheme with a token", pathMe, around("Token ", ""), notBearer),
+		rowOf("bearer: two spaces before the token", pathMe, around("Bearer  ", ""), parse),
+		rowOf("bearer: a trailing space", pathMe, around("Bearer ", " "), parse),
+		rowOf("bearer: a leading space", pathMe, around(" Bearer ", ""), notBearer),
+		rowOf("bearer: a tab instead of a space", pathMe, around("Bearer\t", ""), notBearer),
+		rowOf("bearer: two tokens in one header", pathMe,
+			header(func(r *rig) string { t := token(r); return "Bearer " + t + " " + t }), parse),
+		rowOf("bearer: the header sent twice", pathMe, headersOnly(same), unauthenticated(0, logTwoHeaders)),
+		rowOf("bearer: a good header and a bad one", pathMe, headersOnly(mixed), unauthenticated(0, logTwoHeaders)),
+		rowOf("bearer: garbage", pathMe, literalHeader("Bearer garbage"), parse),
+		rowOf("bearer: a NUL in the token", pathMe, literalHeader("Bearer a\x00b"), parse),
+		rowOf("bearer: an oversized token", pathMe, literalHeader("Bearer "+strings.Repeat("a", 5000)), parse),
+		rowOf("bearer: a huge token", pathMe, literalHeader("Bearer "+strings.Repeat("a.", 50_000)), parse),
+		rowOf("bearer: a failing store", pathMe, failingKey(errDB), failed),
+		rowOf("bearer: a failing store, classified", pathMe, failingKey(classifiedDown), failed),
+		rowOf("bearer: a store that rejected the read", pathMe, failingKey(classifiedBug), internalOutcome().viaKey()),
+		rowOf("bearer: the request was cancelled", pathMe, validKey,
+			unavailable(context.Canceled, "canceled").viaKey()).gone(),
+	}
+}
+
+// bothCarriers: a request that carries a cookie and a bearer token is
+// ambiguous and is refused before either is resolved.
+func bothCarriers() []boundaryCase {
+	refused := unauthenticated(0, logBoth)
+
+	both := func(cookie func(*rig) *http.Cookie, headers func(*rig) []string) carryFn {
+		return func(r *rig) carried {
+			return carried{headers: headers(r), cookies: []*http.Cookie{cookie(r)}}
+		}
+	}
+	session := func(r *rig) *http.Cookie { return sessionCookie(r.session()) }
+	key := func(r *rig) []string { return []string{bearer(r.apiKey(bearerSpec{scope: list()}))} }
+	garbage := func(*rig) []string { return []string{"Bearer garbage"} }
+
+	return []boundaryCase{
+		rowOf("both: a valid session and a valid key", pathMe, both(session, key), refused),
+		rowOf("both: a valid session and a garbage bearer", pathMe, both(session, garbage), refused),
+		rowOf("both: a garbage cookie and a valid key", pathMe,
+			both(func(*rig) *http.Cookie { return requestCookie(auth.CookieName, "garbage") }, key), refused),
+		rowOf("both: an empty cookie and a valid key", pathMe,
+			both(func(*rig) *http.Cookie { return requestCookie(auth.CookieName, "") }, key), refused),
+		rowOf("both: a valid session and an empty bearer", pathMe,
+			both(session, func(*rig) []string { return []string{"Bearer "} }), refused),
+		rowOf("both: a valid session and a non-bearer scheme", pathMe,
+			both(session, func(*rig) []string { return []string{"Basic abc"} }), unauthenticated(0, logNotBearer)),
+		rowOf("both: a valid session and two headers", pathMe,
+			both(session, func(r *rig) []string { return append(key(r), key(r)...) }), unauthenticated(0, logTwoHeaders)),
+	}
+}
+
+// shapes are the ways a value can fail to be a token of tag. None of them is
+// accepted by the parser, so none costs a store read.
+func shapes(tag secret.Tag) map[string]string {
+	prefix := secret.Prefix(tag)
+	body := strings.Repeat("A", secret.BodyLen)
+
+	return map[string]string{
+		"empty":                        "",
+		"garbage":                      "garbage",
+		"the prefix alone":             prefix,
+		"the brand alone":              "susu_",
+		"no prefix":                    body,
+		"one character short":          prefix + body[:secret.BodyLen-1],
+		"one character long":           prefix + body + "A",
+		"a non-canonical last char":    prefix + body[:secret.BodyLen-1] + "B",
+		"padding":                      prefix + body[:secret.BodyLen-1] + "=",
+		"a plus":                       prefix + "+" + body[1:],
+		"a slash":                      prefix + "/" + body[1:],
+		"a dot":                        prefix + "." + body[1:],
+		"a star":                       prefix + "*" + body[1:],
+		"an upper-case prefix":         strings.ToUpper(prefix) + body,
+		"a missing underscore":         strings.Replace(prefix, "_", "", 1) + body,
+		"a doubled underscore":         strings.TrimSuffix(prefix, "_") + "__" + body,
+		"a different brand":            "xusu_" + string(tag) + "_" + body,
+		"three dotted parts":           "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln",
+		"the token twice":              prefix + body + prefix + body,
+		"an oversized value":           strings.Repeat("a", 5000),
+		"an oversized value, prefixed": prefix + strings.Repeat("A", 5000),
+	}
+}
+
+// cookieSafe reports whether value survives being sent as a cookie value
+// unchanged: net/http drops the bytes a cookie value may not hold.
+func cookieSafe(value string) bool {
+	for i := range len(value) {
+		c := value[i]
+		if c < 0x21 || c > 0x7e || c == '"' || c == ',' || c == ';' || c == '\\' || c == '=' {
+			return false
+		}
 	}
 
-	notToken := map[string]string{
-		"a plus":              "abc+def.ghi.jkl",
-		"padding":             "abc=.def.ghi",
-		"a slash":             "abc/def.ghi.jkl",
-		"a star":              "abc*.def.ghi",
-		"longer than a token": strings.Repeat("a", input.MaxTokenBytes+1),
-		"a very long token":   strings.Repeat("a.", 50_000),
+	return true
+}
+
+// shapeCases are values that are not a token of the kind the carrier accepts,
+// in each carrier: always the same 401, with no read of the store.
+func shapeCases() []boundaryCase {
+	var cases []boundaryCase
+
+	for name, value := range shapes(secret.TagSession) {
+		if cookieSafe(value) {
+			cases = append(cases, row("shape: cookie, "+name, pathMe, sessionValue(value),
+				unauthenticated(0, input.CodeInvalidSessionToken)))
+		}
 	}
 
-	for name, value := range notJWT {
-		cases = append(cases, row("token: "+name, pathMe, sessionValue(value), unauthenticated(0, "")))
-	}
-
-	for name, value := range notToken {
-		cases = append(cases, row("token: "+name, pathMe, sessionValue(value), unauthenticated(0, input.CodeInvalidToken)))
+	for name, value := range shapes(secret.TagAPIKey) {
+		cases = append(cases, rowOf("shape: bearer, "+name, pathMe, literalHeader("Bearer "+value),
+			unauthenticated(0, input.CodeInvalidAPIKey).viaKey()))
 	}
 
 	return cases
 }
 
-// cutShort is a valid token with its tail missing.
-func cutShort(_ *rig, jwt string) string { return jwt[:100] }
-
-// flippedSignature is a valid token with one character of its signature
-// changed, in the middle, so the encoding is still canonical and only the
-// signature is wrong.
-func flippedSignature(_ *rig, jwt string) string {
-	at := len(jwt) - 10
-
-	flipped := "A"
-	if jwt[at] == 'A' {
-		flipped = "B"
+// kindCases are tokens of the right shape for another carrier: each carrier
+// accepts exactly one kind, so a wrong-kind token is refused by its parser
+// before the store is read.
+func kindCases() []boundaryCase {
+	sessionToken := func(r *rig) string { return r.session().Token }
+	keyToken := func(r *rig) string { return r.apiKey(bearerSpec{scope: list()}).Token }
+	invitation := func(r *rig) string { return r.foreign(secret.TagInvitation) }
+	bodyUnder := func(from func(*rig) string, tag secret.Tag) func(*rig) string {
+		return func(r *rig) string {
+			return secret.Prefix(tag) + strings.TrimPrefix(from(r), secret.Prefix(secret.TagSession))
+		}
+	}
+	inCookie := func(token func(*rig) string) cookieFn {
+		return func(r *rig) []*http.Cookie { return []*http.Cookie{requestCookie(auth.CookieName, token(r))} }
+	}
+	asBearer := func(token func(*rig) string) carryFn {
+		return header(func(r *rig) string { return "Bearer " + token(r) })
 	}
 
-	return jwt[:at] + flipped + jwt[at+1:]
-}
-
-// swappedPayload is a valid token whose claims are another account's.
-func swappedPayload(r *rig, jwt string) string {
-	mine, theirs := strings.Split(jwt, "."), strings.Split(r.sessionFor(otherUserID, auth.RoleAdmin).JWT, ".")
-
-	return mine[0] + "." + theirs[1] + "." + mine[2]
-}
-
-// foreignRow is a session created for kind, stored only under kind, from a
-// store that does or does not filter by it.
-func foreignRow(kind string, ignoreKind bool) cookieFn {
-	return func(r *rig) []*http.Cookie {
-		key := r.createKey(r.issuer, kind)
-		r.keys.ignoreKind = ignoreKind
-		r.put(key, kind)
-
-		return []*http.Cookie{sessionCookie(key)}
-	}
-}
-
-// neverStored is a session that login never stored.
-func neverStored(r *rig) []*http.Cookie {
-	return []*http.Cookie{sessionCookie(r.createKey(r.issuer, auth.KindSession))}
-}
-
-// anotherKeysRow is a session whose row holds another key's public half.
-func anotherKeysRow(r *rig) []*http.Cookie {
-	key, other := r.session(), r.createKey(r.issuer, auth.KindSession)
-
-	r.setRow(key, func(row *store.ActiveKey) {
-		row.JWK = []byte(strings.ReplaceAll(other.JWK, other.ID.String(), key.ID.String()))
-	})
-
-	return []*http.Cookie{sessionCookie(key)}
-}
-
-// tokenCases are well-formed tokens that the signature, the database or the
-// claims do not support. Each is the same 401.
-func tokenCases() []boundaryCase {
-	return []boundaryCase{
-		row("token: cut short", pathMe, tampered(cutShort), unauthenticated(0, "")),
-		row("token: signature changed", pathMe, tampered(flippedSignature), unauthenticated(1, "")),
-		row("token: another account's claims", pathMe, tampered(swappedPayload), unauthenticated(0, "")),
-		row("key: revoked", pathMe, afterStoring(revoked), unauthenticated(1, logNoKey)),
-		row("key: account revoked", pathMe, afterStoring(revoked), unauthenticated(1, logNoKey)),
-		row("key: expired row", pathMe, afterStoring(revoked), unauthenticated(1, logNoKey)),
-		row("key: never stored", pathMe, neverStored, unauthenticated(1, logNoKey)),
-		row("key: stored as an api key only", pathMe, foreignRow(auth.KindAPIKey, false), unauthenticated(1, logNoKey)),
-		// A store that forgot to filter by kind still cannot make an api key
-		// a session: the token's audience is signed.
-		row("key: api key from a store that ignores kind", pathMe, foreignRow(auth.KindAPIKey, true),
-			unauthenticated(1, "audience")),
-		row("key: subject is not the row's owner", pathMe, ownedBy(otherUserID), unauthenticated(1, logNotOwner)),
-		row("key: row holds another key", pathMe, anotherKeysRow, unauthenticated(1, "")),
-	}
-}
-
-// foreignIssuer is a session created under issuer, which is stored and would
-// verify but for its issuer.
-func foreignIssuer(issuer auth.Issuer) cookieFn {
-	return func(r *rig) []*http.Cookie {
-		key := r.createKey(issuer, auth.KindSession)
-		r.put(key, auth.KindSession)
-
-		return []*http.Cookie{sessionCookie(key)}
-	}
-}
-
-// issuerCases are issuers that are not this API's: refused before any read.
-func issuerCases() []boundaryCase {
-	bases := map[string]auth.Issuer{
-		"another origin":      {Base: "https://other.example.com/keys", Insecure: false},
-		"another path":        {Base: apiOrigin + "/other", Insecure: false},
-		"the origin itself":   {Base: apiOrigin, Insecure: false},
-		"another scheme":      {Base: localIssuer, Insecure: true},
-		"a subdomain":         {Base: "https://evil.auth.example.com/keys", Insecure: false},
-		"a suffix of the API": {Base: "https://auth.example.com.evil.test/keys", Insecure: false},
-	}
-
-	cases := make([]boundaryCase, 0, len(bases))
-
-	for name, issuer := range bases {
-		cases = append(cases, row("issuer: "+name, pathMe, foreignIssuer(issuer), unauthenticated(0, "issuer")))
-	}
-
-	return cases
-}
-
-// forgedClaims is a correctly signed session token whose claims mutate changed,
-// with its row stored, so the one changed claim is the only reason to refuse
-// it.
-func forgedClaims(mutate func(map[string]any)) cookieFn {
-	return func(r *rig) []*http.Cookie {
-		token := forge(r.t, r.issuer, r.now, mutate)
-		r.storeForged(token, userID, auth.RoleAdmin)
-
-		return []*http.Cookie{requestCookie(auth.CookieName, token.JWT)}
-	}
-}
-
-func without(claim string) func(map[string]any) {
-	return func(claims map[string]any) { delete(claims, claim) }
-}
-
-func with(claim string, value any) func(map[string]any) {
-	return func(claims map[string]any) { claims[claim] = value }
-}
-
-func claimRow(name string, mutate func(map[string]any), want outcome) boundaryCase {
-	return row("claims: "+name, pathMe, forgedClaims(mutate), want)
-}
-
-func claimCases() []boundaryCase {
-	past := time.Now().Add(-time.Minute).Unix()
-	future := time.Now().Add(time.Hour).Unix()
-	otherKid := apiOrigin + "/keys/" + otherItemID
+	wrongForCookie := unauthenticated(0, input.CodeInvalidSessionToken)
+	wrongForBearer := unauthenticated(0, input.CodeInvalidAPIKey).viaKey()
 
 	return []boundaryCase{
-		claimRow("control: nothing wrong", nil, ok(1)),
-		claimRow("expired", with(claimExp, past), unauthenticated(0, "expired")),
-		claimRow("no expiry", without(claimExp), unauthenticated(0, "expiration")),
-		claimRow("not yet valid", with("nbf", future), unauthenticated(0, "not yet valid")),
-		claimRow("issued in the future", with(claimIat, future), unauthenticated(0, "future")),
-		claimRow("no issued-at", without(claimIat), unauthenticated(0, "issued-at")),
-		claimRow("another audience", with(claimAud, audForAPI), unauthenticated(1, "audience")),
-		claimRow("no audience", without(claimAud), unauthenticated(1, "")),
-		claimRow("audience among others", with(claimAud, []string{"x", audSession}), ok(1)),
-		claimRow("unsupported version", with(claimVer, "japikey-v9"), unauthenticated(0, "version")),
-		claimRow("no version", without(claimVer), unauthenticated(0, "version")),
-		claimRow("no subject", without(claimSub), unauthenticated(0, "subject")),
-		claimRow("empty subject", with(claimSub, ""), unauthenticated(0, "subject")),
-		claimRow("subject is not a string", with(claimSub, 7), unauthenticated(0, "subject")),
-		claimRow("another account's subject", with(claimSub, otherUserID), unauthenticated(1, logNotOwner)),
-		claimRow("issuer names another kid", with(claimIss, otherKid), unauthenticated(0, "issuer")),
-		claimRow("no issuer", without(claimIss), unauthenticated(0, "issuer")),
+		rowOf("kind: a session token as a bearer", pathMe, asBearer(sessionToken), wrongForBearer),
+		row("kind: an API key in the session cookie", pathMe, inCookie(keyToken), wrongForCookie),
+		rowOf("kind: an invitation token as a bearer", pathMe, asBearer(invitation), wrongForBearer),
+		row("kind: an invitation token in the session cookie", pathMe, inCookie(invitation), wrongForCookie),
+		// The same random body under another tag is another token entirely: it
+		// parses as that kind, and the store is asked, and finds nothing.
+		rowOf("kind: a stored session's body under the key tag", pathMe,
+			asBearer(bodyUnder(sessionToken, secret.TagAPIKey)), unauthenticated(1, logNotActive).viaKey()),
+		row("kind: a stored key's body under the session tag", pathMe,
+			inCookie(func(r *rig) string {
+				return secret.Prefix(secret.TagSession) + strings.TrimPrefix(keyToken(r), secret.Prefix(secret.TagAPIKey))
+			}), unauthenticated(1, logNotActive)),
+	}
+}
+
+// inactiveCases are well-formed tokens of the right kind that the store does
+// not report as active. The store owns the predicate (expiry, revocation, the
+// account's and the agent's standing, the kind), so the boundary can only see
+// that nothing was found, and that is always the same 401. Each is read once, at
+// the injected clock.
+func inactiveCases() []boundaryCase {
+	unknownKey := func(r *rig) string { return "Bearer " + r.issueKey().Token }
+	storedKey := func(r *rig) auth.Issued { return r.apiKey(bearerSpec{scope: list(), agent: agentOne}) }
+	gone := unauthenticated(1, logNotActive)
+
+	return []boundaryCase{
+		row("inactive: a session that was never stored", pathMe,
+			func(r *rig) []*http.Cookie { return []*http.Cookie{sessionCookie(r.issueSession())} }, gone),
+		row("inactive: a session that was revoked", pathMe, afterStoring(revoked), gone),
+		row("inactive: a session that expired", pathMe, afterStoring(revoked), gone),
+		row("inactive: a session of a revoked account", pathMe, afterStoring(revoked), gone),
+		rowOf("inactive: a key that was never stored", pathMe, header(unknownKey), gone.viaKey()),
+		rowOf("inactive: a key that was revoked", pathMe, func(r *rig) carried {
+			issued := r.apiKey(bearerSpec{scope: list()})
+			r.unstore(issued)
+
+			return carried{headers: []string{bearer(issued)}, cookies: nil}
+		}, gone.viaKey()),
+		rowOf("inactive: a key of a revoked account", pathMe, func(r *rig) carried {
+			issued := r.apiKey(bearerSpec{scope: list()})
+			r.unstore(issued)
+
+			return carried{headers: []string{bearer(issued)}, cookies: nil}
+		}, gone.viaKey()),
+		rowOf("inactive: a key of a revoked agent", pathMe, func(r *rig) carried {
+			issued := storedKey(r)
+			r.unstore(issued)
+
+			return carried{headers: []string{bearer(issued)}, cookies: nil}
+		}, gone.viaKey()),
 	}
 }
 
@@ -510,42 +591,28 @@ func classified(kind apierr.Kind, code string) *apierr.Error {
 func internalOutcome() outcome {
 	return outcome{
 		status: http.StatusInternalServerError, body: bodyInternal, code: store.CodeSessionVerifyRejected,
-		cause: errDB, logContains: "", handled: false, storeCalls: 1,
+		cause: errDB, logContains: "", handled: false, storeCalls: 1, kind: auth.KindSession,
 	}
 }
 
 // oursCases are failures of ours: they say nothing about the token, so they are
 // never a 401.
 func oursCases() []boundaryCase {
-	badJWK := func(name, jwk string) boundaryCase {
-		return row("ours: stored jwk "+name, pathMe, rowWithJWK(jwk), unavailable(1, nil, logBadStored))
-	}
-
-	otherKidJWK := afterStoring(func(r *rig, key auth.Key) {
-		r.setRow(key, func(row *store.ActiveKey) {
-			row.JWK = []byte(strings.ReplaceAll(key.JWK, key.ID.String(), otherItemID))
-		})
-	})
-
 	return []boundaryCase{
-		row("ours: store failure", pathMe, failing(errDB), unavailable(1, errDB, "on fire")),
+		row("ours: store failure", pathMe, failing(errDB), unavailable(errDB, "on fire")),
 		row("ours: store failure, classified", pathMe, failing(classified(apierr.Unavailable, store.CodeSessionVerifyFailed)),
-			unavailable(1, errDB, "on fire")),
+			unavailable(errDB, "on fire")),
 		row("ours: store rejected the read", pathMe, failing(classified(apierr.Internal, store.CodeSessionVerifyRejected)),
 			internalOutcome()),
-		row("ours: the request was cancelled", pathMe, valid, unavailable(0, nil, "timed out")).gone(),
-		badJWK("is not json", "garbage"),
-		badJWK("is empty", ""),
-		badJWK("has no keys", `{"keys":[]}`),
-		badJWK("is an array", `[]`),
-		badJWK("is null", `null`),
-		badJWK("is a private-only fragment", `{"keys":[{"kty":"EC","d":"x"}]}`),
-		row("ours: stored jwk is for another kid", pathMe, otherKidJWK, unavailable(1, nil, logBadStored)),
+		row("ours: the request was cancelled", pathMe, valid, unavailable(context.Canceled, "canceled")).gone(),
 	}
 }
 
-// configCases: configuration is read first, so without it nothing else is
-// looked at and the answer does not depend on the cookie.
+// configCases: verifying a credential does not read the deployment's
+// configuration, because a token carries nothing to check against it. A route
+// that needs configuration asks for it itself (Call.Config), and is answered
+// not_configured by its own handler. So the credential's outcome never depends
+// on the deployment's settings.
 func configCases() []boundaryCase {
 	deployments := map[string]map[string]string{
 		"no secret":           noSecret(),
@@ -556,31 +623,22 @@ func configCases() []boundaryCase {
 		"no configuration":    nothingSet(),
 	}
 
-	cookies := map[string]cookieFn{"valid session": valid, nameNoCookie: nil, "garbage cookie": sessionValue("garbage")}
-	cases := make([]boundaryCase, 0, (len(cookies)+1)*len(deployments))
+	cases := make([]boundaryCase, 0, 6*len(deployments))
 
 	for name, env := range deployments {
-		for cookieName, cookie := range cookies {
-			cases = append(cases, row("config: "+name+", "+cookieName, pathMe, cookie, notConfigured()).inDeployment(env))
-		}
-
-		cases = append(cases, row("config: "+name+", admin route", pathAdmin, valid, notConfigured()).inDeployment(env))
+		cases = append(cases,
+			row("config: "+name+", valid session", pathMe, valid, ok(1)).inDeployment(env),
+			row("config: "+name+", valid session, admin route", pathAdmin, valid, ok(1)).inDeployment(env),
+			rowOf("config: "+name+", valid key", pathMe, validKey, ok(1).viaKey()).inDeployment(env),
+			row("config: "+name+", "+nameNoCookie, pathMe, nil, unauthenticated(0, logNoCredential)).inDeployment(env),
+			row("config: "+name+", garbage cookie", pathMe, sessionValue("garbage"),
+				unauthenticated(0, input.CodeInvalidSessionToken)).inDeployment(env),
+			row("config: "+name+", revoked session", pathMe, afterStoring(revoked),
+				unauthenticated(1, logNotActive)).inDeployment(env),
+		)
 	}
 
 	return cases
-}
-
-// localhostCases: a localhost API is plain http, and only then.
-func localhostCases() []boundaryCase {
-	local := auth.IssuerFor(mustOrigin(localOrigin))
-	here := settings(config.VarAPIOrigin, localOrigin)
-
-	return []boundaryCase{
-		row("localhost: a session over http", pathMe, foreignIssuer(local), ok(1)).inDeployment(here),
-		row("localhost: no cookie", pathMe, nil, unauthenticated(0, logNoCookie)).inDeployment(here),
-		row("localhost: a token for the https API", pathMe, valid, unauthenticated(0, "issuer")).inDeployment(here),
-		row("https: a token for the localhost API", pathMe, foreignIssuer(local), unauthenticated(0, "issuer")),
-	}
 }
 
 // requirementCases: a requirement is applied to a verified caller, after the
@@ -589,10 +647,10 @@ func requirementCases() []boundaryCase {
 	cases := make([]boundaryCase, 0, 12)
 	cases = append(cases,
 		row("admin: an administrator", pathAdmin, valid, ok(1)),
-		row("admin: no cookie is 401, not 403", pathAdmin, nil, unauthenticated(0, logNoCookie)),
+		row("admin: no cookie is 401, not 403", pathAdmin, nil, unauthenticated(0, logNoCredential)),
 		row("admin: garbage is 401, not 403", pathAdmin, sessionValue("garbage"), unauthenticated(0, "")),
-		row("admin: revoked is 401, not 403", pathAdmin, afterStoring(revoked), unauthenticated(1, logNoKey)),
-		row("admin: store failure is 503", pathAdmin, failing(errDB), unavailable(1, errDB, "")),
+		row("admin: revoked is 401, not 403", pathAdmin, afterStoring(revoked), unauthenticated(1, logNotActive)),
+		row("admin: store failure is 503", pathAdmin, failing(errDB), unavailable(errDB, "")),
 		row("member: allowed where any session is", pathMe, withRole(roleMember), ok(1)),
 		row("no role: allowed where any session is", pathMe, withRole(""), ok(1)),
 	)
@@ -618,26 +676,27 @@ func idRouteCases() []boundaryCase {
 
 	return []boundaryCase{
 		row("id: valid id, valid session", target, valid, ok(1)),
-		row("id: valid id, no cookie", target, nil, unauthenticated(0, logNoCookie)),
+		row("id: valid id, no cookie", target, nil, unauthenticated(0, logNoCredential)),
 		row("id: valid id, garbage", target, sessionValue("garbage"), unauthenticated(0, "")),
-		row("id: valid id, revoked", target, afterStoring(revoked), unauthenticated(1, logNoKey)),
-		row("id: valid id, no configuration", target, valid, notConfigured()).inDeployment(noSecret()),
+		row("id: valid id, revoked", target, afterStoring(revoked), unauthenticated(1, logNotActive)),
+		row("id: valid id, no configuration", target, valid, ok(1)).inDeployment(noSecret()),
 	}
 }
 
 // TestBoundaryMatrix is the credential x requirement x outcome table: every
-// way a request can present, or fail to present, a session, against a route that
-// is open, one that needs a session, and one that needs an administrator. The
-// route must run only for the cases that pass every check, and the store must
-// be read only when the token has got far enough to name a key.
+// way a request can present, or fail to present, a session or an API key,
+// against a route that is open, one that needs a credential, and one that needs
+// an administrator. The route must run only for the cases that pass every
+// check, the store must be read only when the token has parsed as the kind its
+// carrier accepts, and every refusal of a credential is the same 401.
 func TestBoundaryMatrix(t *testing.T) {
 	t.Parallel()
 
 	var cases []boundaryCase
 
 	for _, group := range [][]boundaryCase{
-		noneCases(), cookieCases(), tokenShapeCases(), tokenCases(), issuerCases(),
-		claimCases(), oursCases(), configCases(), localhostCases(), requirementCases(), idRouteCases(),
+		noneCases(), cookieCases(), bearerCases(), bothCarriers(), shapeCases(), kindCases(), inactiveCases(),
+		oursCases(), configCases(), requirementCases(), idRouteCases(),
 	} {
 		cases = append(cases, group...)
 	}
@@ -659,13 +718,97 @@ func TestBoundaryMatrix(t *testing.T) {
 	}
 }
 
-// mustOrigin is a validated origin for building a case table, where there is no
-// test to fail: a bad constant is a mistake in this file.
-func mustOrigin(value string) config.Origin {
-	parsed, err := config.ParseOrigin(value)
-	if err != nil {
-		panic(err)
+// refusalCases are the cases that are a refusal of the credential.
+func refusalCases() []boundaryCase {
+	var refusals []boundaryCase
+
+	for _, group := range [][]boundaryCase{
+		cookieCases(), bearerCases(), bothCarriers(), shapeCases(), kindCases(), inactiveCases(),
+	} {
+		for _, tc := range group {
+			if tc.want.status == http.StatusUnauthorized && !tc.cancelled {
+				refusals = append(refusals, tc)
+			}
+		}
 	}
 
-	return parsed
+	return refusals
+}
+
+// checkRefusal checks that the case is answered with exactly bodyUnauthenticated
+// and nothing else, without running the route or reading the store more than
+// once.
+func (c boundaryCase) checkRefusal(t *testing.T) {
+	t.Helper()
+
+	r := newRig(t).with(c.env)
+
+	rec := r.serveCtx(r.standardRoutes(), c.target, c.presented(r), false)
+
+	if rec.Code != http.StatusUnauthorized || len(r.handled) != 0 {
+		t.Errorf("%s: status %d, route ran %d times", c.name, rec.Code, len(r.handled))
+	}
+
+	if !bytes.Equal(rec.Body.Bytes(), []byte(bodyUnauthenticated)) {
+		t.Errorf("%s: body = %q, want exactly %q", c.name, rec.Body.Bytes(), bodyUnauthenticated)
+	}
+
+	if rec.Header().Get("Set-Cookie") != "" || rec.Header().Get("WWW-Authenticate") != "" {
+		t.Errorf("%s: headers = %v: a refusal says nothing but the body", c.name, rec.Header())
+	}
+
+	if len(r.creds.calls) > 1 {
+		t.Errorf("%s: the store was read %d times", c.name, len(r.creds.calls))
+	}
+}
+
+// TestEveryRefusalIsTheSameBytes: whatever was wrong with the credential, the
+// client gets the same status, the same body and the same headers, byte for
+// byte, so a response is not an oracle for whether a credential exists, was
+// revoked or expired, or was of the wrong kind. Only a failure of ours differs.
+func TestEveryRefusalIsTheSameBytes(t *testing.T) {
+	t.Parallel()
+
+	refusals := refusalCases()
+	if len(refusals) < 60 {
+		t.Fatalf("only %d refusal cases were collected", len(refusals))
+	}
+
+	for _, tc := range refusals {
+		tc.checkRefusal(t)
+	}
+}
+
+// TestTheClockIsPassedToTheStore: the store decides what is expired or
+// revoked, and the boundary tells it when "now" is, each request, from Deps.Now.
+func TestTheClockIsPassedToTheStore(t *testing.T) {
+	t.Parallel()
+
+	r := newRig(t)
+	issued := r.session()
+	key := r.apiKey(bearerSpec{scope: list()})
+
+	first := r.now
+	second := first.Add(36 * time.Hour)
+
+	r.get(pathMe, sessionCookie(issued))
+
+	r.now = second
+
+	r.serveWith(r.standardRoutes(), pathMe, []string{bearer(key)}, nil)
+
+	want := []credentialCall{
+		{kind: auth.KindSession, token: issued.Token, now: first},
+		{kind: auth.KindAPIKey, token: key.Token, now: second},
+	}
+
+	if len(r.creds.calls) != len(want) {
+		t.Fatalf("store reads = %+v, want %+v", r.creds.calls, want)
+	}
+
+	for i, call := range r.creds.calls {
+		if call.kind != want[i].kind || call.token != want[i].token || !call.now.Equal(want[i].now) {
+			t.Errorf("read %d = %+v, want %+v", i, call, want[i])
+		}
+	}
 }

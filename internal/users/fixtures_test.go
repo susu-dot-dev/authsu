@@ -2,8 +2,11 @@ package users_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -21,14 +24,14 @@ import (
 )
 
 // This file is the package's one fixtures file: the fakes of the account store
-// and of the key store, and the rig that builds the real boundary around the
-// routes under test.
+// and of the credential store, and the rig that builds the real boundary around
+// the routes under test.
 
 // The real *store.Store is what runs in production, so it must satisfy the
 // interfaces the routes and the boundary use.
 var (
-	_ users.Store    = (*store.Store)(nil)
-	_ auth.KeyReader = (*store.Store)(nil)
+	_ users.Store           = (*store.Store)(nil)
+	_ auth.CredentialReader = (*store.Store)(nil)
 )
 
 // Causes the tests inject. They are only ever in the log, never in a response.
@@ -48,6 +51,10 @@ const (
 	invitationID = "01890000-0000-7000-8000-0000000000bb"
 
 	profileAda = `{"name":"Ada"}`
+
+	// sessionBody is a canonical token body (43 base64url characters, the last
+	// with its two unused low bits zero) that no issued session has.
+	sessionBody = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefA"
 
 	collection = "/api/user"
 	itemPrefix = "/api/user/"
@@ -141,26 +148,53 @@ func (f *fakeStore) RevokeUser(_ context.Context, id input.ID, adminRole string,
 	return f.revoked, f.revokeErr
 }
 
-// fakeKeys is the key store the boundary verifies sessions against: the rows
-// the database would hold, by kid.
-type fakeKeys struct {
-	rows map[string]store.ActiveKey
+// fakeCredentials is the credential store the boundary verifies sessions
+// against: the active sessions the database would hold, by token, as the store
+// reports them after applying its own active predicate (the SQL runs only in
+// e2e). It records every read, so a test can assert that a refused request cost
+// none.
+type fakeCredentials struct {
+	rows map[string]store.ActiveSession
 	// err, when set, is what every read fails with.
 	err error
+	// reads is how many times the store was asked to resolve a credential.
+	reads int
 }
 
-func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, _ time.Time) (store.ActiveKey, bool, error) {
+func (f *fakeCredentials) ResolveSession(
+	_ context.Context, token input.SessionToken, _ time.Time,
+) (store.ActiveSession, bool, error) {
+	f.reads++
+
 	if f.err != nil {
-		return store.ActiveKey{}, false, f.err
+		return store.ActiveSession{}, false, f.err
 	}
 
-	if kind != auth.KindSession {
-		return store.ActiveKey{}, false, nil
-	}
-
-	row, ok := f.rows[kid]
+	row, ok := f.rows[token.String()]
 
 	return row, ok, nil
+}
+
+// ResolveAPIKey finds no key: these routes are exercised through sessions, and
+// a key presented to them is unknown.
+func (f *fakeCredentials) ResolveAPIKey(
+	context.Context, input.APIKeyToken, time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	f.reads++
+
+	return store.ActiveAPIKey{}, false, f.err
+}
+
+// sequence is deterministic entropy: each read returns bytes that differ from
+// every other read's, so each issued token is distinct.
+type sequence struct{ reads uint64 }
+
+func (s *sequence) Read(p []byte) (int, error) {
+	s.reads++
+
+	sum := sha256.Sum256(binary.BigEndian.AppendUint64(nil, s.reads))
+
+	return copy(p, sum[:]), nil
 }
 
 // rig is one deployment under test: the real boundary over the account routes
@@ -168,10 +202,11 @@ func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, _ time.Time) (
 type rig struct {
 	t     *testing.T
 	store *fakeStore
-	keys  *fakeKeys
+	creds *fakeCredentials
 	// now is the clock of both the boundary and the routes.
-	now    time.Time
-	issuer auth.Issuer
+	now     time.Time
+	entropy *sequence
+	ids     int
 	// logged records every error the boundary turned into a response.
 	logged  []*apierr.Error
 	handler http.Handler
@@ -179,6 +214,13 @@ type rig struct {
 
 // log records an error the boundary or a handler logged.
 func (r *rig) log(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) }
+
+// newID is the id source sessions are issued with: distinct UUID-shaped values.
+func (r *rig) newID() string {
+	r.ids++
+
+	return fmt.Sprintf("01890000-0000-7000-8000-%012x", 0x1000+r.ids)
+}
 
 func newRig(t *testing.T) *rig {
 	t.Helper()
@@ -189,17 +231,13 @@ func newRig(t *testing.T) *rig {
 		config.VarUIOrigin:  "https://example.com",
 	}
 
-	api, err := config.ParseOrigin(env[config.VarAPIOrigin])
-	if err != nil {
-		t.Fatalf("origin: %v", err)
-	}
-
 	rg := &rig{
 		t:       t,
 		store:   &fakeStore{},
-		keys:    &fakeKeys{rows: map[string]store.ActiveKey{}},
+		creds:   &fakeCredentials{rows: map[string]store.ActiveSession{}},
 		now:     time.Now(),
-		issuer:  auth.IssuerFor(api),
+		entropy: &sequence{reads: 0},
+		ids:     0,
 		logged:  nil,
 		handler: nil,
 	}
@@ -207,30 +245,31 @@ func newRig(t *testing.T) *rig {
 	clock := func() time.Time { return rg.now }
 
 	rg.handler = auth.Handler(users.Routes(users.Deps{Store: rg.store, Now: clock, Log: rg.log}), auth.Deps{
-		Keys:   rg.keys,
-		Now:    clock,
-		Getenv: func(name string) string { return env[name] },
-		Log:    rg.log,
+		Credentials: rg.creds,
+		Now:         clock,
+		Getenv:      func(name string) string { return env[name] },
+		Log:         rg.log,
 	})
 
 	return rg
 }
 
-// signIn creates a real session for owner, whose account has role, stores its
-// row as login would, and returns the cookie a browser sends back.
+// signIn issues a real session token for owner, whose account has role, stores
+// its row as the credential store would report it, and returns the cookie a
+// browser sends back.
 func (r *rig) signIn(owner, role string) *http.Cookie {
 	r.t.Helper()
 
-	key, err := auth.CreateSession(r.issuer, owner, r.now.Add(auth.SessionLifetime))
+	issued, err := auth.IssueSession(r.entropy, r.newID, r.now)
 	if err != nil {
-		r.t.Fatalf("CreateSession: %v", err)
+		r.t.Fatalf("IssueSession: %v", err)
 	}
 
-	r.keys.rows[key.ID.String()] = store.ActiveKey{
-		JWK: []byte(key.JWK), UserID: owner, CredentialID: "", Role: role, ExpiresAt: key.ExpiresAt,
+	r.creds.rows[issued.Token] = store.ActiveSession{
+		ID: issued.ID, UserID: owner, Role: role, ExpiresAt: issued.ExpiresAt,
 	}
 
-	return sessionCookie(key.JWT)
+	return sessionCookie(issued.Token)
 }
 
 // sessionCookie is the session cookie as a browser returns it: only a name and a

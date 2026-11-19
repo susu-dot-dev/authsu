@@ -1,12 +1,12 @@
 # Agents: design direction
 
-> This document sets out the intended direction for agents and *why*. It is not a spec. Do not add details of features to this document, only descrcibe overall intent if it changes
+> This document sets out the intended direction for agents and *why*. It is not a spec. Do not add details of features to this document, only describe overall intent if it changes.
 
-Related: [permissions_design.md](permissions_design.md), [invitations_design.md](invitations_design.md), [users_design.md](users_design.md), [login_design.md](login_design.md)
+Related: [permissions_design.md](permissions_design.md), [secrets_design.md](secrets_design.md), [invitations_design.md](invitations_design.md), [users_design.md](users_design.md), [login_design.md](login_design.md)
 
 ## The problem
 
-A user wants software to act for them: an assistant, a scheduled job, an integration in another service. Today the only way to allow that is to hand over the user's own credential, and then the software *is* the user. It can do everything the user can, its requests look like theirs, and the only way to stop it is to stop the user.
+A user wants software to act for them: an assistant, a scheduled job, an integration in another service. Without agents, the only way to allow that is to hand over the user's own credential, and then the software *is* the user. It can do everything the user can, its requests look like theirs, and the only way to stop it is to stop the user.
 
 An agent is software acting on one user's behalf. It has its own identity and credentials, so it can be told apart, limited and stopped, but it always acts *as* its user, never as someone in its own right.
 
@@ -53,18 +53,18 @@ Some authority is never delegated at all. Managing principals (inviting users, a
 
 An agent has a stable identity and any number of credentials that let it act:
 
-- **API keys scoped to the agent**, using the same japikey mechanism as sessions ([login_design.md](login_design.md)).
-- **OAuth login**, for agents that live in other services and fit a standard authorization flow better than a pasted key.
+- **API keys scoped to the agent**, which are [secrets](secrets_design.md) like every other credential.
+- **OAuth grants**, for agents that live in other services and fit a standard authorization flow better than a pasted key.
 
-As with invitations, the credential is not the identity. A key can be rotated or revoked without touching the agent. Revoking the agent ends all of its credentials, and the audit trail names a stable agent rather than whichever key was in use.
+As with invitations, the credential is not the identity. A key can be rotated or revoked without touching the agent. Revoking the agent ends all of its credentials, and the audit trail names a stable agent rather than whichever credential was in use.
 
-## Tokens: subject and actor
+## Subject and actor
 
-A token an agent presents follows the actor model of OAuth token exchange (RFC 8693): the subject (`sub`) is the user, and an actor claim (`act`) names the agent.
+Every credential an agent holds names two parties: the subject, which is the user, and the actor, which is the agent. Where authsu issues a token for another service to verify, it carries the same two parties, following the actor model of OAuth token exchange (RFC 8693): the subject (`sub`) is the user, and an actor claim (`act`) names the agent.
 
-This is the central decision written into the token. The subject is the party whose authority is being used and who holds access, and that is always a user. The actor is who is exercising it, and it can only narrow what the subject may do. A service checking access asks the same question it would for the user ("may this user do this?"), then applies the agent's limits. A service that knows nothing about agents still sees a user, and so cannot mistake an agent for an independent party.
+This is the central decision. The subject is the party whose authority is being used and who holds access, and that is always a user. The actor is who is exercising it, and it can only narrow what the subject may do. A service checking access asks the same question it would for the user ("may this user do this?"), then applies the agent's limits. A service that knows nothing about agents still sees a user, and so cannot mistake an agent for an independent party.
 
-It also fits what already exists: a key's subject is a user, and keys die with the account, so an agent's keys end with its user without any extra rule.
+It also means a credential belongs to its user, so an agent's credentials end with its user without any extra rule.
 
 ## Effective permissions
 
@@ -95,4 +95,4 @@ These scopes only ever subtract from the user's access. They never stand alone, 
 ## Open questions
 
 - How OAuth agents and user consent fit together.
-- Whether a user may create further keys for an existing agent, once keys can be verified and scoped.
+- Whether a user may issue further keys for an existing agent.

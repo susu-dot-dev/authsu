@@ -24,11 +24,14 @@ package e2e_test
 //     blocks the Worker's writer.
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -150,20 +153,28 @@ func refused(t *testing.T, query string, args ...any) bool {
 	return err != nil
 }
 
-// tableAgents is named because several tests count it.
+// Tables the tests name. Several are counted by many tests.
 const (
 	tableAgents      = "agents"
 	tableLabels      = "agent_labels"
 	tableCredentials = "credentials"
-	tableKeys        = "japikeys"
+	tableKeys        = "api_keys"
+	tableSessions    = "sessions"
+	tableSecrets     = "secrets"
 	tableUsers       = "users"
 	tableInvitations = "invitations"
 )
 
-// tables are every table a test may leave rows in, children first so a foreign
-// key never blocks a delete.
+// tables are every table a test may leave rows in, in the order that empties
+// them without a foreign key ever blocking a delete: a kind's own tables first,
+// then the owners they point at, and last the secrets that no kind row holds
+// any more. users go before invitations because users.invitation_id has no
+// ON DELETE action. Deleting a session or a key also deletes its secret (a
+// trigger), so by the time secrets is emptied it only removes strays.
 func tables() []string {
-	return []string{tableKeys, tableLabels, tableAgents, tableCredentials, tableUsers, tableInvitations}
+	return []string{
+		tableKeys, tableLabels, tableAgents, tableSessions, tableCredentials, tableUsers, tableInvitations, tableSecrets,
+	}
 }
 
 // reset empties every table, so a test starts from a fresh deployment whatever
@@ -174,4 +185,179 @@ func reset(t *testing.T) {
 	for _, table := range tables() {
 		seed(t, "DELETE FROM "+table)
 	}
+}
+
+// firstRow returns the columns of the first row as text, and whether there was a
+// row. A NULL is "". Use it to read several columns in one statement.
+func firstRow(t *testing.T, query string, args ...any) ([]string, bool) {
+	t.Helper()
+
+	rows, err := database(t).QueryContext(t.Context(), query, args...)
+	if err != nil {
+		t.Fatalf("query %q: %v", query, err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("columns of %q: %v", query, err)
+	}
+
+	if !rows.Next() {
+		err = rows.Err()
+		if err != nil {
+			t.Fatalf("query %q: %v", query, err)
+		}
+
+		return nil, false
+	}
+
+	cells := make([]sql.NullString, len(columns))
+	targets := make([]any, len(columns))
+
+	for i := range cells {
+		targets[i] = &cells[i]
+	}
+
+	err = rows.Scan(targets...)
+	if err != nil {
+		t.Fatalf("scan %q: %v", query, err)
+	}
+
+	out := make([]string, len(cells))
+	for i, cell := range cells {
+		out[i] = cell.String
+	}
+
+	return out, true
+}
+
+// columnsHolding returns "table.column" for every column of every table that
+// holds any of the needles, as text or as bytes. It reads every table the
+// database has (sqlite_master), so a table added later is covered without
+// anyone remembering to list it. It is how a test shows that a value is stored
+// nowhere.
+func columnsHolding(t *testing.T, needles ...string) []string {
+	t.Helper()
+
+	names := rowsOf(t,
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name")
+	found := make([]string, 0, len(names))
+
+	for _, name := range names {
+		found = append(found, columnsHoldingIn(t, name, needles)...)
+	}
+
+	return found
+}
+
+// columnsHoldingIn is columnsHolding for one table.
+func columnsHoldingIn(t *testing.T, table string, needles []string) []string {
+	t.Helper()
+
+	columns := rowsOf(t, "SELECT name FROM pragma_table_info(?) ORDER BY cid", table)
+
+	quoted := make([]string, len(columns))
+	for i, column := range columns {
+		quoted[i] = `"` + column + `"`
+	}
+
+	rows, err := database(t).QueryContext(t.Context(), "SELECT "+strings.Join(quoted, ", ")+` FROM "`+table+`"`)
+	if err != nil {
+		t.Fatalf("read %s: %v", table, err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	seen := map[string]bool{}
+
+	for rows.Next() {
+		cells := make([]any, len(columns))
+		targets := make([]any, len(columns))
+
+		for i := range cells {
+			targets[i] = &cells[i]
+		}
+
+		err = rows.Scan(targets...)
+		if err != nil {
+			t.Fatalf("scan %s: %v", table, err)
+		}
+
+		for i, cell := range cells {
+			if cellHolds(cell, needles) {
+				seen[table+"."+columns[i]] = true
+			}
+		}
+	}
+
+	err = rows.Err()
+	if err != nil {
+		t.Fatalf("read %s: %v", table, err)
+	}
+
+	found := make([]string, 0, len(seen))
+	for name := range seen {
+		found = append(found, name)
+	}
+
+	sort.Strings(found)
+
+	return found
+}
+
+// cellHolds reports whether one stored value, as text or as bytes, contains any
+// of the needles.
+func cellHolds(cell any, needles []string) bool {
+	var data []byte
+
+	switch value := cell.(type) {
+	case string:
+		data = []byte(value)
+	case []byte:
+		data = value
+	default:
+		return false
+	}
+
+	for _, needle := range needles {
+		if needle != "" && bytes.Contains(data, []byte(needle)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// rowsOf returns the first column of every row as text.
+func rowsOf(t *testing.T, query string, args ...any) []string {
+	t.Helper()
+
+	rows, err := database(t).QueryContext(t.Context(), query, args...)
+	if err != nil {
+		t.Fatalf("query %q: %v", query, err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	var out []string
+
+	for rows.Next() {
+		var cell sql.NullString
+
+		err = rows.Scan(&cell)
+		if err != nil {
+			t.Fatalf("scan %q: %v", query, err)
+		}
+
+		out = append(out, cell.String)
+	}
+
+	err = rows.Err()
+	if err != nil {
+		t.Fatalf("query %q: %v", query, err)
+	}
+
+	return out
 }

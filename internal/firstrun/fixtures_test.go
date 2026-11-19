@@ -30,15 +30,18 @@ var _ firstrun.Store = (*store.Store)(nil)
 var (
 	errDB        = errors.New("SELECT EXISTS: database is on fire")
 	errNotScript = errors.New("FirstRunState was called more often than the test scripted")
-	errKeysRead  = errors.New("the key store was read")
+	errCredsRead = errors.New("the credential store was read")
 	// errLeaky is a store failure that quotes the secret, as a careless driver
 	// message might.
 	errLeaky = errors.New("INSERT INTO invitations ... " + validSecret)
 )
 
 const (
-	// validSecret is a generated-looking secret: 43 base64url characters.
-	validSecret = "k3Jx9Qp-Zr2_LmN8vB5tYcD1fGhWaXeUoIiS7dTqA0E"
+	// validBody is a canonical token body: 43 base64url characters whose last
+	// one has its two unused bits clear.
+	validBody = "k3Jx9Qp-Zr2_LmN8vB5tYcD1fGhWaXeUoIiS7dTqA0E"
+	// validSecret is a complete invitation token, a valid FIRST_RUN_SECRET.
+	validSecret = "susu_inv_" + validBody
 	generatedID = "01990000-0000-7000-8000-00000000abcd"
 	jsonType    = "application/json"
 
@@ -74,7 +77,7 @@ func requestCookie(name, value string) *http.Cookie {
 	return &http.Cookie{Name: name, Value: value}
 }
 
-// The exact bodies a client gets: the code and the fixed message are the
+// The exact bodies a client gets: the error code and the fixed message are the
 // contract, and a cause never appears.
 const (
 	bodyMissing  = `{"status":"missing_secret"}` + "\n"
@@ -109,10 +112,12 @@ type createAnswer struct {
 
 // createCall is one call of CreateFirstRunInvitation.
 type createCall struct {
-	id    string
-	code  string
-	label string
-	now   time.Time
+	id        string
+	token     string
+	hash      string
+	label     string
+	expiresAt time.Time
+	now       time.Time
 }
 
 // fakeStore is the first-run store. FirstRunState answers from a script, one
@@ -142,22 +147,34 @@ func (f *fakeStore) FirstRunState(context.Context) (store.FirstRunState, error) 
 }
 
 func (f *fakeStore) CreateFirstRunInvitation(
-	_ context.Context, id string, code input.InvitationCode, label string, now time.Time,
+	_ context.Context, id string, token input.InvitationToken, label string, expiresAt, now time.Time,
 ) (bool, error) {
 	f.calls = append(f.calls, callCreate)
-	f.creates = append(f.creates, createCall{id: id, code: code.String(), label: label, now: now})
+	f.creates = append(f.creates, createCall{
+		id: id, token: token.String(), hash: string(token.Hash()), label: label, expiresAt: expiresAt, now: now,
+	})
 
 	return f.create.created, f.create.err
 }
 
-// deadKeys is the key store of a boundary that must never read it: first-run is
-// a route with no credential.
-type deadKeys struct{ calls int }
+// deadCredentials is the credential store of a boundary that must never read
+// it: first-run is a route with no credential.
+type deadCredentials struct{ calls int }
 
-func (k *deadKeys) ActiveKey(context.Context, string, string, time.Time) (store.ActiveKey, bool, error) {
-	k.calls++
+func (c *deadCredentials) ResolveSession(
+	context.Context, input.SessionToken, time.Time,
+) (store.ActiveSession, bool, error) {
+	c.calls++
 
-	return store.ActiveKey{}, false, errKeysRead
+	return store.ActiveSession{}, false, errCredsRead
+}
+
+func (c *deadCredentials) ResolveAPIKey(
+	context.Context, input.APIKeyToken, time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	c.calls++
+
+	return store.ActiveAPIKey{}, false, errCredsRead
 }
 
 // rig is one deployment under test: the real boundary and the real route over a
@@ -165,7 +182,7 @@ func (k *deadKeys) ActiveKey(context.Context, string, string, time.Time) (store.
 type rig struct {
 	t     *testing.T
 	store *fakeStore
-	keys  *deadKeys
+	creds *deadCredentials
 	env   map[string]string
 	now   time.Time
 
@@ -183,7 +200,7 @@ func newRig(t *testing.T, states ...stateAnswer) *rig {
 	return &rig{
 		t:     t,
 		store: &fakeStore{t: t, states: states, create: createAnswer{created: false, err: nil}, calls: nil, creates: nil},
-		keys:  &deadKeys{calls: 0},
+		creds: &deadCredentials{calls: 0},
 		env:   map[string]string{},
 		now:   time.Date(2026, time.November, 17, 9, 15, 30, 123456789, time.UTC),
 		reads: map[string]int{},
@@ -210,8 +227,8 @@ func (r *rig) routes() []auth.Route {
 // handler is the real boundary over the real routes.
 func (r *rig) handler() http.Handler {
 	return auth.Handler(r.routes(), auth.Deps{
-		Keys: r.keys,
-		Now:  func() time.Time { return r.now },
+		Credentials: r.creds,
+		Now:         func() time.Time { return r.now },
 		Getenv: func(name string) string {
 			r.reads[name]++
 

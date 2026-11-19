@@ -51,7 +51,7 @@ func TestBeginSucceeds(t *testing.T) {
 		t.Errorf("cookies %v, logged %v: want none", rec.Result().Cookies(), r.logged)
 	}
 
-	if len(r.store.looked)+len(r.store.created)+len(r.sessions) != 0 {
+	if len(r.store.looked)+len(r.store.created)+len(r.issues) != 0 {
 		t.Error("begin touched the store or created a key: it must read and write nothing")
 	}
 }
@@ -187,7 +187,7 @@ func TestBeginFailures(t *testing.T) {
 
 			wantFailure(t, r, rec, tc.status, tc.response, tc.logged)
 
-			if len(r.store.looked)+len(r.store.created)+len(r.sessions) != 0 {
+			if len(r.store.looked)+len(r.store.created)+len(r.issues) != 0 {
 				t.Error("a begin that failed touched the store or created a key")
 			}
 		})

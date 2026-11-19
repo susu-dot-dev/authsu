@@ -1,6 +1,7 @@
 package registration_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -18,12 +19,17 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/registration"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 	"github.com/susu-dot-dev/authsu/internal/webauthn"
 )
 
 const (
 	ttl = registration.ChallengeTTL
+
+	// maxInvitationTokenBytes is the length of the only invitation token
+	// shape there is: the prefix and the body.
+	maxInvitationTokenBytes = len("susu_inv_") + secret.BodyLen
 
 	userID1 = "00000000-0000-7000-8000-000000000001"
 	rowID2  = "00000000-0000-7000-8000-000000000002"
@@ -48,7 +54,7 @@ func flipByte(i int) func(*testing.T, *rig, []byte) []byte {
 }
 
 // madeFor is a challenge the registration key made for the test's own choice of
-// expiry (relative to the clock), code and name, as a leaked key would let an
+// expiry (relative to the clock), token and name, as a leaked key would let an
 // attacker make.
 func madeFor(expires time.Duration, code, name string) func(*testing.T, *rig, []byte) []byte {
 	return func(t *testing.T, r *rig, _ []byte) []byte {
@@ -149,7 +155,7 @@ func (c finishCase) afterReads(redeems, creates int) finishCase {
 
 // shapeFailures are requests the decoder or a parser refuses.
 func shapeFailures() []finishCase {
-	return []finishCase{
+	cases := []finishCase{
 		badRequest("not JSON", "invalid_json", "request body is not valid JSON").rawBody("{"),
 		badRequest("empty body", "empty_body", "request body is empty").rawBody(" "),
 		badRequest("unknown member", "unknown_field", "request body has an unknown field").
@@ -164,13 +170,23 @@ func shapeFailures() []finishCase {
 			}),
 		badRequest("a name that is not UTF-8", "invalid_text", "request body has text that is not valid UTF-8").
 			rewriting(func(text string) string { return strings.Replace(text, testName, "Ali\xffce", 1) }),
-		badRequest("invalid code", codeInvalidInvitation, msgInvalidInvitation).
-			editing(func(b jsonBody) { b.set("invitationCode", "not a code") }),
 		badRequest("invalid name", codeInvalidName, msgInvalidName).
 			editing(func(b jsonBody) { b.set("name", "") }),
 		refusal("no configuration", http.StatusServiceUnavailable, codeNotConfigured, msgNotConfigured).
 			afterBegin(func(r *rig) { r.with(map[string]string{config.SecretHMAC: ""}) }),
 	}
+
+	// Every kind of malformed token: refused before the passkey is looked at
+	// and before the store is read.
+	tokens := invalidInvitationTokens()
+	malformedTokens := make([]finishCase, len(tokens))
+
+	for i, bad := range tokens {
+		malformedTokens[i] = badRequest("invalid token: "+bad.name, codeInvalidInvitation, msgInvalidInvitation).
+			editing(func(b jsonBody) { b.set("invitationCode", bad.value) })
+	}
+
+	return slices.Concat(cases, malformedTokens)
 }
 
 // envelopeFailures are credentials whose envelope is wrong.
@@ -311,9 +327,9 @@ func challengeFailures() []finishCase {
 
 			return forgeChallenge(t, r.config().LoginKey, r.now.Add(ttl), registrationAD(testCode, testName)...)
 		}),
-		badChallenge("made for another code").echoing(madeFor(ttl, otherCode, testName)),
+		badChallenge("made for another token").echoing(madeFor(ttl, otherCode, testName)),
 		badChallenge("made for another name").echoing(madeFor(ttl, testCode, "Bob")),
-		badChallenge("finished with another code than it began with").
+		badChallenge("finished with another token than it began with").
 			editing(func(b jsonBody) { b.set("invitationCode", otherCode) }),
 		badChallenge("finished with another name than it began with").
 			editing(func(b jsonBody) { b.set("name", "Bob") }),
@@ -565,8 +581,8 @@ func TestFinishSucceeds(t *testing.T) {
 
 			checkCreatedResponse(t, r, rec)
 
-			if len(r.store.redeemed)-before != 1 || r.store.redeemed[before] != (redeemCall{code: testCode, now: r.now}) {
-				t.Errorf("invitation lookups at finish = %v, want one for the code at now", r.store.redeemed[before:])
+			if len(r.store.redeemed)-before != 1 || r.store.redeemed[before] != wantRedeem(testCode, r.now) {
+				t.Errorf("invitation lookups at finish = %v, want one for the token at now", r.store.redeemed[before:])
 			}
 
 			wantAccount := store.NewAccount{
@@ -574,7 +590,7 @@ func TestFinishSucceeds(t *testing.T) {
 				UserHandle:      unb64(t, options.PublicKey.User.ID),
 				Role:            "admin",
 				Name:            mustName(t, testName),
-				Code:            mustCode(t, testCode),
+				Token:           mustToken(t, testCode),
 				InvitationType:  firstRun,
 				CredentialRowID: rowID2,
 				CredentialID:    a.credID,
@@ -587,6 +603,13 @@ func TestFinishSucceeds(t *testing.T) {
 
 			if len(r.store.created) != 1 || !sameAccount(r.store.created[0], wantAccount) {
 				t.Errorf("account written = %+v\nwant              %+v", r.store.created, wantAccount)
+			}
+
+			// The store looks the invitation up by this hash: the whole token
+			// as the client sent it.
+			if want := secret.Hash(testCode); len(r.store.created) != 1 ||
+				!bytes.Equal(r.store.created[0].Token.Hash(), want[:]) {
+				t.Errorf("account token hash = %x, want secret.Hash(%q)", r.store.created[0].Token.Hash(), testCode)
 			}
 		})
 	}
@@ -712,10 +735,10 @@ func TestFinishReplay(t *testing.T) {
 		t.Fatalf("account writes = %d, want 2", len(r.store.created))
 	}
 
-	// The replay is the same registration: same handle, credential and code.
+	// The replay is the same registration: same handle, credential and token.
 	got, want := r.store.created[1], r.store.created[0]
 	if string(got.UserHandle) != string(want.UserHandle) || string(got.CredentialID) != string(want.CredentialID) ||
-		got.Code != want.Code {
+		got.Token != want.Token {
 		t.Errorf("replayed write differs from the first: %+v vs %+v", got, want)
 	}
 }
@@ -767,13 +790,13 @@ func TestFinishBodyCapFitsEveryLegitimateRequest(t *testing.T) {
 	b64Len := func(n int) int { return base64.RawURLEncoding.EncodedLen(n) }
 
 	// Worst case JSON: every member at its limit, each byte of the name and
-	// code escaped as \u00XX (six bytes), and a full list of full-length
+	// token escaped as \u00XX (six bytes), and a full list of full-length
 	// transports.
 	biggest := b64Len(1023)*2 + // id, rawId
 		b64Len(webauthn.MaxClientDataJSON) +
 		b64Len(webauthn.MaxAttestationObject) +
 		b64Len(webauthn.MaxAttestationObject) + // the authenticatorData and publicKey copies
-		(input.MaxAccountNameBytes+input.MaxInvitationCodeBytes)*6 +
+		(input.MaxAccountNameBytes+maxInvitationTokenBytes)*6 +
 		webauthn.MaxTransports*(32+3) +
 		1024 // member names, braces, quotes, commas
 
@@ -785,7 +808,7 @@ func TestFinishBodyCapFitsEveryLegitimateRequest(t *testing.T) {
 		t.Errorf("MaxFinishBody = %d is not far below the default cap %d", registration.MaxFinishBody, httpapi.DefaultMaxBody)
 	}
 
-	if registration.MaxBeginBody <= (input.MaxAccountNameBytes+input.MaxInvitationCodeBytes)*6 {
+	if registration.MaxBeginBody <= (input.MaxAccountNameBytes+maxInvitationTokenBytes)*6 {
 		t.Errorf("MaxBeginBody = %d cannot hold a maximal begin request", registration.MaxBeginBody)
 	}
 }

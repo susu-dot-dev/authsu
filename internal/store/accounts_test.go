@@ -16,7 +16,7 @@ const (
 )
 
 // TestRedeemableInvitationType holds how the invitation lookup is read: the type
-// when the code is redeemable, nothing otherwise.
+// when the token is redeemable, nothing otherwise.
 func TestRedeemableInvitationType(t *testing.T) {
 	t.Parallel()
 
@@ -37,7 +37,7 @@ func TestRedeemableInvitationType(t *testing.T) {
 
 			fake := newFake(returning(test.rows...))
 
-			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustCode(t, "code-1"), now)
+			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), now)
 
 			checkErr(t, err, nil)
 
@@ -71,7 +71,7 @@ func TestRedeemableInvitationTypeDefects(t *testing.T) {
 
 			fake := newFake(returning(test.rows...))
 
-			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustCode(t, "code-1"), now)
+			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), now)
 
 			checkErr(t, err, defectOf(store.CodeInvitationCheckRejected))
 
@@ -82,28 +82,31 @@ func TestRedeemableInvitationTypeDefects(t *testing.T) {
 	}
 }
 
-// TestRedeemableInvitationTypeStatement pins the conditions that make a code
-// redeemable and the arguments in placeholder order. The code is looked up by
-// its hash, and the first-run type is an argument.
+// TestRedeemableInvitationTypeStatement pins the conditions that make a token
+// redeemable and the arguments in placeholder order. The invitation is found by
+// its secret's hash and kind (the kind is an argument, never a literal), the
+// secret must be active by the one shared predicate, and the first-run type is
+// an argument too.
 func TestRedeemableInvitationTypeStatement(t *testing.T) {
 	t.Parallel()
 
 	fake := newFake(returning())
-	code := mustCode(t, "code-1")
+	token := mustInvitationToken(t, 1)
 
-	_, _, err := fake.store().RedeemableInvitationType(context.Background(), code, now)
+	_, _, err := fake.store().RedeemableInvitationType(context.Background(), token, now)
 	checkErr(t, err, nil)
 
 	checkStatements(t, fake, wantStatement{
 		fragments: []string{
-			"SELECT i.type AS type FROM invitations i",
-			"WHERE i.code_hash = ?",
-			"AND i.revoked_at IS NULL",
-			"AND (i.expires_at IS NULL OR i.expires_at > ?)",
+			"SELECT i.type AS type FROM secrets s",
+			"JOIN invitations i ON i.id = s.id AND i.kind = s.kind",
+			"WHERE s.hash = ?",
+			"AND s.kind = ?",
+			"AND " + activeFragment,
 			"AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites",
 			"AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))",
 		},
-		args: []any{code.Hash(), now.Unix(), store.InvitationFirstRun},
+		args: []any{token.Hash(), store.KindInvitation, now.Unix(), now.Unix(), store.InvitationFirstRun},
 	})
 }
 
@@ -113,7 +116,7 @@ func TestRedeemableInvitationTypeFailures(t *testing.T) {
 
 	runFailures(t, 1, store.CodeInvitationCheckFailed, store.CodeInvitationCheckRejected, registrationDescription,
 		func(s *store.Store) error {
-			return lastErr2(s.RedeemableInvitationType(context.Background(), mustCode(t, "code-1"), now))
+			return lastErr2(s.RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), now))
 		})
 }
 
@@ -124,7 +127,7 @@ func newAccount(t *testing.T, edit func(*store.NewAccount)) store.NewAccount {
 
 	account := store.NewAccount{
 		UserID: "user-1", UserHandle: []byte{1, 2, 3}, Role: "admin", Name: mustName(t, "Ann"),
-		Code: mustCode(t, "code-1"), InvitationType: "member",
+		Token: mustInvitationToken(t, 1), InvitationType: "member",
 		CredentialRowID: "cred-row-1", CredentialID: []byte{4, 5}, PublicKey: []byte{6, 7, 8}, Flags: 0x45,
 		AAGUID: aaguid, Transports: []string{"usb"}, CreatedAt: now,
 	}
@@ -152,11 +155,12 @@ func TestCreateAccountStatements(t *testing.T) {
 
 	userFragments := []string{
 		"INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at)",
-		"SELECT ?, ?, ?, i.id, ?, ? FROM invitations i",
-		"WHERE i.code_hash = ?",
+		"SELECT ?, ?, ?, i.id, ?, ? FROM secrets s",
+		"JOIN invitations i ON i.id = s.id AND i.kind = s.kind",
+		"WHERE s.hash = ?",
+		"AND s.kind = ?",
 		"AND i.type = ?",
-		"AND i.revoked_at IS NULL",
-		"AND (i.expires_at IS NULL OR i.expires_at > ?)",
+		"AND " + activeFragment,
 		"AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites",
 		"AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))",
 	}
@@ -208,7 +212,8 @@ func TestCreateAccountStatements(t *testing.T) {
 					fragments: userFragments,
 					args: []any{
 						"user-1", []byte{1, 2, 3}, "admin", test.profile, created,
-						account.Code.Hash(), account.InvitationType, created, store.InvitationFirstRun,
+						account.Token.Hash(), store.KindInvitation, account.InvitationType, created, created,
+						store.InvitationFirstRun,
 					},
 				},
 				wantStatement{

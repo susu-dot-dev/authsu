@@ -15,9 +15,11 @@ import (
 type Status string
 
 // Statuses, in the order they are decided: a revoked invitation is revoked
-// even if it has also expired or been used up.
+// even if it has also expired or been used up, and an expired one is expired
+// even if it is also used up.
 const (
-	// StatusRevoked means an admin revoked it.
+	// StatusRevoked means an admin revoked it, and the revocation has taken
+	// effect: a revocation scheduled for later has not.
 	StatusRevoked Status = "revoked"
 	// StatusExpired means its expiry has passed.
 	StatusExpired Status = "expired"
@@ -27,7 +29,7 @@ const (
 	StatusActive Status = "active"
 )
 
-// Invitation is one invitation as an admin sees it. It never carries the code
+// Invitation is one invitation as an admin sees it. It never carries the token
 // or its hash: the store does not select them, so nothing here could.
 type Invitation struct {
 	ID    string `json:"id"`
@@ -38,8 +40,10 @@ type Invitation struct {
 	// Uses is how many accounts it has created: the users that point at it.
 	Uses   int64  `json:"uses"`
 	Status Status `json:"status"`
-	// ExpiresAt, RevokedAt and CreatedBy are absent when not set.
-	ExpiresAt *int64  `json:"expiresAt,omitempty"`
+	// ExpiresAt is when it stops working, in Unix seconds. Every invitation
+	// expires, so it is always present.
+	ExpiresAt int64 `json:"expiresAt"`
+	// RevokedAt and CreatedBy are absent when not set.
 	RevokedAt *int64  `json:"revokedAt,omitempty"`
 	CreatedBy *string `json:"createdBy,omitempty"`
 	// CreatedAt is in Unix seconds.
@@ -47,14 +51,18 @@ type Invitation struct {
 }
 
 // statusAt returns the status of row at now. Revocation, expiry and the cap
-// follow the same rules as the redemption query in the store: any revoked_at
-// at all revokes (even one set in the future), and an invitation expires at,
-// not after, its expires_at.
+// follow the same rules as the store's active predicate for secrets and its
+// redemption query: a secret is active while (revoked_at IS NULL OR
+// revoked_at > now) AND expires_at > now. So it is revoked once revoked_at <=
+// now, and a revocation set for the future leaves it active until then; and it
+// is expired at, not after, its expires_at.
 func statusAt(row store.Invitation, now time.Time) Status {
+	at := now.Unix()
+
 	switch {
-	case row.RevokedAt != nil:
+	case row.RevokedAt != nil && *row.RevokedAt <= at:
 		return StatusRevoked
-	case row.ExpiresAt != nil && *row.ExpiresAt <= now.Unix():
+	case row.ExpiresAt <= at:
 		return StatusExpired
 	case row.Uses >= row.NumInvites:
 		return StatusExhausted

@@ -360,7 +360,7 @@ func TestLoginSignatureCoversTheBytes(t *testing.T) {
 		})
 	}
 
-	expectCount(t, "japikeys", "0")
+	expectCount(t, "sessions", "0")
 }
 
 // TestLoginClientDataMembers sends clientDataJSON documents that no browser
@@ -881,7 +881,7 @@ func TestLoginRefusesACrossSiteFormPost(t *testing.T) {
 				t.Errorf("CORS headers for an evil origin: %v", got.header)
 			}
 
-			expectCount(t, "japikeys", "0")
+			expectCount(t, "sessions", "0")
 		})
 	}
 
@@ -955,6 +955,6 @@ func TestLoginRefusesACrossSiteFormPost(t *testing.T) {
 	// logins above that were genuine JSON requests (one naming an evil Origin
 	// and no CORS grant, one from the UI).
 	t.Run("nothing was signed in by a form", func(t *testing.T) {
-		expectCount(t, "japikeys", "2")
+		expectCount(t, "sessions", "2")
 	})
 }

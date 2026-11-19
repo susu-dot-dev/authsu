@@ -3,6 +3,7 @@ package invitations_test
 import (
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"testing"
 
@@ -97,9 +98,9 @@ func TestUpdateAppliesTheCapOnTheNamedInvitation(t *testing.T) {
 				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 			}
 
-			if len(harn.store.calls) != 1 || harn.store.calls[0].op != opUpdate ||
-				harn.store.calls[0].id != tt.id || harn.store.calls[0].n != tt.n {
-				t.Errorf("store calls = %+v, want one update of %s to %d", harn.store.calls, tt.id, tt.n)
+			want := storeCall{op: opUpdate, id: tt.id, n: tt.n, now: fixedNow()}
+			if len(harn.store.calls) != 1 || !reflect.DeepEqual(harn.store.calls[0], want) {
+				t.Errorf("store calls = %+v, want one update %+v", harn.store.calls, want)
 			}
 
 			got := decode[wireInvitation](t, rec)
@@ -121,7 +122,7 @@ func TestUpdateResponseIsTheWireShape(t *testing.T) {
 	harn := newHarness(t)
 	now := fixedNow().Unix()
 	harn.store.updated = storedRow(func(r *store.Invitation) {
-		r.NumInvites, r.ExpiresAt, r.CreatedBy = 9, new(now+60), new(adminID)
+		r.NumInvites, r.ExpiresAt, r.CreatedBy = 9, now+60, new(adminID)
 	})
 	harn.store.applied = true
 
@@ -151,7 +152,7 @@ func TestUpdateAppliedIsWhatTheWriteSaid(t *testing.T) {
 	}{
 		{"active", func(r *store.Invitation) { r.NumInvites = 9 }, statusActive},
 		{"now exhausted", func(r *store.Invitation) { r.NumInvites, r.Uses = 2, 2 }, statusExhausted},
-		{"expiring this second", func(r *store.Invitation) { r.ExpiresAt = new(now) }, statusExpired},
+		{"expiring this second", func(r *store.Invitation) { r.ExpiresAt = now }, statusExpired},
 	}
 
 	for _, tt := range tests {
@@ -187,16 +188,20 @@ func TestUpdateReportsWhyItDidNotApply(t *testing.T) {
 		uses *float64
 	}{
 		{"revoked", func(r *store.Invitation) { r.RevokedAt = new(now - 5) }, invitations.CodeRevoked, nil},
+		{"revoked exactly now", func(r *store.Invitation) { r.RevokedAt = new(now) }, invitations.CodeRevoked, nil},
+		{"revocation scheduled for later is not yet a revocation", func(r *store.Invitation) {
+			r.RevokedAt = new(now + 5)
+		}, invitations.CodeBelowUses, new(2.0)},
 		{"revoked with more uses than the cap", func(r *store.Invitation) {
 			r.RevokedAt, r.Uses = new(now-5), 50
 		}, invitations.CodeRevoked, nil},
 		{"revoked and expired", func(r *store.Invitation) {
-			r.RevokedAt, r.ExpiresAt = new(now-5), new(now-1)
+			r.RevokedAt, r.ExpiresAt = new(now-5), now-1
 		}, invitations.CodeRevoked, nil},
 		{"below the accounts it has created", func(*store.Invitation) {}, invitations.CodeBelowUses, new(2.0)},
 		{"far below them", func(r *store.Invitation) { r.Uses = 10000 }, invitations.CodeBelowUses, new(10000.0)},
 		{"below them, and expired", func(r *store.Invitation) {
-			r.ExpiresAt, r.Uses = new(now-1), 7
+			r.ExpiresAt, r.Uses = now-1, 7
 		}, invitations.CodeBelowUses, new(7.0)},
 	}
 

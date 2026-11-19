@@ -3,7 +3,8 @@ package agents_test
 import (
 	"cmp"
 	"context"
-	"crypto"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,14 +16,10 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"uuid"
-
-	"github.com/susu-dot-dev/japikey_go"
 
 	"github.com/susu-dot-dev/authsu/internal/agents"
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
-	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/scope"
@@ -36,7 +33,7 @@ var _ agents.Store = (*store.Store)(nil)
 // Causes the tests inject. They are only ever in the log, never in a response.
 var (
 	errDB      = errors.New("INSERT INTO agents: database is on fire")
-	errKeyPair = errors.New("the entropy source is broken")
+	errEntropy = errors.New("the entropy source is broken")
 	errNotNull = errors.New("D1_ERROR: SQLITE_CONSTRAINT_NOTNULL: NOT NULL")
 )
 
@@ -55,15 +52,13 @@ const (
 	agentB0 = "00000000-0000-7000-8000-000000000001"
 	nobody  = "00000000-0000-7000-8000-0000000000ee"
 
-	// newAgentID is the id NewID hands out.
+	// newAgentID is the id NewID hands out first, for the new agent, and
+	// newKeyID the one it hands out second, for the agent's key.
 	newAgentID = "00000000-0000-7000-8000-0000000000cc"
+	newKeyID   = "00000000-0000-7000-8000-0000000000dd"
 
 	roleMember = "member"
 	roleAdmin  = auth.RoleAdmin
-
-	apiOrigin = "https://auth.example.com"
-	uiOrigin  = "https://example.com"
-	secret    = "agents-test-secret-0123456789ABCDEFGHIJKLM"
 
 	jsonType = "application/json"
 
@@ -101,10 +96,7 @@ const (
 	// defaultAgentJSON is the stored form of the default agent bundle.
 	defaultAgentJSON = `["default:agent"]`
 
-	// Claims of an agent's key, and bodies several tables send.
-	claimSub      = "sub"
-	claimAct      = "act"
-	claimScope    = "scope"
+	// Bodies several tables send.
 	bodyX         = `{"name":"x"}`
 	bodyAssistant = `{"name":"assistant"}`
 	bodyRenamed   = `{"name":"renamed"}`
@@ -407,47 +399,80 @@ func sameAgent(a, b store.Agent) bool {
 	return reflect.DeepEqual(normalised(a), normalised(b))
 }
 
-// fakeKeys is the key store the boundary reads keys from: rows by kid and kind,
-// as the database holds them.
-type fakeKeys struct {
-	rows map[string]store.ActiveKey
-	// apiRows are the rows of API keys.
-	apiRows map[string]store.ActiveKey
+// fakeCredentials is the credential store the boundary resolves tokens with:
+// the active sessions and API keys by the hash their token has, as the real
+// store holds them. It is keyed by hash, so a key is found only when the hash
+// that was written for it is the hash of the token presented.
+type fakeCredentials struct {
+	sessions map[string]store.ActiveSession
+	keys     map[string]store.ActiveAPIKey
 }
 
-func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, _ time.Time) (store.ActiveKey, bool, error) {
-	rows := f.rows
-	if kind == auth.KindAPIKey {
-		rows = f.apiRows
-	} else if kind != auth.KindSession {
-		return store.ActiveKey{}, false, nil
-	}
+// ResolveSession answers for an active session.
+func (f *fakeCredentials) ResolveSession(
+	_ context.Context, token input.SessionToken, _ time.Time,
+) (store.ActiveSession, bool, error) {
+	row, found := f.sessions[string(token.Hash())]
 
-	row, ok := rows[kid]
-
-	return row, ok, nil
+	return row, found, nil
 }
 
-// keyCall is one call to the CreateKey the routes were given.
-type keyCall struct {
-	issuer auth.Issuer
-	spec   auth.KeySpec
-	key    auth.Key
+// ResolveAPIKey answers for an active API key.
+func (f *fakeCredentials) ResolveAPIKey(
+	_ context.Context, token input.APIKeyToken, _ time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	row, found := f.keys[string(token.Hash())]
+
+	return row, found, nil
+}
+
+// sequence is a deterministic source of entropy: each read returns bytes that
+// differ from every other read's, so issued tokens are distinct. A sequence
+// starts from its seed, so two with different seeds never agree.
+type sequence struct{ reads uint64 }
+
+func (s *sequence) Read(p []byte) (int, error) {
+	s.reads++
+
+	sum := sha256.Sum256(binary.BigEndian.AppendUint64(nil, s.reads))
+
+	return copy(p, sum[:]), nil
+}
+
+// brokenReader is an entropy source that always fails.
+type brokenReader struct{}
+
+func (brokenReader) Read([]byte) (int, error) { return 0, errEntropy }
+
+// issueCall is one call to the IssueAPIKey the routes were given: what it was
+// asked for and what it answered.
+type issueCall struct {
+	now      time.Time
+	lifetime time.Duration
+	issued   auth.Issued
+	err      error
 }
 
 // rig is one deployment under test: the real boundary and the real agent routes
-// over a fake store, a fake key store and a clock the test controls.
+// over a fake store, a fake credential store and a clock the test controls.
 type rig struct {
 	t     *testing.T
 	store *fakeStore
-	keys  *fakeKeys
-	env   map[string]string
+	creds *fakeCredentials
 	// now is the clock the routes run on.
 	now time.Time
-	// keyCalls records every key the routes created, and keyErr, when set, makes
-	// the creation fail.
-	keyCalls []keyCall
-	keyErr   error
+	// entropy is what the routes issue keys from. signer is the separate
+	// source the rig's own sign-ins use, so the two never produce the same
+	// token.
+	entropy io.Reader
+	signer  *sequence
+	// ids is how many ids NewID has handed out, and signs how many the rig's
+	// own sign-ins have used.
+	ids, signs int
+	// issueCalls records every key the routes issued, and issueErr, when set,
+	// makes issuing fail without calling auth.IssueAPIKey.
+	issueCalls []issueCall
+	issueErr   error
 	// logged records every error the boundary turned into a response.
 	logged  []*apierr.Error
 	handler http.Handler
@@ -459,48 +484,70 @@ func newRig(t *testing.T) *rig {
 	rg := &rig{
 		t:     t,
 		store: &fakeStore{rows: nil, failures: map[string]error{}, calls: nil},
-		keys:  &fakeKeys{rows: map[string]store.ActiveKey{}, apiRows: map[string]store.ActiveKey{}},
-		env: map[string]string{
-			config.SecretHMAC: secret, config.VarAPIOrigin: apiOrigin, config.VarUIOrigin: uiOrigin,
-		},
-		// Whole seconds: the response carries Unix seconds.
-		now: time.Now().Truncate(time.Second),
+		creds: &fakeCredentials{sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}},
+		// A fixed instant, in whole seconds: the response carries Unix seconds.
+		now:     time.Date(2030, time.March, 4, 5, 6, 7, 0, time.UTC),
+		entropy: &sequence{reads: 1 << 32},
+		signer:  &sequence{reads: 0},
 	}
 
 	rg.handler = auth.Handler(agents.Routes(rg.deps()), auth.Deps{
-		Keys:   rg.keys,
-		Now:    func() time.Time { return rg.now },
-		Getenv: func(name string) string { return rg.env[name] },
-		Log:    func(_ httpapi.Request, failure *apierr.Error) { rg.logged = append(rg.logged, failure) },
+		Credentials: rg.creds,
+		Now:         func() time.Time { return rg.now },
+		Getenv:      func(string) string { return "" },
+		Log:         func(_ httpapi.Request, failure *apierr.Error) { rg.logged = append(rg.logged, failure) },
 	})
 
 	return rg
 }
 
-// deps are the agent routes' dependencies, over the rig's fakes.
-func (r *rig) deps() agents.Deps {
-	return agents.Deps{
-		Store: r.store,
-		Now:   func() time.Time { return r.now },
-		NewID: func() string { return newAgentID },
-		CreateKey: func(issuer auth.Issuer, spec auth.KeySpec) (auth.Key, error) {
-			if r.keyErr != nil {
-				r.keyCalls = append(r.keyCalls, keyCall{issuer: issuer, spec: spec, key: auth.Key{}})
+// newID is the routes' id source: the new agent's id first, then its key's, and
+// distinct ones after that.
+func (r *rig) newID() string {
+	r.ids++
 
-				return auth.Key{}, r.keyErr
-			}
-
-			key, err := auth.CreateKey(issuer, spec)
-			r.keyCalls = append(r.keyCalls, keyCall{issuer: issuer, spec: spec, key: key})
-
-			if err != nil {
-				return key, fmt.Errorf("create key: %w", err)
-			}
-
-			return key, nil
-		},
+	switch r.ids {
+	case 1:
+		return newAgentID
+	case 2:
+		return newKeyID
+	default:
+		return fmt.Sprintf("00000000-0000-7000-8000-%012x", 0x1000+r.ids)
 	}
 }
+
+// deps are the agent routes' dependencies, over the rig's fakes. The entropy is
+// read through the rig, so a test may replace it before a request.
+func (r *rig) deps() agents.Deps {
+	return agents.Deps{
+		Store:       r.store,
+		Now:         func() time.Time { return r.now },
+		NewID:       r.newID,
+		Entropy:     readerFunc(func(p []byte) (int, error) { return r.entropy.Read(p) }),
+		IssueAPIKey: r.issueAPIKey,
+	}
+}
+
+// issueAPIKey is the routes' IssueAPIKey: auth.IssueAPIKey, recorded, unless a
+// test programmed a failure, which is returned without calling it.
+func (r *rig) issueAPIKey(
+	entropy io.Reader, newID func() string, now time.Time, lifetime time.Duration,
+) (auth.Issued, error) {
+	call := issueCall{now: now, lifetime: lifetime, issued: auth.Issued{}, err: r.issueErr}
+
+	if r.issueErr == nil {
+		call.issued, call.err = auth.IssueAPIKey(entropy, newID, now, lifetime)
+	}
+
+	r.issueCalls = append(r.issueCalls, call)
+
+	return call.issued, call.err
+}
+
+// readerFunc is an io.Reader made of a function.
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
 // seed puts agents in the store for owner.
 func (r *rig) seed(owner string, agent ...store.Agent) {
@@ -509,27 +556,28 @@ func (r *rig) seed(owner string, agent ...store.Agent) {
 	}
 }
 
-// signIn creates a session for owner, with role, and returns the cookie a
-// browser would send. The key lives in real time: japikey checks a token's own
-// claims against the wall clock.
+// signID is an id for the rig's own sign-ins, apart from the routes' ids.
+func (r *rig) signID() string {
+	r.signs++
+
+	return fmt.Sprintf("00000000-0000-7000-8000-%012x", 0x5000+r.signs)
+}
+
+// signIn issues a session for owner, with role, stores it as active and returns
+// the cookie a browser would send.
 func (r *rig) signIn(owner, role string) *http.Cookie {
 	r.t.Helper()
 
-	origin, err := config.ParseOrigin(apiOrigin)
+	issued, err := auth.IssueSession(r.signer, r.signID, r.now)
 	if err != nil {
-		r.t.Fatalf("origin: %v", err)
+		r.t.Fatalf("IssueSession: %v", err)
 	}
 
-	key, err := auth.CreateSession(auth.IssuerFor(origin), owner, time.Now().Add(auth.SessionLifetime))
-	if err != nil {
-		r.t.Fatalf("CreateSession: %v", err)
+	r.creds.sessions[string(issued.Hash)] = store.ActiveSession{
+		ID: issued.ID, UserID: owner, Role: role, ExpiresAt: issued.ExpiresAt,
 	}
 
-	r.keys.rows[key.ID.String()] = store.ActiveKey{
-		JWK: []byte(key.JWK), UserID: owner, CredentialID: "", Role: role, ExpiresAt: key.ExpiresAt,
-	}
-
-	return sessionCookie(key.JWT)
+	return sessionCookie(issued.Token)
 }
 
 // sessionCookie is the session cookie with value as a browser returns it: only
@@ -603,12 +651,12 @@ func (r *rig) writes() int {
 	return count
 }
 
-// untouched asserts that no request reached the store or created a key.
+// untouched asserts that no request reached the store or issued a key.
 func (r *rig) untouched() {
 	r.t.Helper()
 
-	if len(r.store.calls) != 0 || len(r.keyCalls) != 0 {
-		r.t.Errorf("the request reached the store (%+v) or created %d keys", r.store.calls, len(r.keyCalls))
+	if len(r.store.calls) != 0 || len(r.issueCalls) != 0 {
+		r.t.Errorf("the request reached the store (%+v) or issued %d keys", r.store.calls, len(r.issueCalls))
 	}
 }
 
@@ -689,46 +737,6 @@ func agentJSONWith(id, name string, createdAt int64, revokedAt *int64, labels st
 		id, name, createdAt, labels)
 }
 
-// verifiedKey is a key token that japikey accepted.
-type verifiedKey struct {
-	kid    uuid.UUID
-	claims map[string]any
-}
-
-// verifyToken verifies token the way a verifier of authsu keys would: with the
-// issuer of the API origin, the audience of kind, and the public key out of
-// jwk, the document that reached the store.
-func verifyToken(t *testing.T, token, jwk, kind string) (verifiedKey, error) {
-	t.Helper()
-
-	origin, err := config.ParseOrigin(apiOrigin)
-	if err != nil {
-		t.Fatalf("origin: %v", err)
-	}
-
-	issuer := auth.IssuerFor(origin)
-
-	lookup := func(_ context.Context, kid uuid.UUID) (crypto.PublicKey, error) {
-		var document japikey.JWKS
-
-		err := json.Unmarshal([]byte(jwk), &document)
-		if err != nil {
-			return nil, fmt.Errorf("stored jwk: %w", err)
-		}
-
-		return document.GetPublicKey(kid)
-	}
-
-	verified, err := japikey.Verify(t.Context(), token, japikey.VerifyConfig{
-		BaseIssuerURL: issuer.Base, AllowInsecureHTTP: issuer.Insecure, Timeout: 0, Audience: auth.Audience(kind),
-	}, lookup)
-	if err != nil {
-		return verifiedKey{}, fmt.Errorf("verify: %w", err)
-	}
-
-	return verifiedKey{kid: verified.KeyID, claims: verified.Claims}, nil
-}
-
 // wantBadRequest is wantCode for the common case, a 400.
 func wantBadRequest(t *testing.T, r *rig, rec *httptest.ResponseRecorder, code string) {
 	t.Helper()
@@ -768,42 +776,29 @@ func wantCode(t *testing.T, r *rig, rec *httptest.ResponseRecorder, status int, 
 type keySpec struct {
 	// owner and role are the account's, as the row holds them.
 	owner, role string
-	// scope is the key's own list, signed into its token.
+	// scope is the key's own list, as stored with it.
 	scope scope.List
 	// agent is the agent the key acts for, or "" for the user's own key; and
 	// agentScopes is that agent's stored list (JSON), read now.
 	agent, agentScopes string
 }
 
-// signInKey creates an API key as spec describes, stores its row, and returns
-// the Authorization header value a client would send. The key lives in real
-// time, as signIn's does.
+// signInKey issues an API key as spec describes, stores its row as active, and
+// returns the Authorization header value a client would send.
 func (r *rig) signInKey(spec keySpec) string {
 	r.t.Helper()
 
-	origin, err := config.ParseOrigin(apiOrigin)
+	issued, err := auth.IssueAPIKey(r.signer, r.signID, r.now, time.Hour)
 	if err != nil {
-		r.t.Fatalf("origin: %v", err)
+		r.t.Fatalf("IssueAPIKey: %v", err)
 	}
 
-	claims := map[string]any{}
-	if spec.agent != "" {
-		claims["act"] = map[string]any{"sub": spec.agent}
+	r.creds.keys[string(issued.Hash)] = store.ActiveAPIKey{
+		ID: issued.ID, UserID: spec.owner, Role: spec.role, ExpiresAt: issued.ExpiresAt,
+		AgentID: spec.agent, AgentScopes: spec.agentScopes, Scope: spec.scope.JSON(),
 	}
 
-	key, err := auth.CreateKey(auth.IssuerFor(origin), auth.KeySpec{
-		Kind: auth.KindAPIKey, Subject: spec.owner, Expires: time.Now().Add(time.Hour), Scope: spec.scope, Claims: claims,
-	})
-	if err != nil {
-		r.t.Fatalf("CreateKey: %v", err)
-	}
-
-	r.keys.apiRows[key.ID.String()] = store.ActiveKey{
-		JWK: []byte(key.JWK), UserID: spec.owner, CredentialID: "", Role: spec.role, ExpiresAt: key.ExpiresAt,
-		AgentID: spec.agent, AgentScopes: spec.agentScopes,
-	}
-
-	return "Bearer " + key.JWT
+	return "Bearer " + issued.Token
 }
 
 // withKey sends method target with body, authorized by header (an API key).
@@ -813,12 +808,13 @@ func (r *rig) withKey(header, method, target, body string) *httptest.ResponseRec
 	return r.serve(request{method: method, target: target, body: body, authorization: header})
 }
 
-// storeKeyRow is the row the database would hold for the key a create wrote: the
-// owner's, the agent's id, and that agent's stored scopes, read from its row.
-func storeKeyRow(written store.NewAgent, rg *rig) store.ActiveKey {
-	return store.ActiveKey{
-		JWK: []byte(written.KeyJWK), UserID: written.Owner, CredentialID: "", Role: roleMember,
-		ExpiresAt: written.KeyExpiresAt, AgentID: written.ID, AgentScopes: rg.store.agent2(written.ID).Scopes,
+// storeKeyRow is the row the database would hold for the key a create wrote,
+// found by the hash that was written: the owner's, the agent's id and that
+// agent's stored scopes, read from its row.
+func storeKeyRow(written store.NewAgent, rg *rig) store.ActiveAPIKey {
+	return store.ActiveAPIKey{
+		ID: written.KeyID, UserID: written.Owner, Role: roleMember, ExpiresAt: written.KeyExpiresAt,
+		AgentID: written.ID, AgentScopes: rg.store.agent2(written.ID).Scopes, Scope: written.KeyScope,
 	}
 }
 

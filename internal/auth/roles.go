@@ -5,7 +5,7 @@ import (
 )
 
 // RoleAdmin is the role of an administrator. A role is the account's, read from
-// the database on every request; it is never a claim in a token.
+// the database on every request; a token carries nothing to hold it.
 const RoleAdmin = "admin"
 
 // RoleMember is the role of an ordinary account: a signed-in user with no

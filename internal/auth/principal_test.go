@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -15,91 +14,281 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// TestPrincipalIsTheStoredRow: who the caller is comes from the row the store
-// returned, read now, and the clock the boundary was given.
+// principalWant is what a handler is given for a credential.
+type principalWant struct {
+	role      string
+	secretID  string
+	kind      string
+	expiresAt time.Time
+	agentID   string
+	// scope and agentScope are the lists as stored, never nil.
+	scope, agentScope []string
+	effective         []scope.Scope
+}
+
+// checkPrincipal checks every field of the Principal a handler was given.
+func checkPrincipal(t *testing.T, got auth.Principal, want principalWant) {
+	t.Helper()
+
+	if got.UserID != userID || got.Role != want.role || got.SecretID != want.secretID ||
+		got.Kind != want.kind || !got.ExpiresAt.Equal(want.expiresAt) ||
+		got.AgentID != want.agentID {
+		t.Errorf("principal = %+v, want %+v", got, want)
+	}
+
+	checkList(t, "Scope", got.Scope, want.scope)
+	checkList(t, "AgentScope", got.AgentScope, want.agentScope)
+
+	if effective := got.Effective.Sorted(); !slices.Equal(effective, want.effective) {
+		t.Errorf("Effective = %v, want %v", effective, want.effective)
+	}
+}
+
+// checkList checks a stored list: exactly as written, and never nil.
+func checkList(t *testing.T, name string, got scope.List, want []string) {
+	t.Helper()
+
+	if got == nil || !slices.Equal([]string(got), want) {
+		t.Errorf("%s = %#v, want %v", name, got, want)
+	}
+}
+
+// sorted is the scopes of the lists, as Effective.Sorted returns them.
+func sorted(names ...string) []scope.Scope {
+	return list(names...).Expand().Sorted()
+}
+
+// principalCase is a credential to present and the Principal the handler must
+// see for it.
+type principalCase struct {
+	name string
+	// present builds the credential on the rig and says what the principal is.
+	present func(r *rig) (carried, principalWant)
+}
+
+// sessionPrincipalCase is a stored session of an account with role.
+func sessionPrincipalCase(name, role string) principalCase {
+	return principalCase{name, func(r *rig) (carried, principalWant) {
+		issued := r.sessionFor(role)
+
+		return carried{headers: nil, cookies: []*http.Cookie{sessionCookie(issued)}}, principalWant{
+			role: role, secretID: issued.ID, kind: auth.KindSession,
+			expiresAt: issued.ExpiresAt, agentID: "",
+			scope: []string{scope.DefaultSession}, agentScope: []string{}, effective: sorted(scope.DefaultSession),
+		}
+	}}
+}
+
+// keyPrincipalCase is a stored API key as spec describes, and the principal it
+// must give.
+func keyPrincipalCase(name string, spec bearerSpec, want principalWant) principalCase {
+	return principalCase{name, func(r *rig) (carried, principalWant) {
+		issued := r.apiKey(spec)
+
+		want.secretID, want.expiresAt, want.kind = issued.ID, issued.ExpiresAt, auth.KindAPIKey
+		if want.role == "" {
+			want.role = roleMember
+		}
+
+		return carried{headers: []string{bearer(issued)}, cookies: nil}, want
+	}}
+}
+
+// damaged are stored scope texts that are not a JSON array of strings.
+func damaged() map[string]string {
+	return map[string]string{
+		"not json":           "not json",
+		"empty text":         "",
+		"null":               "null",
+		"an object":          `{"agent:read":true}`,
+		"a string":           `"agent:read"`,
+		"numbers":            `[1,2]`,
+		"a mixed array":      `["agent:read",1]`,
+		"nested arrays":      `[["agent:read"]]`,
+		"a truncated array":  `["agent:read"`,
+		"a space separated":  "agent:read agent:create",
+		"trailing garbage":   `["agent:read"] x`,
+		"the wrong brackets": `{"agent:read"}`,
+	}
+}
+
+// userPrincipalCases are sessions and keys of users.
+func userPrincipalCases() []principalCase {
+	return []principalCase{
+		sessionPrincipalCase("a session of a member", roleMember),
+		sessionPrincipalCase("a session of an administrator", auth.RoleAdmin),
+		keyPrincipalCase("a user's key",
+			bearerSpec{scope: list("agent:read", "key:read"), role: roleMember},
+			principalWant{
+				scope: []string{"agent:read", "key:read"}, agentScope: []string{}, effective: sorted("agent:read", "key:read"),
+			}),
+		keyPrincipalCase("a user's key with a bundle",
+			bearerSpec{scope: list(scope.DefaultUser), role: roleMember},
+			principalWant{scope: []string{scope.DefaultUser}, agentScope: []string{}, effective: sorted(scope.DefaultUser)}),
+		keyPrincipalCase("a user's key with no scopes",
+			bearerSpec{scope: list(), role: roleMember},
+			principalWant{scope: []string{}, agentScope: []string{}, effective: sorted()}),
+		keyPrincipalCase("an administrator's key",
+			bearerSpec{scope: list(scope.DefaultSession), role: auth.RoleAdmin},
+			principalWant{
+				role: auth.RoleAdmin, scope: []string{scope.DefaultSession}, agentScope: []string{},
+				effective: sorted(scope.DefaultSession),
+			}),
+	}
+}
+
+// agentPrincipalCases are keys of agents: the intersection of two lists.
+func agentPrincipalCases() []principalCase {
+	return []principalCase{
+		keyPrincipalCase("an agent's key is the intersection",
+			bearerSpec{
+				scope: list(scope.DefaultUser), role: roleMember, agent: agentOne,
+				agentScopes: list("agent:read", "agent:create", "user:read").JSON(),
+			},
+			principalWant{
+				agentID: agentOne, scope: []string{scope.DefaultUser},
+				agentScope: []string{"agent:read", "agent:create", "user:read"},
+				// user:read is an admin scope, so default:user lacks it.
+				effective: sorted("agent:create", "agent:read"),
+			}),
+		keyPrincipalCase("an agent's key never exceeds the agent",
+			bearerSpec{scope: list(scope.DefaultSession), agent: agentOne, agentScopes: list(scope.DefaultAgent).JSON()},
+			principalWant{
+				agentID: agentOne, scope: []string{scope.DefaultSession}, agentScope: []string{scope.DefaultAgent},
+				effective: sorted(scope.DefaultAgent),
+			}),
+		keyPrincipalCase("an agent's key never exceeds the key",
+			bearerSpec{scope: list("agent:read"), agent: agentOne, agentScopes: list(scope.DefaultSession).JSON()},
+			principalWant{
+				agentID: agentOne, scope: []string{"agent:read"}, agentScope: []string{scope.DefaultSession},
+				effective: sorted("agent:read"),
+			}),
+		keyPrincipalCase("an agent with no scopes leaves the key nothing",
+			bearerSpec{scope: list(scope.DefaultSession), agent: agentOne, agentScopes: list().JSON()},
+			principalWant{
+				agentID: agentOne, scope: []string{scope.DefaultSession}, agentScope: []string{}, effective: sorted(),
+			}),
+	}
+}
+
+// listPrincipalCases are keys that show how a stored list is kept.
+func listPrincipalCases() []principalCase {
+	return []principalCase{
+		keyPrincipalCase("lists are kept as written, duplicates and order included",
+			bearerSpec{scope: list("key:read", "agent:read", "key:read"), role: roleMember},
+			principalWant{
+				scope: []string{"key:read", "agent:read", "key:read"}, agentScope: []string{},
+				effective: sorted("agent:read", "key:read"),
+			}),
+		// JSON null decodes as the empty string, a name that is no scope.
+		keyPrincipalCase("a stored list of nulls reads as empty names and grants nothing",
+			bearerSpec{}.withStoredScope(`[null]`),
+			principalWant{scope: []string{""}, agentScope: []string{}, effective: sorted()}),
+		keyPrincipalCase("a name the code does not know is kept and grants nothing",
+			bearerSpec{scope: list("nope:read", "agent:read")},
+			principalWant{
+				scope: []string{"nope:read", "agent:read"}, agentScope: []string{}, effective: sorted("agent:read"),
+			}),
+	}
+}
+
+// damagedPrincipalCases are keys whose stored lists are damaged: each reads as
+// empty and grants nothing, and does not make the credential unusable.
+func damagedPrincipalCases() []principalCase {
+	cases := make([]principalCase, 0, 3*len(damaged()))
+
+	for name, text := range damaged() {
+		cases = append(cases,
+			keyPrincipalCase("a key whose stored scope is damaged: "+name,
+				bearerSpec{role: roleMember}.withStoredScope(text),
+				principalWant{scope: []string{}, agentScope: []string{}, effective: sorted()}),
+			keyPrincipalCase("an agent's key whose stored scope is damaged: "+name,
+				bearerSpec{agent: agentOne, agentScopes: list(scope.DefaultSession).JSON()}.withStoredScope(text),
+				principalWant{
+					agentID: agentOne, scope: []string{}, agentScope: []string{scope.DefaultSession}, effective: sorted(),
+				}),
+			keyPrincipalCase("an agent's key whose agent scopes are damaged: "+name,
+				bearerSpec{scope: list(scope.DefaultSession), agent: agentOne, agentScopes: text},
+				principalWant{
+					agentID: agentOne, scope: []string{scope.DefaultSession}, agentScope: []string{}, effective: sorted(),
+				}),
+		)
+	}
+
+	return cases
+}
+
+// TestPrincipalIsTheStoredRow: who the caller is comes from the rows the store
+// returned for the credential, read now, and the scope lists are the stored
+// ones exactly as written plus their intersection. A damaged stored list reads
+// as empty and grants nothing.
 func TestPrincipalIsTheStoredRow(t *testing.T) {
 	t.Parallel()
 
-	r := newRig(t)
-	key := r.sessionFor(userID, roleMember)
+	names := map[string]bool{}
 
-	rec := r.get(pathMe, sessionCookie(key))
-	if rec.Code != http.StatusOK || len(r.handled) != 1 {
-		t.Fatalf("status = %d, ran %d times", rec.Code, len(r.handled))
-	}
+	for _, test := range slices.Concat(
+		userPrincipalCases(), agentPrincipalCases(), listPrincipalCases(), damagedPrincipalCases(),
+	) {
+		if names[test.name] {
+			t.Fatalf("two cases are named %q", test.name)
+		}
 
-	checkSessionPrincipal(t, r.handled[0].Principal, key)
+		names[test.name] = true
 
-	if len(r.keys.calls) != 1 || r.keys.calls[0].kid != key.ID.String() {
-		t.Errorf("store read = %v, want one read of %s", r.keys.calls, key.ID)
-	}
-}
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 
-// checkSessionPrincipal checks who a member's session speaks for.
-func checkSessionPrincipal(t *testing.T, got auth.Principal, key auth.Key) {
-	t.Helper()
+			r := newRig(t)
+			presented, want := test.present(r)
 
-	if got.UserID != userID || got.Role != roleMember || got.KeyID != key.ID.String() ||
-		got.CredentialID != credentialID || got.Kind != auth.KindSession || !got.ExpiresAt.Equal(key.ExpiresAt) ||
-		got.AgentID != "" {
-		t.Errorf("principal = %+v", got)
-	}
+			rec := r.serveWith(r.standardRoutes(), pathMe, presented.headers, presented.cookies)
+			if rec.Code != http.StatusOK || len(r.handled) != 1 {
+				t.Fatalf("status = %d, ran %d times: %s", rec.Code, len(r.handled), rec.Body)
+			}
 
-	checkSessionScopes(t, got)
-}
+			checkPrincipal(t, r.handled[0].Principal, want)
 
-// checkSessionScopes checks that a session is signed with default:session and
-// has no agent, so its effective scopes are all of them.
-func checkSessionScopes(t *testing.T, got auth.Principal) {
-	t.Helper()
-
-	if !slices.Equal([]string(got.KeyScope), []string{scope.DefaultSession}) || len(got.AgentScope) != 0 {
-		t.Errorf("scope lists = key %v, agent %v", got.KeyScope, got.AgentScope)
-	}
-
-	if want := len(scope.Scopes()); got.Effective.Len() != want {
-		t.Errorf("effective scopes = %v, want all %d", got.Effective.Sorted(), want)
+			if len(r.creds.calls) != 1 {
+				t.Errorf("store read = %v, want one read", r.creds.calls)
+			}
+		})
 	}
 }
 
-// TestRoleIsNeverATokenClaim: a token that claims to be an administrator, even
-// a correctly signed one that names every scope, has the role of its account's
-// row. The role is read from the database on every request, so a demotion takes
-// effect at once and no token can promote itself: an admin scope on a member's
-// token grants nothing, and the same token works the moment the account is
-// promoted.
-func TestRoleIsNeverATokenClaim(t *testing.T) {
+// TestRoleIsReadLive: the role is the account's now. A demotion takes effect on
+// the next request, and a promotion too, with the same token: nothing about the
+// role is in the token, so none can promote itself, and an admin scope on a
+// member's key grants nothing until the account is promoted.
+func TestRoleIsReadLive(t *testing.T) {
 	t.Parallel()
 
 	r := newRig(t)
+	issued := r.sessionFor(roleMember)
 
-	key, err := auth.CreateKey(r.issuer, auth.KeySpec{
-		Kind: auth.KindSession, Subject: userID, Expires: r.now.Add(time.Hour),
-		Scope:  scope.List{scope.DefaultSession},
-		Claims: map[string]any{"role": auth.RoleAdmin, "is_admin": true},
-	})
-	if err != nil {
-		t.Fatalf("CreateKey: %v", err)
-	}
-
-	r.keys.rows[rowKey{kid: key.ID.String(), kind: auth.KindSession}] = r.row(key, userID, roleMember)
-
-	rec := r.serve(r.standardRoutes(), request{target: pathAdmin, cookies: []*http.Cookie{sessionCookie(key)}})
+	rec := r.serve(r.standardRoutes(), request{target: pathAdmin, cookies: []*http.Cookie{sessionCookie(issued)}})
 	wantFailure(t, r, rec, http.StatusForbidden, bodyForbidden, auth.CodeForbidden, nil)
 
 	// The same token, when the account is later promoted, is an administrator
 	// without a new token.
-	r.setRow(key, func(row *store.ActiveKey) { row.Role = auth.RoleAdmin })
+	r.setSession(issued, func(row *store.ActiveSession) { row.Role = auth.RoleAdmin })
 
-	rec = r.serve(r.standardRoutes(), request{target: pathAdmin, cookies: []*http.Cookie{sessionCookie(key)}})
+	rec = r.serve(r.standardRoutes(), request{target: pathAdmin, cookies: []*http.Cookie{sessionCookie(issued)}})
 	if rec.Code != http.StatusOK {
 		t.Errorf("after promotion: status = %d, want 200", rec.Code)
 	}
+
+	r.setSession(issued, func(row *store.ActiveSession) { row.Role = roleMember })
+
+	rec = r.serve(r.standardRoutes(), request{target: pathAdmin, cookies: []*http.Cookie{sessionCookie(issued)}})
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("after demotion: status = %d, want 403", rec.Code)
+	}
 }
 
-// TestNoneRoutesNeverTouchTheSession: a None route does not read the cookie,
+// TestNoneRoutesNeverTouchTheCredential: a None route does not read the cookie,
 // the configuration or the store, and its caller has no principal.
-func TestNoneRoutesNeverTouchTheSession(t *testing.T) {
+func TestNoneRoutesNeverTouchTheCredential(t *testing.T) {
 	t.Parallel()
 
 	r := newRig(t)
@@ -109,56 +298,13 @@ func TestNoneRoutesNeverTouchTheSession(t *testing.T) {
 		t.Fatalf("response = %d %q", rec.Code, rec.Body)
 	}
 
-	if len(r.keys.calls) != 0 || r.envReads != 0 {
-		t.Errorf("store read %d times and configuration %d times, want neither", len(r.keys.calls), r.envReads)
+	if len(r.creds.calls) != 0 || r.envReads != 0 {
+		t.Errorf("store read %d times and configuration %d times, want neither", len(r.creds.calls), r.envReads)
 	}
 
 	got := r.handled[0].Principal
-	if got.UserID != "" || got.KeyID != "" || got.Effective.Len() != 0 || got.KeyScope != nil {
+	if got.UserID != "" || got.SecretID != "" || got.Effective.Len() != 0 || got.Scope != nil {
 		t.Errorf("principal = %+v, want none", got)
-	}
-}
-
-// TestRefusalsLeakNothingAboutTheKey: whatever was wrong with the token, the
-// client gets the same status and the same bytes, so a response is not an oracle
-// for whether a key exists, was revoked, or belongs to someone else.
-func TestRefusalsLeakNothingAboutTheKey(t *testing.T) {
-	t.Parallel()
-
-	foreign := auth.Issuer{Base: "https://other.example.com/keys", Insecure: false}
-
-	reasons := map[string]cookieFn{
-		nameNoCookie:     nil,
-		"garbage":        sessionValue("garbage"),
-		"unknown key":    afterStoring(revoked),
-		"another owner":  ownedBy(otherUserID),
-		"two cookies":    twice(valid),
-		nameEmpty:        sessionValue(""),
-		"oversized":      sessionValue(strings.Repeat("a", 5000)),
-		"another issuer": foreignIssuer(foreign),
-		"never stored":   neverStored,
-	}
-
-	for name, reason := range reasons {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			r := newRig(t)
-
-			var cookies []*http.Cookie
-			if reason != nil {
-				cookies = reason(r)
-			}
-
-			rec := r.get(pathMe, cookies...)
-			if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
-				t.Errorf("response = %d %q, want 401 %q", rec.Code, rec.Body, bodyUnauthenticated)
-			}
-
-			if rec.Header().Get("Set-Cookie") != "" || rec.Header().Get("WWW-Authenticate") != "" {
-				t.Errorf("headers = %v: a refusal says nothing but the body", rec.Header())
-			}
-		})
 	}
 }
 

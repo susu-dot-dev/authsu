@@ -101,12 +101,6 @@ func TestTheOwnerIsAlwaysTheSession(t *testing.T) {
 				t.Errorf("owner = %q, want the session's user %q", call.owner, userB)
 			}
 
-			for _, made := range rg.keyCalls {
-				if made.spec.Subject != userB {
-					t.Errorf("a key was created for %q, want %q", made.spec.Subject, userB)
-				}
-			}
-
 			if got := rg.store.agent(t, agentA1); !sameAgent(got, stored(agentA1, nameAlpha, 1, nil)) {
 				t.Errorf("A's agent became %+v", got)
 			}
@@ -122,7 +116,7 @@ func TestABodyCannotNameAnOwner(t *testing.T) {
 	t.Parallel()
 
 	members := []string{
-		"userId", "user_id", "owner", "ownerId", claimSub, claimAct, claimScope,
+		"userId", "user_id", "owner", "ownerId", "sub", "act", "scope",
 		"id", "kind", "status", "revokedAt", "scope", "keyScope", "createdBy", "agentId",
 	}
 

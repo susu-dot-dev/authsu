@@ -20,8 +20,13 @@ package e2e_test
 // registration), permission confusion (the route is open and must stay inert).
 //
 // missing_secret is not reachable here: the Worker under test always has a
-// valid FIRST_RUN_SECRET (harness_test.go), and it is read per request from the
-// environment, which a test cannot change.
+// valid FIRST_RUN_SECRET, a complete "susu_inv_" invitation token
+// (harness_test.go), and it is read per request from the environment, which a
+// test cannot change. That a value that is not a token of that exact shape
+// (too short, another tag, not canonical, a bare random string) is reported as
+// "missing secret" and never creates an invitation is therefore covered by the
+// unit tests of internal/firstrun and of the invitation token parser, and not
+// here.
 
 import (
 	"crypto/sha256"
@@ -39,13 +44,10 @@ const (
 		`"first-run setup cannot finish with this database: wipe it and redeploy"}}` + "\n"
 
 	frLabel = "First run: initial administrator"
-
-	// frOtherType is an invitation type that is not first_run.
-	frOtherType = "e2e_invite"
 )
 
-// frSecretHashHex is the hex of sha256(FIRST_RUN_SECRET): the code_hash the
-// Worker must store.
+// frSecretHashHex is the hex of sha256(FIRST_RUN_SECRET), the whole token
+// string with its prefix: the hash the Worker must store in secrets.hash.
 func frSecretHashHex() string {
 	sum := sha256.Sum256([]byte(firstRunSecret))
 
@@ -62,29 +64,19 @@ func frExpectStatus(t *testing.T, what, want string) {
 	}
 }
 
-// frSeedFirstRunInvitation inserts a first_run invitation whose code is the
-// configured secret, as the Worker would have, with the given extra columns.
+// frSeedFirstRunInvitation inserts a first_run invitation whose token is the
+// configured secret, as the Worker would have, with an extra column of its
+// secret set (revoked_at or expires_at) to value, or none when extraColumn is "".
 func frSeedFirstRunInvitation(t *testing.T, id, extraColumn string, extraValue any) {
 	t.Helper()
 
-	query := "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at"
-	args := []any{id, mustDecodeHex(t, frSecretHashHex()), "first_run", frLabel}
+	seedSecret(t, id, kindInvitation, firstRunSecret)
 
 	if extraColumn != "" {
-		query += ", " + extraColumn
+		seed(t, "UPDATE secrets SET "+extraColumn+" = ? WHERE id = ?", extraValue, id)
 	}
 
-	query += ") VALUES (?, ?, ?, ?, 1, strftime('%s','now')"
-
-	if extraColumn != "" {
-		query += ", ?"
-
-		args = append(args, extraValue)
-	}
-
-	query += ")"
-
-	seed(t, query, args...)
+	seed(t, "INSERT INTO invitations (id, type, label, num_invites) VALUES (?, 'first_run', ?, 1)", id, frLabel)
 }
 
 func mustDecodeHex(t *testing.T, s string) []byte {
@@ -109,26 +101,42 @@ func TestFirstRunCreatesTheInvitation(t *testing.T) {
 	frExpectStatus(t, "first check on an empty database", frPending)
 	expectCount(t, "invitations", "1")
 
-	// The stored row, column by column.
+	// The stored rows, column by column: the invitation, and its secret, which
+	// holds the hash of the token, the expiry, the revocation and the creation time.
 	row := func(column string) string { return scalar(t, "SELECT "+column+" FROM invitations") }
+	secret := func(column string) string { return scalar(t, "SELECT "+column+" FROM secrets") }
 
-	if got := row("lower(hex(code_hash))"); got != frSecretHashHex() {
-		t.Errorf("code_hash = %s, want sha256 of the secret %s", got, frSecretHashHex())
+	expectCount(t, "secrets", "1")
+
+	if got := secret("lower(hex(hash))"); got != frSecretHashHex() {
+		t.Errorf("secrets.hash = %s, want sha256 of the whole token %s", got, frSecretHashHex())
 	}
 
-	if got := row("typeof(code_hash)"); got != "blob" {
-		t.Errorf("typeof(code_hash) = %s, want blob", got)
+	for column, want := range map[string]string{
+		"typeof(hash)":                      "blob",
+		"length(hash)":                      "32",
+		"kind":                              kindInvitation,
+		"id = (SELECT id FROM invitations)": "1",
+		"revoked_at IS NULL":                "1",
+		"typeof(expires_at)":                "integer",
+		"typeof(created_at)":                "integer",
+		// Every secret expires: ten years of 365 days after it was created.
+		"expires_at - created_at = 10 * 365 * 24 * 3600": "1",
+		// created_at is "now": within a minute of the database clock.
+		"abs(created_at - strftime('%s','now')) < 60": "1",
+	} {
+		if got := secret(column); got != want {
+			t.Errorf("secrets.%s = %q, want %q", column, got, want)
+		}
 	}
 
 	for column, want := range map[string]string{
 		"type":                "first_run",
+		"kind":                kindInvitation,
 		"label":               frLabel,
 		"num_invites":         "1",
 		"typeof(num_invites)": "integer",
-		"expires_at IS NULL":  "1",
-		"revoked_at IS NULL":  "1",
 		"created_by IS NULL":  "1",
-		"typeof(created_at)":  "integer",
 		"length(id)":          "36",
 	} {
 		if got := row(column); got != want {
@@ -136,10 +144,8 @@ func TestFirstRunCreatesTheInvitation(t *testing.T) {
 		}
 	}
 
-	// created_at is "now": within a minute of the database clock.
-	if got := scalar(t, "SELECT abs(created_at - strftime('%s','now')) < 60 FROM invitations"); got != "1" {
-		t.Errorf("created_at is not recent: %s", scalar(t, "SELECT created_at FROM invitations"))
-	}
+	expectStoredNowhere(t, firstRunSecret)
+	expectNoOrphanSecrets(t)
 
 	// The id is a UUIDv7: version nibble 7.
 	if got := scalar(t, "SELECT substr(id, 15, 1) FROM invitations"); got != "7" {
@@ -201,8 +207,8 @@ func TestFirstRunStateMachine(t *testing.T) {
 			name: "a first_run invitation with a DIFFERENT code hash is still pending (the secret is not consulted)",
 			setup: func(t *testing.T) {
 				t.Helper()
-				seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
-					"VALUES (?, randomblob(32), 'first_run', 'older secret', 1, 1)", idFirstRun)
+				seedSecret(t, idFirstRun, kindInvitation, newToken(tagInvitation))
+				seed(t, "INSERT INTO invitations (id, type, label, num_invites) VALUES (?, 'first_run', 'older secret', 1)", idFirstRun)
 			},
 			wantStatus: http.StatusOK, wantBody: frPending, wantInvitations: "1", wantFirstRun: "1",
 		},
@@ -226,8 +232,7 @@ func TestFirstRunStateMachine(t *testing.T) {
 			name: "an invitation of another type and no account is blocked, nothing created",
 			setup: func(t *testing.T) {
 				t.Helper()
-				seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
-					"VALUES (?, randomblob(32), ?, 'seeded', 1, 1)", idOther, frOtherType)
+				seedInvitation(t, idOther, 1)
 			},
 			wantStatus: http.StatusConflict, wantBody: frBlocked, wantInvitations: "1", wantFirstRun: "0",
 		},
@@ -255,7 +260,7 @@ func TestFirstRunStateMachine(t *testing.T) {
 				t.Helper()
 				frSeedFirstRunInvitation(t, idFirstRun, "", nil)
 				seedUser(t, idUserB, roleAdmin)
-				seed(t, "UPDATE invitations SET revoked_at = 1")
+				seed(t, "UPDATE secrets SET revoked_at = 1 WHERE kind = 'invitation'")
 			},
 			wantStatus: http.StatusOK, wantBody: frAccepted, wantInvitations: "1", wantFirstRun: "1",
 		},
@@ -466,7 +471,7 @@ func TestFirstRunNeverDisclosesTheSecret(t *testing.T) {
 	forbidden := func(extra ...string) []string {
 		return append([]string{
 			firstRunSecret, b64([]byte(firstRunSecret)), frSecretHashHex(), strings.ToUpper(frSecretHashHex()),
-			b64(mustDecodeHex(t, frSecretHashHex())), "code_hash", "invitation_id",
+			b64(mustDecodeHex(t, frSecretHashHex())), "susu_inv_", "invitation_id",
 		}, extra...)
 	}
 
@@ -558,9 +563,13 @@ func TestFirstRunConcurrentChecksCreateOneInvitation(t *testing.T) {
 		expectCount(t, "invitations WHERE type = 'first_run' AND num_invites = 1", "1")
 		expectCount(t, "users", "0")
 
-		if got := scalar(t, "SELECT lower(hex(code_hash)) FROM invitations"); got != frSecretHashHex() {
-			t.Errorf("round %d: code_hash = %s, want %s", round, got, frSecretHashHex())
+		expectCount(t, "secrets", "1")
+
+		if got := scalar(t, "SELECT lower(hex(hash)) FROM secrets"); got != frSecretHashHex() {
+			t.Errorf("round %d: hash = %s, want %s", round, got, frSecretHashHex())
 		}
+
+		expectNoOrphanSecrets(t)
 	}
 }
 

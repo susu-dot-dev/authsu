@@ -8,7 +8,7 @@ import (
 // Codes of the access refusals. They are stable: clients may match on them.
 const (
 	// CodeForbidden is the caller's credential being valid but not enough: the
-	// role is not administrator, the key is not a session, or an agent is
+	// role is not administrator, the credential is not a session, or an agent is
 	// acting where agents are never allowed. The description says which.
 	CodeForbidden = "forbidden"
 	// CodeInsufficientScope is a credential that lacks the scope the route
@@ -53,7 +53,7 @@ type Access struct {
 }
 
 // Open declares a route that needs a valid credential and nothing more: no
-// scope, any kind of key, agents included. It is what whoami and logout are,
+// scope, any kind of credential, agents included. It is what whoami and logout are,
 // where the caller only ever acts on their own credential.
 func Open() Access { return Access{declared: true} }
 

@@ -5,7 +5,7 @@
 //
 // The route is open to anyone (it is what a person with no account reads), and
 // that is safe because of what it says and does. It says one of three words and
-// never the secret or the code. The write it may make records only the hash of a
+// never the secret or the token. The write it may make records only the hash of a
 // secret the caller does not hold, and only while the database has no invitation
 // and no account, so whoever's request makes it, the outcome is the same.
 package firstrun
@@ -57,11 +57,11 @@ type Store interface {
 	// FirstRunState reads whether any account and any first-run invitation
 	// exist, as one snapshot.
 	FirstRunState(ctx context.Context) (store.FirstRunState, error)
-	// CreateFirstRunInvitation inserts the first-run invitation for code, only
-	// while there is no invitation and no account. It reports whether this
-	// call inserted it.
+	// CreateFirstRunInvitation inserts the first-run invitation for token,
+	// expiring at expiresAt, only while there is no invitation and no account.
+	// It reports whether this call inserted it.
 	CreateFirstRunInvitation(
-		ctx context.Context, id string, code input.InvitationCode, label string, now time.Time,
+		ctx context.Context, id string, token input.InvitationToken, label string, expiresAt, now time.Time,
 	) (bool, error)
 }
 
@@ -69,14 +69,15 @@ type Store interface {
 type Deps struct {
 	// Store reads the state and creates the invitation.
 	Store Store
-	// Now is the clock, the invitation's creation time.
+	// Now is the clock: the invitation's creation time, from which its expiry
+	// (input.ExpiryHorizon later) is counted.
 	Now func() time.Time
 	// NewID returns a fresh UUIDv7 in canonical text form, the invitation's id.
 	NewID func() string
 }
 
 // statusBody is the JSON response body. It holds the status and nothing else:
-// neither the code nor the secret may ever be in a response.
+// neither the token nor the secret may ever be in a response.
 type statusBody struct {
 	Status Status `json:"status"`
 }
@@ -132,14 +133,17 @@ func (d Deps) advance(call *auth.Call, state store.FirstRunState) (Status, error
 		return status, nil
 	}
 
-	code, ok := firstRunCode(call.Getenv)
+	token, ok := firstRunToken(call.Getenv)
 	if !ok {
 		return StatusMissingSecret, nil
 	}
 
 	ctx := call.Request.Context
+	now := d.Now()
 
-	created, err := d.Store.CreateFirstRunInvitation(ctx, d.NewID(), code, InvitationLabel, d.Now())
+	expiresAt := now.Add(input.ExpiryHorizon)
+
+	created, err := d.Store.CreateFirstRunInvitation(ctx, d.NewID(), token, InvitationLabel, expiresAt, now)
 	if err != nil {
 		return "", err //nolint:wrapcheck // the store's error is already the classified client error
 	}
@@ -151,24 +155,20 @@ func (d Deps) advance(call *auth.Call, state store.FirstRunState) (Status, error
 	return d.afterRefusal(ctx)
 }
 
-// firstRunCode turns the configured first-run secret into the invitation code.
-// It reports false when the secret is missing, is shorter than
-// config.MinFirstRunSecretLen bytes, or is not a valid invitation code (it is
-// used as one: it must be 1 to input.MaxInvitationCodeBytes characters of the
-// base64url alphabet). A rejected value is never described, so the secret
-// cannot leak through an error or a log line.
-func firstRunCode(getenv func(string) string) (input.InvitationCode, bool) {
-	secret := config.FirstRunSecret(getenv)
-	if len(secret) < config.MinFirstRunSecretLen {
-		return input.InvitationCode{}, false
-	}
-
-	code, err := input.ParseInvitationCode(secret)
+// firstRunToken turns the configured first-run secret into the invitation
+// token. The secret is the token itself, so it must parse as one
+// (input.ParseInvitationToken): "susu_inv_" and 43 canonical base64url
+// characters, exactly. It reports false for anything else, including an unset
+// secret, one of another kind, an old-style random string and a value with
+// whitespace around it, which is never trimmed. A rejected value is never
+// described, so the secret cannot leak through an error or a log line.
+func firstRunToken(getenv func(string) string) (input.InvitationToken, bool) {
+	token, err := input.ParseInvitationToken(config.FirstRunSecret(getenv))
 	if err != nil {
-		return input.InvitationCode{}, false
+		return input.InvitationToken{}, false
 	}
 
-	return code, true
+	return token, true
 }
 
 // afterRefusal answers a request whose insert the database refused.

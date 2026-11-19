@@ -11,12 +11,6 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
-// KindAPIKey is japikeys.kind of an API key, such as an agent's. CreateAgent
-// writes it. It is bound as an argument and not written into the SQL, so this
-// constant is the only place the text is written, and it is the value the auth
-// layer derives the token's audience from.
-const KindAPIKey = "api_key"
-
 // Error codes of the agent operations. They are stable: clients and dashboards
 // may match on them.
 const (
@@ -242,22 +236,26 @@ WHERE u.id = ?5
   AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6
 RETURNING scopes`
 
-// insertAgentKeyQuery stores an agent's API key. The key's owner and the agent
-// it belongs to are read from the agent's row, in the write, so the key's
-// subject is the agent's owner by construction. If the agent was not created
-// (the user was at the limit, or was revoked in the meantime, or the creating
-// agent was revoked) the subselect is NULL, user_id is NOT NULL, and the whole
-// batch fails as a conflict, which rolls the agent insert back with it. Without
-// this the batch would commit with no key.
+// insertAgentKeyQuery writes an agent's API key's own row, after its secret
+// (insertSecretQuery, in the same batch). The key's owner and the agent it
+// belongs to are read from the agent's row, in the write, so the key's subject
+// is the agent's owner by construction. If the agent was not created (the user
+// was at the limit, or was revoked in the meantime, or the creating agent was
+// revoked) the subselects are NULL, user_id is NOT NULL, and the whole batch
+// fails as a conflict, which rolls the agent insert and the secret back with
+// it. Without this the batch would commit with no key. The secret is written
+// before this statement and does not depend on the agent, which is why a
+// refused agent must fail here and not earlier.
 //
-// granted_from and credential_id stay NULL: only a login grants those, and the
-// table's CHECK requires an API key to have neither.
+// agent_id is read from the agent's row too, and not bound, so it can never
+// name an agent the owner does not have; a NULL one would make a user's own
+// key, but user_id fails first.
 //
-// Arguments, in order: kid, agent id (for the subselect), kind, jwk,
-// expires_at, agent id, scope, created_at.
+// Arguments, by number: ?1 key id, ?2 kind, ?3 agent id (for the subselects),
+// ?4 scope.
 const insertAgentKeyQuery = `
-INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, agent_id, scope, created_at)
-VALUES (?, (SELECT user_id FROM agents WHERE id = ?), ?, ?, ?, ?, ?, ?)`
+INSERT INTO api_keys (id, kind, user_id, agent_id, scope)
+VALUES (?1, ?2, (SELECT user_id FROM agents WHERE id = ?3), (SELECT id FROM agents WHERE id = ?3), ?4)`
 
 // insertAgentLabelQuery gives a new agent one label, in the batch that creates
 // it. Like insertAgentKeyQuery it reads the agent's id from the agent's row, in
@@ -294,8 +292,8 @@ type NewAgent struct {
 	// CreateAgent returns what the row holds.
 	Scopes string
 
-	// KeyScope is the key's scope list as JSON: the scope claim signed into its
-	// token, copied to the key's row.
+	// KeyScope is the key's scope list as JSON, stored on the key's row. It is
+	// authoritative: nothing updates it.
 	KeyScope string
 
 	// CreatedBy is the id of the agent that is creating this one, or "" when its
@@ -313,18 +311,20 @@ type NewAgent struct {
 	// refused when the owner already has that many.
 	MaxActive int
 
-	// KeyID is the key's kid, KeyJWK its public JWK as JSON, and KeyExpiresAt
-	// when it stops working.
+	// KeyID is the key's id, which is also its secret's id. KeyHash is the
+	// SHA-256 of the key's token (32 bytes): the token itself is never stored.
+	// KeyExpiresAt is when it stops working.
 	KeyID        string
-	KeyJWK       string
+	KeyHash      []byte
 	KeyExpiresAt time.Time
 
 	// CreatedAt is when the agent and its key were created.
 	CreatedAt time.Time
 }
 
-// CreateAgent writes an agent, its first key and its labels as one batch:
-// either all of them exist or none does. See insertAgentQuery,
+// CreateAgent writes an agent, its first key (the key's secret, then its own
+// row) and its labels as one batch: either all of them exist or none does. See
+// insertAgentQuery,
 // insertAgentKeyQuery and insertAgentLabelQuery for how the owner being revoked
 // or at the limit fails the batch and not just the first statement.
 //
@@ -337,7 +337,8 @@ type NewAgent struct {
 // agents, the account was revoked after the request was authenticated, or the
 // creating agent was revoked. The write cannot tell which, and a revoked
 // account has no session to be told on.
-// The id and the kid are fresh UUIDv7s, so no other constraint can conflict.
+// The id and the key's id are fresh UUIDv7s and the key's hash that of 256
+// random bits, so no other constraint can conflict.
 func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (string, error) {
 	o := op{failed: CodeAgentCreateFailed, rejected: CodeAgentCreateRejected, description: agentsDescription}
 
@@ -351,10 +352,9 @@ func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (string, error)
 		}}
 	}
 
-	key := Statement{Query: insertAgentKeyQuery, Args: []any{
-		agent.KeyID, agent.ID, KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
-		agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
-	}}
+	secret := insertSecret(agent.KeyID, KindAPIKey, agent.KeyHash, agent.KeyExpiresAt.Unix(), agent.CreatedAt.Unix())
+
+	key := Statement{Query: insertAgentKeyQuery, Args: []any{agent.KeyID, KindAPIKey, agent.ID, agent.KeyScope}}
 
 	labels := agent.Labels.Labels()
 	labelInserts := make([]Statement, len(labels))
@@ -363,10 +363,10 @@ func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (string, error)
 		labelInserts[i] = Statement{Query: insertAgentLabelQuery, Args: []any{agent.ID, label.String()}}
 	}
 
-	// The agent, its key, then each label: every statement after the first
-	// reads the agent's row, so none of them can be written for an agent that
-	// was not.
-	statements := slices.Concat([]Statement{insert, key}, labelInserts)
+	// The agent, its key's secret, its key, then each label: the key and every
+	// label read the agent's row, so none of them can be written for an agent
+	// that was not, and the key's failure rolls back the secret before it.
+	statements := slices.Concat([]Statement{insert, secret, key}, labelInserts)
 
 	stored, err := result.Of(s.run(ctx, o, statements...)).
 		Then(func(results []Result) (string, error) { return one(results[0].Rows, o, readScopes) }).
@@ -550,18 +550,17 @@ RETURNING id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
    FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels`
 
-// agentRevokeKeysQuery revokes every key of an agent, in the same batch as
-// agentRevokeQuery and after it. It applies only if the agent is revoked once
-// agentRevokeQuery has run, and only to keys of that owner's agent. A key whose
-// revocation is already due keeps its time; one scheduled for later is brought
-// forward.
+// agentRevokeKeysQuery revokes the secret of every key of an agent, in the same
+// batch as agentRevokeQuery and after it. It applies only if the agent is
+// revoked once agentRevokeQuery has run, and only to keys of that owner's agent.
+// A secret whose revocation is already due keeps its time; one scheduled for
+// later is brought forward.
 //
 // Arguments, by number: ?1 revoked_at (unix seconds), ?2 agent id, ?3 user id.
 const agentRevokeKeysQuery = `
-UPDATE japikeys
+UPDATE secrets
 SET revoked_at = ?1
-WHERE agent_id = ?2
-  AND user_id = ?3
+WHERE id IN (SELECT id FROM api_keys WHERE agent_id = ?2 AND user_id = ?3)
   AND (revoked_at IS NULL OR revoked_at > ?1)
   AND EXISTS (SELECT 1 FROM agents WHERE id = ?2 AND user_id = ?3 AND revoked_at IS NOT NULL)`
 

@@ -21,8 +21,8 @@
 //
 // A credential's scopes are a List: the names exactly as written, in the order
 // written, each a scope or a bundle. A List is stored as a JSON array of
-// strings and signed into a key's token as the same array. A list is expanded
-// (Expand) when a request is checked, never when it is written, so adding a
+// strings. A list is expanded (Expand) when a request is checked, never when
+// it is written, so adding a
 // scope to a bundle reaches every credential that names the bundle.
 //
 // # Lenient reading, strict writing

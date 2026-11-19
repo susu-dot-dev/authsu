@@ -11,7 +11,7 @@ import (
 )
 
 // This file extends the seam of schema_test.go to the agent columns, with that
-// file's bound table and checks. agents and japikeys.scope bound BYTES and
+// file's bound table and checks. agents.name, agents.scopes and api_keys.scope bound BYTES and
 // refuse NUL, because SQLite's length() on TEXT stops at the first NUL.
 
 // agentDefaultScopes is the shape of the scope list every agent is created
@@ -34,7 +34,7 @@ func agentSchemaBounds(t *testing.T) []bound {
 
 	name := agentWorstName(t)
 
-	// column is the start of a size CHECK of 0005, so that a pattern matches
+	// column is the start of a size CHECK of free text, so that a pattern matches
 	// only the one column it names.
 	column := func(name string) string {
 		return fmt.Sprintf(`CHECK \(typeof\(%[1]s\) = 'text' AND instr\(%[1]s, char\(0\)\) = 0 AND `, name)
@@ -43,13 +43,14 @@ func agentSchemaBounds(t *testing.T) []bound {
 	return []bound{
 		{name: "agents.name bytes", pattern: column("name") + `length\(cast\(name AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)`,
 			lowest: 1, highest: len(name.String()), exact: false},
+		// The scope lists are Go's to size: a ScopeList's stored form is at most
+		// input.MaxScopeListJSONBytes, and at least "[]".
 		{name: "agents.scopes bytes",
 			pattern: column("scopes") + `length\(cast\(scopes AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)`,
-			lowest:  len(agentDefaultScopes), highest: len(agentDefaultScopes), exact: false},
-		{name: "japikeys.scope bytes",
-			pattern: `CHECK \(scope IS NULL OR \(typeof\(scope\) = 'text' AND instr\(scope, char\(0\)\) = 0 ` +
-				`AND length\(cast\(scope AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)\)`,
-			lowest: len(agentDefaultScopes), highest: len(agentDefaultScopes), exact: false},
+			lowest:  len("[]"), highest: input.MaxScopeListJSONBytes, exact: false},
+		{name: "api_keys.scope bytes",
+			pattern: column("scope") + `length\(cast\(scope AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)`,
+			lowest:  len("[]"), highest: input.MaxScopeListJSONBytes, exact: false},
 		// The longest label is exactly the CHECK's upper bound, and the
 		// shortest its lower: a label's alphabet is ASCII, so bytes are
 		// characters.
@@ -155,7 +156,7 @@ func TestLabelBoundsAreMeaningful(t *testing.T) {
 	}
 }
 
-// TestLabelMigrationShape holds the parts of 0006 that the behaviour of the
+// TestLabelMigrationShape holds the parts of the schema that the behaviour of the
 // store depends on and that no Go value can show: the primary key that makes a
 // label a member of a set (an add's ON CONFLICT target, and the filter's
 // probe), and the cascade from the agent.

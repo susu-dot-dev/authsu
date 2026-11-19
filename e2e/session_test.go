@@ -5,14 +5,14 @@ package e2e_test
 
 // session_test.go drives what happens to a session after login, against the
 // real Worker: reading it (GET /api/session), ending it (POST /api/logout), and
-// every way a stored key stops being usable. The key lookup and the revocation
-// are SQL (a join of japikeys and users, a conditional UPDATE), so only the
-// real SQLite proves them; the cookie parsing is net/http as TinyGo built it.
+// every way a stored session stops being usable. The lookup and the revocation
+// are SQL (a join of secrets, sessions and users, a conditional UPDATE), so
+// only the real SQLite proves them; the cookie parsing is net/http as TinyGo
+// built it.
 //
 // A session lasts two weeks and is never extended. Real time cannot be waited
-// out, so a test ages a session by rewriting its stored expiry. The token's own
-// signed exp is not changed, which is what makes this a test of the stored copy:
-// the token stays valid for verification either way.
+// out, so a test ages a session by rewriting its stored expiry. The token
+// carries nothing, so the stored row is the only place the expiry exists.
 //
 // REVIEW.md categories covered: interleaving (8 concurrent logouts of one
 // session against the one conditional UPDATE), permission confusion (a role
@@ -22,6 +22,7 @@ package e2e_test
 // input edge cases (the Content-Type of logout, malformed cookies).
 
 import (
+	"encoding/hex"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,12 +30,16 @@ import (
 	"time"
 )
 
-// sesStored reads a column of a session's row.
-func sesStored(t *testing.T, column, kid string) string {
+// sesStored reads a column of a session's secret row: its expiry, revocation
+// and creation time, which every secret has, and its hash.
+func sesStored(t *testing.T, column, id string) string {
 	t.Helper()
 
-	return scalar(t, "SELECT "+column+" FROM japikeys WHERE kid = ?", kid)
+	return scalar(t, "SELECT "+column+" FROM secrets WHERE id = ?", id)
 }
+
+// sesSnapshot is everything stored about a session's secret, in one string.
+const sesSnapshot = "expires_at || ':' || ifnull(revoked_at,'N') || ':' || created_at || ':' || hex(hash)"
 
 // sesRawGet sends GET /api/session with a hand-written Cookie header.
 func sesRawGet(t *testing.T, cookie string) reply {
@@ -69,12 +74,12 @@ func sesExpectNotSignedIn(t *testing.T, what string, got reply) {
 func TestSessionRead(t *testing.T) {
 	pk := newAdmin(t)
 	token := login(t, pk)
-	kid := kidOf(t, token)
+	id := idOfToken(t, token)
 
-	before := sesStored(t, "expires_at || ':' || ifnull(revoked_at,'N') || ':' || created_at || ':' || jwk", kid)
+	before := sesStored(t, sesSnapshot, id)
 	got := get(t, pathSession, token)
 
-	expected := `{"userId":"` + pk.userID + `","role":"admin","expiresAt":` + sesStored(t, "expires_at", kid) + `}` + "\n"
+	expected := `{"userId":"` + pk.userID + `","role":"admin","expiresAt":` + sesStored(t, "expires_at", id) + `}` + "\n"
 	if got.status != http.StatusOK || got.body != expected {
 		t.Errorf("GET /api/session = %d %q, want 200 %q", got.status, got.body, expected)
 	}
@@ -87,7 +92,7 @@ func TestSessionRead(t *testing.T) {
 		t.Errorf("a read set cookies %q: reading a session must never renew it", got.setCookies)
 	}
 
-	for _, secret := range []string{token, strings.Split(token, ".")[2], kid} {
+	for _, secret := range []string{token, token[len(tokenPrefix(tagSession)):], id, hex.EncodeToString(tokenHash(token))} {
 		if strings.Contains(got.body, secret) {
 			t.Errorf("the session response carries %q", secret)
 		}
@@ -98,11 +103,11 @@ func TestSessionRead(t *testing.T) {
 			get(t, pathSession, token).expect(t, "GET /api/session", http.StatusOK, "")
 		}
 
-		if after := sesStored(t, "expires_at || ':' || ifnull(revoked_at,'N') || ':' || created_at || ':' || jwk", kid); after != before {
+		if after := sesStored(t, sesSnapshot, id); after != before {
 			t.Errorf("reading a session changed its row: %q -> %q", before, after)
 		}
 
-		expectCount(t, "japikeys", "1")
+		expectCount(t, "sessions", "1")
 	})
 
 	t.Run("methods other than GET", func(t *testing.T) {
@@ -140,11 +145,11 @@ func TestSessionRead(t *testing.T) {
 func TestSessionIsNotExtended(t *testing.T) {
 	pk := newAdmin(t)
 	token := login(t, pk)
-	kid := kidOf(t, token)
+	id := idOfToken(t, token)
 
-	seed(t, "UPDATE japikeys SET expires_at = strftime('%s','now') + 3600 WHERE kid = ?", kid)
+	seed(t, "UPDATE secrets SET expires_at = strftime('%s','now') + 3600 WHERE id = ?", id)
 
-	before := sesStored(t, "expires_at", kid)
+	before := sesStored(t, "expires_at", id)
 
 	bodies := make([]string, 0, 3)
 
@@ -159,7 +164,7 @@ func TestSessionIsNotExtended(t *testing.T) {
 		}
 	}
 
-	if after := sesStored(t, "expires_at", kid); after != before {
+	if after := sesStored(t, "expires_at", id); after != before {
 		t.Errorf("using a session moved its expiry from %s to %s", before, after)
 	}
 
@@ -167,7 +172,7 @@ func TestSessionIsNotExtended(t *testing.T) {
 		t.Errorf("expiresAt moved between reads: %q", bodies)
 	}
 
-	expectCount(t, "japikeys", "1")
+	expectCount(t, "sessions", "1")
 
 	// There is no refresh: the user signs in again.
 	for _, path := range []string{"/api/refresh", "/api/session/refresh", "/api/token", "/api/session/extend"} {
@@ -183,9 +188,9 @@ func TestSessionIsNotExtended(t *testing.T) {
 		}
 	}
 
-	expectCount(t, "japikeys", "1")
+	expectCount(t, "sessions", "1")
 
-	if after := sesStored(t, "expires_at", kid); after != before {
+	if after := sesStored(t, "expires_at", id); after != before {
 		t.Errorf("a refresh attempt moved the expiry from %s to %s", before, after)
 	}
 }
@@ -215,14 +220,14 @@ func TestSessionAgeing(t *testing.T) {
 			pk := newAdmin(t)
 			token := login(t, pk)
 
-			seed(t, "UPDATE japikeys SET expires_at = "+tt.expires+" WHERE kid = ?", kidOf(t, token))
+			seed(t, "UPDATE secrets SET expires_at = "+tt.expires+" WHERE id = ?", idOfToken(t, token))
 
 			got := get(t, pathSession, token)
 			if tt.want == http.StatusOK {
 				got.expect(t, "GET /api/session", http.StatusOK, "")
 
 				// The body reports the stored expiry, not the token's exp.
-				stored := sesStored(t, "expires_at", kidOf(t, token))
+				stored := sesStored(t, "expires_at", idOfToken(t, token))
 				if !strings.Contains(got.body, `"expiresAt":`+stored) {
 					t.Errorf("body = %s, want expiresAt %s (the stored one)", got.body, stored)
 				}
@@ -232,7 +237,7 @@ func TestSessionAgeing(t *testing.T) {
 
 			sesExpectNotSignedIn(t, "GET /api/session", got)
 			sesExpectNotSignedIn(t, "logout of an expired session", post(t, pathLogout, nil, token))
-			expectCount(t, "japikeys WHERE revoked_at IS NOT NULL", "0")
+			expectCount(t, "secrets WHERE kind = 'session' AND revoked_at IS NOT NULL", "0")
 		})
 	}
 
@@ -243,7 +248,7 @@ func TestSessionAgeing(t *testing.T) {
 		// The stored expiry is compared with the Worker's clock in whole
 		// seconds: expires_at > now. Give it two seconds, so the first request
 		// cannot straddle the boundary even on a slow machine.
-		seed(t, "UPDATE japikeys SET expires_at = strftime('%s','now') + 2 WHERE kid = ?", kidOf(t, token))
+		seed(t, "UPDATE secrets SET expires_at = strftime('%s','now') + 2 WHERE id = ?", idOfToken(t, token))
 
 		get(t, pathSession, token).expect(t, "GET /api/session with 2s left", http.StatusOK, "")
 
@@ -253,27 +258,30 @@ func TestSessionAgeing(t *testing.T) {
 	})
 }
 
-// TestSessionStopsWorkingWhenItsKeyIsNotUsable proves the lookup refuses a key
-// the database says is not usable, even though the token itself still verifies.
+// TestSessionStopsWorkingWhenItsRowsAreNotUsable proves the lookup refuses a
+// session the database says is not usable. The token carries nothing, so the
+// stored rows are the only thing that can end it.
 //
 //nolint:paralleltest // shares one database
-func TestSessionStopsWorkingWhenItsKeyIsNotUsable(t *testing.T) {
+func TestSessionStopsWorkingWhenItsRowsAreNotUsable(t *testing.T) {
 	cases := []struct {
 		name   string
-		update string // {KID}, {USER} and {CRED} are filled in
+		update string // {ID}, {USER} and {CRED} are filled in
 		works  bool
 	}{
-		{"revoked a second ago", "UPDATE japikeys SET revoked_at = strftime('%s','now') - 1 WHERE kid = '{KID}'", false},
-		{"revoked now", "UPDATE japikeys SET revoked_at = strftime('%s','now') WHERE kid = '{KID}'", false},
-		{"revoked at zero", "UPDATE japikeys SET revoked_at = 0 WHERE kid = '{KID}'", false},
-		{"revoked at a negative time", "UPDATE japikeys SET revoked_at = -5 WHERE kid = '{KID}'", false},
-		// A key is active when revoked_at IS NULL OR revoked_at > now (the
+		{"revoked a second ago", "UPDATE secrets SET revoked_at = strftime('%s','now') - 1 WHERE id = '{ID}'", false},
+		{"revoked now", "UPDATE secrets SET revoked_at = strftime('%s','now') WHERE id = '{ID}'", false},
+		{"revoked at zero", "UPDATE secrets SET revoked_at = 0 WHERE id = '{ID}'", false},
+		{"revoked at a negative time", "UPDATE secrets SET revoked_at = -5 WHERE id = '{ID}'", false},
+		// A secret is active when revoked_at IS NULL OR revoked_at > now (the
 		// design: revocation is a time, so one scheduled for later is not yet in
 		// force).
-		{"revoked in an hour", "UPDATE japikeys SET revoked_at = strftime('%s','now') + 3600 WHERE kid = '{KID}'", true},
-		{"revoked at the far future", "UPDATE japikeys SET revoked_at = 9223372036854775807 WHERE kid = '{KID}'", true},
-		{"expired in the database", "UPDATE japikeys SET expires_at = strftime('%s','now') - 1 WHERE kid = '{KID}'", false},
-		{"deleted", "DELETE FROM japikeys WHERE kid = '{KID}'", false},
+		{"revoked in an hour", "UPDATE secrets SET revoked_at = strftime('%s','now') + 3600 WHERE id = '{ID}'", true},
+		{"revoked at the far future", "UPDATE secrets SET revoked_at = 9223372036854775807 WHERE id = '{ID}'", true},
+		{"expired in the database", "UPDATE secrets SET expires_at = strftime('%s','now') - 1 WHERE id = '{ID}'", false},
+		{"deleted: its secret", "DELETE FROM secrets WHERE id = '{ID}'", false},
+		{"deleted: its session row", "DELETE FROM sessions WHERE id = '{ID}'", false},
+		{"its hash changed", "UPDATE secrets SET hash = randomblob(32) WHERE id = '{ID}'", false},
 		// A session is bound to the passkey that made it, so removing the passkey
 		// ends its sessions.
 		{"its passkey deleted", "DELETE FROM credentials WHERE id = '{CRED}'", false},
@@ -281,12 +289,7 @@ func TestSessionStopsWorkingWhenItsKeyIsNotUsable(t *testing.T) {
 		{"its account revoked in the future", "UPDATE users SET revoked_at = strftime('%s','now') + 3600 WHERE id = '{USER}'", false},
 		{"its account revoked at zero", "UPDATE users SET revoked_at = 0 WHERE id = '{USER}'", false},
 		{"its account deleted", "DELETE FROM users WHERE id = '{USER}'", false},
-		{"its kind changed to api_key", "UPDATE japikeys SET kind = 'api_key' WHERE kid = '{KID}'", false},
-		{"its kind changed to another text", "UPDATE japikeys SET kind = 'Session' WHERE kid = '{KID}'", false},
-		{"its kind changed to a trailing-space kind", "UPDATE japikeys SET kind = 'session ' WHERE kid = '{KID}'", false},
-		// The signed subject must be the account the row belongs to.
-		{"the row moved to another account", "UPDATE japikeys SET user_id = '" + idUserB + "' WHERE kid = '{KID}'", false},
-		{"unrelated rows revoked", "UPDATE japikeys SET revoked_at = strftime('%s','now') - 1 WHERE kid <> '{KID}'", true},
+		{"unrelated secrets revoked", "UPDATE secrets SET revoked_at = strftime('%s','now') - 1 WHERE id <> '{ID}'", true},
 		{"another account revoked", "UPDATE users SET revoked_at = strftime('%s','now') WHERE id = '" + idUserB + "'", true},
 		{"its passkey flags changed", "UPDATE credentials SET flags = 29 WHERE id = '{CRED}'", true},
 	}
@@ -298,15 +301,15 @@ func TestSessionStopsWorkingWhenItsKeyIsNotUsable(t *testing.T) {
 			seedUser(t, idUserB, roleMember)
 
 			token := login(t, pk)
-			kid := kidOf(t, token)
+			id := idOfToken(t, token)
 
 			who := get(t, pathSession, token)
 			if who.status != http.StatusOK {
 				t.Fatalf("GET /api/session before = %d %s, want 200", who.status, who.body)
 			}
 
-			cred := scalar(t, "SELECT credential_id FROM japikeys WHERE kid = ?", kid)
-			stmt := strings.NewReplacer("{KID}", kid, "{USER}", pk.userID, "{CRED}", cred).Replace(tt.update)
+			cred := scalar(t, "SELECT credential_id FROM sessions WHERE id = ?", id)
+			stmt := strings.NewReplacer("{ID}", id, "{USER}", pk.userID, "{CRED}", cred).Replace(tt.update)
 
 			seed(t, stmt)
 
@@ -324,54 +327,57 @@ func TestSessionStopsWorkingWhenItsKeyIsNotUsable(t *testing.T) {
 }
 
 // TestSessionTokenVerification sends tokens that are wrong in every way a token
-// can be wrong: all must be the same 401, and none may be a 5xx.
+// can be wrong: all must be the same 401, and none may be a 5xx. The malformed
+// ones are refused by the parser before the database is read; the well-formed
+// ones that nothing stores are refused by the lookup.
 //
 //nolint:paralleltest // shares one database
 func TestSessionTokenVerification(t *testing.T) {
 	pk := newAdmin(t)
 	token := login(t, pk)
-	kid := kidOf(t, token)
+	other := login(t, pk)
 
-	parts := strings.Split(token, ".")
-	header, payload, signature := parts[0], parts[1], parts[2]
+	prefix := tokenPrefix(tagSession)
+	body := token[len(prefix):]
 
-	flip := func(segment string) string {
-		if segment[0] == 'A' {
-			return "B" + segment[1:]
+	// flipFirst changes the first character of the body: still well-formed,
+	// but a different 256-bit value that nothing stores.
+	flipFirst := func(s string) string {
+		if s[0] == 'A' {
+			return "B" + s[1:]
 		}
 
-		return "A" + segment[1:]
+		return "A" + s[1:]
 	}
 
-	other := login(t, pk)
-	otherParts := strings.Split(other, ".")
-
 	cases := map[string]string{
-		"garbage":                       "garbage",
-		"empty cookie value":            "",
-		"truncated":                     token[:len(token)-4],
-		"one segment":                   header,
-		"two segments":                  header + "." + payload,
-		"four segments":                 token + ".x",
-		"empty signature":               header + "." + payload + ".",
-		"signature flipped":             header + "." + payload + "." + flip(signature),
-		"payload altered":               header + "." + flip(payload) + "." + signature,
-		"header altered":                flip(header) + "." + payload + "." + signature,
-		"payload of another session":    header + "." + otherParts[1] + "." + signature,
-		"header of another session":     otherParts[0] + "." + payload + "." + signature,
-		"signature of another":          header + "." + payload + "." + otherParts[2],
-		"alg none":                      b64([]byte(`{"alg":"none","kid":"`+kid+`","typ":"JWT"}`)) + "." + payload + ".",
-		"alg HS256 with the sig":        b64([]byte(`{"alg":"HS256","kid":"`+kid+`","typ":"JWT"}`)) + "." + payload + "." + signature,
-		"alg RS256":                     b64([]byte(`{"alg":"RS256","kid":"`+kid+`","typ":"JWT"}`)) + "." + payload + "." + signature,
-		"kid of a key that is absent":   b64([]byte(`{"alg":"ES256","kid":"`+idMissing+`","typ":"JWT"}`)) + "." + payload + "." + signature,
-		"kid not a uuid":                b64([]byte(`{"alg":"ES256","kid":"x","typ":"JWT"}`)) + "." + payload + "." + signature,
-		"kid missing":                   b64([]byte(`{"alg":"ES256","typ":"JWT"}`)) + "." + payload + "." + signature,
-		"kid a number":                  b64([]byte(`{"alg":"ES256","kid":7,"typ":"JWT"}`)) + "." + payload + "." + signature,
-		"standard base64 spelling":      strings.NewReplacer("-", "+", "_", "/").Replace(token) + "=",
-		"the token with a space inside": token[:20] + " " + token[20:],
-		"the token in another case":     strings.ToUpper(token),
-		"4097 characters":               strings.Repeat("a", 4097),
-		"outside the alphabet":          token + "!",
+		"garbage":                         "garbage",
+		"empty cookie value":              "",
+		"truncated":                       token[:len(token)-1],
+		"one character too many":          token + "A",
+		"the prefix alone":                prefix,
+		"the body alone":                  body,
+		"the body flipped at the start":   prefix + flipFirst(body),
+		"another well-formed, unstored":   newToken(tagSession),
+		"an API key's prefix":             tokenPrefix(tagAPIKey) + body,
+		"an invitation's prefix":          tokenPrefix(tagInvitation) + body,
+		"an unknown tag":                  "susu_xyz_" + body,
+		"no tag":                          "susu__" + body,
+		"the prefix in upper case":        strings.ToUpper(prefix) + body,
+		"the prefix with a different app": "other_ses_" + body,
+		"the body in lower case":          prefix + strings.ToLower(body),
+		"the body in upper case":          prefix + strings.ToUpper(body),
+		"the hash in hex":                 hex.EncodeToString(tokenHash(token)),
+		"the session id":                  idOfToken(t, token),
+		"standard base64 spelling":        prefix + strings.NewReplacer("-", "+", "_", "/").Replace(body) + "=",
+		"padding":                         token + "=",
+		"the token with a space inside":   token[:20] + " " + token[20:],
+		"the token in another case":       strings.ToUpper(token),
+		"4097 characters":                 strings.Repeat("a", 4097),
+		"outside the alphabet":            token + "!",
+		"a dot instead of an underscore":  strings.Replace(token, "_", ".", 1),
+		"the token with a separator":      token + "." + other,
+		"two tokens joined":               token + other,
 	}
 
 	for name, bad := range cases {
@@ -385,13 +391,9 @@ func TestSessionTokenVerification(t *testing.T) {
 		})
 	}
 
-	t.Run("the audience of another kind", func(t *testing.T) {
-		// An API key row is not a session: a token for kind api_key never opens a
-		// session route, whatever its signature. The honest session token under
-		// an api_key row is the closest e2e can get without private keys.
-		seed(t, "UPDATE japikeys SET kind = 'api_key' WHERE kid = ?", kid)
-		sesExpectNotSignedIn(t, "a session token whose row is an api_key", get(t, pathSession, token))
-	})
+	// None of the bad ones disturbed the real ones.
+	get(t, pathSession, token).expect(t, "the real session afterwards", http.StatusOK, "")
+	get(t, pathSession, other).expect(t, "the other real session afterwards", http.StatusOK, "")
 }
 
 // TestSessionRoleIsLive holds that the role is read on every request: a change
@@ -462,7 +464,7 @@ func (c sesLogoutCases) sesLogoutRequiresASession(t *testing.T) {
 // logoutRevokesNowAndClearsTheCookieWithTheSameA is the "revokes now and clears the cookie with the same attributes" case of TestLogout.
 func (c sesLogoutCases) sesLogoutRevokesNowAndClearsTheCookieWithTheSameA(t *testing.T) {
 	token := login(t, c.pk)
-	kid := kidOf(t, token)
+	id := idOfToken(t, token)
 
 	started := time.Now()
 	got := post(t, pathLogout, nil, token)
@@ -510,12 +512,18 @@ func (c sesLogoutCases) sesLogoutRevokesNowAndClearsTheCookieWithTheSameA(t *tes
 
 	// Revoked now, and the row stays: deleting it would reopen replay of the
 	// login that created it.
-	revoked := lgUnix(t, sesStored(t, "revoked_at", kid))
+	revoked := lgUnix(t, sesStored(t, "revoked_at", id))
 	if d := revoked.Sub(started); d < -lgClockSlack || d > lgClockSlack {
 		t.Errorf("revoked_at = %s, want about now", revoked)
 	}
 
-	expectCount(t, "japikeys WHERE kid = '"+kid+"'", "1")
+	// Both rows stay, the secret revoked and the session it belongs to.
+	stored := mustSecretOf(t, token)
+	if !stored.revoked || !stored.kindRow || stored.id != id {
+		t.Errorf("after logout the secret is %+v, want revoked with its session row kept", stored)
+	}
+
+	expectCount(t, "sessions WHERE id = ?", "1", id)
 
 	sesExpectNotSignedIn(t, "GET /api/session after logout", get(t, pathSession, token))
 
@@ -524,7 +532,7 @@ func (c sesLogoutCases) sesLogoutRevokesNowAndClearsTheCookieWithTheSameA(t *tes
 	time.Sleep(1100 * time.Millisecond)
 	sesExpectNotSignedIn(t, "second logout", post(t, pathLogout, nil, token))
 
-	if again := lgUnix(t, sesStored(t, "revoked_at", kid)); !again.Equal(revoked) {
+	if again := lgUnix(t, sesStored(t, "revoked_at", id)); !again.Equal(revoked) {
 		t.Errorf("a second logout moved revoked_at from %s to %s", revoked, again)
 	}
 }
@@ -536,7 +544,7 @@ func (c sesLogoutCases) sesLogoutOnlyEndsTheSessionItWasGiven(t *testing.T) {
 	post(t, pathLogout, nil, first).expect(t, "logout", http.StatusNoContent, "")
 
 	get(t, pathSession, second).expect(t, "another session after logout", http.StatusOK, "")
-	expectCount(t, "japikeys WHERE revoked_at IS NULL AND kid = ?", "1", kidOf(t, second))
+	expectCount(t, "secrets WHERE revoked_at IS NULL AND id = ?", "1", idOfToken(t, second))
 	sesExpectNotSignedIn(t, "the logged-out session", get(t, pathSession, first))
 }
 
@@ -580,7 +588,7 @@ func (c sesLogoutCases) x(t *testing.T) {
 
 	// The session is untouched by every refused logout.
 	get(t, pathSession, token).expect(t, "the session after refused logouts", http.StatusOK, "")
-	expectCount(t, "japikeys WHERE kid = ? AND revoked_at IS NULL", "1", kidOf(t, token))
+	expectCount(t, "secrets WHERE id = ? AND revoked_at IS NULL", "1", idOfToken(t, token))
 
 	// application/json with charset=utf-8 is what a browser may send.
 	got := send(t, request{
@@ -621,12 +629,12 @@ func (c sesLogoutCases) sesLogoutOtherMethodsAndABody(t *testing.T) {
 func (c sesLogoutCases) sesLogoutOfASessionWhoseRowWasRevokedBySomethingE(t *testing.T) {
 	token := login(t, c.pk)
 
-	seed(t, "UPDATE japikeys SET revoked_at = strftime('%s','now') - 100 WHERE kid = ?", kidOf(t, token))
+	seed(t, "UPDATE secrets SET revoked_at = strftime('%s','now') - 100 WHERE id = ?", idOfToken(t, token))
 
 	sesExpectNotSignedIn(t, "logout of a revoked session", post(t, pathLogout, nil, token))
 
 	// Its revocation time is the earlier one: logout cannot move it.
-	if got := sesStored(t, "strftime('%s','now') - revoked_at", kidOf(t, token)); got != "100" && got != "101" && got != "102" {
+	if got := sesStored(t, "strftime('%s','now') - revoked_at", idOfToken(t, token)); got != "100" && got != "101" && got != "102" {
 		t.Errorf("revoked_at moved: now - revoked_at = %s, want about 100", got)
 	}
 }
@@ -666,7 +674,7 @@ func TestLogoutRace(t *testing.T) {
 			}
 		}
 
-		expectCount(t, "japikeys WHERE revoked_at IS NOT NULL", "1")
+		expectCount(t, "secrets WHERE kind = 'session' AND revoked_at IS NOT NULL", "1")
 		get(t, pathSession, other).expect(t, "an unrelated session", http.StatusOK, "")
 		sesExpectNotSignedIn(t, "the raced session afterwards", get(t, pathSession, token))
 	}
@@ -686,7 +694,7 @@ func TestLogoutRace(t *testing.T) {
 			t.Errorf("statuses %v, want %d x 204", got, workers)
 		}
 
-		expectCount(t, "japikeys WHERE revoked_at IS NOT NULL", strconv.Itoa(workers))
+		expectCount(t, "secrets WHERE kind = 'session' AND revoked_at IS NOT NULL", strconv.Itoa(workers))
 	})
 
 	// A session read racing a logout answers 200 or 401, never a 5xx, and after
@@ -738,8 +746,8 @@ func TestLoginRowsSurviveLogout(t *testing.T) {
 		t.Errorf("the replay after logout changed the database: %+v -> %+v", before, after)
 	}
 
-	expectCount(t, "japikeys", "1")
-	expectCount(t, "japikeys WHERE revoked_at IS NOT NULL", "1")
+	expectCount(t, "sessions", "1")
+	expectCount(t, "secrets WHERE kind = 'session' AND revoked_at IS NOT NULL", "1")
 
 	sesExpectNotSignedIn(t, "the logged-out session after the replay", get(t, pathSession, first.session()))
 }

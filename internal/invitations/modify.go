@@ -3,6 +3,7 @@ package invitations
 import (
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
@@ -44,16 +45,18 @@ func (h *handlers) update(call *auth.Call) result.Result[httpapi.Response] {
 	return httpapi.Decode[updateBody](call.Request).
 		Then(parseUpdate).
 		Then(func(n input.NumInvites) (Invitation, error) {
-			row, applied, err := h.store.UpdateNumInvites(call.Request.Context, id, n)
+			now := h.now()
+
+			row, applied, err := h.store.UpdateNumInvites(call.Request.Context, id, n, now)
 			if err != nil {
 				return Invitation{}, missing(err)
 			}
 
 			if !applied {
-				return Invitation{}, refusal(row)
+				return Invitation{}, refusal(row, now)
 			}
 
-			return present(row, h.now()), nil
+			return present(row, now), nil
 		}).
 		Map(func(out Invitation) httpapi.Response { return httpapi.JSON(http.StatusOK, out) })
 }
@@ -76,9 +79,10 @@ func missingNumInvites() *apierr.Error {
 // statement returned. Its own test failed on that row, so exactly one of two
 // things is true of it: the invitation was revoked, or it had created more
 // accounts than the new cap allows. A revoked invitation is reported as revoked
-// whatever its uses.
-func refusal(row store.Invitation) *apierr.Error {
-	if row.RevokedAt != nil {
+// whatever its uses. Revoked is judged at now, the time the write ran with, as
+// the write judged it: a revocation scheduled for later does not yet count.
+func refusal(row store.Invitation, now time.Time) *apierr.Error {
+	if row.RevokedAt != nil && *row.RevokedAt <= now.Unix() {
 		return apierr.New(apierr.Conflict, CodeRevoked, "the invitation is revoked and cannot be changed")
 	}
 

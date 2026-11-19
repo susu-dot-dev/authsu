@@ -19,11 +19,12 @@ import (
 )
 
 // finishBody is the body of POST /api/register/finish, as the client sent it.
-// The code and name are sent again because the challenge is bound to them.
+// The invitation token (member invitationCode) and the name are sent again
+// because the challenge is bound to them.
 type finishBody struct {
-	InvitationCode string         `json:"invitationCode"`
-	Name           string         `json:"name"`
-	Credential     credentialBody `json:"credential"`
+	InvitationToken string         `json:"invitationCode"`
+	Name            string         `json:"name"`
+	Credential      credentialBody `json:"credential"`
 }
 
 // credentialBody is PublicKeyCredential.toJSON() for a registration
@@ -76,7 +77,7 @@ type finishCommand struct {
 }
 
 func parseFinish(body finishBody) (finishCommand, error) {
-	c, err := parseCeremony(body.InvitationCode, body.Name)
+	c, err := parseCeremony(body.InvitationToken, body.Name)
 
 	return finishCommand{ceremony: c, credential: body.Credential}, err
 }
@@ -188,7 +189,7 @@ func invalidCredential(cause error) error {
 // condition, so a request that went stale since this read gets a clean 403
 // here and the race this read cannot close gets a 409 there.
 func (h *handlers) authorize(ctx context.Context, cmd finishCommand, ok verified, now time.Time) (authorized, error) {
-	invitationType, redeemable, err := h.store.RedeemableInvitationType(ctx, cmd.code, now)
+	invitationType, redeemable, err := h.store.RedeemableInvitationType(ctx, cmd.token, now)
 	if err != nil {
 		return authorized{}, err //nolint:wrapcheck // the store classifies its own failures
 	}
@@ -218,7 +219,7 @@ func (h *handlers) createAccount(
 		UserHandle:      ok.handle,
 		Role:            ok.role,
 		Name:            cmd.name,
-		Code:            cmd.code,
+		Token:           cmd.token,
 		InvitationType:  ok.invitationType,
 		CredentialRowID: h.newID(),
 		CredentialID:    ok.credential.ID,

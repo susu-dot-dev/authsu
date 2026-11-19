@@ -6,8 +6,8 @@
 // they are from the credential id in the response.
 //
 // Begin writes nothing. It returns request options with a challenge that is
-// signed rather than stored. Finish verifies the assertion and then, in one
-// store operation, issues the session and records what it was granted from:
+// signed rather than stored. Finish verifies the assertion, issues the session
+// token and then, in one store operation, stores the session and records what it was granted from:
 // the hash of the challenge, in a unique column, which is what makes a login
 // single use.
 //
@@ -62,7 +62,7 @@ type Store interface {
 	// names, and reports false when there is none or its account is revoked.
 	CredentialByID(ctx context.Context, credentialID []byte) (store.Credential, bool, error)
 
-	// CreateSession records the flags the login reported and issues the
+	// CreateSession records the flags the login reported and stores the
 	// session in one operation, and reports store.ErrConflict when the login
 	// cannot stand (a replay, a deleted passkey, a revoked account).
 	CreateSession(ctx context.Context, session store.NewSession) error
@@ -78,18 +78,22 @@ type Deps struct {
 	// Entropy supplies random bytes (crypto/rand.Reader in production). It is
 	// where the challenge's nonce comes from.
 	Entropy io.Reader
-	// CreateSession creates the session key: auth.CreateSession in production.
-	// It is injected so that its failure, which a valid configuration does not
-	// cause, is reachable from a test.
-	CreateSession func(issuer auth.Issuer, userID string, expires time.Time) (auth.Key, error)
+	// NewID returns a fresh identifier for a session (a UUIDv7 in production).
+	NewID func() string
+	// IssueSession issues the session token: auth.IssueSession in production.
+	// It is called with Entropy, NewID and the clock's time. It is injected so
+	// that its failure, which working entropy does not cause, is reachable from
+	// a test.
+	IssueSession func(r io.Reader, newID func() string, now time.Time) (auth.Issued, error)
 }
 
 // handlers carries the dependencies the two handlers share.
 type handlers struct {
-	store         Store
-	now           func() time.Time
-	entropy       io.Reader
-	createSession func(auth.Issuer, string, time.Time) (auth.Key, error)
+	store        Store
+	now          func() time.Time
+	entropy      io.Reader
+	newID        func() string
+	issueSession func(io.Reader, func() string, time.Time) (auth.Issued, error)
 }
 
 // Routes returns the login routes. It panics when a dependency is missing: the
@@ -98,7 +102,7 @@ type handlers struct {
 func Routes(deps Deps) []auth.Route {
 	for name, missing := range map[string]bool{
 		"Store": deps.Store == nil, "Now": deps.Now == nil, "Entropy": deps.Entropy == nil,
-		"CreateSession": deps.CreateSession == nil,
+		"NewID": deps.NewID == nil, "IssueSession": deps.IssueSession == nil,
 	} {
 		if missing {
 			panic("login: Deps." + name + " is required")
@@ -106,7 +110,7 @@ func Routes(deps Deps) []auth.Route {
 	}
 
 	handle := &handlers{
-		store: deps.Store, now: deps.Now, entropy: deps.Entropy, createSession: deps.CreateSession,
+		store: deps.Store, now: deps.Now, entropy: deps.Entropy, newID: deps.NewID, issueSession: deps.IssueSession,
 	}
 
 	return []auth.Route{

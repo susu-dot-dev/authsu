@@ -35,7 +35,7 @@ The secret is passed to Wrangler on stdin, so it is never on a command line, nev
 Two changes cannot be undone, so the helpers refuse them unless you opt in:
 
 - Replacing an existing `AUTH_HMAC_SECRET` (`CONFIRM_SECRET_ROTATE=1`). Ceremonies begun but not finished are invalidated.
-- Changing the host of a non-`localhost` `UI_ORIGIN` (`CONFIRM_RP_ID_CHANGE=1`). The relying party ID is that host and a passkey is bound to it, so this invalidates every registered passkey. Changing `API_ORIGIN` does not, but it changes the session issuer and so ends every live session.
+- Changing the host of a non-`localhost` `UI_ORIGIN` (`CONFIRM_RP_ID_CHANGE=1`). The relying party ID is that host and a passkey is bound to it, so this invalidates every registered passkey. Changing `API_ORIGIN` invalidates neither passkeys nor credentials.
 
 `set-vars` also checks that both values are bare origins (an `https://` origin with no path, query or user info, lower case; `http` only for localhost). Set them before the first registration, and never leave a value in `wrangler.jsonc` that you do not control.
 
@@ -59,9 +59,6 @@ Conventions for writing migrations are in [DATABASE.md](DATABASE.md). Applying t
 - **Always pass `--local`** for anything that is not a deliberate remote migration. Local and e2e use the same `DB` binding name as production but are simulated.
 - **Remote migrations are applied by hand.** Neither CI nor Workers Builds applies them, so apply a new migration to the target database before deploying code that needs it.
   - **Production:** `npx wrangler d1 migrations apply DB --remote`.
-  - **Order matters for `0006_agent_labels`.** Every agent list, read, patch and revoke selects from `agent_labels`, so apply this migration *before* deploying code that includes it; otherwise those routes fail until it is applied. Applying it early is safe: the table is additive and the previous Worker never references it.
-  - **Order matters for `0005_agents`.** Revoking a user writes the `agents` table, so apply this migration *before* deploying code that includes it; otherwise revoking an account fails until it is applied.
-  - **Order matters for `0004_users_revoked_at`.** The session and login queries read `users.revoked_at`, so apply this migration *before* deploying code that includes it; otherwise every request fails to verify until it is applied.
 - **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. Once a migration is on `main`, the append-only rule applies and the fix is a new migration.
 - The `database_id` in `wrangler.jsonc` is an identifier, not a secret.
 
@@ -80,18 +77,7 @@ TinyGo's version and checksum come from `tools.env`, so bumping it there updates
 
 ### Ceremonies in flight when the challenge format changes
 
-A deploy that changes how challenges are signed (the shared layout in `internal/challenge` did) invalidates every challenge issued before it. A registration or login that began on the old version and finishes on the new one fails once (400 `invalid_challenge` or 401 `invalid_login`) and succeeds when retried. Challenges last five minutes, so prefer a quiet moment for such a deploy; nothing needs repairing afterwards. The same is true of rotating `AUTH_HMAC_SECRET`.
-
-### The japikey_go module is private
-
-Sessions depend on `github.com/susu-dot-dev/japikey_go`, a private repository, so `go mod download` fails without credentials: on a developer machine with no GitHub access, on CI, and on Workers Builds. This is the one place the "no secrets in CI" stance in [CI.md](CI.md) does not hold by itself. This section is temporary: publishing the module removes it.
-
-Until then a build needs:
-
-- `GOPRIVATE=github.com/susu-dot-dev`, so Go neither asks the public proxy nor checks the public checksum database for it, and
-- git access to the repository. A developer with an SSH key needs one rewrite, because Go clones over `https://`: `git config --global url."git@github.com:susu-dot-dev/".insteadOf "https://github.com/susu-dot-dev/"`. CI would use an `https://` rewrite carrying a token.
-
-Do not commit either. A token for CI should be a fine-grained, read-only, single-repository credential held as an Actions secret, and the jobs that run `go mod download` (`lint`, `test`, `build`) are the ones that need it. That is a deliberate change to the supply-chain stance and needs maintainer approval.
+A deploy that changes how challenges are signed invalidates every challenge issued before it. A registration or login that began on the old version and finishes on the new one fails once (400 `invalid_challenge` or 401 `invalid_login`) and succeeds when retried. Challenges last five minutes, so prefer a quiet moment for such a deploy; nothing needs repairing afterwards. The same is true of rotating `AUTH_HMAC_SECRET`.
 
 ## Upkeep
 

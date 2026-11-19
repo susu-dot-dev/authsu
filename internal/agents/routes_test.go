@@ -9,7 +9,6 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/agents"
 	"github.com/susu-dot-dev/authsu/internal/auth"
-	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/scope"
 )
 
@@ -92,7 +91,8 @@ func TestRoutesPanicOnAMissingDependency(t *testing.T) {
 		{name: "store", without: func(d *agents.Deps) { d.Store = nil }, mention: "Store"},
 		{name: "clock", without: func(d *agents.Deps) { d.Now = nil }, mention: "Now"},
 		{name: "ids", without: func(d *agents.Deps) { d.NewID = nil }, mention: "NewID"},
-		{name: "key creation", without: func(d *agents.Deps) { d.CreateKey = nil }, mention: "CreateKey"},
+		{name: "entropy", without: func(d *agents.Deps) { d.Entropy = nil }, mention: "Entropy"},
+		{name: "key issuing", without: func(d *agents.Deps) { d.IssueAPIKey = nil }, mention: "IssueAPIKey"},
 	}
 
 	for _, tt := range tests {
@@ -123,8 +123,8 @@ func TestLimits(t *testing.T) {
 		t.Errorf("MaxAgentsPerUser = %d, want 25", agents.MaxAgentsPerUser)
 	}
 
-	if agents.KeyLifetime != 90*24*time.Hour {
-		t.Errorf("KeyLifetime = %v, want 90 days", agents.KeyLifetime)
+	if auth.AgentKeyLifetime != 90*24*time.Hour {
+		t.Errorf("AgentKeyLifetime = %v, want 90 days", auth.AgentKeyLifetime)
 	}
 
 	if got := agents.DefaultScopes().JSON(); got != `["default:agent"]` {
@@ -178,36 +178,21 @@ func withoutAValidSession() []situation {
 		anonymous("not a token", withCookie(sessionCookie("not.a token"))),
 		anonymous("a session of nobody the store knows", func(rg *rig, req *request) {
 			cookie := rg.signIn(userA, roleMember)
-			clear(rg.keys.rows)
+			clear(rg.creds.sessions)
 
 			req.cookies = []*http.Cookie{cookie}
 		}),
 		anonymous("an agent's own api key presented as the session", func(rg *rig, req *request) {
-			origin, err := config.ParseOrigin(apiOrigin)
-			if err != nil {
-				rg.t.Fatal(err)
-			}
-
-			key, err := auth.CreateKey(auth.IssuerFor(origin), auth.KeySpec{
-				Kind: auth.KindAPIKey, Subject: userA, Expires: time.Now().Add(time.Hour),
-				Scope:  agents.DefaultScopes(),
-				Claims: map[string]any{claimAct: map[string]any{claimSub: agentA1}},
+			header := rg.signInKey(keySpec{
+				owner: userA, role: roleMember, scope: agents.DefaultScopes(), agent: agentA1,
+				agentScopes: agents.DefaultScopes().JSON(),
 			})
-			if err != nil {
-				rg.t.Fatal(err)
-			}
 
-			req.cookies = []*http.Cookie{sessionCookie(key.JWT)}
+			req.cookies = []*http.Cookie{sessionCookie(strings.TrimPrefix(header, "Bearer "))}
 		}),
-		{
-			name: "the deployment is not configured",
-			change: func(rg *rig, req *request) {
-				req.cookies = []*http.Cookie{rg.signIn(userA, roleMember)}
-				delete(rg.env, config.VarAPIOrigin)
-			},
-			status: http.StatusServiceUnavailable,
-			body:   errorBody(auth.CodeNotConfigured, "the service is not configured"), logCode: auth.CodeNotConfigured,
-		},
+		anonymous("a session presented as an api key", func(rg *rig, req *request) {
+			req.authorization = "Bearer " + rg.signIn(userA, roleMember).Value
+		}),
 	}
 }
 

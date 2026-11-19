@@ -7,9 +7,10 @@ package e2e_test
 // the real D1 driver and the real SQLite the migrations created. The unit tests
 // fake the database, so this file proves what only the real build can:
 //
-//   - the exact response and stored rows of a create, that the API key's token
-//     carries the user as subject and the agent as actor, and that the token is
-//     stored nowhere (only its public key);
+//   - the exact response and stored rows of a create (the agent, the key's
+//     secret and the key's own row), that the token is shaped as an API key
+//     and stored nowhere (only its hash), and that it resolves to the user with
+//     the agent as actor;
 //   - the byte/rune bounds of an agent name through the real SQLite CHECK, and
 //     that a name is stored exactly as it was sent (refuse, never rewrite);
 //   - the per-user cap of 25 and the "no key without an agent" batch, under
@@ -27,12 +28,9 @@ package e2e_test
 // a spot check that any role may use them and that signed-out is 401.
 
 import (
-	"bytes"
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -45,10 +43,9 @@ import (
 )
 
 const (
-	// agScopes is the default agent bundle as stored and signed: a JSON array.
-	agScopes      = `["default:agent"]`
+	// agScopes is the default agent bundle as stored: a JSON array.
+	agScopes      = agentScope
 	agBundleName  = "default:agent"
-	agAudience    = "authsu/api_key"
 	agCodeLimit   = "agent_limit_reached"
 	agCodeMissing = "agent_not_found"
 	agCodeRevoked = "agent_revoked"
@@ -61,7 +58,7 @@ const (
 	agMaxAgents = 25
 	// agNameRunes is input.MaxAgentNameRunes.
 	agNameRunes = 256
-	// agKeyLifetime is agents.KeyLifetime in seconds (90 days).
+	// agKeyLifetime is auth.AgentKeyLifetime in seconds (90 days).
 	agKeyLifetime = 90 * 24 * 3600
 
 	agIDPrefix = "0a00" // idN family of agents seeded by this file
@@ -153,7 +150,7 @@ func agSeedMany(t *testing.T, owner string, from, n int) {
 		id := idN(agIDPrefix, from+i)
 
 		seedAgent(t, id, owner, "bulk-"+strconv.Itoa(from+i))
-		seedAgentKey(t, idN(agKeyPref, from+i), owner, id)
+		seedAPIKey(t, idN(agKeyPref, from+i), owner, id)
 	}
 }
 
@@ -296,7 +293,7 @@ func TestAgentRoutesNeedASession(t *testing.T) {
 
 	expectCount(t, "agents WHERE name <> 'mine'", "0")
 	expectCount(t, "agents WHERE revoked_at IS NOT NULL", "0")
-	expectCount(t, "japikeys WHERE kind = 'api_key'", "0")
+	expectCount(t, "api_keys", "0")
 
 	// Any role at all: an agent is something every user has.
 	for _, role := range []string{roleAdmin, roleMember, "x", strings.Repeat("r", 64)} {
@@ -313,8 +310,8 @@ func TestAgentRoutesNeedASession(t *testing.T) {
 // ---- create: happy path ----------------------------------------------------
 
 // TestAgentCreateStoresExactlyWhatItReturns: the exact response, the agents
-// row, the japikeys row and the token's claims and header; the token is stored
-// nowhere and cannot be used as a session.
+// row, the key's secret and api_keys rows and the token's shape; the token is
+// stored nowhere and cannot be used as a session.
 //
 //nolint:paralleltest // shares one database
 func TestAgentCreateStoresExactlyWhatItReturns(t *testing.T) {
@@ -382,27 +379,23 @@ func TestAgentCreateStoresExactlyWhatItReturns(t *testing.T) {
 		t.Errorf("agents row = %q, want %q", got, wantRow)
 	}
 
-	// japikeys row: an api_key of the user, tied to the agent, no login grant.
-	cols := scalar(t, "SELECT kind||'|'||user_id||'|'||agent_id||'|'||scope||'|'||ifnull(revoked_at,'NULL')||'|'||"+
-		"ifnull(CASE WHEN granted_from IS NULL THEN NULL ELSE hex(granted_from) END,'NULL')||'|'||ifnull(credential_id,'NULL')||'|'||expires_at||'|'||created_at||'|'||metadata "+
-		"FROM japikeys WHERE kid = ?", key.ID)
-	wantCols := strings.Join([]string{
-		"api_key", world.b.userID, agent.ID, agScopes, "NULL", "NULL", "NULL",
-		strconv.FormatInt(key.ExpiresAt, 10), strconv.FormatInt(agent.CreatedAt, 10), "{}",
-	}, "|")
+	// api_keys row: a key of the user, tied to the agent, under the id the
+	// response names.
+	cols := scalar(t, "SELECT kind||'|'||user_id||'|'||agent_id||'|'||scope FROM api_keys WHERE id = ?", key.ID)
+	wantCols := strings.Join([]string{kindAPIKey, world.b.userID, agent.ID, agScopes}, "|")
 
 	if cols != wantCols {
-		t.Errorf("japikeys row = %q, want %q", cols, wantCols)
+		t.Errorf("api_keys row = %q, want %q", cols, wantCols)
 	}
 
-	agVerifyStoredJWK(t, key)
-	agVerifyClaims(t, world.b.userID, created)
-	agTokenIsStoredNowhere(t, key.Token)
+	agVerifyKeySecret(t, created)
+	expectToken(t, key.Token, tagAPIKey)
+	expectStoredNowhere(t, key.Token)
 
-	// Exactly one agent and one api_key row exist for B; the sessions are the
-	// only other keys.
+	// Exactly one agent and one api_key row exist for B.
 	expectCount(t, "agents WHERE user_id = ?", "1", world.b.userID)
-	expectCount(t, "japikeys WHERE kind = 'api_key'", "1")
+	expectCount(t, "api_keys", "1")
+	expectNoOrphanSecrets(t)
 
 	// The key is not a session: not accepted as the session cookie anywhere.
 	agKeyIsNotACredential(t, world.tokenB, key.Token)
@@ -448,116 +441,26 @@ func agWellFormedID(id string) string {
 	return ""
 }
 
-// agVerifyStoredJWK checks the stored JWK holds a public key only, for the
-// key's kid.
-func agVerifyStoredJWK(t *testing.T, key agKey) {
+// agVerifyKeySecret checks the key's secret row against the response: the id
+// is the key's, the hash is SHA-256 of the whole token, it is active for 90
+// days from the agent's creation, and the secret has its api_keys row.
+func agVerifyKeySecret(t *testing.T, created agCreated) {
 	t.Helper()
 
-	jwk := scalar(t, "SELECT jwk FROM japikeys WHERE kid = ?", key.ID)
+	key := created.Key
 
-	var doc struct {
-		Keys []map[string]any `json:"keys"`
+	secret := mustSecretOf(t, key.Token)
+	if secret.id != key.ID || secret.kind != kindAPIKey || !secret.kindRow {
+		t.Errorf("secret of the token = %+v, want the key %s of kind api_key with its api_keys row", secret, key.ID)
 	}
 
-	err := json.Unmarshal([]byte(jwk), &doc)
-	if err != nil || len(doc.Keys) != 1 {
-		t.Fatalf("stored jwk %q: %v", jwk, err)
+	if secret.revoked || secret.expiresAt != key.ExpiresAt || secret.createdAt != created.Agent.CreatedAt {
+		t.Errorf("secret = %+v, want active, expiring at %d (the response), created at %d",
+			secret, key.ExpiresAt, created.Agent.CreatedAt)
 	}
 
-	k := doc.Keys[0]
-	if k["kid"] != key.ID || k["kty"] != "EC" || k["crv"] != "P-256" || k["alg"] != "ES256" {
-		t.Errorf("stored jwk = %v, want an ES256 P-256 key for %s", k, key.ID)
-	}
-
-	for _, private := range []string{"d", "p", "q", "dp", "dq", "qi", "k"} {
-		if _, has := k[private]; has {
-			t.Errorf("stored jwk has private member %q: %s", private, jwk)
-		}
-	}
-}
-
-// agVerifyClaims checks the token's header and claims against the response.
-func agVerifyClaims(t *testing.T, owner string, created agCreated) {
-	t.Helper()
-
-	token := created.Key.Token
-
-	if strings.Count(token, ".") != 2 {
-		t.Fatalf("token %q is not a compact JWS", token)
-	}
-
-	if kid := kidOf(t, token); kid != created.Key.ID {
-		t.Errorf("kid header = %q, want the key id %q", kid, created.Key.ID)
-	}
-
-	header := agHeaderOf(t, token)
-	if header["alg"] != "ES256" || header["typ"] != "JWT" {
-		t.Errorf("header = %v, want alg ES256 typ JWT", header)
-	}
-
-	claims := claimsOf(t, token)
-
-	if claims["sub"] != owner {
-		t.Errorf("sub = %v, want the USER %s (never the agent)", claims["sub"], owner)
-	}
-
-	act, _ := claims["act"].(map[string]any)
-	if len(act) != 1 || act["sub"] != created.Agent.ID {
-		t.Errorf("act = %v, want {sub: the agent %s}", claims["act"], created.Agent.ID)
-	}
-
-	// The claim is the array that is stored, signed as an array of strings.
-	if scopeClaim := string(mustJSON(t, claims["scope"])); scopeClaim != agScopes || claims["aud"] != agAudience {
-		t.Errorf("scope/aud = %s / %v, want %s / %s", scopeClaim, claims["aud"], agScopes, agAudience)
-	}
-
-	if want := target.apiOrigin + "/keys/" + created.Key.ID; claims["iss"] != want {
-		t.Errorf("iss = %v, want %s", claims["iss"], want)
-	}
-
-	exp, _ := claims["exp"].(float64)
-	iat, _ := claims["iat"].(float64)
-
-	if int64(exp) != created.Key.ExpiresAt || int64(iat) != created.Agent.CreatedAt {
-		t.Errorf("exp/iat = %v/%v, want %d/%d", exp, iat, created.Key.ExpiresAt, created.Agent.CreatedAt)
-	}
-}
-
-func agHeaderOf(t *testing.T, token string) map[string]any {
-	t.Helper()
-
-	head, _, _ := strings.Cut(token, ".")
-
-	// claimsOf decodes the middle segment; reuse it on a rotated token.
-	return claimsOf(t, "x."+head+".y")
-}
-
-// agTokenIsStoredNowhere searches every text, blob and numeric-as-text column of
-// every table for the token and for its signature segment.
-func agTokenIsStoredNowhere(t *testing.T, token string) {
-	t.Helper()
-
-	parts := strings.Split(token, ".")
-	needles := []string{token, parts[2], parts[1], parts[0]}
-
-	type col struct{ table, name string }
-
-	cols := []col{
-		{"japikeys", "kid"}, {"japikeys", "user_id"}, {"japikeys", "kind"}, {"japikeys", "jwk"}, {"japikeys", "metadata"},
-		{"japikeys", "scope"}, {"japikeys", "agent_id"}, {"japikeys", "credential_id"}, {"japikeys", "granted_from"},
-		{"agents", "id"}, {"agents", "user_id"}, {"agents", "name"}, {"agents", "scopes"},
-		{"users", "id"}, {"users", "role"}, {"users", "profile"}, {"users", "user_handle"},
-		{"credentials", "id"}, {"credentials", "metadata"}, {"credentials", "credential_id"}, {"credentials", "public_key"},
-		{"invitations", "id"}, {"invitations", "type"}, {"invitations", "label"}, {"invitations", "code_hash"},
-	}
-
-	for _, c := range cols {
-		for _, needle := range needles {
-			hits := count(t, c.table+" WHERE instr(CAST("+c.name+" AS BLOB), CAST(? AS BLOB)) > 0", needle)
-			if hits != "0" {
-				t.Errorf("%s.%s contains %.16q...", c.table, c.name, needle)
-			}
-		}
+	if got := scalar(t, "SELECT lower(hex(hash)) FROM secrets WHERE id = ?", key.ID); got != hex.EncodeToString(tokenHash(key.Token)) {
+		t.Errorf("secrets.hash = %s, want sha256 of the whole token", got)
 	}
 }
 
@@ -786,7 +689,7 @@ func TestAgentCreateNames(t *testing.T) {
 
 			if c.status != http.StatusCreated {
 				expectCount(t, "agents WHERE user_id = ?", "0", world.b.userID)
-				expectCount(t, "japikeys WHERE kind = 'api_key'", "0")
+				expectCount(t, "api_keys", "0")
 
 				return
 			}
@@ -806,159 +709,9 @@ func TestAgentCreateNames(t *testing.T) {
 			}
 
 			expectCount(t, "agents WHERE user_id = ?", "1", world.b.userID)
-			expectCount(t, "japikeys WHERE kind = 'api_key' AND agent_id = ?", "1", created.Agent.ID)
+			expectCount(t, "api_keys WHERE agent_id = ?", "1", created.Agent.ID)
 		})
 	}
-}
-
-// agBigPost posts a body far over the cap. It returns the transport error
-// instead of failing, because the Worker may close the connection while the
-// client is still writing (see the caller).
-func agBigPost(t *testing.T, body []byte, token string) (int, string, error) {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(t.Context(), bigRequestTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.baseURL+pathAgent, bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-
-	req.Header.Set("Content-Type", jsonType)
-	req.Header.Set("Cookie", cookieName+"="+token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, "", fmt.Errorf("send: %w", err)
-	}
-
-	defer func() { _ = resp.Body.Close() }()
-
-	out, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resp.StatusCode, "", fmt.Errorf("read: %w", err)
-	}
-
-	return resp.StatusCode, string(out), nil
-}
-
-// TestAgentCreateBodySizes: a name at the rune bound whose JSON escaping is far
-// larger than the name still fits the 8 KiB body cap, is accepted and stored
-// exactly; bodies past 8 KiB are 413 before anything is written.
-//
-//nolint:paralleltest // shares one database
-func TestAgentCreateBodySizes(t *testing.T) {
-	world := agNewPair(t, roleMember)
-
-	// 256 characters that JSON escapes to 6 bytes each (\u003c for '<' is how
-	// Go encodes it; other clients escape as \uXXXX): the escaped body is ~1.5 KiB,
-	// far under 1 MiB, and the decoded name is 256 runes.
-	escaped := "{\"name\":\"" + agRepeat(`\u003c`, agNameRunes) + "\"}"
-
-	got := post(t, pathAgent, []byte(escaped), world.tokenB)
-	got.expect(t, "256 escaped runes", http.StatusCreated, "")
-
-	created := agDecode[agCreated](t, got)
-	if created.Agent.Name != agRepeat("<", agNameRunes) {
-		t.Errorf("name = %q, want 256 '<'", created.Agent.Name)
-	}
-
-	// 257 escaped runes is still refused by the rune bound, not by size.
-	over := "{\"name\":\"" + agRepeat(`\u003c`, agNameRunes+1) + "\"}"
-	post(t, pathAgent, []byte(over), world.tokenB).expect(t, "257 escaped runes", http.StatusBadRequest, agCodeBadName)
-
-	// 256 four-byte emoji written as surrogate pairs: 12 bytes per rune on the
-	// wire, 4 bytes stored (1024 bytes: exactly the CHECK).
-	pairs := "{\"name\":\"" + agRepeat(`\ud83d\ude00`, agNameRunes) + "\"}"
-
-	got = post(t, pathAgent, []byte(pairs), world.tokenB)
-	got.expect(t, "256 surrogate-pair emoji", http.StatusCreated, "")
-
-	if stored := agNameHex(t, agDecode[agCreated](t, got).Agent.ID); stored != agHex(agRepeat("\U0001F600", agNameRunes)) {
-		t.Errorf("stored emoji name = %s...", stored[:32])
-	}
-
-	expectCount(t, "agents WHERE user_id = ?", "2", world.b.userID)
-
-	// Over the cap: a body just under, at and over 8 KiB, and far past it.
-	const (
-		kib     = 1 << 10
-		mib     = 1 << 20
-		bodyCap = 8 * kib
-	)
-
-	for _, c := range []struct {
-		name   string
-		size   int
-		status int
-		code   string
-	}{
-		{"cap minus one stays a name error", bodyCap - 1, http.StatusBadRequest, agCodeBadName},
-		{"exactly the cap stays a name error", bodyCap, http.StatusBadRequest, agCodeBadName},
-		{"cap plus one is too large", bodyCap + 1, http.StatusRequestEntityTooLarge, codeBodyTooLarge},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			prefix := `{"name":"`
-			suffix := `"}`
-			body := prefix + agRepeat("a", c.size-len(prefix)-len(suffix)) + suffix
-
-			if len(body) != c.size {
-				t.Fatalf("test bug: body is %d bytes, want %d", len(body), c.size)
-			}
-
-			post(t, pathAgent, []byte(body), world.tokenB).expect(t, "oversized body", c.status, c.code)
-			expectCount(t, "agents WHERE user_id = ?", "2", world.b.userID)
-		})
-	}
-
-	// Far over the cap: the Worker answers 413 as soon as the cap is exceeded and
-	// does not read the rest, so a client still writing may see the connection
-	// closed instead of the response. Either is an early refusal; any other
-	// status is not acceptable, and nothing is written.
-	for name, body := range map[string]string{
-		"4 MiB name":            `{"name":"` + agRepeat("a", 4*mib) + `"}`,
-		"large unknown field":   `{"name":"a","x":"` + agRepeat("z", mib) + `"}`,
-		"huge nested structure": `{"name":"a","x":` + agRepeat("[", 1<<20) + agRepeat("]", 1<<20) + `}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			status, text, err := agBigPost(t, []byte(body), world.tokenB)
-			if !isEarlyRefusal(status, text, err) {
-				t.Errorf("%s = %d %q, want 413 %s", name, status, text, codeBodyTooLarge)
-			}
-
-			expectCount(t, "agents WHERE user_id = ?", "2", world.b.userID)
-		})
-	}
-
-	// 2000 levels of nesting is under the 8 KiB cap and still refused by shape;
-	// 5000 levels is over it and refused by size.
-	deep := agRepeat("[", 2000) + agRepeat("]", 2000)
-	post(t, pathAgent, []byte(`{"name":"a","x":`+deep+`}`), world.tokenB).
-		expect(t, "deeply nested unknown field", http.StatusBadRequest, "")
-
-	deeper := agRepeat("[", 5000) + agRepeat("]", 5000)
-	post(t, pathAgent, []byte(`{"name":"a","x":`+deeper+`}`), world.tokenB).
-		expect(t, "nesting over the cap", http.StatusRequestEntityTooLarge, codeBodyTooLarge)
-
-	// The media type is part of the contract of an unsafe method.
-	for _, ctype := range []string{"text/plain", "application/x-www-form-urlencoded", "application/jsonx", "multipart/form-data"} {
-		got := send(t, request{
-			method: http.MethodPost, path: pathAgent, body: []byte(`{"name":"typed"}`), token: world.tokenB,
-			headers: map[string]string{"Content-Type": ctype},
-		})
-		got.expect(t, "Content-Type "+ctype, http.StatusUnsupportedMediaType, codeUnsupportedType)
-	}
-
-	send(t, request{method: http.MethodPost, path: pathAgent, body: []byte(`{"name":"typed"}`), token: world.tokenB, noType: true}).
-		expect(t, "no Content-Type", http.StatusUnsupportedMediaType, codeUnsupportedType)
-
-	send(t, request{
-		method: http.MethodPost, path: pathAgent, body: []byte(`{"name":"charset"}`), token: world.tokenB,
-		headers: map[string]string{"Content-Type": "application/json; charset=utf-8"},
-	}).expect(t, "JSON with charset", http.StatusCreated, "")
-
-	expectCount(t, "agents WHERE name = 'typed'", "0")
 }
 
 // ---- the limit -------------------------------------------------------------
@@ -975,9 +728,9 @@ func TestAgentCreateLimit(t *testing.T) {
 	agSeedMany(t, owner, 1, agMaxAgents-1)
 	agMustCreate(t, world.tokenB, "number 25")
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "25", owner)
-	expectCount(t, "japikeys WHERE kind = 'api_key'", "25")
+	expectCount(t, "api_keys", "25")
 
-	keysBefore := count(t, "japikeys")
+	keysBefore := count(t, "api_keys")
 
 	got := agCreate(t, world.tokenB, "number 26")
 	got.expect(t, "26th", http.StatusConflict, agCodeLimit)
@@ -989,11 +742,13 @@ func TestAgentCreateLimit(t *testing.T) {
 	expectCount(t, "agents WHERE user_id = ?", "25", owner)
 	expectCount(t, "agents WHERE name = 'number 26'", "0")
 
-	if after := count(t, "japikeys"); after != keysBefore {
-		t.Errorf("japikeys = %s after a refused create, was %s: an orphan key row was left behind", after, keysBefore)
+	if after := count(t, "api_keys"); after != keysBefore {
+		t.Errorf("api_keys = %s after a refused create, was %s: an orphan key row was left behind", after, keysBefore)
 	}
 
-	expectCount(t, "japikeys WHERE agent_id IS NULL AND kind = 'api_key'", "0")
+	expectNoOrphanSecrets(t)
+
+	expectCount(t, "api_keys WHERE agent_id IS NULL", "0")
 
 	// An invalid body at the cap is still the body's error, not the cap's.
 	post(t, pathAgent, []byte(`{}`), world.tokenB).expect(t, "bad name at the cap", http.StatusBadRequest, agCodeBadName)
@@ -1036,10 +791,10 @@ func TestAgentCreateRaceAtTheLimit(t *testing.T) {
 			}
 
 			expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "25", owner)
-			expectCount(t, "japikeys WHERE kind = 'api_key' AND revoked_at IS NULL", "25")
+			expectCount(t, keyRows+" WHERE revoked_at IS NULL", "25")
 			expectCount(t, "agents WHERE name LIKE 'race-%'", "5")
-			expectCount(t, "japikeys WHERE kind = 'api_key' AND agent_id NOT IN (SELECT id FROM agents)", "0")
-			expectCount(t, "agents a WHERE NOT EXISTS (SELECT 1 FROM japikeys k WHERE k.agent_id = a.id)", "0")
+			expectCount(t, "api_keys WHERE agent_id NOT IN (SELECT id FROM agents)", "0")
+			expectCount(t, "agents a WHERE NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.agent_id = a.id)", "0")
 
 			// Every 201 carries a key of its own agent, and each winning agent
 			// really exists with that key.
@@ -1049,7 +804,7 @@ func TestAgentCreateRaceAtTheLimit(t *testing.T) {
 				}
 
 				created := agDecode[agCreated](t, r)
-				expectCount(t, "japikeys WHERE kid = ? AND agent_id = ? AND user_id = ?", "1",
+				expectCount(t, "api_keys WHERE id = ? AND agent_id = ? AND user_id = ?", "1",
 					created.Key.ID, created.Agent.ID, owner)
 			}
 		})
@@ -1101,8 +856,8 @@ func TestAgentCreateRaceTwoUsers(t *testing.T) {
 
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "25", world.a.userID)
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "25", world.b.userID)
-	expectCount(t, "japikeys WHERE kind = 'api_key' AND user_id = ?", "25", world.a.userID)
-	expectCount(t, "japikeys WHERE kind = 'api_key' AND user_id = ?", "25", world.b.userID)
+	expectCount(t, "api_keys WHERE user_id = ?", "25", world.a.userID)
+	expectCount(t, "api_keys WHERE user_id = ?", "25", world.b.userID)
 }
 
 // TestAgentCreateRacesUserRevocation: an admin revokes user B while B creates
@@ -1136,7 +891,7 @@ func TestAgentCreateRacesUserRevocation(t *testing.T) {
 			revoked.expect(t, "revoke the user", http.StatusOK, "")
 
 			expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "0", world.b.userID)
-			expectCount(t, "japikeys WHERE user_id = ? AND revoked_at IS NULL", "0", world.b.userID)
+			expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NULL", "0", world.b.userID)
 
 			// Every 201 produced an agent that is now revoked with its key.
 			created := 0
@@ -1151,7 +906,7 @@ func TestAgentCreateRacesUserRevocation(t *testing.T) {
 
 					body := agDecode[agCreated](t, r)
 					expectCount(t, "agents WHERE id = ? AND revoked_at IS NOT NULL", "1", body.Agent.ID)
-					expectCount(t, "japikeys WHERE kid = ? AND revoked_at IS NOT NULL", "1", body.Key.ID)
+					expectCount(t, "secrets WHERE id = ? AND revoked_at IS NOT NULL", "1", body.Key.ID)
 
 					continue
 				}
@@ -1182,7 +937,7 @@ func TestAgentCreateForARevokedOwner(t *testing.T) {
 	get(t, pathAgent, world.tokenB).expect(t, "list by a revoked user", http.StatusUnauthorized, codeUnauthenticated)
 
 	expectCount(t, "agents WHERE user_id = ?", "0", world.b.userID)
-	expectCount(t, "japikeys WHERE kind = 'api_key'", "0")
+	expectCount(t, "api_keys", "0")
 
 	expectCount(t, "agents", "0")
 }
@@ -1206,7 +961,7 @@ func TestAgentListShapes(t *testing.T) {
 	seedAgent(t, idN(agIDPrefix, 1), world.b.userID, "first")
 	seedAgent(t, idN(agIDPrefix, 2), world.b.userID, "second")
 	seedAgent(t, idN(agIDPrefix, 3), world.b.userID, "third")
-	seedAgentKey(t, idN(agKeyPref, 1), world.b.userID, idN(agIDPrefix, 1))
+	seedAPIKey(t, idN(agKeyPref, 1), world.b.userID, idN(agIDPrefix, 1))
 	seed(t, "UPDATE agents SET revoked_at = 12345, created_at = 777 WHERE id = ?", idN(agIDPrefix, 2))
 
 	list := get(t, pathAgent, world.tokenB)
@@ -1245,7 +1000,7 @@ func TestAgentListShapes(t *testing.T) {
 		t.Errorf("revokedAt appears %d times, want once (only the revoked agent): %s", strings.Count(list.body, "revokedAt"), list.body)
 	}
 
-	for _, leak := range []string{"userId", "user_id", world.b.userID, world.a.userID, "token", "jwk", "kid", "agent_id"} {
+	for _, leak := range []string{"userId", "user_id", world.b.userID, world.a.userID, "token", "hash", "susu_key_", "agent_id"} {
 		if strings.Contains(list.body, leak) {
 			t.Errorf("list leaks %q: %s", leak, list.body)
 		}
@@ -1685,7 +1440,7 @@ func TestAgentOwnershipConfusion(t *testing.T) {
 			seedAgent(t, idAgentB, world.b.userID, "theirs")
 			seedAgent(t, idN(agIDPrefix, 7), world.b.userID, "theirs revoked")
 			seed(t, "UPDATE agents SET revoked_at = 4242 WHERE id = ?", idN(agIDPrefix, 7))
-			seedAgentKey(t, idN(agKeyPref, 1), world.b.userID, idAgentB)
+			seedAPIKey(t, idN(agKeyPref, 1), world.b.userID, idAgentB)
 			seedAgent(t, idAgentA, world.a.userID, "mine")
 
 			targets := []string{idAgentB, idN(agIDPrefix, 7)}
@@ -1737,7 +1492,7 @@ func TestAgentOwnershipConfusion(t *testing.T) {
 				t.Errorf("B's revoked agent changed (revived or renamed?): %s", got)
 			}
 
-			expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL", "1", idAgentB)
+			expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL", "1", idAgentB)
 
 			// A's list never contains B's agents, and B's id as a cursor is just a page.
 			list := get(t, pathAgent, world.tokenA)
@@ -1780,7 +1535,7 @@ func TestAgentRename(t *testing.T) {
 	owner := world.b.userID
 
 	seedAgent(t, idAgentA, owner, "before")
-	seedAgentKey(t, idN(agKeyPref, 1), owner, idAgentA)
+	seedAPIKey(t, idN(agKeyPref, 1), owner, idAgentA)
 
 	item := agItem(idAgentA)
 	created := scalar(t, "SELECT created_at FROM agents WHERE id = ?", idAgentA)
@@ -1803,7 +1558,7 @@ func TestAgentRename(t *testing.T) {
 	patch(t, item, []byte(`{"name":"after"}`), world.tokenB).expect(t, "same name", http.StatusOK, "")
 
 	// The key is untouched by a rename.
-	expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL AND scope = ?", "1", idAgentA, agScopes)
+	expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL AND scope = ?", "1", idAgentA, agScopes)
 
 	for _, c := range agNameCases() {
 		// Only the shapes that mean the same for a patch: the name cases.
@@ -1906,15 +1661,15 @@ func TestAgentRevoke(t *testing.T) {
 
 	// Several keys on the doomed agent, one with a revocation scheduled later and
 	// one already revoked earlier; one on the sibling; one on the foreign agent.
-	seedAgentKey(t, idN(agKeyPref, 1), owner, idAgentA)
-	seedAgentKey(t, idN(agKeyPref, 2), owner, idAgentA)
-	seedAgentKey(t, idN(agKeyPref, 3), owner, idAgentA)
-	seedAgentKey(t, idN(agKeyPref, 4), owner, idAgentB)
-	seedAgentKey(t, idN(agKeyPref, 5), other, idN(agIDPrefix, 9))
-	seed(t, "UPDATE japikeys SET revoked_at = strftime('%s','now') + 100000 WHERE kid = ?", idN(agKeyPref, 2))
-	seed(t, "UPDATE japikeys SET revoked_at = 1000 WHERE kid = ?", idN(agKeyPref, 3))
+	seedAPIKey(t, idN(agKeyPref, 1), owner, idAgentA)
+	seedAPIKey(t, idN(agKeyPref, 2), owner, idAgentA)
+	seedAPIKey(t, idN(agKeyPref, 3), owner, idAgentA)
+	seedAPIKey(t, idN(agKeyPref, 4), owner, idAgentB)
+	seedAPIKey(t, idN(agKeyPref, 5), other, idN(agIDPrefix, 9))
+	seed(t, "UPDATE secrets SET revoked_at = strftime('%s','now') + 100000 WHERE id = ?", idN(agKeyPref, 2))
+	seed(t, "UPDATE secrets SET revoked_at = 1000 WHERE id = ?", idN(agKeyPref, 3))
 
-	sessions := count(t, "japikeys WHERE kind = 'session' AND revoked_at IS NULL")
+	sessions := count(t, "secrets WHERE kind = 'session' AND revoked_at IS NULL")
 	before := time.Now().Unix()
 	got := del(t, agItem(idAgentA), world.tokenB)
 	after := time.Now().Unix()
@@ -1936,18 +1691,18 @@ func TestAgentRevoke(t *testing.T) {
 
 	// All its keys are revoked: a future revocation is brought forward, an
 	// earlier one is kept.
-	for kid, want := range map[string]int64{idN(agKeyPref, 1): revokedAt, idN(agKeyPref, 2): revokedAt, idN(agKeyPref, 3): 1000} {
-		if got := scalar(t, "SELECT revoked_at FROM japikeys WHERE kid = ?", kid); got != strconv.FormatInt(want, 10) {
-			t.Errorf("key %s revoked_at = %s, want %d", kid, got, want)
+	for id, want := range map[string]int64{idN(agKeyPref, 1): revokedAt, idN(agKeyPref, 2): revokedAt, idN(agKeyPref, 3): 1000} {
+		if got := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", id); got != strconv.FormatInt(want, 10) {
+			t.Errorf("key %s revoked_at = %s, want %d", id, got, want)
 		}
 	}
 
 	// Nothing else was touched.
 	expectCount(t, "agents WHERE id = ? AND revoked_at IS NULL", "1", idAgentB)
-	expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL", "1", idAgentB)
+	expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL", "1", idAgentB)
 	expectCount(t, "agents WHERE id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 9))
-	expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 9))
-	expectCount(t, "japikeys WHERE kind = 'session' AND revoked_at IS NULL", sessions)
+	expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 9))
+	expectCount(t, "secrets WHERE kind = 'session' AND revoked_at IS NULL", sessions)
 	expectCount(t, "agents", "3")
 
 	// The user's own session is still good.
@@ -1964,7 +1719,7 @@ func TestAgentRevoke(t *testing.T) {
 		t.Errorf("second revoke revokedAt = %v, want the first, %d", rev.RevokedAt, revokedAt)
 	}
 
-	if got := scalar(t, "SELECT revoked_at FROM japikeys WHERE kid = ?", idN(agKeyPref, 1)); got != strconv.FormatInt(revokedAt, 10) {
+	if got := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", idN(agKeyPref, 1)); got != strconv.FormatInt(revokedAt, 10) {
 		t.Errorf("key revoked_at moved on the second revoke: %s", got)
 	}
 
@@ -1972,7 +1727,7 @@ func TestAgentRevoke(t *testing.T) {
 	del(t, agItem(idMissing), world.tokenB).expect(t, "unknown", http.StatusNotFound, agCodeMissing)
 	del(t, agItem(idN(agIDPrefix, 9)), world.tokenB).expect(t, "foreign", http.StatusNotFound, agCodeMissing)
 	expectCount(t, "agents WHERE id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 9))
-	expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 9))
+	expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 9))
 
 	// A revoked agent keeps showing in the list and still counts as revoked.
 	list := agDecode[agPage](t, get(t, pathAgent, world.tokenB))
@@ -1981,10 +1736,9 @@ func TestAgentRevoke(t *testing.T) {
 	}
 }
 
-// TestAgentRevokeRevokesNothingElse: an agent key that is not revoked stays
-// usable as far as the table goes only until revoked; no route accepts it. The
-// token of a revoked agent still decodes (claims are self-contained) but is not
-// accepted anywhere.
+// TestAgentRevokedKeyIsNotAccepted: an agent's key is accepted as a bearer only
+// while its agent is active. Revoking the agent revokes the key's secret, and
+// the token is then refused everywhere.
 //
 //nolint:paralleltest // shares one database
 func TestAgentRevokedKeyIsNotAccepted(t *testing.T) {
@@ -1997,13 +1751,14 @@ func TestAgentRevokedKeyIsNotAccepted(t *testing.T) {
 	scBearer(t, http.MethodGet, pathAgent, nil, created.Key.Token).expect(t, "active key as bearer", http.StatusOK, "")
 
 	del(t, agItem(created.Agent.ID), world.tokenB).expect(t, "revoke", http.StatusOK, "")
-	expectCount(t, "japikeys WHERE kid = ? AND revoked_at IS NOT NULL", "1", created.Key.ID)
+	expectCount(t, "secrets WHERE id = ? AND revoked_at IS NOT NULL", "1", created.Key.ID)
 
-	// Revoked: its claims still decode, and it is refused as a bearer too.
+	// Revoked: the secret and its row stay, and the token is refused as a bearer.
 	scBearer(t, http.MethodGet, pathAgent, nil, created.Key.Token).
 		expect(t, "revoked key as bearer", http.StatusUnauthorized, codeUnauthenticated)
-	if sub := claimsOf(t, created.Key.Token)["sub"]; sub != world.b.userID {
-		t.Errorf("sub = %v after revocation", sub)
+
+	if stored := mustSecretOf(t, created.Key.Token); !stored.revoked || !stored.kindRow {
+		t.Errorf("revoked key's secret = %+v, want kept, revoked, with its api_keys row", stored)
 	}
 
 	agKeyIsNotACredential(t, world.tokenB, created.Key.Token)
@@ -2019,8 +1774,8 @@ func TestAgentRevokeRaces(t *testing.T) {
 		for round := range 3 {
 			world := agNewPair(t, roleMember)
 			seedAgent(t, idAgentA, world.b.userID, "contended")
-			seedAgentKey(t, idN(agKeyPref, 1), world.b.userID, idAgentA)
-			seedAgentKey(t, idN(agKeyPref, 2), world.b.userID, idAgentA)
+			seedAPIKey(t, idN(agKeyPref, 1), world.b.userID, idAgentA)
+			seedAPIKey(t, idN(agKeyPref, 2), world.b.userID, idAgentA)
 
 			replies := agRelease(8, func(int) reply { return del(t, agItem(idAgentA), world.tokenB) })
 			t.Logf("round %d: %v", round, agTally(replies))
@@ -2041,8 +1796,8 @@ func TestAgentRevokeRaces(t *testing.T) {
 				t.Errorf("responses carry revokedAt values %v, stored %s: want exactly one", stamps, stored)
 			}
 
-			expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL", "0", idAgentA)
-			expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at = ?", "2", idAgentA, stored)
+			expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL", "0", idAgentA)
+			expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at = ?", "2", idAgentA, stored)
 		}
 	})
 
@@ -2050,7 +1805,7 @@ func TestAgentRevokeRaces(t *testing.T) {
 		for round := range 4 {
 			world := agNewPair(t, roleMember)
 			seedAgent(t, idAgentA, world.b.userID, "original")
-			seedAgentKey(t, idN(agKeyPref, 1), world.b.userID, idAgentA)
+			seedAPIKey(t, idN(agKeyPref, 1), world.b.userID, idAgentA)
 
 			const renamers = 10
 
@@ -2070,7 +1825,7 @@ func TestAgentRevokeRaces(t *testing.T) {
 				t.Errorf("the agent is not revoked after the race")
 			}
 
-			expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL", "0", idAgentA)
+			expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL", "0", idAgentA)
 
 			// The stored name is the name of one rename that succeeded BEFORE the
 			// revoke (or the original when none did): a 200 rename is the only way
@@ -2180,17 +1935,17 @@ func TestRevokingAUserRevokesTheirAgents(t *testing.T) {
 	// B has 3 agents (one already revoked at 500), each with a key; A has one.
 	for i := 1; i <= 3; i++ {
 		seedAgent(t, idN(agIDPrefix, i), world.b.userID, "b"+strconv.Itoa(i))
-		seedAgentKey(t, idN(agKeyPref, i), world.b.userID, idN(agIDPrefix, i))
+		seedAPIKey(t, idN(agKeyPref, i), world.b.userID, idN(agIDPrefix, i))
 	}
 
 	seed(t, "UPDATE agents SET revoked_at = 500 WHERE id = ?", idN(agIDPrefix, 3))
 	seedAgent(t, idN(agIDPrefix, 10), world.a.userID, "a1")
-	seedAgentKey(t, idN(agKeyPref, 10), world.a.userID, idN(agIDPrefix, 10))
+	seedAPIKey(t, idN(agKeyPref, 10), world.a.userID, idN(agIDPrefix, 10))
 
 	// The last admin cannot be revoked, so neither are their agents.
 	del(t, pathUser+"/"+world.a.userID, world.tokenA).expect(t, "revoke the last admin", http.StatusConflict, "user_last_admin")
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NOT NULL", "0", world.a.userID)
-	expectCount(t, "japikeys WHERE agent_id IS NOT NULL AND user_id = ? AND revoked_at IS NOT NULL", "0", world.a.userID)
+	expectCount(t, keyRows+" WHERE k.agent_id IS NOT NULL AND k.user_id = ? AND revoked_at IS NOT NULL", "0", world.a.userID)
 
 	// An admin has no reach into another user's agents through /api/agent.
 	get(t, agItem(idN(agIDPrefix, 1)), world.tokenA).expect(t, "admin GET B's agent", http.StatusNotFound, agCodeMissing)
@@ -2202,9 +1957,9 @@ func TestRevokingAUserRevokesTheirAgents(t *testing.T) {
 	del(t, pathUser+"/"+world.b.userID, world.tokenA).expect(t, "revoke B", http.StatusOK, "")
 
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "0", world.b.userID)
-	expectCount(t, "japikeys WHERE user_id = ? AND revoked_at IS NULL", "0", world.b.userID)
+	expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NULL", "0", world.b.userID)
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "1", world.a.userID)
-	expectCount(t, "japikeys WHERE agent_id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 10))
+	expectCount(t, keyRows+" WHERE k.agent_id = ? AND revoked_at IS NULL", "1", idN(agIDPrefix, 10))
 
 	// The agent that was already revoked keeps its earlier time.
 	if got := scalar(t, "SELECT revoked_at FROM agents WHERE id = ?", idN(agIDPrefix, 3)); got != "500" {

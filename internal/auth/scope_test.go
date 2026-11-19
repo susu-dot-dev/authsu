@@ -7,18 +7,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/scope"
-	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-const (
-	agentOne = "00000000-0000-7000-8000-0000000000a1"
-	agentTwo = "00000000-0000-7000-8000-0000000000a2"
-)
+const agentOne = "00000000-0000-7000-8000-0000000000a1"
 
 // scopedRoutes is a route table where each route declares one access rule, so a
 // request's outcome shows exactly which rule it met. Every route records its
@@ -129,6 +124,9 @@ func userKeyCases() []accessCase {
 		{"no agent, so a route that refuses agents is fine", userKey(bundleUser), "/open-no-agents", allowed},
 		{"an unknown name grants nothing", userKey("nope:read"), "/agent-read", noScope},
 		{"an unknown name beside a known one", userKey("nope:read", scopeRead), "/agent-read", allowed},
+		{"a damaged stored list grants nothing", userKeyStored("not json"), "/agent-read", noScope},
+		{"a damaged stored list still opens an open route", userKeyStored("not json"), "/open", allowed},
+		{"a stored list that is not strings grants nothing", userKeyStored(`[1]`), "/agent-read", noScope},
 	}
 }
 
@@ -173,8 +171,8 @@ func agentKeyCases() []accessCase {
 }
 
 // TestAccessMatrix is the permission table, one row per credential, route and
-// answer. It drives the real boundary, so the declaration, the token's claim,
-// the agent's row and the role are all the real ones.
+// answer. It drives the real boundary, so the declaration, the key's stored
+// scopes, the agent's row and the role are all the real ones.
 func TestAccessMatrix(t *testing.T) {
 	t.Parallel()
 
@@ -250,7 +248,7 @@ type credentialFn = func(*rig) (string, *http.Cookie)
 
 // session is a stored session for a user with role.
 func session(role string) credentialFn {
-	return func(r *rig) (string, *http.Cookie) { return "", sessionCookie(r.sessionFor(userID, role)) }
+	return func(r *rig) (string, *http.Cookie) { return "", sessionCookie(r.sessionFor(role)) }
 }
 
 func member(f func(string) credentialFn) credentialFn { return f(roleMember) }
@@ -265,6 +263,14 @@ func adminKey(names ...string) credentialFn { return keyOf(auth.RoleAdmin, names
 func keyOf(role string, names ...string) credentialFn {
 	return func(r *rig) (string, *http.Cookie) {
 		return bearer(r.apiKey(bearerSpec{scope: list(names...), role: role})), nil
+	}
+}
+
+// userKeyStored is a stored API key of a member whose stored scope text is text
+// as it is.
+func userKeyStored(text string) credentialFn {
+	return func(r *rig) (string, *http.Cookie) {
+		return bearer(r.apiKey(bearerSpec{role: roleMember}.withStoredScope(text))), nil
 	}
 }
 
@@ -285,482 +291,6 @@ func agentKeyStored(key scope.List, stored string) credentialFn {
 func agentOf(role string, key scope.List, agentStored string) credentialFn {
 	return func(r *rig) (string, *http.Cookie) {
 		return bearer(r.apiKey(bearerSpec{scope: key, role: role, agent: agentOne, agentScopes: agentStored})), nil
-	}
-}
-
-// TestPrincipalCarriesTheScopeLists: what the handler is given is the key's list
-// and the agent's list exactly as written, plus their intersection.
-func TestPrincipalCarriesTheScopeLists(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		spec bearerSpec
-		want principalWant
-	}{
-		{
-			name: "a user's key",
-			spec: bearerSpec{scope: list("agent:read", "key:read"), role: roleMember},
-			want: principalWant{
-				key: []string{"agent:read", "key:read"}, agent: []string{},
-				effective: []scope.Scope{scope.AgentRead, scope.KeyRead},
-			},
-		},
-		{
-			name: "an agent's key is the intersection",
-			spec: bearerSpec{
-				scope: list(scope.DefaultUser), role: roleMember, agent: agentOne,
-				agentScopes: list("agent:read", "agent:create", "user:read").JSON(),
-			},
-			want: principalWant{
-				key: []string{scope.DefaultUser}, agent: []string{"agent:read", "agent:create", "user:read"},
-				agentID: agentOne, effective: []scope.Scope{scope.AgentCreate, scope.AgentRead},
-			},
-		},
-		{
-			name: "lists are kept as written, duplicates and order included",
-			spec: bearerSpec{scope: list("key:read", "agent:read", "key:read"), role: roleMember},
-			want: principalWant{
-				key: []string{"key:read", "agent:read", "key:read"}, agent: []string{},
-				effective: []scope.Scope{scope.AgentRead, scope.KeyRead},
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			r := newRig(t)
-			key := r.apiKey(test.spec)
-
-			routes := []auth.Route{r.getRoute("/me", auth.Authenticated, auth.Open())}
-
-			rec := r.serveWith(routes, "/me", []string{bearer(key)}, nil)
-			if rec.Code != http.StatusOK || len(r.handled) != 1 {
-				t.Fatalf("status = %d, ran %d times: %s", rec.Code, len(r.handled), rec.Body)
-			}
-
-			checkPrincipal(t, r.handled[0].Principal, key, test.want)
-		})
-	}
-}
-
-// principalWant is what a handler is given for a key.
-type principalWant struct {
-	key, agent []string
-	agentID    string
-	effective  []scope.Scope
-}
-
-// checkPrincipal checks the Principal of an API key: who, and the two lists as
-// written and their intersection.
-func checkPrincipal(t *testing.T, who auth.Principal, key auth.Key, want principalWant) {
-	t.Helper()
-
-	if who.UserID != userID || who.Kind != auth.KindAPIKey || who.AgentID != want.agentID ||
-		who.KeyID != key.ID.String() || who.CredentialID != "" {
-		t.Errorf("principal = %+v", who)
-	}
-
-	if !slices.Equal([]string(who.KeyScope), want.key) {
-		t.Errorf("KeyScope = %v, want %v", who.KeyScope, want.key)
-	}
-
-	if !slices.Equal([]string(who.AgentScope), want.agent) {
-		t.Errorf("AgentScope = %v, want %v", who.AgentScope, want.agent)
-	}
-
-	if got := who.Effective.Sorted(); !slices.Equal(got, want.effective) {
-		t.Errorf("Effective = %v, want %v", got, want.effective)
-	}
-}
-
-// TestTheKeysClaimIsTheScopeNotTheRow: the signed claim is authoritative, and
-// the row's copy is only for listing. The fake store's row has no scope field at
-// all, so a boundary that read it would see nothing; this holds that the claim is
-// what is used, for both a user's key and an agent's.
-func TestTheKeysClaimIsTheScopeNotTheRow(t *testing.T) {
-	t.Parallel()
-
-	r := newRig(t)
-	key := r.apiKey(bearerSpec{scope: list("agent:read"), role: roleMember})
-
-	rec := r.serveWith(r.scopedRoutes(), "/agent-read", []string{bearer(key)}, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("a key whose claim names agent:read was refused: %d %s", rec.Code, rec.Body)
-	}
-
-	rec = r.serveWith(r.scopedRoutes(), "/agent-create", []string{bearer(key)}, nil)
-	if rec.Code != http.StatusForbidden {
-		t.Errorf("a key whose claim lacks agent:create was allowed: %d", rec.Code)
-	}
-}
-
-// TestMalformedScopeClaimsGrantNothing: whatever the token's scope claim is, if
-// it is not an array of strings the key can use only open routes. A token the
-// service did not create with this shape is signed by a key whose public half is
-// in the database, so this is about a defect on our side, not a forgery.
-func TestMalformedScopeClaimsGrantNothing(t *testing.T) {
-	t.Parallel()
-
-	tests := map[string]any{
-		"missing":                  nil,
-		"a string":                 "agent:read",
-		"a space separated string": "agent:read agent:create",
-		"a number":                 1,
-		"an object":                map[string]any{"agent:read": true},
-		"nested array":             []any{[]any{"agent:read"}},
-		"a number in the array":    []any{"agent:read", 1},
-		"null elements":            []any{nil},
-	}
-
-	for name, claim := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			r := newRig(t)
-			f := forgeKey(t, r, claim, auth.KindAPIKey)
-			r.storeForgedAs(f, auth.KindAPIKey)
-
-			rec := r.serveWith(r.scopedRoutes(), "/agent-read", []string{"Bearer " + f.JWT}, nil)
-			if rec.Code != http.StatusForbidden {
-				t.Errorf("status = %d (%s), want 403 for a claim that is %s", rec.Code, rec.Body, name)
-			}
-
-			rec = r.serveWith(r.scopedRoutes(), "/open", []string{"Bearer " + f.JWT}, nil)
-			if rec.Code != http.StatusOK {
-				t.Errorf("an open route refused a valid key with a bad scope claim: %d %s", rec.Code, rec.Body)
-			}
-		})
-	}
-}
-
-// forgeKey signs an API key token for the standard user with the given scope
-// claim, or none when claim is nil.
-func forgeKey(t *testing.T, r *rig, claim any, kind string) forged {
-	t.Helper()
-
-	return forge(t, r.issuer, r.now, func(claims map[string]any) {
-		claims[claimAud] = auth.Audience(kind)
-
-		if claim != nil {
-			claims[claimScope] = claim
-		}
-	})
-}
-
-// storeForgedAs stores a forged key's row under kind, owned by a member.
-func (r *rig) storeForgedAs(f forged, kind string) {
-	r.keys.rows[rowKey{kid: f.ID.String(), kind: kind}] = store.ActiveKey{
-		JWK: []byte(f.JWK), UserID: userID, CredentialID: "", Role: roleMember, ExpiresAt: r.now.Add(time.Hour),
-	}
-}
-
-// agentSpec is a stored key of agentOne whose scopes are bundleAgent on both
-// sides: the baseline the actor tests spoil one way at a time.
-func agentSpec() bearerSpec {
-	return bearerSpec{scope: list(bundleAgent), agent: agentOne, agentScopes: list(bundleAgent).JSON()}
-}
-
-// TestActorMustMatchTheRow: the token's actor and the row's agent must agree,
-// both ways. A mismatch is not a valid key, so it is a 401, and the rest of the
-// request is never judged.
-func TestActorMustMatchTheRow(t *testing.T) {
-	t.Parallel()
-
-	const ok, no = http.StatusOK, http.StatusUnauthorized
-
-	noAgent := bearerSpec{scope: list(bundleAgent)}
-
-	tests := []struct {
-		name string
-		spec bearerSpec
-		want int
-	}{
-		{"agent row and matching actor", agentSpec(), ok},
-		{"no agent and no actor", noAgent, ok},
-		{"agent row, token names another agent", agentSpec().withActor(agentTwo), no},
-		{"agent row, token names no actor", agentSpec().withActor(""), no},
-		{"no agent row, token names an actor", noAgent.withActor(agentOne), no},
-		{"agent row, actor in another case", agentSpec().withActor(strings.ToUpper(agentOne)), no},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			r := newRig(t)
-			key := r.apiKey(test.spec)
-
-			rec := r.serveWith(r.scopedRoutes(), "/open", []string{bearer(key)}, nil)
-			if rec.Code != test.want {
-				t.Errorf("status = %d (%s), want %d", rec.Code, rec.Body, test.want)
-			}
-
-			if test.want == no && rec.Body.String() != bodyUnauthenticated {
-				t.Errorf("body = %q, want the one unauthenticated answer", rec.Body)
-			}
-		})
-	}
-}
-
-// forgedWithAct signs an API key token whose act claim is act, as written, and
-// stores its row with agent (which may be empty: no agent).
-func forgedWithAct(t *testing.T, act any, agent string) (*rig, string) {
-	t.Helper()
-
-	r := newRig(t)
-
-	f := forge(t, r.issuer, r.now, func(claims map[string]any) {
-		claims[claimAud] = auth.Audience(auth.KindAPIKey)
-		claims[claimScope] = []any{bundleAgent}
-		claims[claimAct] = act
-	})
-
-	row := store.ActiveKey{
-		JWK: []byte(f.JWK), UserID: userID, CredentialID: "", Role: roleMember, ExpiresAt: r.now.Add(time.Hour),
-		AgentID: agent,
-	}
-	if agent != "" {
-		row.AgentScopes = list(bundleAgent).JSON()
-	}
-
-	r.keys.rows[rowKey{kid: f.ID.String(), kind: auth.KindAPIKey}] = row
-
-	return r, "Bearer " + f.JWT
-}
-
-// TestMalformedActorClaimIsRefused: an act claim that is present but is not
-// {"sub": "<id>"} is not a token this service issued, so it is a 401 whatever
-// the row holds: against a key that has an agent and against one that has none.
-// It is never read as "no actor" and let through.
-func TestMalformedActorClaimIsRefused(t *testing.T) {
-	t.Parallel()
-
-	shapes := map[string]any{
-		"a string":          agentOne,
-		"an array":          []any{agentOne},
-		"sub is a number":   map[string]any{claimSub: 1},
-		"sub is missing":    map[string]any{"id": agentOne},
-		"sub is an object":  map[string]any{claimSub: map[string]any{"id": agentOne}},
-		"null":              nil,
-		"an empty object":   map[string]any{},
-		"sub is empty text": map[string]any{claimSub: ""},
-	}
-
-	for name, act := range shapes {
-		t.Run(name+" against an agent's row", func(t *testing.T) {
-			t.Parallel()
-
-			r, header := forgedWithAct(t, act, agentOne)
-
-			rec := r.serveWith(r.scopedRoutes(), "/open", []string{header}, nil)
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("status %d, want 401", rec.Code)
-			}
-		})
-
-		t.Run(name+" against a key with no agent", func(t *testing.T) {
-			t.Parallel()
-
-			r, header := forgedWithAct(t, act, "")
-
-			rec := r.serveWith(r.scopedRoutes(), "/open", []string{header}, nil)
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("status %d (%s), want 401", rec.Code, rec.Body)
-			}
-
-			if rec.Body.String() != bodyUnauthenticated {
-				t.Errorf("body = %q, want the one unauthenticated answer", rec.Body)
-			}
-		})
-	}
-}
-
-// validBearer is the header of a stored API key with no scopes.
-func validBearer(r *rig) string { return bearer(r.apiKey(bearerSpec{scope: list()})) }
-
-// bearerCase is one Authorization header, built on a rig, and the status it gets.
-type bearerCase struct {
-	name  string
-	build func(*rig) []string
-	want  int
-}
-
-// bearerCases are the shapes an Authorization header can take.
-func bearerCases() []bearerCase {
-	one := func(f func(*rig) string) func(*rig) []string {
-		return func(r *rig) []string { return []string{f(r)} }
-	}
-	token := func(r *rig) string { return r.apiKey(bearerSpec{scope: list()}).JWT }
-	fixed := func(value string) func(*rig) []string { return func(*rig) []string { return []string{value} } }
-
-	const ok, no = http.StatusOK, http.StatusUnauthorized
-
-	return []bearerCase{
-		{"a bearer token", one(validBearer), ok},
-		{"scheme in lower case", one(func(r *rig) string { return "bearer " + token(r) }), ok},
-		{"scheme in upper case", one(func(r *rig) string { return "BEARER " + token(r) }), ok},
-		{"no header", func(*rig) []string { return nil }, no},
-		{"the scheme alone", fixed("Bearer"), no},
-		{"the scheme and a space", fixed("Bearer "), no},
-		{"basic auth", fixed("Basic dXNlcjpwYXNz"), no},
-		{"a token with no scheme", one(token), no},
-		{"two spaces before the token", one(func(r *rig) string { return "Bearer  " + token(r) }), no},
-		{"a trailing space", one(func(r *rig) string { return validBearer(r) + " " }), no},
-		{"a tab instead of a space", one(func(r *rig) string { return "Bearer\t" + token(r) }), no},
-		{"two tokens in one header", one(func(r *rig) string { t := token(r); return "Bearer " + t + " " + t }), no},
-		{"the header sent twice", func(r *rig) []string { h := validBearer(r); return []string{h, h} }, no},
-		{"a good header and a bad one", func(r *rig) []string { return []string{validBearer(r), "Bearer " + garbage} }, no},
-		{"garbage", fixed("Bearer " + garbage), no},
-		{"an oversized token", fixed("Bearer " + strings.Repeat("a", 5000)), no},
-		{"a NUL in the token", fixed("Bearer a\x00b"), no},
-		{"a key that is not stored", one(func(r *rig) string { return bearer(r.createKey(r.issuer, auth.KindAPIKey)) }), no},
-	}
-}
-
-// garbage is a bearer value that is a token by alphabet and nothing else.
-const garbage = "garbage"
-
-// TestBearerParsing: the header is parsed strictly and a request that sent a
-// credential in the header is never treated as having sent none.
-func TestBearerParsing(t *testing.T) {
-	t.Parallel()
-
-	for _, test := range bearerCases() {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			r := newRig(t)
-
-			rec := r.serveWith(r.scopedRoutes(), "/open", test.build(r), nil)
-			if rec.Code != test.want {
-				t.Errorf("status = %d (%s), want %d", rec.Code, rec.Body, test.want)
-			}
-
-			if test.want == http.StatusUnauthorized && (rec.Body.String() != bodyUnauthenticated || len(r.handled) != 0) {
-				t.Errorf("body = %q, handler ran %d times, want the one unauthenticated answer", rec.Body, len(r.handled))
-			}
-		})
-	}
-}
-
-// TestCarriersAreNotInterchangeable: a session token presented as a bearer is not
-// an API key, and an API key presented as the session cookie is not a session.
-// The audience, the kind the row is read with, and the carrier all have to
-// agree, so no kind can be passed off as the other.
-func TestCarriersAreNotInterchangeable(t *testing.T) {
-	t.Parallel()
-
-	t.Run("a session token as a bearer token", func(t *testing.T) {
-		t.Parallel()
-
-		r := newRig(t)
-		key := r.session()
-
-		rec := r.serveWith(r.scopedRoutes(), "/open", []string{bearer(key)}, nil)
-		if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
-			t.Errorf("response = %d %q, want 401", rec.Code, rec.Body)
-		}
-	})
-
-	t.Run("an API key as the session cookie", func(t *testing.T) {
-		t.Parallel()
-
-		r := newRig(t)
-		key := r.apiKey(bearerSpec{scope: list(scope.DefaultSession)})
-
-		rec := r.serveWith(r.scopedRoutes(), "/open", nil, []*http.Cookie{sessionCookie(key)})
-		if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
-			t.Errorf("response = %d %q, want 401", rec.Code, rec.Body)
-		}
-	})
-
-	t.Run("each read asks the store for its own kind", func(t *testing.T) {
-		t.Parallel()
-
-		r := newRig(t)
-		apiKey := r.apiKey(bearerSpec{scope: list()})
-		sessionKey := r.session()
-
-		r.serveWith(r.scopedRoutes(), "/open", []string{bearer(apiKey)}, nil)
-		r.serveWith(r.scopedRoutes(), "/open", nil, []*http.Cookie{sessionCookie(sessionKey)})
-
-		if len(r.keys.calls) != 2 || r.keys.calls[0].kind != auth.KindAPIKey || r.keys.calls[1].kind != auth.KindSession {
-			t.Errorf("store reads = %+v, want one api_key then one session", r.keys.calls)
-		}
-	})
-
-	t.Run("a kind the store does not hold under that kid", func(t *testing.T) {
-		t.Parallel()
-
-		r := newRig(t)
-		r.keys.ignoreKind = true
-		key := r.session()
-
-		// The store answers for the kid whatever its kind; the audience still
-		// refuses a session token on the bearer path.
-		rec := r.serveWith(r.scopedRoutes(), "/open", []string{bearer(key)}, nil)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want 401", rec.Code)
-		}
-	})
-}
-
-// TestBothCredentialsAreRefused: a request carrying a session cookie and a
-// bearer token is ambiguous, and picking either would let whoever controls the
-// other decide. It is refused before either is verified, with the one
-// unauthenticated answer.
-func TestBothCredentialsAreRefused(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		build func(*rig) ([]string, []*http.Cookie)
-	}{
-		{"a valid session and a valid key", func(r *rig) ([]string, []*http.Cookie) {
-			header := bearer(r.apiKey(bearerSpec{scope: list(bundleSession)}))
-
-			return []string{header}, []*http.Cookie{sessionCookie(r.session())}
-		}},
-		{"a valid session and a garbage bearer", func(r *rig) ([]string, []*http.Cookie) {
-			return []string{"Bearer garbage"}, []*http.Cookie{sessionCookie(r.session())}
-		}},
-		{"a garbage cookie and a valid key", func(r *rig) ([]string, []*http.Cookie) {
-			return []string{bearer(r.apiKey(bearerSpec{scope: list(scope.DefaultSession)}))},
-				[]*http.Cookie{requestCookie(auth.CookieName, "garbage")}
-		}},
-		{"an empty cookie and a valid key", func(r *rig) ([]string, []*http.Cookie) {
-			return []string{bearer(r.apiKey(bearerSpec{scope: list(scope.DefaultSession)}))},
-				[]*http.Cookie{requestCookie(auth.CookieName, "")}
-		}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			r := newRig(t)
-			headers, cookies := test.build(r)
-
-			rec := r.serveWith(r.scopedRoutes(), "/open", headers, cookies)
-			if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
-				t.Errorf("response = %d %q, want 401 unauthenticated", rec.Code, rec.Body)
-			}
-
-			if len(r.keys.calls) != 0 {
-				t.Errorf("the store was read %d times; an ambiguous request is refused before any read", len(r.keys.calls))
-			}
-
-			if len(r.handled) != 0 {
-				t.Error("an ambiguous request reached the handler")
-			}
-
-			if len(r.logged) != 1 || !strings.Contains(r.logged[0].Error(), "both a session cookie and a bearer token") {
-				t.Errorf("logged = %v, want the cause in the log only", r.logged)
-			}
-		})
 	}
 }
 
@@ -793,7 +323,7 @@ func TestCredentialIsJudgedBeforeAccess(t *testing.T) {
 				scope: list(scope.DefaultSession), agent: agentOne, agentScopes: list(scope.DefaultSession).JSON(),
 			})
 			// The store reports nothing active for a key whose agent is revoked.
-			delete(r.keys.rows, rowKey{kid: key.ID.String(), kind: auth.KindAPIKey})
+			r.unstore(key)
 
 			rec := r.serveWith(r.scopedRoutes(), path, []string{bearer(key)}, nil)
 			if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {

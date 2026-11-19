@@ -8,17 +8,20 @@
 //  1. Everything httpapi does first: the method (405 with Allow), the
 //     Content-Type of an unsafe method (415), and the body up to the route's
 //     MaxBody (413). Nothing below runs for a request that fails here.
-//  2. For an Authenticated route: loads the configuration (503 not_configured),
-//     reads the credential, which is either the one __Host-session cookie (a
-//     session) or an "Authorization: Bearer" token (an API key) and never both,
-//     parses it as an input.Token, verifies the JWT with the audience of its
-//     kind and this API's issuer, reads the key's row (with its account and, for
-//     an agent's key, the agent) and checks that the signed subject is the
-//     row's owner and the signed actor is the row's agent. Every verdict on the
-//     token is one answer, 401 unauthenticated (see Unauthenticated); a failure
-//     of the store is 503 session_verify_failed.
-//  3. Works out the effective scopes: the key's signed scope claim, narrowed by
-//     the agent's scopes when an agent is acting (docs/permissions_design.md).
+//  2. For an Authenticated route: reads the credential, which is either the
+//     one __Host-session cookie (a session) or an "Authorization: Bearer"
+//     token (an API key) and never both. Each carrier accepts exactly one kind
+//     of token, so a token of the other kind, or anything that is not a token,
+//     is refused here, before the store is read. A token that parses is resolved
+//     in the store (store.ResolveSession, store.ResolveAPIKey), which reads
+//     the secret, its account and, for an agent's key, the agent in one
+//     statement and finds it only while every part is active. Every verdict on
+//     the credential is one answer, 401 unauthenticated (see Unauthenticated); a
+//     failure of the store is 503 session_verify_failed. Verifying a credential
+//     needs no configuration: a token carries nothing to check.
+//  3. Works out the effective scopes: the credential's scope list (a session's
+//     is SessionScope, a key's is the one stored with it), narrowed by the
+//     agent's scopes when an agent is acting (docs/permissions_design.md).
 //  4. Applies the route's Access (403): the administrator role for an admin
 //     scope, then the scope, then session-only, then no-agents.
 //  5. Parses the route's {id} wildcard, if it has one, as an input.ID (400
@@ -36,9 +39,11 @@
 // Access: leaving either out is a programming error, not a public route (see
 // Handler).
 //
-// What the boundary does not do: it never writes. Reads of the account happen
-// in the same primary-key read that finds the key, so a revoked account or a
-// changed role takes effect on the next request (store.ActiveKey).
+// What the boundary does not do: it never writes. The account is read in the
+// same statement that finds the credential, so a revoked account or a changed
+// role takes effect on the next request (store.ResolveSession,
+// store.ResolveAPIKey). A handler that needs the deployment's configuration asks
+// for it (Call.Config), and is answered 503 not_configured if it is missing.
 package auth
 
 import (
@@ -73,12 +78,12 @@ const (
 
 // Credential is what a route requires of the request's proof of identity.
 //
-// There are two answers, not one per kind of key: an Authenticated route
-// accepts whichever valid key the request carries (a session in the cookie, an
-// API key as a bearer token), and Access decides which kinds and which callers
-// may use the route. Adding a kind of key is local to this package: a constant
-// in keys.go, the place the request is read, and the audience of its
-// verification. No route and no feature changes.
+// There are two answers, not one per kind of credential: an Authenticated
+// route accepts whichever valid credential the request carries (a session in
+// the cookie, an API key as a bearer token), and Access decides which kinds and
+// which callers may use the route. Adding a kind of credential is local to this
+// package: a constant in issue.go, the place the request is read, and the
+// resolver of its token. No route and no feature changes.
 type Credential uint8
 
 const (
@@ -91,43 +96,40 @@ const (
 	// before they have a session. It never reads the credential or the store.
 	None
 
-	// Authenticated is a route that needs a valid key: a login session in the
+	// Authenticated is a route that needs a valid credential: a login session in the
 	// __Host-session cookie, or an API key as a bearer token.
 	Authenticated
 )
 
 // Principal is who a verified credential speaks for. Every field comes from
-// the stored key and its account, read at the time of the request, never from
-// the token's claims except the subject, the actor and the scope, which the
-// boundary checks against the row or intersects with it.
+// the stored rows read for the request, never from the token, which carries
+// nothing.
 type Principal struct {
 	// UserID is the account. It is the user whose authority is being used,
 	// even when an agent is acting.
 	UserID string
-	// Role is the account's role now, not at the key's creation.
+	// Role is the account's role now, not at the credential's issue.
 	Role string
-	// KeyID is the kid of the token presented.
-	KeyID string
-	// CredentialID is the passkey the session was issued for, or "" for a key
-	// that has none.
-	CredentialID string
-	// Kind is the kind of key presented (KindSession or KindAPIKey).
+	// SecretID is the id of the session or API key presented: the identifier
+	// it is listed and revoked by.
+	SecretID string
+	// Kind is the kind of credential presented (KindSession or KindAPIKey).
 	Kind string
-	// ExpiresAt is when the key stops being active.
+	// ExpiresAt is when the credential stops being active.
 	ExpiresAt time.Time
 
-	// AgentID is the agent acting, or "" when the user is. It is the row's, and
-	// the token's act claim agrees with it.
+	// AgentID is the agent acting, or "" when the user is.
 	AgentID string
-	// KeyScope is the key's scope list exactly as signed into its token. The
-	// claim is authoritative: the row's copy is only for listing.
-	KeyScope scope.List
+	// Scope is the credential's own scope list exactly as stored: SessionScope
+	// for a session, the key row's list for an API key. A list that is damaged
+	// reads as empty.
+	Scope scope.List
 	// AgentScope is the acting agent's scope list exactly as stored, read now,
 	// or empty when no agent is acting.
 	AgentScope scope.List
-	// Effective is what the request may do: the key's scopes narrowed by the
-	// agent's, when one is acting. The role is not part of it: it gates admin
-	// scopes separately (Access).
+	// Effective is what the request may do: the credential's scopes narrowed by
+	// the agent's, when one is acting. The role is not part of it: it gates
+	// admin scopes separately (Access).
 	Effective scope.Set
 }
 
@@ -208,10 +210,12 @@ func (c *Call) Config() (config.Config, error) {
 
 // Deps are the collaborators of Handler. All are required.
 type Deps struct {
-	// Keys reads the stored key a token names. *store.Store satisfies it. A
-	// failure must come back classified (store does), because it is sent as is.
-	Keys KeyReader
-	// Now is the clock, used to decide whether a stored key is still active.
+	// Credentials resolves the token a request presents. *store.Store satisfies
+	// it. A failure must come back classified (store does), because it is sent
+	// as is.
+	Credentials CredentialReader
+	// Now is the clock, used to decide whether a stored credential is still
+	// active.
 	Now func() time.Time
 	// Getenv reads the deploy-time configuration. See Call.Getenv.
 	Getenv func(string) string
@@ -249,7 +253,7 @@ func Handler(routes []Route, deps Deps) http.Handler {
 	checkDeps(deps)
 
 	paths := groupRoutes(routes)
-	router := &router{keys: deps.Keys, now: deps.Now, getenv: deps.Getenv}
+	router := &router{creds: deps.Credentials, now: deps.Now, getenv: deps.Getenv}
 	mux := http.NewServeMux()
 
 	for _, path := range slices.Sorted(maps.Keys(paths)) {
@@ -273,7 +277,7 @@ func Handler(routes []Route, deps Deps) http.Handler {
 // checkDeps panics when a dependency is missing.
 func checkDeps(deps Deps) {
 	for name, missing := range map[string]bool{
-		"Keys": deps.Keys == nil, "Now": deps.Now == nil, "Getenv": deps.Getenv == nil, "Log": deps.Log == nil,
+		"Credentials": deps.Credentials == nil, "Now": deps.Now == nil, "Getenv": deps.Getenv == nil, "Log": deps.Log == nil,
 	} {
 		if missing {
 			panic("auth: Deps." + name + " is required")
@@ -389,7 +393,7 @@ func wildcardNames(path string) ([]string, string) {
 
 // router carries what every route's pipeline needs.
 type router struct {
-	keys   KeyReader
+	creds  CredentialReader
 	now    func() time.Time
 	getenv func(string) string
 }
@@ -439,7 +443,7 @@ func (c *Call) parseID(wildcards []string) error {
 }
 
 // authenticate fills call.Principal for credential. A None route has no step:
-// it does not read the cookie, the header, the configuration or the store.
+// it does not read the cookie, the header or the store.
 func (r *router) authenticate(credential Credential, call *Call) result.Result[*Call] {
 	if credential != Authenticated {
 		return result.Ok(call)

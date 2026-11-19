@@ -5,17 +5,19 @@
 //	GET    /api/user/{id}   one account
 //	DELETE /api/user/{id}   revoke it
 //
-// Every route is declared with a session credential and the auth.Admin
-// requirement, so the boundary refuses a request without a session (401) and one
-// from a signed-in account that is not an admin (403) before any handler here
-// runs. The role is the one stored on the account, read on every request in the
-// lookup that verifies the session (store.ActiveKey), so revoking an admin
+// Every route is Authenticated and needs an admin scope (scope.UserRead or
+// scope.UserRevoke), so the boundary refuses a request without a valid
+// credential (401) and one from a caller who is not an administrator, or whose
+// scopes fall short (403), before any handler here runs. The role is the one
+// stored on the account, read on every request in the lookup that verifies the
+// credential (store.ResolveSession, store.ResolveAPIKey), so revoking an admin
 // takes effect at once.
 //
 // Revoking is final and never deletes: the row stays, the account cannot log
-// in, and none of its sessions verify. The last active admin cannot be
-// revoked, because the only recovery from having none is wiping the database.
-// An admin may revoke themselves, as long as another active admin remains.
+// in, and none of its sessions or API keys verify. The last active admin cannot
+// be revoked, because the only recovery from having none is wiping the
+// database. An admin may revoke themselves, as long as another active admin
+// remains.
 //
 // A stored profile that is not a JSON object is logged and served as an empty
 // object: one corrupt row must not hide every other account from the admin who

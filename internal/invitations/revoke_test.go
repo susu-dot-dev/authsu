@@ -30,7 +30,7 @@ func TestRevokeReportsTheRowAsTheWriteLeftIt(t *testing.T) {
 		{"already revoked earlier", func(r *store.Invitation) { r.RevokedAt = new(now - 500) }, now - 500},
 		{"already revoked a second ago", func(r *store.Invitation) { r.RevokedAt = new(now - 1) }, now - 1},
 		{"revoked, expired and exhausted", func(r *store.Invitation) {
-			r.RevokedAt, r.ExpiresAt, r.Uses = new(now-9), new(now-1), r.NumInvites
+			r.RevokedAt, r.ExpiresAt, r.Uses = new(now-9), now-1, r.NumInvites
 		}, now - 9},
 	}
 
@@ -105,7 +105,8 @@ func TestRevokeResponseIsTheWireShape(t *testing.T) {
 	rec := harn.asAdmin(http.MethodDelete, itemPath, "")
 
 	want := `{"id":"` + invID + `","type":"member","label":"November workshop","numInvites":5,"uses":2,` +
-		`"status":"revoked","revokedAt":` + strconv.FormatInt(now-3, 10) + `,"createdBy":"` + adminID + `",` +
+		`"status":"revoked","expiresAt":` + strconv.FormatInt(now+3600, 10) +
+		`,"revokedAt":` + strconv.FormatInt(now-3, 10) + `,"createdBy":"` + adminID + `",` +
 		`"createdAt":` + strconv.FormatInt(now-100, 10) + `}` + "\n"
 
 	if rec.Code != http.StatusOK || rec.Body.String() != want {

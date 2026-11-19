@@ -28,6 +28,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -704,52 +705,176 @@ func login(t *testing.T, pk passkey) string {
 	return token
 }
 
-// kidOf returns the key id in a token's header: how the session row is found
-// without parsing the whole JWT.
-func kidOf(t *testing.T, token string) string {
-	t.Helper()
+// ---- secrets ----------------------------------------------------------------
 
-	header, _, _ := strings.Cut(token, ".")
+// Tokens are "susu_<tag>_" and 43 base64url characters (docs/secrets_design.md).
+// The tests build them here, independently of the Worker's code, so a token the
+// Worker issues is checked against this definition and not against itself.
+const (
+	tokenBodyBytes = 32
+	tokenBodyLen   = 43
 
-	raw, err := base64.RawURLEncoding.DecodeString(header)
-	if err != nil {
-		t.Fatalf("token header: %v", err)
-	}
+	tagInvitation = "inv"
+	tagSession    = "ses"
+	tagAPIKey     = "key"
 
-	var parsed struct {
-		Kid string `json:"kid"`
-	}
+	// The kind each secret has in secrets.kind and the table of its own that
+	// holds the rest of it.
+	kindInvitation = "invitation"
+	kindSession    = "session"
+	kindAPIKey     = "api_key"
+)
 
-	err = json.Unmarshal(raw, &parsed)
-	if err != nil || parsed.Kid == "" {
-		t.Fatalf("token header %s: %v", raw, err)
-	}
+// tokenPrefix is what every token of a tag starts with.
+func tokenPrefix(tag string) string { return "susu_" + tag + "_" }
 
-	return parsed.Kid
+// newToken returns a fresh random token of the tag.
+func newToken(tag string) string {
+	return tokenPrefix(tag) + b64(randomBytes(tokenBodyBytes))
 }
 
-// claimsOf decodes a JWT's claims without verifying it.
-func claimsOf(t *testing.T, token string) map[string]any {
+// tokenHash is what the Worker stores for a token: SHA-256 of the whole string,
+// prefix included.
+func tokenHash(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+
+	return sum[:]
+}
+
+// kindTable is the table that holds a kind's own rows.
+func kindTable(kind string) string {
+	switch kind {
+	case kindInvitation:
+		return tableInvitations
+	case kindSession:
+		return tableSessions
+	case kindAPIKey:
+		return tableKeys
+	default:
+		panic("unknown secret kind " + kind)
+	}
+}
+
+// secretRow is a row of the secrets table, found by the token that hashes to it.
+type secretRow struct {
+	// found is false when no secret has the token's hash; nothing else is set.
+	found bool
+	id    string
+	kind  string
+	// expiresAt, createdAt are Unix seconds.
+	expiresAt int64
+	createdAt int64
+	// revoked is whether revoked_at is set at all, and revokedAt its value.
+	revoked   bool
+	revokedAt int64
+	// kindRow is whether the kind's own table has a row under the same id.
+	kindRow bool
+}
+
+// secretOf finds a token's secret row by hashing the whole token string, the
+// way the Worker finds it, and reads the row back.
+func secretOf(t *testing.T, token string) secretRow {
 	t.Helper()
 
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		t.Fatalf("token %q has %d parts, want 3", token, len(parts))
+	cells, ok := firstRow(t,
+		"SELECT id, kind, expires_at, ifnull(revoked_at, 'NULL'), created_at FROM secrets WHERE hash = ?",
+		tokenHash(token))
+	if !ok {
+		return secretRow{}
 	}
 
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	out := secretRow{
+		found: true, id: cells[0], kind: cells[1], expiresAt: parseInt(t, cells[2]), createdAt: parseInt(t, cells[4]),
+	}
+
+	if cells[3] != "NULL" {
+		out.revoked, out.revokedAt = true, parseInt(t, cells[3])
+	}
+
+	out.kindRow = count(t, kindTable(out.kind)+" WHERE id = ?", out.id) == "1"
+
+	return out
+}
+
+// mustSecretOf is secretOf for a token that must be stored.
+func mustSecretOf(t *testing.T, token string) secretRow {
+	t.Helper()
+
+	got := secretOf(t, token)
+	if !got.found {
+		t.Fatalf("no secret is stored under the hash of %.16s...", token)
+	}
+
+	return got
+}
+
+// idOfToken returns the secret id of a token the Worker issued.
+func idOfToken(t *testing.T, token string) string {
+	t.Helper()
+
+	return mustSecretOf(t, token).id
+}
+
+// expectToken fails the test unless token is exactly "susu_<tag>_" and 43
+// canonical base64url characters: 32 bytes with no stray bits in the last one.
+func expectToken(t *testing.T, token, tag string) {
+	t.Helper()
+
+	body, ok := strings.CutPrefix(token, tokenPrefix(tag))
+	if !ok || len(body) != tokenBodyLen {
+		t.Errorf("token %.20q... is not %s and %d characters", token, tokenPrefix(tag), tokenBodyLen)
+
+		return
+	}
+
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(body)
+	if err != nil || len(raw) != tokenBodyBytes {
+		t.Errorf("token body %q is not canonical base64url of %d bytes: %v", body, tokenBodyBytes, err)
+	}
+}
+
+// expectStoredNowhere fails the test if any column of any table holds a token,
+// or its body, or the 32 random bytes the body encodes, as text or as bytes.
+// What is stored is the hash; the token itself must not be recoverable.
+func expectStoredNowhere(t *testing.T, tokens ...string) {
+	t.Helper()
+
+	needles := make([]string, 0, 3*len(tokens))
+
+	for _, token := range tokens {
+		_, body, _ := strings.Cut(strings.TrimPrefix(token, "susu_"), "_")
+		raw, _ := base64.RawURLEncoding.DecodeString(body)
+
+		needles = append(needles, token, body, string(raw))
+	}
+
+	for _, column := range columnsHolding(t, needles...) {
+		t.Errorf("%s holds a token in the clear", column)
+	}
+}
+
+// expectNoOrphanSecrets fails the test if a secret has no row in its kind's own
+// table, which is how a batch that wrote the secret and lost the rest would
+// show.
+func expectNoOrphanSecrets(t *testing.T) {
+	t.Helper()
+
+	for _, kind := range []string{kindInvitation, kindSession, kindAPIKey} {
+		expectCount(t, "secrets WHERE kind = ? AND id NOT IN (SELECT id FROM "+kindTable(kind)+")", "0", kind)
+	}
+
+	expectCount(t, "secrets WHERE kind NOT IN (?, ?, ?)", "0", kindInvitation, kindSession, kindAPIKey)
+}
+
+func parseInt(t *testing.T, text string) int64 {
+	t.Helper()
+
+	n, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {
-		t.Fatalf("decode payload: %v", err)
+		t.Fatalf("not an integer: %q", text)
 	}
 
-	var claims map[string]any
-
-	err = json.Unmarshal(raw, &claims)
-	if err != nil {
-		t.Fatalf("unmarshal payload: %v", err)
-	}
-
-	return claims
+	return n
 }
 
 // ---- state builders (seeds) -------------------------------------------------
@@ -783,13 +908,46 @@ func idN(prefix string, n int) string {
 	return "00000000-0000-7000-8000-" + prefix + string(suffix[4:])
 }
 
-// seedInvitation inserts an invitation of type 'e2e_invite' (no role, never
-// redeemable through registration) with its own distinct code hash.
-func seedInvitation(t *testing.T, id string, numInvites int) {
+// Joins that let a condition name a key's or an owner's columns together with
+// its secret's, for the tests that count rows by state. revoked_at and
+// expires_at are the secret's; user_id, agent_id and scope are the key's, and
+// user_id the session's. Qualify id and kind (k.id, s.id).
+const (
+	// keyRows is every API key with its secret.
+	keyRows = "api_keys k JOIN secrets s ON s.id = k.id"
+
+	// ownedSecrets is every session and API key secret with its owner's id as
+	// user_id, so a condition can cover "everything this user holds".
+	ownedSecrets = "secrets s JOIN " +
+		"(SELECT id, user_id FROM sessions UNION ALL SELECT id, user_id FROM api_keys) o ON o.id = s.id"
+)
+
+// seedLifetime is how long a seeded secret lasts: long enough that no test
+// outlives it, short enough to read as "valid for a while" in a failure.
+const seedLifetime = 24 * 60 * 60
+
+// seedSecret inserts a secret of kind for token, valid for seedLifetime seconds
+// from the database's now. The kind's own row is the caller's. Only the token's
+// hash is stored, as the Worker does.
+func seedSecret(t *testing.T, id, kind, token string) {
 	t.Helper()
 
-	seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
-		"VALUES (?, randomblob(32), 'e2e_invite', 'seeded', ?, strftime('%s','now'))", id, numInvites)
+	seed(t, "INSERT INTO secrets (id, kind, hash, expires_at, created_at) "+
+		"VALUES (?, ?, ?, strftime('%s','now') + ?, strftime('%s','now'))", id, kind, tokenHash(token), seedLifetime)
+}
+
+// seedInvitation inserts an invitation of type 'e2e_invite' (no role, never
+// redeemable through registration) with a token of its own, and returns the
+// token. It lasts seedLifetime.
+func seedInvitation(t *testing.T, id string, numInvites int) string {
+	t.Helper()
+
+	token := newToken(tagInvitation)
+
+	seedSecret(t, id, kindInvitation, token)
+	seed(t, "INSERT INTO invitations (id, type, label, num_invites) VALUES (?, 'e2e_invite', 'seeded', ?)", id, numInvites)
+
+	return token
 }
 
 // seedUsers makes n accounts of role e2e_none that came from the invitation.
@@ -820,23 +978,44 @@ func seedAgent(t *testing.T, id, owner, name string) {
 		"VALUES (?, ?, ?, '[\"default:agent\"]', strftime('%s','now'))", id, owner, name)
 }
 
-// seedAgentKey inserts an API key row for an agent, so a test can see
-// revocation reach it. It is a row only: it never verifies.
-func seedAgentKey(t *testing.T, kid, owner, agent string) {
+// agentScope is the scope list of seeded agents and of their seeded keys.
+const agentScope = `["default:agent"]`
+
+// seedAPIKey inserts an API key for owner with a token of its own, and returns
+// the token. agent is the agent it belongs to, or "" for the user's own key. It
+// lasts seedLifetime and carries agentScope.
+func seedAPIKey(t *testing.T, id, owner, agent string) string {
 	t.Helper()
 
-	seed(t, "INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, agent_id, scope, created_at) "+
-		"VALUES (?, ?, 'api_key', '{}', strftime('%s','now') + 3600, ?, '[\"default:agent\"]', strftime('%s','now'))",
-		kid, owner, agent)
+	token := newToken(tagAPIKey)
+
+	seedSecret(t, id, kindAPIKey, token)
+
+	var agentID any
+	if agent != "" {
+		agentID = agent
+	}
+
+	seed(t, "INSERT INTO api_keys (id, user_id, agent_id, scope) VALUES (?, ?, ?, ?)", id, owner, agentID, agentScope)
+
+	return token
 }
 
-// seedSession inserts a session key row for a user, so a test can see
-// revocation reach it. It is a row only: it never verifies.
-func seedSession(t *testing.T, kid, user string) {
+// seedSession inserts a session for a user, on a passkey of its own that the
+// seed adds, and returns its token. The login it records is random, so it never
+// collides with a real one.
+func seedSession(t *testing.T, id, user string) string {
 	t.Helper()
 
-	seed(t, "INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, created_at) "+
-		"VALUES (?, ?, 'session', '{}', strftime('%s','now') + 3600, strftime('%s','now'))", kid, user)
+	token := newToken(tagSession)
+
+	seed(t, "INSERT INTO credentials (id, credential_id, user_id, public_key, flags, metadata, created_at) "+
+		"VALUES (?, randomblob(32), ?, randomblob(77), 0, '{}', strftime('%s','now'))", id, user)
+	seedSecret(t, id, kindSession, token)
+	seed(t, "INSERT INTO sessions (id, user_id, credential_id, granted_from) "+
+		"VALUES (?, ?, ?, randomblob(32))", id, user, id)
+
+	return token
 }
 
 // setRole changes an account's role behind the Worker's back.

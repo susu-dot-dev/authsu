@@ -5,7 +5,8 @@
 // There are two origins, and they are deliberately separate:
 //
 //   - API_ORIGIN is where this Worker is served, such as "https://auth.example.com".
-//     It is the identity of the service: the session issuer is derived from it.
+//     It is the API's own origin, the name the service is known by. It is
+//     required and validated like UI_ORIGIN, and available as Config.API.
 //   - UI_ORIGIN is where the UI is served, such as "https://example.com". Passkey
 //     ceremonies run on the UI's pages, so the browser writes this origin into
 //     clientDataJSON, and the relying party ID is its host. It is also the one
@@ -35,10 +36,11 @@ const (
 	// session).
 	SecretHMAC = "AUTH_HMAC_SECRET" //nolint:gosec // the name of a secret, not its value
 	// SecretFirstRun is the Worker secret whose value becomes the first-run
-	// invitation code (see FirstRunSecret).
+	// invitation token (see FirstRunSecret).
 	SecretFirstRun = "FIRST_RUN_SECRET"
 	// VarAPIOrigin is the origin this Worker is served from, such as
-	// "https://auth.example.com". The session issuer is derived from it.
+	// "https://auth.example.com". It is the API's own origin, required and
+	// validated, and available as Config.API.
 	VarAPIOrigin = "API_ORIGIN"
 	// VarUIOrigin is the origin the UI is served from, such as
 	// "https://example.com". Passkey ceremonies are accepted from it alone, its
@@ -49,11 +51,6 @@ const (
 // MinSecretLen is the shortest AUTH_HMAC_SECRET accepted: 32 random bytes is 43
 // base64url characters, so anything shorter is not a generated value.
 const MinSecretLen = 32
-
-// MinFirstRunSecretLen is the shortest FIRST_RUN_SECRET accepted. A
-// browser-generated value is 32 random bytes, which is 43 base64url
-// characters; anything shorter is not a generated value.
-const MinFirstRunSecretLen = 32
 
 // Errors Load returns. They describe the deployment, not the request.
 var (
@@ -71,9 +68,6 @@ type Origin struct {
 	String string
 	// Host is the hostname alone: no scheme and no port.
 	Host string
-	// Insecure is true for plain http, which is accepted for the host
-	// "localhost" only.
-	Insecure bool
 }
 
 // ParseOrigin validates value as a bare origin: a scheme and a host, with an
@@ -93,12 +87,12 @@ func ParseOrigin(value string) (Origin, error) {
 		return Origin{}, fmt.Errorf("%w: %q", ErrOrigin, value)
 	}
 
-	insecure := parsed.Scheme == "http" && parsed.Hostname() == "localhost"
-	if parsed.Scheme != "https" && !insecure {
+	localHTTP := parsed.Scheme == "http" && parsed.Hostname() == "localhost"
+	if parsed.Scheme != "https" && !localHTTP {
 		return Origin{}, fmt.Errorf("%w: %q", ErrOrigin, value)
 	}
 
-	return Origin{String: value, Host: parsed.Hostname(), Insecure: insecure}, nil
+	return Origin{String: value, Host: parsed.Hostname()}, nil
 }
 
 // bare reports whether u is a scheme, a host and an optional port, with
@@ -167,9 +161,14 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, ErrSecret
 	}
 
-	api, ui, err := Origins(getenv)
+	api, err := ParseOrigin(getenv(VarAPIOrigin))
 	if err != nil {
-		return Config{}, err
+		return Config{}, fmt.Errorf("%s: %w", VarAPIOrigin, err)
+	}
+
+	ui, err := ParseOrigin(getenv(VarUIOrigin))
+	if err != nil {
+		return Config{}, fmt.Errorf("%s: %w", VarUIOrigin, err)
 	}
 
 	return Config{
@@ -180,22 +179,6 @@ func Load(getenv func(string) string) (Config, error) {
 		RP:              webauthn.RelyingParty{ID: ui.Host, Origin: ui.String},
 		RPName:          ui.Host,
 	}, nil
-}
-
-// Origins reads and validates just the two origins, for callers that need no
-// secret.
-func Origins(getenv func(string) string) (Origin, Origin, error) {
-	api, err := ParseOrigin(getenv(VarAPIOrigin))
-	if err != nil {
-		return Origin{}, Origin{}, fmt.Errorf("%s: %w", VarAPIOrigin, err)
-	}
-
-	ui, err := ParseOrigin(getenv(VarUIOrigin))
-	if err != nil {
-		return Origin{}, Origin{}, fmt.Errorf("%s: %w", VarUIOrigin, err)
-	}
-
-	return api, ui, nil
 }
 
 // deriveKey derives the key for one purpose from the root secret. Distinct
@@ -209,10 +192,11 @@ func deriveKey(root, context string) []byte {
 }
 
 // FirstRunSecret reads FIRST_RUN_SECRET, the secret whose value becomes the
-// first-run invitation code. It returns the value exactly as configured, or ""
+// first-run invitation token. It returns the value exactly as configured, or ""
 // when it is not set. It does not judge the value: config is a foundation
-// package and knows nothing of invitation codes, so the caller checks the
-// length (MinFirstRunSecretLen) and parses it into an invitation code.
+// package and knows nothing of invitation tokens, so the caller parses it with
+// input.ParseInvitationToken, which accepts only a complete token
+// (susu_inv_ and 43 base64url characters) and nothing else.
 func FirstRunSecret(getenv func(string) string) string {
 	return getenv(SecretFirstRun)
 }

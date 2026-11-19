@@ -137,10 +137,13 @@ func TestEveryRouteIsRouted(t *testing.T) {
 	}
 }
 
-// TestSessionRoutesNeedConfiguration: with the deployment unconfigured, a
-// session route cannot tell who is calling, which is 503 and not a 401 (an
-// outage is not a sign-out), and never touches the database.
-func TestSessionRoutesNeedConfiguration(t *testing.T) {
+// TestSessionRoutesNeedNoConfiguration: a token carries nothing that has to be
+// checked against the deployment's configuration, so who is calling is decided
+// by the database alone. With the deployment unconfigured, a session route
+// without a credential is the 401 it always is and never touches the database,
+// and a valid session is recognised (a route that needs configuration of its
+// own, such as login, still says so).
+func TestSessionRoutesNeedNoConfiguration(t *testing.T) {
 	t.Parallel()
 
 	for _, route := range inventory() {
@@ -154,9 +157,8 @@ func TestSessionRoutesNeedConfiguration(t *testing.T) {
 			h := newHarness(t, map[string]string{})
 			rec := h.do(request{method: route.method, path: route.path})
 
-			want := `{"error":{"code":"not_configured","message":"the service is not configured"}}` + "\n"
-			if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != want {
-				t.Errorf("= %d %s, want 503 not_configured", rec.Code, rec.Body)
+			if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
+				t.Errorf("= %d %s, want the one 401", rec.Code, rec.Body)
 			}
 
 			if got := h.exec.callCount(); got != 0 {
@@ -164,6 +166,18 @@ func TestSessionRoutesNeedConfiguration(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("a valid session is recognised", func(t *testing.T) {
+		t.Parallel()
+
+		signedIn := newSession(t, memberID)
+		h := newHarness(t, map[string]string{}, signedIn.activeSessionStep(roleMember))
+
+		rec := h.do(request{method: http.MethodGet, path: pathSession, cookies: []*http.Cookie{signedIn.cookie}})
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"userId":"`+memberID+`"`) {
+			t.Errorf("= %d %s, want 200 for the signed-in user", rec.Code, rec.Body)
+		}
+	})
 }
 
 // TestOnlyTheInventoryIsRouted: a path answers exactly the methods the
@@ -222,7 +236,7 @@ func TestUnknownPathsAreNotFound(t *testing.T) {
 		"/", "/nope", "/healthz/", "/healthz/x", "/api", "/api/", "/api/sessions", "/api/session/",
 		"/api/session/x", "/api/agent/", "/api/agents", "/api/agent/" + someID + "/keys",
 		"/api/user/" + someID + "/", "/api/users", "/api/invitation/" + someID + "/uses",
-		"/api/register", "/api/login", "/api/refresh", "/API/session", "/api/first-run/x", "/keys/x/.well-known/jwks.json",
+		"/api/register", "/api/login", "/api/refresh", "/API/session", "/api/first-run/x", "/keys/x",
 	}
 
 	for _, path := range unknown {
@@ -248,8 +262,8 @@ func TestUnknownPathsAreNotFound(t *testing.T) {
 // TestCredentialIsJudgedBeforeAPathID: on every route that has an id, for every
 // method it takes, a request that does not present a credential is refused as
 // such whatever the id is: a malformed id is never answered before the caller
-// is known, so it is 503 not_configured with no configuration at all and 401
-// without a session, and the database is not read for either.
+// is known, so it is the 401 any request without a credential gets, and the
+// database is not read.
 func TestCredentialIsJudgedBeforeAPathID(t *testing.T) {
 	t.Parallel()
 
@@ -272,12 +286,11 @@ func TestCredentialIsJudgedBeforeAPathID(t *testing.T) {
 
 				path := strings.TrimSuffix(route.path, someID) + bad
 
-				// No configuration at all: the service is not configured.
-				h := newHarness(t, map[string]string{})
+				h := newHarness(t, fullEnv())
 				rec := h.do(request{method: route.method, path: path})
 
-				if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"not_configured"`) {
-					t.Errorf("unconfigured = %d %s, want 503 not_configured", rec.Code, rec.Body)
+				if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
+					t.Errorf("= %d %s, want the one 401", rec.Code, rec.Body)
 				}
 
 				if got := h.exec.callCount(); got != 0 {
@@ -469,20 +482,20 @@ func TestNoneRoutes(t *testing.T) {
 		"register begin: not redeemable": {
 			env: fullEnv(), method: http.MethodPost, path: "/api/register/begin",
 			body:       `{"invitationCode":"` + someCode + `","name":"Alice"}`,
-			script:     []step{{match: "FROM invitations i", results: rows(), err: nil}},
+			script:     []step{{match: readInvitation, results: rows(), err: nil}},
 			wantStatus: http.StatusForbidden, wantBody: `"invalid_invitation"`,
 			wantLogged: []string{"invalid_invitation"},
 		},
 		"register begin: redeemable": {
 			env: fullEnv(), method: http.MethodPost, path: "/api/register/begin",
 			body:       `{"invitationCode":"` + someCode + `","name":"Alice"}`,
-			script:     []step{{match: "FROM invitations i", results: rows([]any{"first_run"}), err: nil}},
+			script:     []step{{match: readInvitation, results: rows([]any{"first_run"}), err: nil}},
 			wantStatus: http.StatusOK, wantBody: `"userVerification":"required"`,
 		},
 		"register begin: type as a blob": {
 			env: fullEnv(), method: http.MethodPost, path: "/api/register/begin",
 			body:       `{"invitationCode":"` + someCode + `","name":"Alice"}`,
-			script:     []step{{match: "FROM invitations i", results: rows([]any{[]byte("first_run")}), err: nil}},
+			script:     []step{{match: readInvitation, results: rows([]any{[]byte("first_run")}), err: nil}},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeInvitationCheckRejected},
 		},

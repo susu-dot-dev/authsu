@@ -27,13 +27,14 @@ package e2e_test
 //
 // Every refusal of an assertion must be the one answer (401 invalid_login) with
 // a byte-identical body whatever the cause (no oracle), set no cookie, and
-// leave japikeys and credentials exactly as they were.
+// leave the secrets, sessions and credentials exactly as they were.
 
 import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -61,22 +62,22 @@ const lgClockSlack = 10 * time.Second
 // lgState is everything a refused login must leave unchanged: the sessions and
 // the passkeys' flags.
 type lgState struct {
-	keys  string
-	flags string
-	rows  string
+	sessions string
+	flags    string
+	rows     string
 }
 
-// lgSnapshot reads the state a login may write. rows is the whole japikeys
+// lgSnapshot reads the state a login may write. rows is the whole secrets
 // table, so a refusal that touched an existing row (a revocation, say) is seen
 // too, not only an insert.
 func lgSnapshot(t *testing.T) lgState {
 	t.Helper()
 
 	return lgState{
-		keys:  count(t, "japikeys"),
-		flags: scalar(t, "SELECT group_concat(id || ':' || flags, ',') FROM (SELECT id, flags FROM credentials ORDER BY id)"),
-		rows: scalar(t, "SELECT group_concat(kid || ':' || ifnull(revoked_at, 'N') || ':' || expires_at, ',') "+
-			"FROM (SELECT kid, revoked_at, expires_at FROM japikeys ORDER BY kid)"),
+		sessions: count(t, "sessions"),
+		flags:    scalar(t, "SELECT group_concat(id || ':' || flags, ',') FROM (SELECT id, flags FROM credentials ORDER BY id)"),
+		rows: scalar(t, "SELECT group_concat(id || ':' || kind || ':' || ifnull(revoked_at, 'N') || ':' || expires_at, ',') "+
+			"FROM (SELECT id, kind, revoked_at, expires_at FROM secrets ORDER BY id)"),
 	}
 }
 
@@ -254,7 +255,7 @@ func TestLoginBegin(t *testing.T) {
 
 		expectCount(t, "users", users)
 		expectCount(t, "credentials", creds)
-		expectCount(t, "japikeys", "0")
+		expectCount(t, "sessions", "0")
 	})
 
 	// The body is not read by the handler, so whatever the client sends is
@@ -326,7 +327,7 @@ func TestLoginBegin(t *testing.T) {
 		got.expect(t, "begin with a garbage cookie", http.StatusOK, "")
 	})
 
-	expectCount(t, "japikeys", "0")
+	expectCount(t, "sessions", "0")
 }
 
 // lgSeconds reads 8 big-endian bytes of a challenge's expiry as Unix seconds.
@@ -342,14 +343,14 @@ type lgAccepted struct {
 	pk        passkey
 	got       reply
 	token     string
-	kid       string
+	id        string
 	challenge []byte
 	started   time.Time
 }
 
 // TestLoginFinishStoresExactly holds what an accepted login writes and sends:
-// the session row field by field, the credential's flags, the cookie line, the
-// JWT's claims and the response body.
+// the session and its secret field by field, the token's shape and that it is
+// stored nowhere, the credential's flags, the cookie line and the response body.
 //
 //nolint:paralleltest // shares one database
 func TestLoginFinishStoresExactly(t *testing.T) {
@@ -360,16 +361,15 @@ func TestLoginFinishStoresExactly(t *testing.T) {
 	got := lgExpectAccepted(t, pk.assertion().sign(t, options, nil).body(t, nil))
 
 	login := lgAccepted{
-		pk: pk, got: got, token: got.session(), kid: kidOf(t, got.session()),
+		pk: pk, got: got, token: got.session(), id: idOfToken(t, got.session()),
 		challenge: lgChallenge(t, options), started: started,
 	}
 
 	t.Run("response body", login.checkBody)
-	t.Run("session row", login.checkRow)
-	t.Run("stored key is public only", login.checkKey)
+	t.Run("session and secret rows", login.checkRow)
+	t.Run("the token", login.checkToken)
 	t.Run("flags", login.checkFlags)
 	t.Run("cookie", login.checkCookie)
-	t.Run("jwt", login.checkJWT)
 	t.Run("the session works", func(t *testing.T) {
 		get(t, pathSession, login.token).expect(t, "GET /api/session", http.StatusOK, "")
 	})
@@ -392,7 +392,7 @@ func (l lgAccepted) checkBody(t *testing.T) {
 		t.Errorf("body = %+v, want user %s role admin", body, l.pk.userID)
 	}
 
-	stored := scalar(t, "SELECT expires_at FROM japikeys WHERE kid = ?", l.kid)
+	stored := scalar(t, "SELECT expires_at FROM secrets WHERE id = ?", l.id)
 	if strconv.FormatInt(body.ExpiresAt, 10) != stored {
 		t.Errorf("body expiresAt = %d, stored expires_at = %s", body.ExpiresAt, stored)
 	}
@@ -404,7 +404,7 @@ func (l lgAccepted) checkBody(t *testing.T) {
 		t.Errorf("body has %d members, want exactly userId, role, expiresAt: %s", len(members), l.got.body)
 	}
 
-	if strings.Contains(l.got.body, l.token) || strings.Contains(l.got.body, strings.Split(l.token, ".")[2]) {
+	if strings.Contains(l.got.body, l.token) || strings.Contains(l.got.body, l.token[len(tokenPrefix(tagSession)):]) {
 		t.Errorf("the token is in the body: %s", l.got.body)
 	}
 
@@ -413,50 +413,52 @@ func (l lgAccepted) checkBody(t *testing.T) {
 	}
 }
 
-// checkRow checks the japikeys row field by field.
+// checkRow checks the session row and its secret field by field.
 func (l lgAccepted) checkRow(t *testing.T) {
-	expectCount(t, "japikeys", "1")
+	expectCount(t, "sessions", "1")
+	expectCount(t, "secrets", "2") // the first-run invitation and this session
 
-	if got := scalar(t, "SELECT kind FROM japikeys WHERE kid = ?", l.kid); got != "session" {
-		t.Errorf("kind = %q, want session", got)
+	secret := mustSecretOf(t, l.token)
+	if secret.id != l.id || secret.kind != kindSession || !secret.kindRow {
+		t.Errorf("secret = %+v, want the session's own, of kind session, with its session row", secret)
 	}
 
-	if got := scalar(t, "SELECT user_id FROM japikeys WHERE kid = ?", l.kid); got != l.pk.userID {
+	if got := scalar(t, "SELECT kind FROM sessions WHERE id = ?", l.id); got != kindSession {
+		t.Errorf("sessions.kind = %q, want session", got)
+	}
+
+	if got := scalar(t, "SELECT user_id FROM sessions WHERE id = ?", l.id); got != l.pk.userID {
 		t.Errorf("user_id = %q, want %q", got, l.pk.userID)
 	}
 
 	credRow := scalar(t, "SELECT id FROM credentials WHERE hex(credential_id) = ?", strings.ToUpper(hexOf(l.pk.credID)))
-	if got := scalar(t, "SELECT credential_id FROM japikeys WHERE kid = ?", l.kid); got != credRow || credRow == "" {
+	if got := scalar(t, "SELECT credential_id FROM sessions WHERE id = ?", l.id); got != credRow || credRow == "" {
 		t.Errorf("credential_id = %q, want the passkey's row %q", got, credRow)
 	}
 
 	want := sha256.Sum256(l.challenge)
-	if got := scalar(t, "SELECT hex(granted_from) FROM japikeys WHERE kid = ?", l.kid); got != strings.ToUpper(hexOf(want[:])) {
+	if got := scalar(t, "SELECT hex(granted_from) FROM sessions WHERE id = ?", l.id); got != strings.ToUpper(hexOf(want[:])) {
 		t.Errorf("granted_from = %s, want sha256(challenge) = %X", got, want)
 	}
 
-	if got := scalar(t, "SELECT length(granted_from) || typeof(granted_from) FROM japikeys WHERE kid = ?", l.kid); got != "32blob" {
+	if got := scalar(t, "SELECT length(granted_from) || typeof(granted_from) FROM sessions WHERE id = ?", l.id); got != "32blob" {
 		t.Errorf("granted_from is %s, want 32blob", got)
 	}
 
-	if got := scalar(t, "SELECT metadata FROM japikeys WHERE kid = ?", l.kid); got != "{}" {
-		t.Errorf("metadata = %q, want {}", got)
+	if secret.revoked {
+		t.Errorf("a new session is revoked at %d", secret.revokedAt)
 	}
 
-	if got := scalar(t, "SELECT ifnull(revoked_at, 'NULL') FROM japikeys WHERE kid = ?", l.kid); got != "NULL" {
-		t.Errorf("revoked_at = %q, want NULL", got)
-	}
-
-	if got := scalar(t, "SELECT typeof(expires_at) || typeof(created_at) FROM japikeys WHERE kid = ?", l.kid); got != "integerinteger" {
+	if got := scalar(t, "SELECT typeof(expires_at) || typeof(created_at) FROM secrets WHERE id = ?", l.id); got != "integerinteger" {
 		t.Errorf("expires_at and created_at are %s, want integers", got)
 	}
 
-	expires := lgUnix(t, scalar(t, "SELECT expires_at FROM japikeys WHERE kid = ?", l.kid))
+	expires := time.Unix(secret.expiresAt, 0)
 	if d := expires.Sub(l.started.Add(lgSessionLifetime)); d < -lgClockSlack || d > lgClockSlack {
 		t.Errorf("expires_at = %s, want about now + 14d (%s off)", expires, d)
 	}
 
-	created := lgUnix(t, scalar(t, "SELECT created_at FROM japikeys WHERE kid = ?", l.kid))
+	created := time.Unix(secret.createdAt, 0)
 	if d := created.Sub(l.started); d < -lgClockSlack || d > lgClockSlack {
 		t.Errorf("created_at = %s, want about now (%s off)", created, d)
 	}
@@ -466,37 +468,21 @@ func (l lgAccepted) checkRow(t *testing.T) {
 	}
 }
 
-// checkKey checks that the stored JWK is the public half only.
-func (l lgAccepted) checkKey(t *testing.T) {
-	jwk := scalar(t, "SELECT jwk FROM japikeys WHERE kid = ?", l.kid)
+// checkToken checks the token is "susu_ses_" and 43 canonical base64url
+// characters, that the Worker stored its SHA-256 and nothing else about it, and
+// that nothing but the hash identifies it.
+func (l lgAccepted) checkToken(t *testing.T) {
+	expectToken(t, l.token, tagSession)
 
-	var doc struct {
-		Keys []map[string]any `json:"keys"`
+	if got := scalar(t, "SELECT lower(hex(hash)) FROM secrets WHERE id = ?", l.id); got != hex.EncodeToString(tokenHash(l.token)) {
+		t.Errorf("secrets.hash = %s, want sha256 of the whole token %x", got, tokenHash(l.token))
 	}
 
-	err := json.Unmarshal([]byte(jwk), &doc)
-	if err != nil || len(doc.Keys) != 1 {
-		t.Fatalf("jwk = %s, want {keys:[one]}: %v", jwk, err)
+	if got := scalar(t, "SELECT typeof(hash) || length(hash) FROM secrets WHERE id = ?", l.id); got != "blob32" {
+		t.Errorf("secrets.hash is %s, want blob32", got)
 	}
 
-	key := doc.Keys[0]
-	if key["kid"] != l.kid || key["alg"] != "ES256" || key["kty"] != "EC" || key["crv"] != "P-256" {
-		t.Errorf("key = %v, want EC P-256 ES256 with kid %s", key, l.kid)
-	}
-
-	// RFC 7517 / 7518 private members: the private half must be gone.
-	for _, private := range []string{"d", "p", "q", "dp", "dq", "qi", "k", "oth"} {
-		if _, ok := key[private]; ok {
-			t.Errorf("stored JWK has private member %q: %s", private, jwk)
-		}
-	}
-
-	var top map[string]json.RawMessage
-
-	_ = json.Unmarshal([]byte(jwk), &top)
-	if len(top) != 1 {
-		t.Errorf("JWKS has members %v, want only keys", top)
-	}
+	expectStoredNowhere(t, l.token)
 }
 
 // checkFlags checks the credential flags after the login.
@@ -552,62 +538,9 @@ func (l lgAccepted) checkCookie(t *testing.T) {
 		t.Fatalf("Expires %q: %v", attrs["expires"], err)
 	}
 
-	stored := lgUnix(t, scalar(t, "SELECT expires_at FROM japikeys WHERE kid = ?", l.kid))
+	stored := lgUnix(t, scalar(t, "SELECT expires_at FROM secrets WHERE id = ?", l.id))
 	if !expires.Equal(stored) {
 		t.Errorf("cookie Expires = %s, stored expires_at = %s", expires, stored)
-	}
-}
-
-// checkJWT checks the token header and claims.
-func (l lgAccepted) checkJWT(t *testing.T) {
-	parts := strings.Split(l.token, ".")
-	if len(parts) != 3 {
-		t.Fatalf("token has %d parts", len(parts))
-	}
-
-	raw, _ := base64.RawURLEncoding.DecodeString(parts[0])
-
-	var header map[string]any
-
-	_ = json.Unmarshal(raw, &header)
-	if header["alg"] != "ES256" || header["kid"] != l.kid || header["typ"] != "JWT" || len(header) != 3 {
-		t.Errorf("header = %v, want alg ES256, kid %s, typ JWT", header, l.kid)
-	}
-
-	claims := claimsOf(t, l.token)
-	if claims["sub"] != l.pk.userID {
-		t.Errorf("sub = %v, want %s", claims["sub"], l.pk.userID)
-	}
-
-	if claims["iss"] != target.apiOrigin+"/keys/"+l.kid {
-		t.Errorf("iss = %v, want %s/keys/%s", claims["iss"], target.apiOrigin, l.kid)
-	}
-
-	if claims["aud"] != "authsu/session" {
-		t.Errorf("aud = %v, want authsu/session", claims["aud"])
-	}
-
-	stored := lgUnix(t, scalar(t, "SELECT expires_at FROM japikeys WHERE kid = ?", l.kid))
-	if exp, _ := claims["exp"].(float64); int64(exp) != stored.Unix() {
-		t.Errorf("exp = %v, stored expires_at = %d", claims["exp"], stored.Unix())
-	}
-
-	iat, _ := claims["iat"].(float64)
-	if d := time.Unix(int64(iat), 0).Sub(l.started); d < -lgClockSlack || d > lgClockSlack {
-		t.Errorf("iat = %v, want about now", claims["iat"])
-	}
-
-	// The role is read per request and never signed into the token.
-	for _, forbidden := range []string{"role", "roles", "act", "admin"} {
-		if _, ok := claims[forbidden]; ok {
-			t.Errorf("claims carry %q: %v", forbidden, claims)
-		}
-	}
-
-	// A session is signed with every scope, as the default:session bundle: the
-	// one thing besides the registered claims that a token carries.
-	if list, _ := claims["scope"].([]any); len(list) != 1 || list[0] != "default:session" {
-		t.Errorf("scope claim = %v, want [default:session]", claims["scope"])
 	}
 }
 
@@ -891,7 +824,7 @@ func TestLoginRefusalsAreIndistinguishable(t *testing.T) {
 	seed(t, "DELETE FROM credentials WHERE user_id = ?", pk.userID)
 	check("deleted credential", post(t, pathLoginEnd, body, ""))
 
-	expectCount(t, "japikeys", "0")
+	expectCount(t, "sessions", "0")
 }
 
 // TestLoginFinishChallengeTampering flips, truncates and extends the challenge
@@ -1046,7 +979,7 @@ func TestLoginFinishAccountState(t *testing.T) {
 		seed(t, "DELETE FROM credentials WHERE user_id = ?", pk.userID)
 		// The row cascaded with the passkey: the grant went with it, but the
 		// credential is gone, so the replay still cannot log in.
-		expectCount(t, "japikeys", "0")
+		expectCount(t, "sessions", "0")
 		get(t, pathSession, token).expect(t, "session of a deleted passkey", http.StatusUnauthorized, codeUnauthenticated)
 		lgExpectRefused(t, body)
 	})
@@ -1089,7 +1022,7 @@ func TestLoginFinishAccountState(t *testing.T) {
 	})
 
 	t.Run("the same public key under two credential ids is refused by the schema", func(t *testing.T) {
-		// migration 0003: one public key belongs to one credential, so a response
+		// migration 0001 (credentials_public_key): one public key belongs to one credential, so a response
 		// cannot verify against two rows.
 		pk := newAdmin(t)
 
@@ -1312,7 +1245,7 @@ func TestLoginFinishBodyShape(t *testing.T) {
 			honest := string(pk.assertion().sign(t, beginLogin(t), nil).body(t, nil))
 			body := tt.edit(t, honest)
 
-			before := count(t, "japikeys")
+			before := count(t, "sessions")
 			got := post(t, pathLoginEnd, []byte(body), "")
 			got.expect(t, "finish", tt.status, tt.code)
 
@@ -1323,13 +1256,13 @@ func TestLoginFinishBodyShape(t *testing.T) {
 				}
 			case http.StatusUnauthorized:
 				lgRequireRefusal(t, got)
-				expectCount(t, "japikeys", before)
+				expectCount(t, "sessions", before)
 			default:
 				if len(got.setCookies) != 0 {
 					t.Errorf("a malformed request set cookies %q", got.setCookies)
 				}
 
-				expectCount(t, "japikeys", before)
+				expectCount(t, "sessions", before)
 
 				// A 400 never echoes the input back.
 				if strings.Contains(got.body, "public-") || strings.Contains(got.body, id) {
@@ -1338,134 +1271,6 @@ func TestLoginFinishBodyShape(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestLoginFinishBounds sends each bounded member at, one under and one over
-// its bound. The bounds are the Worker's: id and rawId 1023 bytes,
-// clientDataJSON 2048, signature 80, user handle 64, the body 16 KiB.
-//
-//nolint:paralleltest // shares one database
-func TestLoginFinishBounds(t *testing.T) {
-	pk := newAdmin(t)
-
-	// build is an honest body with one response member replaced.
-	build := func(t *testing.T, member string, value string) []byte {
-		t.Helper()
-
-		var members map[string]any
-
-		err := json.Unmarshal(pk.assertion().sign(t, beginLogin(t), nil).body(t, nil), &members)
-		if err != nil {
-			t.Fatalf("honest body: %v", err)
-		}
-
-		members["response"].(map[string]any)[member] = value //nolint:forcetypeassert // built by body()
-
-		return mustJSON(t, members)
-	}
-
-	cases := []struct {
-		name   string
-		member string
-		size   int // decoded bytes of the member
-	}{
-		{"clientDataJSON 2048", "clientDataJSON", 2048},
-		{"clientDataJSON 2049", "clientDataJSON", 2049},
-		{"clientDataJSON 4096", "clientDataJSON", 4096},
-		{"clientDataJSON 10000", "clientDataJSON", 10000},
-		{"signature 80", "signature", 80},
-		{"signature 81", "signature", 81},
-		{"signature 1000", "signature", 1000},
-		{"userHandle 64", "userHandle", 64},
-		{"userHandle 65", "userHandle", 65},
-		{"userHandle 1000", "userHandle", 1000},
-		{"authenticatorData 36", "authenticatorData", 36},
-		{"authenticatorData 38", "authenticatorData", 38},
-		{"authenticatorData 4096", "authenticatorData", 4096},
-		{"authenticatorData 4097", "authenticatorData", 4097},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			// Every one of these members is wrong for another reason as well
-			// (random bytes), so the point is that none is anything but the one
-			// answer, and none reaches the database.
-			lgExpectRefused(t, build(t, tt.member, b64(randomBytes(tt.size))))
-		})
-	}
-
-	t.Run("credential id bounds", func(t *testing.T) {
-		for _, size := range []int{0, 1, 1022, 1023, 1024, 1025, 4000} {
-			id := b64(randomBytes(size))
-
-			var members map[string]any
-
-			_ = json.Unmarshal(pk.assertion().sign(t, beginLogin(t), nil).body(t, nil), &members)
-			members["id"], members["rawId"] = id, id
-
-			t.Run(strconv.Itoa(size), func(t *testing.T) {
-				lgExpectRefused(t, mustJSON(t, members))
-			})
-		}
-	})
-
-	t.Run("the body cap", func(t *testing.T) {
-		honest := string(pk.assertion().sign(t, beginLogin(t), nil).body(t, nil))
-
-		// Whitespace after the document is legal JSON, so the body is exactly
-		// the cap, one under and one over, around an otherwise valid request.
-		const limit = 16 << 10
-
-		under := honest + strings.Repeat(" ", limit-len(honest))
-		if len(under) != limit {
-			t.Fatalf("test body is %d bytes, want %d", len(under), limit)
-		}
-
-		lgExpectAccepted(t, []byte(under))
-
-		over := pk.assertion().sign(t, beginLogin(t), nil).body(t, nil)
-		over = append(over, bytes.Repeat([]byte(" "), limit+1-len(over))...)
-
-		before := lgSnapshot(t)
-		post(t, pathLoginEnd, over, "").expect(t, "finish over the cap", http.StatusRequestEntityTooLarge, codeBodyTooLarge)
-
-		if after := lgSnapshot(t); after != before {
-			t.Errorf("an oversized body changed the database")
-		}
-
-		post(t, pathLoginEnd, bytes.Repeat([]byte("x"), 1<<20+1), "").
-			expect(t, "finish of 1 MiB + 1", http.StatusRequestEntityTooLarge, codeBodyTooLarge)
-	})
-
-	t.Run("base64 spellings", func(t *testing.T) {
-		honest := string(pk.assertion().sign(t, beginLogin(t), nil).body(t, nil))
-
-		var members map[string]any
-
-		_ = json.Unmarshal([]byte(honest), &members)
-
-		response, _ := members["response"].(map[string]any)
-
-		for _, member := range []string{"clientDataJSON", "authenticatorData", "signature", "userHandle"} {
-			value, _ := response[member].(string)
-
-			for name, spelling := range map[string]string{
-				"padded":        value + strings.Repeat("=", (4-len(value)%4)%4+4),
-				"standard":      strings.NewReplacer("-", "+", "_", "/").Replace(value) + "+",
-				"whitespace":    value + " ",
-				"newline":       value[:4] + "\n" + value[4:],
-				"invalid alpha": value + "!",
-				"empty":         "",
-			} {
-				t.Run(member+" "+name, func(t *testing.T) {
-					body := bytes.Clone([]byte(honest))
-					body = bytes.Replace(body, []byte(`"`+member+`":"`+value+`"`), []byte(`"`+member+`":`+string(mustJSON(t, spelling))), 1)
-
-					lgExpectRefused(t, body)
-				})
-			}
-		}
-	})
 }
 
 // ---- replay and interleaving -----------------------------------------------
@@ -1494,7 +1299,7 @@ func TestLoginReplayIsSingleUse(t *testing.T) {
 
 		// The first session is untouched and still works.
 		get(t, pathSession, first.session()).expect(t, "the first session", http.StatusOK, "")
-		expectCount(t, "japikeys", "1")
+		expectCount(t, "sessions", "1")
 	})
 
 	t.Run("a replay with the signature re-encoded is still a replay", func(t *testing.T) {
@@ -1545,8 +1350,12 @@ func TestLoginReplayIsSingleUse(t *testing.T) {
 				t.Errorf("round %d: %d x 200 and %d x 401, want 1 and %d", round, won, refused, workers-1)
 			}
 
-			expectCount(t, "japikeys", "1")
-			expectCount(t, "japikeys WHERE kind = 'session' AND revoked_at IS NULL", "1")
+			// Exactly one session, and exactly one secret of kind session: a losing
+			// finish left no secret behind without its session.
+			expectCount(t, "sessions", "1")
+			expectCount(t, "secrets WHERE kind = 'session'", "1")
+			expectCount(t, "secrets WHERE kind = 'session' AND revoked_at IS NULL", "1")
+			expectNoOrphanSecrets(t)
 		}
 	})
 
@@ -1564,7 +1373,7 @@ func TestLoginReplayIsSingleUse(t *testing.T) {
 
 			replies := lgRace(t, workers, func(i int) reply { return post(t, pathLoginEnd, bodies[i], "") })
 			tokens := map[string]bool{}
-			kids := map[string]bool{}
+			ids := map[string]bool{}
 
 			for _, got := range replies {
 				if got.status != http.StatusOK || got.session() == "" {
@@ -1574,15 +1383,17 @@ func TestLoginReplayIsSingleUse(t *testing.T) {
 				}
 
 				tokens[got.session()] = true
-				kids[kidOf(t, got.session())] = true
+				ids[idOfToken(t, got.session())] = true
 			}
 
-			if len(tokens) != workers || len(kids) != workers {
-				t.Errorf("round %d: %d tokens and %d kids from %d logins, want all distinct", round, len(tokens), len(kids), workers)
+			if len(tokens) != workers || len(ids) != workers {
+				t.Errorf("round %d: %d tokens and %d secret ids from %d logins, want all distinct", round, len(tokens), len(ids), workers)
 			}
 
-			expectCount(t, "japikeys", strconv.Itoa(workers))
-			expectCount(t, "(SELECT DISTINCT granted_from FROM japikeys)", strconv.Itoa(workers))
+			expectCount(t, "sessions", strconv.Itoa(workers))
+			expectCount(t, "(SELECT DISTINCT granted_from FROM sessions)", strconv.Itoa(workers))
+			expectCount(t, "secrets WHERE kind = 'session'", strconv.Itoa(workers))
+			expectNoOrphanSecrets(t)
 		}
 	})
 
@@ -1616,7 +1427,9 @@ func TestLoginReplayIsSingleUse(t *testing.T) {
 			t.Errorf("%d winners, want %d", wins, distinct)
 		}
 
-		expectCount(t, "japikeys", strconv.Itoa(distinct))
+		expectCount(t, "sessions", strconv.Itoa(distinct))
+		expectCount(t, "secrets WHERE kind = 'session'", strconv.Itoa(distinct))
+		expectNoOrphanSecrets(t)
 	})
 }
 
@@ -1701,14 +1514,14 @@ func TestLoginMalleatedSignature(t *testing.T) {
 				a, b = malleated, s
 			}
 
-			before := count(t, "japikeys")
+			before := count(t, "sessions")
 
 			lgExpectAccepted(t, a.body(t, nil))
 			lgExpectRefused(t, b.body(t, nil))
 			lgExpectRefused(t, a.body(t, nil))
 			lgExpectRefused(t, b.body(t, nil))
 
-			if got := count(t, "japikeys"); got == before {
+			if got := count(t, "sessions"); got == before {
 				t.Errorf("no session was created")
 			}
 		})
@@ -1727,7 +1540,7 @@ func TestLoginMalleatedSignature(t *testing.T) {
 				t.Errorf("statuses = %v, want one 200 and fifteen 401", got)
 			}
 
-			expectCount(t, "japikeys", "1")
+			expectCount(t, "sessions", "1")
 		}
 	})
 }
@@ -1755,11 +1568,11 @@ func TestLoginAfterSessionEnds(t *testing.T) {
 		t.Errorf("the replay after logout changed the database: %+v -> %+v", before, after)
 	}
 
-	expectCount(t, "japikeys", "1")
+	expectCount(t, "sessions", "1")
 
 	fresh := lgLogin(t, pk)
 	get(t, pathSession, fresh.session()).expect(t, "a fresh login after logout", http.StatusOK, "")
-	expectCount(t, "japikeys", "2")
+	expectCount(t, "sessions", "2")
 }
 
 // ---- a login racing a change of state ---------------------------------------
@@ -1807,7 +1620,9 @@ func TestLoginRacingAStateChange(t *testing.T) {
 
 			// The whole batch rolled back: no session row, and nothing the
 			// trigger did survives either.
-			expectCount(t, "japikeys", "0")
+			expectCount(t, "sessions", "0")
+			expectCount(t, "secrets WHERE kind = 'session'", "0")
+			expectNoOrphanSecrets(t)
 			expectCount(t, "credentials", "1")
 			expectCount(t, "users WHERE revoked_at IS NULL", "1")
 

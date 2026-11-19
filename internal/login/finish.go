@@ -61,7 +61,6 @@ type FinishResponse struct {
 // claimed is an assertion that passed every check that needs no stored
 // credential, to a challenge this deployment issued.
 type claimed struct {
-	cfg    config.Config
 	parsed webauthn.Parsed
 }
 
@@ -81,9 +80,9 @@ type proved struct {
 
 // finished is a completed login.
 type finished struct {
-	userID string
-	role   string
-	key    auth.Key
+	userID  string
+	role    string
+	session auth.Issued
 }
 
 var (
@@ -144,7 +143,7 @@ func claim(cfg config.Config, body finishBody, now time.Time) (claimed, error) {
 		return claimed{}, invalid(err)
 	}
 
-	return claimed{cfg: cfg, parsed: parsed}, nil
+	return claimed{parsed: parsed}, nil
 }
 
 // checkEnvelope checks the members of the credential that are not part of the
@@ -214,7 +213,7 @@ func prove(in found) (proved, error) {
 	return proved{found: in, asserted: asserted}, nil
 }
 
-// accept issues the session. The write records the challenge's hash in a unique
+// accept issues the session token and stores the session. The write records the challenge's hash in a unique
 // column, so a replay of this response collides with the row the first login
 // created; the flags update rides in the same operation, so a refused replay
 // changes nothing. A conflict is reported as any other failed login, because
@@ -223,19 +222,18 @@ func prove(in found) (proved, error) {
 func (h *handlers) accept(ctx context.Context, in proved, now time.Time) (finished, error) {
 	credential := in.credential
 
-	key, err := h.createSession(auth.IssuerFor(in.cfg.API), credential.UserID, now.Add(auth.SessionLifetime))
+	issued, err := h.issueSession(h.entropy, h.newID, now)
 	if err != nil {
 		return finished{}, apierr.Wrap(err, apierr.Internal, CodeSessionCreateFailed, "internal error")
 	}
 
 	err = h.store.CreateSession(ctx, store.NewSession{
-		KeyID:           key.ID.String(),
+		ID:              issued.ID,
+		Hash:            issued.Hash,
 		CredentialRowID: credential.ID,
-		JWK:             key.JWK,
-		ExpiresAt:       key.ExpiresAt,
 		GrantedFrom:     auth.LoginGrant(in.parsed.Challenge),
-		Scope:           key.Scope,
 		Flags:           in.asserted.Flags.Stored(),
+		ExpiresAt:       issued.ExpiresAt,
 		CreatedAt:       now,
 	})
 	if errors.Is(err, store.ErrConflict) {
@@ -246,7 +244,7 @@ func (h *handlers) accept(ctx context.Context, in proved, now time.Time) (finish
 		return finished{}, err //nolint:wrapcheck // the store classifies its own failures
 	}
 
-	return finished{userID: credential.UserID, role: credential.Role, key: key}, nil
+	return finished{userID: credential.UserID, role: credential.Role, session: issued}, nil
 }
 
 // present is the response of a completed login: the session is the cookie, not
@@ -255,6 +253,6 @@ func present(done finished) httpapi.Response {
 	return httpapi.JSON(http.StatusOK, FinishResponse{
 		UserID:    done.userID,
 		Role:      done.role,
-		ExpiresAt: done.key.ExpiresAt.Unix(),
-	}).WithCookies(auth.SessionCookie(done.key))
+		ExpiresAt: done.session.ExpiresAt.Unix(),
+	}).WithCookies(auth.SessionCookie(done.session))
 }

@@ -54,9 +54,12 @@ const (
 	wranglerConfig = "wrangler.e2e.jsonc"
 
 	// firstRunSecret is the FIRST_RUN_SECRET the Worker under test is started
-	// with. It is a fixed, throwaway value (43 characters, like a generated
-	// one) so tests can compute what the Worker should have stored for it.
-	firstRunSecret = "e2e-first-run-secret-0123456789ABCDEFGHIJKL"
+	// with. It is a fixed, throwaway invitation token ("susu_inv_" and 43
+	// base64url characters, the last one canonical), so tests can compute what
+	// the Worker should have stored for it. Anything else would be reported as
+	// "missing secret"; the value is read per request from the environment, so
+	// no test can vary it (see firstrun_test.go).
+	firstRunSecret = "susu_inv_wYCCgEx_IWkXKzIV3WMZoYb7BSpdE7IzkSfl8f3uuA8"
 
 	// authHMACSecret is the AUTH_HMAC_SECRET the Worker under test is started
 	// with: fixed and throwaway, 43 characters like a generated one.
@@ -88,7 +91,7 @@ type worker struct {
 	// origin is the UI origin: the relying party origin the Worker accepts
 	// ceremonies from, and the one origin it allows cross-origin.
 	origin string
-	// apiOrigin is the origin the Worker is served from: its session issuer.
+	// apiOrigin is the origin the Worker is served from.
 	apiOrigin string
 
 	// root is the repository root and state the Worker's local D1 state
@@ -216,8 +219,8 @@ func serve(ctx context.Context, root, state string, m *testing.M) int {
 
 	// Tests connect to 127.0.0.1 (wrangler binds IPv4, and "localhost" may
 	// resolve to ::1 first). The origins are only ever strings (inside
-	// clientDataJSON, in an Origin header, in an issuer), so they can use the
-	// name "localhost".
+	// clientDataJSON, in an Origin header), so they can use the name
+	// "localhost".
 	target = worker{
 		baseURL: "http://127.0.0.1:" + port, origin: uiOrigin, apiOrigin: apiOrigin, root: root, state: state,
 	}

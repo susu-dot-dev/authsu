@@ -2,17 +2,12 @@ package auth_test
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/asn1"
-	"encoding/base64"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,44 +17,39 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"uuid"
-
-	"github.com/susu-dot-dev/japikey_go"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/scope"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
 // *store.Store is what runs in production, so it must satisfy the interface the
-// boundary reads keys through. KeyReader has no write method, which is how the
-// tests know the boundary cannot write.
-var _ auth.KeyReader = (*store.Store)(nil)
+// boundary resolves credentials through. CredentialReader has no write method,
+// which is how the tests know the boundary cannot write.
+var _ auth.CredentialReader = (*store.Store)(nil)
 
 // Causes the tests inject. They are only ever in the log, never in a response.
 var (
-	errDB      = errors.New("SELECT jwk FROM japikeys: database is on fire")
-	errEncode  = errors.New("encoder is broken")
+	errDB      = errors.New("SELECT hash FROM secrets: database is on fire")
 	errRevoked = errors.New("the session was revoked by another request")
 )
 
 const (
-	testSecret   = "auth-test-secret-0123456789ABCDEFGHIJKLMNOPQ"
-	apiOrigin    = "https://auth.example.com"
-	uiOrigin     = "https://example.com"
-	localOrigin  = "http://localhost:8787"
-	localIssuer  = localOrigin + "/keys"
-	userID       = "00000000-0000-7000-8000-000000000002"
-	otherUserID  = "00000000-0000-7000-8000-0000000000ff"
-	credentialID = "00000000-0000-7000-8000-000000000001"
-	itemID       = "00000000-0000-7000-8000-0000000000aa"
-	otherItemID  = "00000000-0000-7000-8000-0000000000bb"
-	roleMember   = "member"
-	adminText    = "admin" // how the role is stored, spelled out
+	testSecret  = "auth-test-secret-0123456789ABCDEFGHIJKLMNOPQ"
+	apiOrigin   = "https://auth.example.com"
+	uiOrigin    = "https://example.com"
+	userID      = "00000000-0000-7000-8000-000000000002"
+	otherUserID = "00000000-0000-7000-8000-0000000000ff"
+	itemID      = "00000000-0000-7000-8000-0000000000aa"
+	otherItemID = "00000000-0000-7000-8000-0000000000bb"
+	roleMember  = "member"
+	adminText   = "admin" // how the role is stored, spelled out
 
 	jsonType = "application/json"
 
@@ -76,21 +66,6 @@ const (
 	pathAdmin   = "/admin"
 	pathItems   = "/items/"
 	patternItem = "/items/{id}"
-)
-
-// Claim names and values of a token.
-const (
-	claimSub   = "sub"
-	claimIss   = "iss"
-	claimAud   = "aud"
-	claimExp   = "exp"
-	claimIat   = "iat"
-	claimVer   = "ver"
-	claimScope = "scope"
-	claimAct   = "act"
-	versionV2  = "japikey-v2"
-	audSession = "authsu/session"
-	audForAPI  = "authsu/api_key"
 )
 
 // The answers a client is given: the status text is part of the contract. A
@@ -115,56 +90,102 @@ func errorBody(code, message string) string {
 	return `{"error":{"code":"` + code + `","message":"` + message + `"}}` + "\n"
 }
 
-// keyCall is one read of the key store.
-type keyCall struct {
-	kid, kind string
-	now       time.Time
+// credentialCall is one read of the credential store: which kind was asked for,
+// the token's text, and the time the boundary passed.
+type credentialCall struct {
+	kind  string
+	token string
+	now   time.Time
 }
 
-type rowKey struct{ kid, kind string }
-
-// fakeKeys is the key store: rows by kid and kind, as the database holds them,
-// with a programmable failure. It records every call.
-type fakeKeys struct {
-	rows map[rowKey]store.ActiveKey
+// fakeCredentials is the credential store: active sessions and keys by the
+// token that names them, as the store reports them after applying its own
+// active predicate (the SQL runs only in e2e), with a programmable failure. It
+// records every call, so a test can assert that a refused request cost no read.
+type fakeCredentials struct {
+	sessions map[string]store.ActiveSession
+	keys     map[string]store.ActiveAPIKey
 	// err, when set, is returned by every read.
 	err error
-	// ignoreKind makes the fake answer for a kid whatever its kind, as a
-	// store that forgot its kind condition would.
-	ignoreKind bool
-	calls      []keyCall
+	// calls is every read, in order.
+	calls []credentialCall
 }
 
-func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, now time.Time) (store.ActiveKey, bool, error) {
-	f.calls = append(f.calls, keyCall{kid: kid, kind: kind, now: now})
+func newFakeCredentials() *fakeCredentials {
+	return &fakeCredentials{
+		sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}, err: nil, calls: nil,
+	}
+}
 
+// ResolveSession answers for an active session, honouring a cancelled request
+// as the real store does.
+func (f *fakeCredentials) ResolveSession(
+	ctx context.Context, token input.SessionToken, now time.Time,
+) (store.ActiveSession, bool, error) {
+	f.calls = append(f.calls, credentialCall{kind: auth.KindSession, token: token.String(), now: now})
+
+	err := f.failure(ctx)
+	if err != nil {
+		return store.ActiveSession{}, false, err
+	}
+
+	row, found := f.sessions[token.String()]
+
+	return row, found, nil
+}
+
+// ResolveAPIKey answers for an active API key, as ResolveSession does.
+func (f *fakeCredentials) ResolveAPIKey(
+	ctx context.Context, token input.APIKeyToken, now time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	f.calls = append(f.calls, credentialCall{kind: auth.KindAPIKey, token: token.String(), now: now})
+
+	err := f.failure(ctx)
+	if err != nil {
+		return store.ActiveAPIKey{}, false, err
+	}
+
+	row, found := f.keys[token.String()]
+
+	return row, found, nil
+}
+
+// failure is why every read fails, or nil.
+func (f *fakeCredentials) failure(ctx context.Context) error {
 	if f.err != nil {
-		return store.ActiveKey{}, false, f.err
+		return f.err
 	}
 
-	if row, ok := f.rows[rowKey{kid: kid, kind: kind}]; ok {
-		return row, true, nil
+	err := ctx.Err()
+	if err != nil {
+		return fmt.Errorf("the request ended: %w", err)
 	}
 
-	if f.ignoreKind {
-		for key, row := range f.rows {
-			if key.kid == kid {
-				return row, true, nil
-			}
-		}
-	}
-
-	return store.ActiveKey{}, false, nil
+	return nil
 }
 
-// rig is one deployment under test: the real boundary over a fake key store, a
-// route that records whether and how it ran, and the errors the boundary logged.
+// sequence is a deterministic source of entropy: each read returns bytes that
+// differ from every other read's, so issued tokens are distinct.
+type sequence struct{ reads uint64 }
+
+func (s *sequence) Read(p []byte) (int, error) {
+	s.reads++
+
+	sum := sha256.Sum256(binary.BigEndian.AppendUint64(nil, s.reads))
+
+	return copy(p, sum[:]), nil
+}
+
+// rig is one deployment under test: the real boundary over a fake credential
+// store, a route that records whether and how it ran, and the errors the
+// boundary logged.
 type rig struct {
-	t      *testing.T
-	keys   *fakeKeys
-	env    map[string]string
-	now    time.Time
-	issuer auth.Issuer
+	t       *testing.T
+	creds   *fakeCredentials
+	env     map[string]string
+	now     time.Time
+	entropy *sequence
+	ids     int
 
 	// handled records every call a route's Handle received.
 	handled []*auth.Call
@@ -180,13 +201,14 @@ func newRig(t *testing.T) *rig {
 	t.Helper()
 
 	return &rig{
-		t:    t,
-		keys: &fakeKeys{rows: map[rowKey]store.ActiveKey{}, err: nil, ignoreKind: false, calls: nil},
+		t:     t,
+		creds: newFakeCredentials(),
 		env: map[string]string{
 			config.SecretHMAC: testSecret, config.VarAPIOrigin: apiOrigin, config.VarUIOrigin: uiOrigin,
 		},
-		now:    time.Now(),
-		issuer: auth.IssuerFor(origin(t, apiOrigin)),
+		now:     time.Date(2030, time.March, 4, 5, 6, 7, 0, time.UTC),
+		entropy: &sequence{reads: 0},
+		ids:     0,
 	}
 }
 
@@ -199,8 +221,8 @@ func (r *rig) with(settings map[string]string) *rig {
 
 func (r *rig) deps() auth.Deps {
 	return auth.Deps{
-		Keys: r.keys,
-		Now:  func() time.Time { return r.now },
+		Credentials: r.creds,
+		Now:         func() time.Time { return r.now },
 		Getenv: func(name string) string {
 			r.envReads++
 
@@ -208,6 +230,14 @@ func (r *rig) deps() auth.Deps {
 		},
 		Log: func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },
 	}
+}
+
+// newID is the id source the rig issues secrets with: distinct UUID-shaped
+// values.
+func (r *rig) newID() string {
+	r.ids++
+
+	return fmt.Sprintf("00000000-0000-7000-8000-%012x", 0x1000+r.ids)
 }
 
 // capture is a route body that records the call and answers 200.
@@ -314,142 +344,130 @@ func requestCookie(name, value string) *http.Cookie {
 	return &http.Cookie{Name: name, Value: value}
 }
 
-// sessionCookie is the session cookie of key as the browser sends it back.
-func sessionCookie(key auth.Key) *http.Cookie {
-	return requestCookie(auth.CookieName, key.JWT)
+// sessionCookie is the session cookie of an issued session as the browser
+// sends it back.
+func sessionCookie(issued auth.Issued) *http.Cookie {
+	return requestCookie(auth.CookieName, issued.Token)
 }
 
-// row is the stored row for key, owned by userID with role.
-func (r *rig) row(key auth.Key, owner, role string) store.ActiveKey {
-	return store.ActiveKey{
-		JWK: []byte(key.JWK), UserID: owner, CredentialID: credentialID, Role: role, ExpiresAt: key.ExpiresAt,
-	}
-}
+// bearer is the Authorization header value for an issued key.
+func bearer(issued auth.Issued) string { return "Bearer " + issued.Token }
 
-// sessionFor creates a session for owner and stores its row, as login would,
-// with the given role.
-func (r *rig) sessionFor(owner, role string) auth.Key {
+// issueSession issues a session as login would, from the rig's entropy.
+func (r *rig) issueSession() auth.Issued {
 	r.t.Helper()
 
-	key, err := auth.CreateSession(r.issuer, owner, r.now.Add(auth.SessionLifetime))
+	issued, err := auth.IssueSession(r.entropy, r.newID, r.now)
 	if err != nil {
-		r.t.Fatalf("CreateSession: %v", err)
+		r.t.Fatalf("IssueSession: %v", err)
 	}
 
-	r.keys.rows[rowKey{kid: key.ID.String(), kind: auth.KindSession}] = r.row(key, owner, role)
+	return issued
+}
 
-	return key
+// issueKey issues an API key that lives an hour, from the rig's entropy.
+func (r *rig) issueKey() auth.Issued {
+	r.t.Helper()
+
+	issued, err := auth.IssueAPIKey(r.entropy, r.newID, r.now, time.Hour)
+	if err != nil {
+		r.t.Fatalf("IssueAPIKey: %v", err)
+	}
+
+	return issued
+}
+
+// foreign is a token of another kind than session or key, as an invitation is.
+func (r *rig) foreign(tag secret.Tag) string {
+	r.t.Helper()
+
+	token, err := secret.Generate(r.entropy, tag)
+	if err != nil {
+		r.t.Fatalf("Generate: %v", err)
+	}
+
+	return token
+}
+
+// sessionFor issues a session for the standard user and stores its row as
+// active, as login and the store would, with the given role.
+func (r *rig) sessionFor(role string) auth.Issued {
+	r.t.Helper()
+
+	issued := r.issueSession()
+
+	r.creds.sessions[issued.Token] = store.ActiveSession{
+		ID: issued.ID, UserID: userID, Role: role, ExpiresAt: issued.ExpiresAt,
+	}
+
+	return issued
 }
 
 // session is a stored session of the standard user, an administrator.
-func (r *rig) session() auth.Key { return r.sessionFor(userID, auth.RoleAdmin) }
+func (r *rig) session() auth.Issued { return r.sessionFor(auth.RoleAdmin) }
 
-// unstore removes key's row, as a revocation, an expiry or a revoked account
-// does: the store reports nothing active.
-func (r *rig) unstore(key auth.Key) {
-	delete(r.keys.rows, rowKey{kid: key.ID.String(), kind: auth.KindSession})
+// unstore makes a session or key inactive, as a revocation, an expiry or a
+// revoked account or agent does: the store reports nothing active, and that is
+// all the boundary learns.
+func (r *rig) unstore(issued auth.Issued) {
+	delete(r.creds.sessions, issued.Token)
+	delete(r.creds.keys, issued.Token)
 }
 
-// setRow replaces the stored row of a session.
-func (r *rig) setRow(key auth.Key, change func(*store.ActiveKey)) {
-	rk := rowKey{kid: key.ID.String(), kind: auth.KindSession}
-	row := r.keys.rows[rk]
+// setSession replaces the stored row of a session.
+func (r *rig) setSession(issued auth.Issued, change func(*store.ActiveSession)) {
+	row := r.creds.sessions[issued.Token]
 
 	change(&row)
-	r.keys.rows[rk] = row
+	r.creds.sessions[issued.Token] = row
 }
 
-// forged is a token that this test signed itself, so that it can carry claims
-// the creation code never writes. It is correctly signed, and its public key
-// is a valid stored JWK for its kid.
-type forged struct {
-	ID  uuid.UUID
-	JWT string
-	JWK string
+// bearerSpec describes an API key to issue and store, for the tests of the
+// bearer credential and of scopes.
+type bearerSpec struct {
+	// scope is the key's own scope list, stored as its JSON.
+	scope scope.List
+	// stored, when set, is the key's stored scope text as it is, whatever scope
+	// says: how a damaged value is put in the row.
+	stored *string
+	// role is the owner's role in the stored row.
+	role string
+	// agent is the agent the key belongs to, or "" for a user's own key.
+	agent string
+	// agentScopes is the agent's stored scope list (JSON), read now.
+	agentScopes string
 }
 
-// forge signs a session token for the standard user under issuer, with claims
-// that mutate may change or delete.
-func forge(t *testing.T, issuer auth.Issuer, now time.Time, mutate func(claims map[string]any)) forged {
-	t.Helper()
+// withStoredScope returns a copy of s whose stored scope text is text.
+func (s bearerSpec) withStoredScope(text string) bearerSpec {
+	s.stored = &text
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("key: %v", err)
-	}
-
-	kid := uuid.NewV7()
-	claims := map[string]any{
-		claimSub: userID,
-		claimIss: issuer.Base + "/" + kid.String(),
-		claimAud: auth.Audience(auth.KindSession),
-		claimExp: now.Add(time.Hour).Unix(),
-		claimIat: now.Unix(),
-		claimVer: versionV2,
-	}
-
-	if mutate != nil {
-		mutate(claims)
-	}
-
-	jwt := signJWT(t, priv, kid, claims)
-
-	document, err := japikey.NewJWKS(&priv.PublicKey, kid)
-	if err != nil {
-		t.Fatalf("jwks: %v", err)
-	}
-
-	jwk, err := json.Marshal(document)
-	if err != nil {
-		t.Fatalf("jwk: %v", err)
-	}
-
-	return forged{ID: kid, JWT: jwt, JWK: string(jwk)}
+	return s
 }
 
-// signJWT signs claims as an ES256 JWT with priv, under the key id kid.
-func signJWT(t *testing.T, priv *ecdsa.PrivateKey, kid uuid.UUID, claims map[string]any) string {
-	t.Helper()
+// apiKey issues an API key as spec describes, stores its row as the store would
+// return it, and returns it.
+func (r *rig) apiKey(spec bearerSpec) auth.Issued {
+	r.t.Helper()
 
-	header, err := json.Marshal(map[string]any{"alg": "ES256", "typ": "JWT", "kid": kid.String()})
-	if err != nil {
-		t.Fatalf("header: %v", err)
+	issued := r.issueKey()
+
+	stored := spec.scope.JSON()
+	if spec.stored != nil {
+		stored = *spec.stored
 	}
 
-	payload, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("claims: %v", err)
+	role := spec.role
+	if role == "" {
+		role = roleMember
 	}
 
-	enc := base64.RawURLEncoding
-	signing := enc.EncodeToString(header) + "." + enc.EncodeToString(payload)
-	digest := sha256.Sum256([]byte(signing))
-
-	der, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
-	if err != nil {
-		t.Fatalf("sign: %v", err)
+	r.creds.keys[issued.Token] = store.ActiveAPIKey{
+		ID: issued.ID, UserID: userID, Role: role, ExpiresAt: issued.ExpiresAt,
+		AgentID: spec.agent, AgentScopes: spec.agentScopes, Scope: stored,
 	}
 
-	var sig struct{ R, S *big.Int }
-
-	_, err = asn1.Unmarshal(der, &sig)
-	if err != nil {
-		t.Fatalf("signature: %v", err)
-	}
-
-	// A JWS ES256 signature is R and S as two fixed-width 32-byte integers.
-	raw := make([]byte, 64)
-	sig.R.FillBytes(raw[:32])
-	sig.S.FillBytes(raw[32:])
-
-	return signing + "." + enc.EncodeToString(raw)
-}
-
-// storeForged puts the forged key's row in the fake store.
-func (r *rig) storeForged(f forged, owner, role string) {
-	r.keys.rows[rowKey{kid: f.ID.String(), kind: auth.KindSession}] = store.ActiveKey{
-		JWK: []byte(f.JWK), UserID: owner, CredentialID: credentialID, Role: role, ExpiresAt: r.now.Add(time.Hour),
-	}
+	return issued
 }
 
 // wantFailure checks the status and the exact body of a failure response, that
@@ -481,39 +499,6 @@ func wantFailure(t *testing.T, r *rig, rec *httptest.ResponseRecorder, status in
 	if cause != nil && !errors.Is(r.logged[0], cause) {
 		t.Errorf("logged error %v does not wrap the cause %v", r.logged[0], cause)
 	}
-}
-
-// createKey creates a key of kind under issuer for the standard user, valid for
-// an hour. Nothing is stored.
-func (r *rig) createKey(issuer auth.Issuer, kind string) auth.Key {
-	r.t.Helper()
-
-	key, err := auth.CreateKey(issuer, auth.KeySpec{
-		Kind: kind, Subject: userID, Expires: r.now.Add(time.Hour), Claims: nil,
-	})
-	if err != nil {
-		r.t.Fatalf("CreateKey: %v", err)
-	}
-
-	return key
-}
-
-// put stores key's row under kind, as the database would hold it, owned by the
-// standard user, an administrator.
-func (r *rig) put(key auth.Key, kind string) {
-	r.keys.rows[rowKey{kid: key.ID.String(), kind: kind}] = r.row(key, userID, auth.RoleAdmin)
-}
-
-// origin parses an origin, which the test knows is valid.
-func origin(t *testing.T, value string) config.Origin {
-	t.Helper()
-
-	parsed, err := config.ParseOrigin(value)
-	if err != nil {
-		t.Fatalf("origin: %v", err)
-	}
-
-	return parsed
 }
 
 // migrationLimits reads the numbers a CHECK of the migrations states, by a
@@ -559,92 +544,39 @@ func migrationLimits(t *testing.T, pattern string) []int {
 	return limits
 }
 
-// bearerSpec describes an API key to create and store, for the tests of the
-// bearer credential and of scopes.
-type bearerSpec struct {
-	// scope is the key's own scope list, signed into its token.
-	scope scope.List
-	// role is the owner's role in the stored row.
-	role string
-	// agent is the agent the key belongs to, or "" for a user's own key.
-	agent string
-	// agentScopes is the agent's stored scope list (JSON), read now.
-	agentScopes string
-	// actor is what the token's act claim says. By default it is agent.
-	actor *string
-	// claims are further claims to sign into the token.
-	claims map[string]any
-	// kind is the kind of key; it defaults to KindAPIKey.
-	kind string
-}
-
-// withActor returns a copy of s whose token names actor as its actor, whatever
-// the row's agent is.
-func (s bearerSpec) withActor(actor string) bearerSpec {
-	s.actor = &actor
-
-	return s
-}
-
-// apiKey creates an API key as spec describes, stores its row as the database
-// would hold it, and returns it.
-func (r *rig) apiKey(spec bearerSpec) auth.Key {
-	r.t.Helper()
-
-	kind := spec.kind
-	if kind == "" {
-		kind = auth.KindAPIKey
-	}
-
-	claims := map[string]any{}
-	maps.Copy(claims, spec.claims)
-
-	actor := spec.agent
-	if spec.actor != nil {
-		actor = *spec.actor
-	}
-
-	if actor != "" {
-		claims[claimAct] = map[string]any{claimSub: actor}
-	}
-
-	key, err := auth.CreateKey(r.issuer, auth.KeySpec{
-		Kind: kind, Subject: userID, Expires: r.now.Add(time.Hour), Scope: spec.scope, Claims: claims,
-	})
-	if err != nil {
-		r.t.Fatalf("CreateKey: %v", err)
-	}
-
-	role := spec.role
-	if role == "" {
-		role = roleMember
-	}
-
-	r.keys.rows[rowKey{kid: key.ID.String(), kind: kind}] = store.ActiveKey{
-		JWK: []byte(key.JWK), UserID: userID, CredentialID: "", Role: role, ExpiresAt: key.ExpiresAt,
-		AgentID: spec.agent, AgentScopes: spec.agentScopes,
-	}
-
-	return key
-}
-
-// bearer is the Authorization header value for key.
-func bearer(key auth.Key) string { return "Bearer " + key.JWT }
-
 // serveWith is serve with Authorization header values.
 func (r *rig) serveWith(
 	routes []auth.Route, target string, authorization []string, cookies []*http.Cookie,
 ) *httptest.ResponseRecorder {
 	r.t.Helper()
 
-	httpReq := httptest.NewRequestWithContext(r.t.Context(), http.MethodGet, target, nil)
+	return r.serveCtx(routes, target, carried{headers: authorization, cookies: cookies}, false)
+}
+
+// serveCtx sends a GET of target presenting what a request carries, from a
+// client that has already gone away when cancelled.
+func (r *rig) serveCtx(
+	routes []auth.Route, target string, presented carried, cancelled bool,
+) *httptest.ResponseRecorder {
+	r.t.Helper()
+
+	ctx := r.t.Context()
+
+	if cancelled {
+		var cancel context.CancelFunc
+
+		ctx, cancel = context.WithCancel(ctx)
+		cancel()
+	}
+
+	httpReq := httptest.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	httpReq.Header.Set("Content-Type", jsonType)
 
-	for _, value := range authorization {
+	for _, value := range presented.headers {
 		httpReq.Header.Add("Authorization", value)
 	}
 
-	for _, cookie := range cookies {
+	for _, cookie := range presented.cookies {
 		httpReq.AddCookie(cookie)
 	}
 

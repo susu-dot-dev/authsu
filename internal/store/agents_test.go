@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -152,122 +151,6 @@ func agentWriteFailures(statements int, failed, rejected string) []failure {
 	}
 
 	return failures
-}
-
-// agentPlaceholder matches a bound parameter: a bare ? or a numbered ?N.
-var agentPlaceholder = regexp.MustCompile(`\?(\d*)`)
-
-var (
-	errAgentMixed = errors.New("bare and numbered placeholders are mixed")
-	errAgentGap   = errors.New("numbered placeholders have a gap")
-)
-
-// agentParameters returns how many arguments a query binds. Bare placeholders
-// are counted one by one; numbered ones are one argument per number, and the
-// numbers must be 1 to n with no gap. Mixing the two is refused, since SQLite
-// numbers a bare ? after the highest number seen so far.
-func agentParameters(query string) (int, error) {
-	bare, highest := 0, 0
-	seen := map[int]bool{}
-
-	for _, match := range agentPlaceholder.FindAllStringSubmatch(query, -1) {
-		if match[1] == "" {
-			bare++
-
-			continue
-		}
-
-		number, err := strconv.Atoi(match[1])
-		if err != nil {
-			return 0, fmt.Errorf("placeholder %q: %w", match[0], err)
-		}
-
-		seen[number] = true
-		highest = max(highest, number)
-	}
-
-	switch {
-	case bare > 0 && len(seen) > 0:
-		return 0, errAgentMixed
-	case bare > 0:
-		return bare, nil
-	}
-
-	for number := 1; number <= highest; number++ {
-		if !seen[number] {
-			return 0, fmt.Errorf("%w: ?%d is missing below ?%d", errAgentGap, number, highest)
-		}
-	}
-
-	return highest, nil
-}
-
-// TestAgentParameters validates the placeholder counting the checks below rely
-// on.
-func TestAgentParameters(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		query   string
-		want    int
-		wantErr bool
-	}{
-		{name: "none", query: "SELECT 1", want: 0},
-		{name: "bare", query: "WHERE a = ? AND b = ?", want: 2},
-		{name: "numbered, one reused", query: "WHERE a = ?1 AND b = ?2 AND c > ?1", want: 2},
-		{name: "numbered in a different order", query: "SET a = ?3 WHERE b = ?1 AND c = ?2", want: 3},
-		{name: "a gap", query: "WHERE a = ?1 AND b = ?3", wantErr: true},
-		{name: "mixed", query: "WHERE a = ?1 AND b = ?", wantErr: true},
-		{name: "a number too large", query: "WHERE a = ?99999999999999999999", wantErr: true},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			got, err := agentParameters(test.query)
-			if (err != nil) != test.wantErr || got != test.want {
-				t.Errorf("agentParameters = %d, %v; want %d, error %v", got, err, test.want, test.wantErr)
-			}
-		})
-	}
-}
-
-// checkAgentBatch is checkStatements for queries that number their
-// placeholders: the fake must have seen exactly one batch of the wanted
-// statements, each with the wanted fragments and the exact arguments, and each
-// binding as many arguments as its text has parameters.
-func checkAgentBatch(t *testing.T, fake *fakeExec, want ...wantStatement) {
-	t.Helper()
-
-	if len(fake.calls) != 1 {
-		t.Fatalf("exec called %d times, want exactly one batch", len(fake.calls))
-	}
-
-	got := fake.calls[0]
-	if len(got) != len(want) {
-		t.Fatalf("batch has %d statements, want %d", len(got), len(want))
-	}
-
-	for i, expected := range want {
-		query := squash(got[i].Query)
-
-		for _, fragment := range expected.fragments {
-			if !strings.Contains(query, fragment) {
-				t.Errorf("statement %d lacks %q:\n%s", i, fragment, query)
-			}
-		}
-
-		if !reflect.DeepEqual(got[i].Args, expected.args) {
-			t.Errorf("statement %d args = %#v, want %#v", i, got[i].Args, expected.args)
-		}
-
-		count, err := agentParameters(query)
-		if err != nil || count != len(got[i].Args) {
-			t.Errorf("statement %d has %d parameters (%v) for %d args:\n%s", i, count, err, len(got[i].Args), query)
-		}
-	}
 }
 
 // agentOp is one operation that reads an agent row, for the tables that hold
@@ -643,7 +526,7 @@ func TestListAgentsStatement(t *testing.T) {
 				}
 			}
 
-			checkAgentBatch(t, fake, wantStatement{
+			checkBatch(t, fake, wantStatement{
 				fragments: []string{
 					"FROM agents",
 					"WHERE user_id = ?1 AND id < ?2",
@@ -680,7 +563,7 @@ func TestGetAgentStatement(t *testing.T) {
 	_, err := fake.store().GetAgent(context.Background(), agentOwner, mustAgentID(t))
 	checkErr(t, err, nil)
 
-	checkAgentBatch(t, fake, wantStatement{
+	checkBatch(t, fake, wantStatement{
 		fragments: []string{
 			"SELECT id, name, scopes, revoked_at, created_at,",
 			"FROM agents",
@@ -718,28 +601,28 @@ func createAgentCases(t *testing.T) []createAgentCase {
 	return []createAgentCase{
 		{name: "a typical agent", agent: store.NewAgent{
 			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
-			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1),
 			KeyExpiresAt: expires, CreatedAt: now,
 		}},
 		{name: "a multibyte name and another limit", agent: store.NewAgent{
 			ID: agentCursorID, Owner: "user-2", Name: mustAgentName(t, "ボット 🤖"), Scopes: `[]`,
-			KeyScope: `[]`, MaxActive: 1, KeyID: "kid-2", KeyJWK: `{"keys":[]}`, KeyExpiresAt: expires.Add(time.Hour),
+			KeyScope: `[]`, MaxActive: 1, KeyID: "key-2", KeyHash: hashOf(2), KeyExpiresAt: expires.Add(time.Hour),
 			CreatedAt: now.Add(time.Minute),
 		}},
 		{name: "one label", labels: []string{"prod"}, agent: store.NewAgent{
 			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
-			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1),
 			KeyExpiresAt: expires, CreatedAt: now, Labels: mustAgentLabelSet(t, "prod"),
 		}},
 		{name: "labels are written in the order sent, not sorted", labels: []string{"zeta", "alpha", "mid"},
 			agent: store.NewAgent{
 				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
-				KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+				KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1),
 				KeyExpiresAt: expires, CreatedAt: now, Labels: mustAgentLabelSet(t, "zeta", "alpha", "mid"),
 			}},
 		{name: "the most labels, each the longest", labels: longestLabelSet(), agent: store.NewAgent{
 			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
-			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`,
+			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1),
 			KeyExpiresAt: expires, CreatedAt: now, Labels: mustAgentLabelSet(t, longestLabelSet()...),
 		}},
 	}
@@ -803,8 +686,9 @@ func TestCreateAgentStatements(t *testing.T) {
 
 			agent := test.agent
 
-			// The agent, its key, then each label in order: the agent is first
-			// because the others read its row.
+			// The agent, its key's secret, its key, then each label in order:
+			// the agent is first because the key and the labels read its row,
+			// and the key follows its secret.
 			fixed := []wantStatement{
 				{
 					fragments: []string{
@@ -823,22 +707,30 @@ func TestCreateAgentStatements(t *testing.T) {
 					},
 				},
 				{
-					fragments: []string{
-						"INSERT INTO japikeys (kid, user_id, kind, jwk, expires_at, agent_id, scope, created_at)",
-						// The key's owner is the agent row's, not an argument.
-						"(SELECT user_id FROM agents WHERE id = ?)",
-					},
+					fragments: []string{"INSERT INTO secrets (id, kind, hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"},
 					args: []any{
-						agent.KeyID, agent.ID, store.KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
-						agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
+						agent.KeyID, store.KindAPIKey, agent.KeyHash, agent.KeyExpiresAt.Unix(), agent.CreatedAt.Unix(),
 					},
+				},
+				{
+					fragments: []string{
+						"INSERT INTO api_keys (id, kind, user_id, agent_id, scope)",
+						// The key's owner and agent are the agent row's, not
+						// arguments: no agent, no owner, and the batch fails,
+						// secret included.
+						"(SELECT user_id FROM agents WHERE id = ?3)",
+						"(SELECT id FROM agents WHERE id = ?3)",
+					},
+					args: []any{agent.KeyID, store.KindAPIKey, agent.ID, agent.KeyScope},
 				},
 			}
 
-			checkAgentBatch(t, fake, slices.Concat(fixed, labelStatements(agent.ID, test.labels))...)
+			checkBatch(t, fake, slices.Concat(fixed, labelStatements(agent.ID, test.labels))...)
 
-			if strings.Contains(squash(fake.calls[0][1].Query), "'api_key'") {
-				t.Error("the key insert writes the kind as a literal; bind store.KindAPIKey")
+			for i := 1; i <= 2; i++ {
+				if strings.Contains(squash(fake.calls[0][i].Query), "'api_key'") {
+					t.Errorf("statement %d writes the kind as a literal; bind store.KindAPIKey", i)
+				}
 			}
 		})
 	}
@@ -849,11 +741,11 @@ func TestCreateAgentStatements(t *testing.T) {
 func TestCreateAgentFailures(t *testing.T) {
 	t.Parallel()
 
-	runFailures(t, 2, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
+	runFailures(t, 3, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
 		func(s *store.Store) error {
 			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
 				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
-				MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+				MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(3), KeyExpiresAt: now, CreatedAt: now,
 			}))
 		})
 }
@@ -866,11 +758,11 @@ func TestCreateAgentFailures(t *testing.T) {
 func TestCreateAgentWithLabelsFailures(t *testing.T) {
 	t.Parallel()
 
-	runFailures(t, 4, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
+	runFailures(t, 5, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
 		func(s *store.Store) error {
 			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
 				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
-				MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+				MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(3), KeyExpiresAt: now, CreatedAt: now,
 				Labels: mustAgentLabelSet(t, "a", "b"),
 			}))
 		})
@@ -889,7 +781,7 @@ func TestCreateAgentByAgentStatements(t *testing.T) {
 		ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "child"),
 		// A request's idea of the scopes must never reach the write.
 		Scopes: `["user:read"]`, KeyScope: `["default:agent"]`, CreatedBy: agentCursorID,
-		MaxActive: 25, KeyID: "kid-1", KeyJWK: `{"keys":[{}]}`, KeyExpiresAt: expires, CreatedAt: now,
+		MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1), KeyExpiresAt: expires, CreatedAt: now,
 	}
 
 	// The creating agent's row holds other scopes than the request offered, and
@@ -905,7 +797,7 @@ func TestCreateAgentByAgentStatements(t *testing.T) {
 		t.Errorf("stored scopes = %q, want the creating agent's %q", stored, creatorScopes)
 	}
 
-	checkAgentBatch(t, fake,
+	checkBatch(t, fake,
 		wantStatement{
 			fragments: []string{
 				"INSERT INTO agents (id, user_id, name, scopes, created_at)",
@@ -923,11 +815,14 @@ func TestCreateAgentByAgentStatements(t *testing.T) {
 			},
 		},
 		wantStatement{
-			fragments: []string{"(SELECT user_id FROM agents WHERE id = ?)"},
+			fragments: []string{"INSERT INTO secrets (id, kind, hash, expires_at, created_at)"},
 			args: []any{
-				agent.KeyID, agent.ID, store.KindAPIKey, agent.KeyJWK, agent.KeyExpiresAt.Unix(),
-				agent.ID, agent.KeyScope, agent.CreatedAt.Unix(),
+				agent.KeyID, store.KindAPIKey, agent.KeyHash, agent.KeyExpiresAt.Unix(), agent.CreatedAt.Unix(),
 			},
+		},
+		wantStatement{
+			fragments: []string{"(SELECT user_id FROM agents WHERE id = ?3)"},
+			args:      []any{agent.KeyID, store.KindAPIKey, agent.ID, agent.KeyScope},
 		},
 	)
 
@@ -943,11 +838,11 @@ func TestCreateAgentByAgentStatements(t *testing.T) {
 func TestCreateAgentByAgentFailures(t *testing.T) {
 	t.Parallel()
 
-	runFailures(t, 2, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
+	runFailures(t, 3, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
 		func(s *store.Store) error {
 			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
 				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
-				CreatedBy: agentCursorID, MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+				CreatedBy: agentCursorID, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(3), KeyExpiresAt: now, CreatedAt: now,
 			}))
 		})
 }
@@ -956,9 +851,9 @@ func TestCreateAgentByAgentFailures(t *testing.T) {
 // scopes it stored and whose key insert returned nothing, followed by one result
 // for each label the batch wrote.
 func createdAgent(scopes string, labels ...string) outcome {
-	// The agent insert returns its row; every later statement (the key, then
-	// each label) changes one row and returns none.
-	results := make([]store.Result, 1+1+len(labels))
+	// The agent insert returns its row; every later statement (the key's
+	// secret, the key, then each label) changes one row and returns none.
+	results := make([]store.Result, 1+2+len(labels))
 	results[0] = store.Result{Changes: 1, Rows: [][]any{row(scopes)}}
 
 	for i := 1; i < len(results); i++ {
@@ -976,7 +871,9 @@ func TestCreateAgentResultShape(t *testing.T) {
 	t.Parallel()
 
 	two := func(rows [][]any) outcome {
-		return outcome{results: []store.Result{{Changes: 1, Rows: rows}, {Changes: 1, Rows: nil}}, err: nil}
+		return outcome{err: nil, results: []store.Result{
+			{Changes: 1, Rows: rows}, {Changes: 1, Rows: nil}, {Changes: 1, Rows: nil},
+		}}
 	}
 
 	tests := []struct {
@@ -999,7 +896,7 @@ func TestCreateAgentResultShape(t *testing.T) {
 
 			stored, err := fake.store().CreateAgent(context.Background(), store.NewAgent{
 				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
-				MaxActive: 25, KeyID: "kid-1", KeyJWK: "{}", KeyExpiresAt: now, CreatedAt: now,
+				MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(3), KeyExpiresAt: now, CreatedAt: now,
 			})
 
 			checkErr(t, err, defectOf(store.CodeAgentCreateRejected))
@@ -1193,7 +1090,7 @@ func TestPatchAgentStatements(t *testing.T) {
 			_, err := fake.store().PatchAgent(context.Background(), agentOwner, mustAgentID(t), test.patch)
 			checkErr(t, err, nil)
 
-			checkAgentBatch(t, fake, test.want...)
+			checkBatch(t, fake, test.want...)
 		})
 	}
 }
@@ -1304,10 +1201,11 @@ func revokeStatements() []wantStatement {
 		},
 		{
 			fragments: []string{
-				"UPDATE japikeys",
+				// The secrets of the agent's keys, found through api_keys under
+				// the owner as well.
+				"UPDATE secrets",
 				"SET revoked_at = ?1",
-				"WHERE agent_id = ?2",
-				"AND user_id = ?3",
+				"WHERE id IN (SELECT id FROM api_keys WHERE agent_id = ?2 AND user_id = ?3)",
 				// A due revocation keeps its time; a later one is brought forward.
 				"AND (revoked_at IS NULL OR revoked_at > ?1)",
 				// Only once the agent is revoked, and only the owner's agent.
@@ -1356,7 +1254,7 @@ func TestRevokeAgent(t *testing.T) {
 				t.Errorf("agent = %+v, want %+v", got, test.want)
 			}
 
-			checkAgentBatch(t, fake, revokeStatements()...)
+			checkBatch(t, fake, revokeStatements()...)
 		})
 	}
 }
@@ -1392,6 +1290,7 @@ func TestAgentQueriesAreChecked(t *testing.T) {
 
 	for _, name := range []string{
 		"agentListQuery", "agentGetQuery", "insertAgentQuery", "insertAgentKeyQuery", "insertAgentLabelQuery",
+		"insertSecretQuery",
 		"agentPatchRenameQuery", "agentPatchReadQuery", "agentLabelAddQuery", "agentLabelRemoveQuery",
 		"agentRevokeQuery", "agentRevokeKeysQuery",
 	} {
@@ -1436,7 +1335,6 @@ func TestAgentCodes(t *testing.T) {
 		{store.CodeAgentUpdateRejected, "agent_update_rejected"},
 		{store.CodeAgentRevokeFailed, "agent_revoke_failed"},
 		{store.CodeAgentRevokeRejected, "agent_revoke_rejected"},
-		{store.KindAPIKey, "api_key"},
 	}
 
 	for _, test := range tests {

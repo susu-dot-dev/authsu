@@ -74,7 +74,8 @@ func TestRoutesPanicOnMissingDependency(t *testing.T) {
 		{"Store", func(d *login.Deps) { d.Store = nil }},
 		{"Now", func(d *login.Deps) { d.Now = nil }},
 		{"Entropy", func(d *login.Deps) { d.Entropy = nil }},
-		{"CreateSession", func(d *login.Deps) { d.CreateSession = nil }},
+		{"NewID", func(d *login.Deps) { d.NewID = nil }},
+		{"IssueSession", func(d *login.Deps) { d.IssueSession = nil }},
 	}
 
 	for _, tc := range cases {
@@ -159,16 +160,16 @@ func TestRoutesAreServedByTheBoundary(t *testing.T) {
 				t.Errorf("Allow = %q, want %q", got, tc.allow)
 			}
 
-			if len(r.store.looked)+len(r.store.created)+len(r.sessions) != 0 {
+			if len(r.store.looked)+len(r.store.created)+len(r.issues) != 0 {
 				t.Error("the store was used for a request the boundary refused")
 			}
 		})
 	}
 }
 
-// TestSessionCookiesAreIgnored: an open route never reads the cookie or the key
+// TestSessionCookiesAreIgnored: an open route never reads the cookie or the credential
 // store, so a request that carries a session cookie, valid or not, is answered
-// as one without. (noKeys fails the test if the store is read.) In particular a
+// as one without. (noCredentials fails the test if the store is read.) In particular a
 // caller who already has a session can log in again, and gets a new one.
 func TestSessionCookiesAreIgnored(t *testing.T) {
 	t.Parallel()

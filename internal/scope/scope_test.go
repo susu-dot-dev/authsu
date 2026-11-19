@@ -393,37 +393,6 @@ func TestReadRoundTripsJSON(t *testing.T) {
 	}
 }
 
-func TestFromClaim(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		claim any
-		want  []string
-	}{
-		{"strings", []any{"agent:read", "default:agent"}, []string{"agent:read", "default:agent"}},
-		{"empty", []any{}, []string{}},
-		{"missing", nil, []string{}},
-		{"a string is not a list", "agent:read", []string{}},
-		{"a space separated string is not a list", "agent:read agent:create", []string{}},
-		{"number element", []any{"agent:read", 1.0}, []string{}},
-		{"nested", []any{[]any{"agent:read"}}, []string{}},
-		{"object", map[string]any{"agent:read": true}, []string{}},
-		{"typed []string is not what JSON decoding yields", []string{"agent:read"}, []string{}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := scope.FromClaim(test.claim)
-			if got == nil || !slices.Equal([]string(got), test.want) {
-				t.Errorf("FromClaim(%#v) = %#v, want %#v", test.claim, got, test.want)
-			}
-		})
-	}
-}
-
 func TestClaim(t *testing.T) {
 	t.Parallel()
 

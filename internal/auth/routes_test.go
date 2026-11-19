@@ -171,10 +171,10 @@ func depProblems() map[string]struct {
 		change func(*auth.Deps)
 		want   string
 	}{
-		"no Keys":   {func(d *auth.Deps) { d.Keys = nil }, "Deps.Keys"},
-		"no Now":    {func(d *auth.Deps) { d.Now = nil }, "Deps.Now"},
-		"no Getenv": {func(d *auth.Deps) { d.Getenv = nil }, "Deps.Getenv"},
-		"no Log":    {func(d *auth.Deps) { d.Log = nil }, "Deps.Log"},
+		"no Credentials": {func(d *auth.Deps) { d.Credentials = nil }, "Deps.Credentials"},
+		"no Now":         {func(d *auth.Deps) { d.Now = nil }, "Deps.Now"},
+		"no Getenv":      {func(d *auth.Deps) { d.Getenv = nil }, "Deps.Getenv"},
+		"no Log":         {func(d *auth.Deps) { d.Log = nil }, "Deps.Log"},
 	}
 }
 
@@ -360,8 +360,8 @@ func TestMethodDispatch(t *testing.T) {
 			}
 
 			if tt.wantStatus == http.StatusMethodNotAllowed &&
-				(len(r.keys.calls) != 0 || len(r.logged) != 1 || r.logged[0].Code != "method_not_allowed") {
-				t.Errorf("store read %d times, logged %v: want no reads and method_not_allowed", len(r.keys.calls), r.logged)
+				(len(r.creds.calls) != 0 || len(r.logged) != 1 || r.logged[0].Code != "method_not_allowed") {
+				t.Errorf("store read %d times, logged %v: want no reads and method_not_allowed", len(r.creds.calls), r.logged)
 			}
 		})
 	}
@@ -464,9 +464,9 @@ func (tt limitCase) checkRoute(t *testing.T, r *rig, rec *httptest.ResponseRecor
 			t.Errorf("route got %d calls, want one with a %d-byte body", len(r.handled), tt.bodyLen)
 		}
 	case http.StatusRequestEntityTooLarge:
-		if len(r.handled) != 0 || len(r.keys.calls) != 0 || !strings.Contains(rec.Body.String(), "body_too_large") {
+		if len(r.handled) != 0 || len(r.creds.calls) != 0 || !strings.Contains(rec.Body.String(), "body_too_large") {
 			t.Errorf("route ran %d times, store read %d times, body %q: want neither and body_too_large",
-				len(r.handled), len(r.keys.calls), rec.Body)
+				len(r.handled), len(r.creds.calls), rec.Body)
 		}
 	}
 }
@@ -514,8 +514,8 @@ func TestUnsafeMethodsNeedJSONBeforeAuth(t *testing.T) {
 
 			// Refused before the route and before the credential: the store is
 			// never read for a request httpapi turned away.
-			if tt.want == http.StatusUnsupportedMediaType && (len(r.ran) != 0 || len(r.keys.calls) != 0) {
-				t.Errorf("route ran %d times, store read %d times", len(r.ran), len(r.keys.calls))
+			if tt.want == http.StatusUnsupportedMediaType && (len(r.ran) != 0 || len(r.creds.calls) != 0) {
+				t.Errorf("route ran %d times, store read %d times", len(r.ran), len(r.creds.calls))
 			}
 		})
 	}
@@ -551,8 +551,8 @@ func TestUnknownPathsAreTheJSON404(t *testing.T) {
 
 				wantFailure(t, r, rec, http.StatusNotFound, bodyNotFound, "not_found", nil)
 
-				if len(r.keys.calls) != 0 || len(r.handled) != 0 {
-					t.Errorf("store read %d times, route ran %d times", len(r.keys.calls), len(r.handled))
+				if len(r.creds.calls) != 0 || len(r.handled) != 0 {
+					t.Errorf("store read %d times, route ran %d times", len(r.creds.calls), len(r.handled))
 				}
 			})
 		}

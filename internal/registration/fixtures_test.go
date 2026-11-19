@@ -29,6 +29,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/registration"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -47,9 +48,13 @@ const (
 	testRPID   = "example.com"
 	testUI     = "https://example.com"
 	testAPI    = "https://auth.example.com"
-	testCode   = "the-invitation-code-0123456789ABCDEFGHIJKL"
-	otherCode  = "another-invitation-code-0123456789ABCDEFG"
-	testName   = "Alice"
+	// testCode and otherCode are canonical invitation tokens: the prefix, 42
+	// body characters and a last character whose two unused low bits are zero.
+	testCode  = "susu_inv_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefA"
+	otherCode = "susu_inv_zyxwvutsrqponmlkjihgfedcba9876543210-_-_-_E"
+	// unknownCode is well formed, and no invitation has it.
+	unknownCode = "susu_inv_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	testName    = "Alice"
 
 	jsonType = "application/json"
 
@@ -76,9 +81,9 @@ const (
 
 // Messages clients see. They are fixed text: a cause never reaches a client.
 const (
-	msgInvalidInvitation = "invitation code must be 1 to 256 characters from A-Z, a-z, 0-9, '_' and '-'"
+	msgInvalidInvitation = "invitation token must be susu_inv_ followed by 43 base64url characters"
 	msgInvalidName       = "name must be 1 to 128 bytes of normalised text without control or formatting characters"
-	msgNotRedeemable     = "invitation code is not valid"
+	msgNotRedeemable     = "invitation token is not valid"
 	msgNotConfigured     = "the service is not configured"
 	msgUnavailable       = "registration is temporarily unavailable"
 	msgBodyTooLarge      = "request body is too large"
@@ -127,16 +132,23 @@ func brokenEntropy() io.Reader {
 	return readerFunc(func([]byte) (int, error) { return 0, errEntropy })
 }
 
-// redeemCall is one RedeemableInvitationType call.
+// redeemCall is one RedeemableInvitationType call: the token as the store
+// received it, the hash the store would look it up by, and the time.
 type redeemCall struct {
-	code string
-	now  time.Time
+	token string
+	hash  [sha256.Size]byte
+	now   time.Time
+}
+
+// wantRedeem is the call a store receives for token at now.
+func wantRedeem(token string, now time.Time) redeemCall {
+	return redeemCall{token: token, hash: secret.Hash(token), now: now}
 }
 
 // fakeStore is the database as registration sees it. It records every call and
 // can be programmed to return any outcome.
 type fakeStore struct {
-	// invitations maps the code of each redeemable invitation to its type.
+	// invitations maps the token of each redeemable invitation to its type.
 	invitations map[string]string
 	// redeemErr, when set, is returned by every RedeemableInvitationType.
 	redeemErr error
@@ -149,15 +161,15 @@ type fakeStore struct {
 }
 
 func (f *fakeStore) RedeemableInvitationType(
-	_ context.Context, code input.InvitationCode, now time.Time,
+	_ context.Context, token input.InvitationToken, now time.Time,
 ) (string, bool, error) {
-	f.redeemed = append(f.redeemed, redeemCall{code: code.String(), now: now})
+	f.redeemed = append(f.redeemed, redeemCall{token: token.String(), hash: [sha256.Size]byte(token.Hash()), now: now})
 
 	if f.redeemErr != nil {
 		return "", false, f.redeemErr
 	}
 
-	invitationType, ok := f.invitations[code.String()]
+	invitationType, ok := f.invitations[token.String()]
 
 	return invitationType, ok, nil
 }
@@ -172,14 +184,24 @@ func (f *fakeStore) CreateAccount(_ context.Context, account store.NewAccount) e
 	return nil
 }
 
-// noKeys is the key store of a deployment under a route that needs no session:
-// reading it at all is a defect.
-type noKeys struct{ t *testing.T }
+// noCredentials is the credential store of a deployment under a route that
+// needs no session: reading it at all is a defect.
+type noCredentials struct{ t *testing.T }
 
-func (k noKeys) ActiveKey(context.Context, string, string, time.Time) (store.ActiveKey, bool, error) {
-	k.t.Error("an open route read the key store")
+func (c noCredentials) ResolveSession(
+	context.Context, input.SessionToken, time.Time,
+) (store.ActiveSession, bool, error) {
+	c.t.Error("an open route resolved a session")
 
-	return store.ActiveKey{}, false, nil
+	return store.ActiveSession{}, false, nil
+}
+
+func (c noCredentials) ResolveAPIKey(
+	context.Context, input.APIKeyToken, time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	c.t.Error("an open route resolved an API key")
+
+	return store.ActiveAPIKey{}, false, nil
 }
 
 // rig is one deployment under test: the real boundary and routes over a fake
@@ -255,10 +277,10 @@ func (r *rig) deps() registration.Deps {
 // handler is the real boundary over the real routes.
 func (r *rig) handler() http.Handler {
 	return auth.Handler(registration.Routes(r.deps()), auth.Deps{
-		Keys:   noKeys{t: r.t},
-		Now:    func() time.Time { return r.now },
-		Getenv: r.getenv,
-		Log:    func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },
+		Credentials: noCredentials{t: r.t},
+		Now:         func() time.Time { return r.now },
+		Getenv:      r.getenv,
+		Log:         func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },
 	})
 }
 
@@ -534,7 +556,7 @@ func (a authenticator) clientData(t *testing.T, options creationOptions) []byte 
 }
 
 // respond builds the finish request a browser would post for options, for the
-// invitation code and name it was begun with.
+// invitation token and name it was begun with.
 func (a authenticator) respond(t *testing.T, options creationOptions) jsonBody {
 	t.Helper()
 
@@ -613,6 +635,64 @@ func wantFailure(t *testing.T, r *rig, rec *httptest.ResponseRecorder, status in
 	}
 }
 
+// invalidToken is a value of the invitationCode member that is not an
+// invitation token.
+type invalidToken struct{ name, value string }
+
+// invalidInvitationTokens are values that must be refused as malformed (400
+// invalid_invitation) before the store is touched, whatever the route. Each is
+// derived from testCode, so a case differs from a valid token in one respect.
+func invalidInvitationTokens() []invalidToken {
+	prefix := secret.Prefix(secret.TagInvitation)
+	body := strings.TrimPrefix(testCode, prefix)
+	last := len(testCode) - 1
+
+	// A token whose last body character is not zero in its two low bits is one
+	// of four spellings of the same 256 bits.
+	noncanonical := func(c string) string { return testCode[:last] + c }
+
+	return []invalidToken{
+		{"empty", ""},
+		{"a session token", secret.Prefix(secret.TagSession) + body},
+		{"an API key", secret.Prefix(secret.TagAPIKey) + body},
+		{"an unknown tag", "susu_xyz_" + body},
+		{"uppercase prefix", strings.ToUpper(prefix) + body},
+		{"capitalised prefix", "Susu_inv_" + body},
+		{"another brand", "xusu_inv_" + body},
+		{"no prefix", body},
+		{"the tag only", "inv_" + body},
+		{"prefix without a body", prefix},
+		{"prefix twice", prefix + testCode},
+		{"body one character short", testCode[:last]},
+		{"body one character long", testCode + "A"},
+		{"body doubled", testCode + body},
+		{"padding after the body", testCode + "="},
+		{"padding in place of the last character", testCode[:last] + "="},
+		{"two padding characters", testCode[:last-1] + "=="},
+		{"leading space", " " + testCode},
+		{"trailing space", testCode + " "},
+		{"trailing newline", testCode + "\n"},
+		{"trailing carriage return and newline", testCode + "\r\n"},
+		{"embedded newline", testCode[:20] + "\n" + testCode[21:]},
+		{"leading tab", "\t" + testCode},
+		{"NUL at the end", testCode + "\x00"},
+		{"NUL in the body", testCode[:20] + "\x00" + testCode[21:]},
+		{"non-ASCII in place of two characters", testCode[:20] + "\u00e9" + testCode[22:]},
+		{"non-ASCII appended", testCode + "\u00e9"},
+		{"full-width letter in the body", testCode[:20] + "\uff21" + testCode[23:]},
+		{"standard base64 plus", testCode[:20] + "+" + testCode[21:]},
+		{"standard base64 slash", testCode[:20] + "/" + testCode[21:]},
+		{"a dot in the body", testCode[:20] + "." + testCode[21:]},
+		{"last character with bit 0 set", noncanonical("B")},
+		{"last character with bit 1 set", noncanonical("C")},
+		{"last character with both low bits set", noncanonical("D")},
+		{"last character 9", noncanonical("9")},
+		{"last character _", noncanonical("_")},
+		{"huge", strings.Repeat("A", 3000)},
+		{"huge with the right prefix", prefix + strings.Repeat("A", 3000)},
+	}
+}
+
 // requestCookie is a cookie as a browser returns it: only a name and a value.
 func requestCookie(name, value string) *http.Cookie {
 	//nolint:gosec // a request cookie carries no attributes; G124 is about Set-Cookie
@@ -636,16 +716,16 @@ func mustName(t *testing.T, raw string) input.AccountName {
 	return name
 }
 
-// mustCode parses an invitation code the test knows is valid.
-func mustCode(t *testing.T, raw string) input.InvitationCode {
+// mustToken parses an invitation token the test knows is valid.
+func mustToken(t *testing.T, raw string) input.InvitationToken {
 	t.Helper()
 
-	code, err := input.ParseInvitationCode(raw)
+	token, err := input.ParseInvitationToken(raw)
 	if err != nil {
-		t.Fatalf("code: %v", err)
+		t.Fatalf("token: %v", err)
 	}
 
-	return code
+	return token
 }
 
 // asToJSONWrites sets the members PublicKeyCredential.toJSON() adds to a
