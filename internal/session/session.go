@@ -3,9 +3,9 @@
 // and logout.
 //
 // It is thin because the boundary does the rest. internal/auth reads the cookie,
-// verifies the token, checks the stored key and its account, and hands each
-// route here a Principal; a request without a valid session never reaches
-// these handlers. Login (internal/login) is what issues a session.
+// resolves the token in the store along with its account, and hands each route
+// here a Principal; a request without a valid session never reaches these
+// handlers. Login (internal/login) is what issues a session.
 package session
 
 import (
@@ -31,15 +31,15 @@ const (
 // satisfies it. Failures must come back classified, as the store's do, because
 // they are sent as they are.
 type Store interface {
-	// RevokeKey ends the key kid of the user as of now: the one the request
+	// RevokeSecret ends the secret id of the user as of now: the one the request
 	// presented, a session or an API key alike. It reports false when there was
-	// nothing to revoke: the key was already revoked.
-	RevokeKey(ctx context.Context, userID, kid string, now time.Time) (bool, error)
+	// nothing to revoke: the secret was already revoked.
+	RevokeSecret(ctx context.Context, userID, id string, now time.Time) (bool, error)
 }
 
 // Deps are the collaborators of Routes. All are required.
 type Deps struct {
-	// Store revokes a session on logout.
+	// Store revokes the presented session or API key on logout.
 	Store Store
 	// Now is the clock, the time a logout takes effect.
 	Now func() time.Time
@@ -63,8 +63,9 @@ var errRevokedFirst = errors.New("session was revoked by another request")
 // dependency is a wiring mistake to find at start, not in a request.
 //
 //   - GET /api/session: who the session cookie speaks for. It never writes.
-//   - POST /api/logout: revoke the presented session now and clear the cookie.
-//     A session that is already gone is a 401 like any request without one.
+//   - POST /api/logout: revoke the presented session or API key now and clear
+//     the cookie. A secret that is already gone is a 401, like any request
+//     without one.
 //
 // Both need a session and no more: a caller may always ask about and end their
 // own, whatever their role.
@@ -98,14 +99,14 @@ func whoAmI(call *auth.Call) result.Result[httpapi.Response] {
 	}))
 }
 
-// logout answers POST /api/logout: it revokes the key the request presented
+// logout answers POST /api/logout: it revokes the secret the request presented
 // (key:revoke_self in docs/permissions_design.md), so a session ends itself and
 // an API key ends itself, with no scope. The revocation is one conditional write
-// (store.RevokeKey): the boundary saw the key active, so a write that changes
-// nothing means another request revoked it in between. The key is gone, which is
-// what any request without one is told.
+// (store.RevokeSecret): the boundary saw the secret active, so a write that
+// changes nothing means another request revoked it in between. The secret is
+// gone, which is what any request without one is told.
 func (d Deps) logout(call *auth.Call) result.Result[httpapi.Response] {
-	return result.Of(d.Store.RevokeKey(call.Request.Context, call.Principal.UserID, call.Principal.KeyID, d.Now())).
+	return result.Of(d.Store.RevokeSecret(call.Request.Context, call.Principal.UserID, call.Principal.SecretID, d.Now())).
 		Then(func(revoked bool) (httpapi.Response, error) {
 			if !revoked {
 				return httpapi.Response{}, auth.Unauthenticated(errRevokedFirst)

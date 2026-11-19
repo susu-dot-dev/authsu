@@ -368,7 +368,7 @@ func memberUser(revokedAt *int64) store.User {
 }
 
 // revokeBatch is the outcome of RevokeUser's three-statement batch: the account
-// statement returned rows and the key and agent statements changed the given
+// statement returned rows and the secrets and agent statements changed the given
 // number of rows each.
 func revokeBatch(keys, agents int64, rows ...[]any) outcome {
 	return outcome{err: nil, results: []store.Result{
@@ -480,7 +480,7 @@ func TestRevokeUserStatements(t *testing.T) {
 		{name: "another role and another account", id: userID2, role: "owner", at: 1_700_000_999},
 	}
 
-	// The account must be revoked, as the statement left it, for the keys and
+	// The account must be revoked, as the statement left it, for the secrets and
 	// agents statements to apply: this is the condition that lets a refused
 	// revocation change nothing else.
 	followsRevocation := "AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)"
@@ -512,10 +512,13 @@ func TestRevokeUserStatements(t *testing.T) {
 				},
 				wantStatement{
 					fragments: []string{
-						// The keys: one already due keeps its time, one
-						// scheduled for later is brought forward.
-						"UPDATE japikeys SET revoked_at = ?1",
-						"WHERE user_id = ?2",
+						// The user's sessions and API keys, which include
+						// those of its agents (a key's user_id is its agent's
+						// owner), by their secrets: one already due keeps its
+						// time, one scheduled for later is brought forward.
+						"UPDATE secrets SET revoked_at = ?1",
+						"WHERE id IN (SELECT id FROM sessions WHERE user_id = ?2 " +
+							"UNION ALL SELECT id FROM api_keys WHERE user_id = ?2)",
 						"AND (revoked_at IS NULL OR revoked_at > ?1)",
 						followsRevocation,
 					},

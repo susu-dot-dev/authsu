@@ -136,6 +136,75 @@ func TestAKeyAndItsAgentBoundWhatARequestMayDo(t *testing.T) {
 	expectCount(t, "agents WHERE id = ? AND revoked_at IS NULL", "1", victim.Agent.ID)
 }
 
+// TestAnAgentKeyReadsItsAgentsScopesLive: an agent's scope list is read from the
+// agent's row on every request and intersected with the key's, so narrowing or
+// widening the agent after its key was issued takes effect on the key's very
+// next request, with the same token. The key is issued with every scope the
+// agent starts with, so the agent's list is the only thing that changes.
+//
+//nolint:paralleltest // shares one database
+func TestAnAgentKeyReadsItsAgentsScopesLive(t *testing.T) {
+	both := []string{"agent:read", "agent:create"}
+
+	tests := []struct {
+		name         string
+		agentScopes  string // JSON stored in agents.scopes after issue
+		wantRead     int
+		wantCreate   int
+		wantCreateCd string
+	}{
+		{"unchanged", `["agent:read","agent:create"]`, http.StatusOK, http.StatusCreated, ""},
+		{"narrowed to read only", `["agent:read"]`, http.StatusOK, http.StatusForbidden, "insufficient_scope"},
+		{"narrowed to create only", `["agent:create"]`, http.StatusForbidden, http.StatusCreated, ""},
+		{"narrowed to nothing", `[]`, http.StatusForbidden, http.StatusForbidden, "insufficient_scope"},
+		{"damaged list grants nothing", `not json`, http.StatusForbidden, http.StatusForbidden, "insufficient_scope"},
+		{"widened beyond the key: the key still bounds it", `["agent:read","agent:create","agent:update"]`,
+			http.StatusOK, http.StatusCreated, ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			world := agNewPair(t, roleMember)
+
+			made := scMakeAgent(t, world.tokenB, "live", both, both)
+
+			// Before the change the key does both, so the table's differences
+			// are only the stored change.
+			scBearer(t, http.MethodGet, pathAgent, nil, made.Key.Token).
+				expect(t, "read before the change", http.StatusOK, "")
+
+			seed(t, "UPDATE agents SET scopes = ? WHERE id = ?", test.agentScopes, made.Agent.ID)
+
+			scBearer(t, http.MethodGet, pathAgent, nil, made.Key.Token).
+				expect(t, "read after the change", test.wantRead, scCode(test.wantRead))
+
+			scBearer(t, http.MethodPost, pathAgent, scCreateBody(t, "child", nil, nil), made.Key.Token).
+				expect(t, "create after the change", test.wantCreate, test.wantCreateCd)
+		})
+	}
+
+	t.Run("the key's own list is not widened by the agent", func(t *testing.T) {
+		world := agNewPair(t, roleMember)
+
+		made := scMakeAgent(t, world.tokenB, "keyed", both, []string{"agent:read"})
+
+		seed(t, "UPDATE agents SET scopes = ? WHERE id = ?", `["agent:read","agent:create"]`, made.Agent.ID)
+
+		scBearer(t, http.MethodPost, pathAgent, scCreateBody(t, "child", nil, nil), made.Key.Token).
+			expect(t, "create: the agent now holds it, the key never did", http.StatusForbidden, "insufficient_scope")
+	})
+}
+
+// scCode is the error code of a refused request in TestAnAgentKeyReadsItsAgentsScopesLive:
+// a 200 has none.
+func scCode(status int) string {
+	if status == http.StatusOK {
+		return ""
+	}
+
+	return "insufficient_scope"
+}
+
 // TestAUserKeyIsALimitedUser: a user's own key, with no agent, is the user
 // narrowed to what it names. Presented as a bearer to the real build it reads
 // and writes agents exactly as far as its scopes go, and never as a session.
@@ -231,8 +300,9 @@ func TestAnAgentCreatesAgentsOnlyWithinItself(t *testing.T) {
 		t.Errorf("stored scopes = %s", stored)
 	}
 
-	// The key row's copy is the claim that was signed.
-	if row := scalar(t, "SELECT scope FROM japikeys WHERE kid = ?", got.Key.ID); row != `["default:agent","agent:create"]` {
+	// The key row holds the scope list, the only copy there is: the token
+	// carries nothing.
+	if row := scalar(t, "SELECT scope FROM api_keys WHERE id = ?", got.Key.ID); row != `["default:agent","agent:create"]` {
 		t.Errorf("stored key scope = %s", row)
 	}
 
@@ -316,11 +386,12 @@ func TestARevokedAgentsKeyStopsWorking(t *testing.T) {
 
 	// A key whose own row was left active while its agent is revoked is still not
 	// active: the read joins the agent.
-	if rows := scalar(t, "SELECT count(*) FROM japikeys WHERE agent_id = ? AND revoked_at IS NOT NULL", creator.Agent.ID); rows != "1" {
+	if rows := scalar(t, "SELECT count(*) FROM api_keys k JOIN secrets s ON s.id = k.id "+
+		"WHERE k.agent_id = ? AND s.revoked_at IS NOT NULL", creator.Agent.ID); rows != "1" {
 		t.Errorf("revoked key rows = %s, want the agent's one key revoked with it", rows)
 	}
 
-	seed(t, "UPDATE japikeys SET revoked_at = NULL WHERE agent_id = ?", creator.Agent.ID)
+	seed(t, "UPDATE secrets SET revoked_at = NULL WHERE id IN (SELECT id FROM api_keys WHERE agent_id = ?)", creator.Agent.ID)
 
 	scBearer(t, http.MethodGet, pathAgent, nil, creator.Key.Token).
 		expect(t, "a key row left active under a revoked agent", http.StatusUnauthorized, "unauthenticated")
@@ -374,8 +445,9 @@ func TestCreatesRacingTheCreatorsRevocation(t *testing.T) {
 	// Every active agent that was not the creator has exactly one key, and every
 	// key has its agent: the batch is atomic.
 	expectCount(t, "agents a WHERE a.user_id = ? AND a.id <> ? AND NOT EXISTS "+
-		"(SELECT 1 FROM japikeys k WHERE k.agent_id = a.id)", "0", world.b.userID, creator.Agent.ID)
-	expectCount(t, "japikeys WHERE agent_id IS NOT NULL AND agent_id NOT IN (SELECT id FROM agents)", "0")
+		"(SELECT 1 FROM api_keys k WHERE k.agent_id = a.id)", "0", world.b.userID, creator.Agent.ID)
+	expectCount(t, "api_keys WHERE agent_id IS NOT NULL AND agent_id NOT IN (SELECT id FROM agents)", "0")
+	expectNoOrphanSecrets(t)
 
 	// Every agent the race made is a copy of the creator's scopes.
 	expectCount(t, "agents WHERE user_id = ? AND id <> ? AND scopes <> ?", "0",
@@ -390,28 +462,29 @@ func TestCreatesRacingTheCreatorsRevocation(t *testing.T) {
 	}
 }
 
-// TestSessionsCarryEveryScope: a login signs default:session into the session
-// and stores the same text, so a session is limited only by the role.
+// TestSessionsCarryEveryScope: a session's scope is the default:session bundle
+// and is not stored: the credential's scopes come from the code, so a session is
+// limited only by the role. A session has no scope column to read, and the
+// token carries nothing, so the proof is what the session may do: every route
+// of the member's default:user bundle, as the member.
 //
 //nolint:paralleltest // shares one database
 func TestSessionsCarryEveryScope(t *testing.T) {
 	world := agNewPair(t, roleMember)
 
+	// A session reaches every scope's route that its role allows: the member
+	// lists and creates agents, and is refused the admin routes by role.
 	for _, token := range []string{world.tokenA, world.tokenB} {
-		claims := claimsOf(t, token)
-
-		list, _ := claims["scope"].([]any)
-		if len(list) != 1 || list[0] != scBundleSession {
-			t.Errorf("session scope claim = %v, want [%s]", claims["scope"], scBundleSession)
-		}
+		get(t, pathAgent, token).expect(t, "a scoped route by session", http.StatusOK, "")
 	}
 
-	issuer, _ := claimsOf(t, world.tokenB)["iss"].(string)
-	kid := issuer[strings.LastIndex(issuer, "/")+1:]
+	post(t, pathAgent, scCreateBody(t, "by-session", nil, nil), world.tokenB).
+		expect(t, "a create by session", http.StatusCreated, "")
 
-	if stored := scalar(t, "SELECT scope FROM japikeys WHERE kid = ?", kid); stored != `["`+scBundleSession+`"]` {
-		t.Errorf("the session row's scope = %s, want the signed claim", stored)
-	}
+	get(t, pathUser, world.tokenB).expect(t, "an admin route by a member's session", http.StatusForbidden, codeForbidden)
+
+	// The sessions table holds no scope.
+	expectCount(t, "pragma_table_info('sessions') WHERE name IN ('scope', 'scopes')", "0")
 }
 
 // TestCreateRefusesBadScopeLists: lists the code does not accept are refused by
@@ -451,7 +524,7 @@ func TestCreateRefusesBadScopeLists(t *testing.T) {
 		t.Errorf("stored agent scopes = %q, want []", stored)
 	}
 
-	if stored := scalar(t, "SELECT scope FROM japikeys WHERE kid = ?", made.Key.ID); stored != "[]" {
+	if stored := scalar(t, "SELECT scope FROM api_keys WHERE id = ?", made.Key.ID); stored != "[]" {
 		t.Errorf("stored key scope = %q, want []", stored)
 	}
 

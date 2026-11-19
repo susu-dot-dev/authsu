@@ -1,20 +1,24 @@
 package agents_test
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
-	"slices"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/agents"
 	"github.com/susu-dot-dev/authsu/internal/auth"
-	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/scope"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -25,18 +29,15 @@ func nameBody(t *testing.T, name string) string {
 	return marshal(t, map[string]string{fieldName: name})
 }
 
-// claimString is the string claim name of verified, or "".
-func claimString(claims map[string]any, name string) string {
-	value, _ := claims[name].(string)
-
-	return value
-}
+// keyTokenPattern is the shape of an API key token: the key prefix and a
+// 43-character base64url body.
+var keyTokenPattern = regexp.MustCompile(`^susu_key_[A-Za-z0-9_-]{43}$`)
 
 // TestCreateWritesTheAgentAndItsKey is the whole of a create: one key is
-// created, one write is made, and the key that is returned to the client is the
-// one that was written. The token verifies as an API key of this service, for
-// the user, acting as the agent, with exactly the expiry and public key that
-// reached the store, and does not verify as a session.
+// issued for the agent's lifetime, one write is made, and the key that is
+// returned to the client is the one that was written. The token has the shape of
+// an API key, only its hash is stored, the key's id and expiry are the ones that
+// reached the store, and the returned token is accepted as that agent's key.
 func TestCreateWritesTheAgentAndItsKey(t *testing.T) {
 	t.Parallel()
 
@@ -58,9 +59,9 @@ func TestCreateWritesTheAgentAndItsKey(t *testing.T) {
 		t.Fatalf("body %q: %v", rec.Body.String(), err)
 	}
 
-	expires := rg.now.Add(agents.KeyLifetime)
-	created := checkKeyCreation(t, rg, expires)
-	written := checkWrite(t, rg, created, expires)
+	expires := rg.now.Add(90 * 24 * time.Hour)
+	issued := checkKeyIssued(t, rg, expires)
+	written := checkWrite(t, rg, issued, expires)
 
 	// The response is built from what was written.
 	wantAgent := createdAgent(newAgentID, "assistant", rg.now.Unix())
@@ -69,24 +70,13 @@ func TestCreateWritesTheAgentAndItsKey(t *testing.T) {
 	}
 
 	wantKey := agents.Key{
-		ID: written.KeyID, Token: created.key.JWT, Scopes: []string{scope.DefaultAgent}, ExpiresAt: expires.Unix(),
+		ID: newKeyID, Token: issued.Token, Scopes: []string{scope.DefaultAgent}, ExpiresAt: expires.Unix(),
 	}
 	if !reflect.DeepEqual(response.Key, wantKey) {
 		t.Errorf("key = %+v, want %+v", response.Key, wantKey)
 	}
 
-	// The token is what the key's public half, as stored, verifies.
-	verified, err := verifyToken(t, response.Key.Token, written.KeyJWK, auth.KindAPIKey)
-	if err != nil {
-		t.Fatalf("the returned token does not verify as an api key: %v", err)
-	}
-
-	checkClaims(t, verified, written, expires)
-
-	_, err = verifyToken(t, response.Key.Token, written.KeyJWK, auth.KindSession)
-	if err == nil {
-		t.Error("the agent's key verifies as a session")
-	}
+	checkToken(t, response.Key, written)
 
 	// The agent is the user's, and only theirs.
 	mine := rg.as(rg.signIn(userA, roleMember), http.MethodGet, itemPrefix+newAgentID, "")
@@ -97,40 +87,32 @@ func TestCreateWritesTheAgentAndItsKey(t *testing.T) {
 	}
 }
 
-// checkKeyCreation asserts that exactly one key was created, for the user and
-// the new agent, under the deployment's issuer, and returns it.
-func checkKeyCreation(t *testing.T, rg *rig, expires time.Time) keyCall {
+// checkKeyIssued asserts that exactly one key was issued, for the agent's key
+// lifetime from the routes' clock and without an error, and returns it.
+func checkKeyIssued(t *testing.T, rg *rig, expires time.Time) auth.Issued {
 	t.Helper()
 
-	origin, err := config.ParseOrigin(apiOrigin)
-	if err != nil {
-		t.Fatal(err)
+	if len(rg.issueCalls) != 1 {
+		t.Fatalf("issued %d keys, want 1", len(rg.issueCalls))
 	}
 
-	if len(rg.keyCalls) != 1 {
-		t.Fatalf("created %d keys, want 1", len(rg.keyCalls))
+	call := rg.issueCalls[0]
+
+	if call.now != rg.now || call.lifetime != auth.AgentKeyLifetime || call.err != nil {
+		t.Errorf("issued at %v for %v with error %v, want %v for %v and no error",
+			call.now, call.lifetime, call.err, rg.now, auth.AgentKeyLifetime)
 	}
 
-	made := rg.keyCalls[0]
-	want := keyCall{
-		issuer: auth.IssuerFor(origin),
-		spec: auth.KeySpec{
-			Kind: auth.KindAPIKey, Subject: userA, Expires: expires, Scope: agents.DefaultScopes(),
-			Claims: map[string]any{claimAct: map[string]any{claimSub: newAgentID}},
-		},
-		key: made.key,
+	if !call.issued.ExpiresAt.Equal(expires) {
+		t.Errorf("the key expires at %v, want %v", call.issued.ExpiresAt, expires)
 	}
 
-	if !reflect.DeepEqual(made, want) {
-		t.Errorf("key created as %+v, want %+v", made, want)
-	}
-
-	return made
+	return call.issued
 }
 
 // checkWrite asserts that exactly one write was made, of the agent and of the
-// key that was created, and returns what was written.
-func checkWrite(t *testing.T, rg *rig, made keyCall, expires time.Time) store.NewAgent {
+// key that was issued, and returns what was written.
+func checkWrite(t *testing.T, rg *rig, issued auth.Issued, expires time.Time) store.NewAgent {
 	t.Helper()
 
 	name, err := input.ParseAgentName("assistant")
@@ -140,7 +122,7 @@ func checkWrite(t *testing.T, rg *rig, made keyCall, expires time.Time) store.Ne
 
 	want := store.NewAgent{
 		ID: newAgentID, Owner: userA, Name: name, Scopes: defaultAgentJSON, KeyScope: defaultAgentJSON,
-		MaxActive: agents.MaxAgentsPerUser, KeyID: made.key.ID.String(), KeyJWK: made.key.JWK,
+		MaxActive: agents.MaxAgentsPerUser, KeyID: issued.ID, KeyHash: issued.Hash,
 		KeyExpiresAt: expires, CreatedAt: rg.now,
 	}
 
@@ -156,6 +138,32 @@ func checkWrite(t *testing.T, rg *rig, made keyCall, expires time.Time) store.Ne
 	return written
 }
 
+// checkToken asserts that the returned token is the one whose hash was stored,
+// and that nothing but the hash was: the token is an API key of the right shape,
+// its id is the stored key's, and the stored hash is the SHA-256 of the whole
+// token, prefix included.
+func checkToken(t *testing.T, key agents.Key, written store.NewAgent) {
+	t.Helper()
+
+	if !keyTokenPattern.MatchString(key.Token) {
+		t.Errorf("token %q is not susu_key_ and %d characters", key.Token, secret.BodyLen)
+	}
+
+	hash := secret.Hash(key.Token)
+	if !bytes.Equal(written.KeyHash, hash[:]) || len(written.KeyHash) != sha256.Size {
+		t.Errorf("stored hash = %x, want the SHA-256 of the token, %x", written.KeyHash, hash)
+	}
+
+	if key.ID != written.KeyID {
+		t.Errorf("key id = %q, stored %q", key.ID, written.KeyID)
+	}
+
+	stored := string(written.KeyHash) + written.KeyID + written.KeyScope
+	if strings.Contains(stored, key.Token) {
+		t.Error("the token itself reached the store")
+	}
+}
+
 // createdAgent is the agent a create returns.
 func createdAgent(id, name string, createdAt int64) agents.Agent {
 	return agents.Agent{
@@ -164,36 +172,62 @@ func createdAgent(id, name string, createdAt int64) agents.Agent {
 	}
 }
 
-// checkClaims asserts the claims of an agent's key.
-func checkClaims(t *testing.T, verified verifiedKey, written store.NewAgent, expires time.Time) {
-	t.Helper()
+// TestCreateResponseJSON pins the exact JSON of a create, key included: the key
+// has an id, a token, scopes and an expiry, and nothing else.
+func TestCreateResponseJSON(t *testing.T) {
+	t.Parallel()
 
-	claims := verified.claims
-	actor, _ := claims[claimAct].(map[string]any)
+	rg := newRig(t)
+	rec := rg.as(rg.signIn(userA, roleMember), http.MethodPost, collection, bodyAssistant)
 
-	got := map[string]any{
-		"kid": verified.kid.String(), claimSub: claimString(claims, claimSub), "iss": claimString(claims, "iss"),
-		claimScope: fmt.Sprint(claims[claimScope]), "act.sub": actor[claimSub], "act.len": len(actor),
-	}
-	want := map[string]any{
-		"kid": written.KeyID, claimSub: userA, "iss": apiOrigin + "/keys/" + written.KeyID,
-		claimScope: "[" + scope.DefaultAgent + "]", "act.sub": newAgentID, "act.len": 1,
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %q, want 201", rec.Code, rec.Body.String())
 	}
 
-	for name, value := range want {
-		if got[name] != value {
-			t.Errorf("claim %s = %v, want %v", name, got[name], value)
-		}
+	token := rg.issueCalls[0].issued.Token
+	want := `{"agent":` + agentJSON(newAgentID, "assistant", rg.now.Unix(), nil) + `,"key":{"id":"` + newKeyID +
+		`","token":"` + token + `","scopes":["default:agent"],"expiresAt":` +
+		strconv.FormatInt(rg.now.Add(auth.AgentKeyLifetime).Unix(), 10) + `}}` + "\n"
+
+	if rec.Body.String() != want {
+		t.Errorf("body = %s, want %s", rec.Body.String(), want)
+	}
+}
+
+// TestCreatedKeyIsTheAgentsKey: the token a create returns is accepted by the
+// boundary as the new agent's key, with the scopes it was given, and only that.
+// An agent's token is not accepted where a session is, nor with one character
+// changed.
+func TestCreatedKeyIsTheAgentsKey(t *testing.T) {
+	t.Parallel()
+
+	rg := newRig(t)
+	rec := rg.as(rg.signIn(userA, roleMember), http.MethodPost, collection, bodyAssistant)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %q, want 201", rec.Code, rec.Body.String())
 	}
 
-	if aud, _ := claims["aud"].([]any); !slices.Equal(aud, []any{auth.Audience(auth.KindAPIKey)}) {
-		if single, _ := claims["aud"].(string); single != auth.Audience(auth.KindAPIKey) {
-			t.Errorf("aud = %v, want %s", claims["aud"], auth.Audience(auth.KindAPIKey))
-		}
+	response := created(t, rec.Body.Bytes())
+	written := rg.store.calls[0].agent
+
+	rg.creds.keys[string(written.KeyHash)] = storeKeyRow(written, rg)
+
+	good := rg.withKey("Bearer "+response.Key.Token, http.MethodGet, collection, "")
+	if good.Code != http.StatusOK {
+		t.Errorf("the returned token was refused: %d %s", good.Code, good.Body)
 	}
 
-	if exp, _ := claims["exp"].(float64); int64(exp) != expires.Unix() {
-		t.Errorf("exp = %v, want %d", claims["exp"], expires.Unix())
+	altered := response.Key.Token[:len(response.Key.Token)-4] + "AAAA"
+	if got := rg.withKey("Bearer "+altered, http.MethodGet, collection, ""); got.Code != http.StatusUnauthorized {
+		t.Errorf("an altered token was accepted: %d %s", got.Code, got.Body)
+	}
+
+	asSession := rg.serve(request{
+		method: http.MethodGet, target: collection, cookies: []*http.Cookie{sessionCookie(response.Key.Token)},
+	})
+	if asSession.Code != http.StatusUnauthorized {
+		t.Errorf("the key was accepted as a session: %d %s", asSession.Code, asSession.Body)
 	}
 }
 
@@ -435,22 +469,31 @@ func TestLargestLegitimateCreateFitsTheCap(t *testing.T) {
 	}
 }
 
-// TestCreateFailures: what a failed create leaves behind and tells the client.
-func TestCreateFailures(t *testing.T) {
-	t.Parallel()
+// createFailure is one way a create fails, and what it leaves behind.
+type createFailure struct {
+	name    string
+	prepare func(*rig)
+	status  int
+	body    string
+	logged  string
+	// issued is how many keys were asked for, and writes how many writes tried.
+	issued, writes int
+}
 
-	tests := []struct {
-		name    string
-		prepare func(*rig)
-		status  int
-		body    string
-		logged  string
-		// keys is how many keys were created, and writes how many writes tried.
-		keys, writes int
-	}{
+// createFailures are the ways a create fails after the request was accepted.
+func createFailures() []createFailure {
+	return []createFailure{
 		{
-			name: "the key cannot be created", prepare: func(rg *rig) { rg.keyErr = errKeyPair },
-			status: http.StatusInternalServerError, body: bodyInternal, logged: agents.CodeKeyFailed, keys: 1, writes: 0,
+			name: "the key cannot be issued", prepare: func(rg *rig) { rg.issueErr = errEntropy },
+			status: http.StatusInternalServerError, body: bodyInternal, logged: agents.CodeKeyFailed, issued: 1, writes: 0,
+		},
+		{
+			name: "the key's lifetime is refused", prepare: func(rg *rig) { rg.issueErr = auth.ErrKeyLifetime },
+			status: http.StatusInternalServerError, body: bodyInternal, logged: agents.CodeKeyFailed, issued: 1, writes: 0,
+		},
+		{
+			name: "the entropy source fails", prepare: func(rg *rig) { rg.entropy = brokenReader{} },
+			status: http.StatusInternalServerError, body: bodyInternal, logged: agents.CodeKeyFailed, issued: 1, writes: 0,
 		},
 		{
 			name: "the user is at the limit, or was revoked",
@@ -459,11 +502,25 @@ func TestCreateFailures(t *testing.T) {
 			},
 			status: http.StatusConflict,
 			body:   errorBody("agent_limit_reached", "an account may have at most 25 active agents"),
-			logged: agents.CodeLimit, keys: 1, writes: 1,
+			logged: agents.CodeLimit, issued: 1, writes: 1,
+		},
+		{
+			name: "the database fails",
+			prepare: func(rg *rig) {
+				rg.store.failures[methodCreate] = unavailableErr("agent_create_failed")
+			},
+			status: http.StatusServiceUnavailable,
+			body:   errorBody("agent_create_failed", "agents are temporarily unavailable"),
+			logged: "agent_create_failed", issued: 1, writes: 1,
 		},
 	}
+}
 
-	for _, tt := range tests {
+// TestCreateFailures: what a failed create leaves behind and tells the client.
+func TestCreateFailures(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range createFailures() {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -474,13 +531,32 @@ func TestCreateFailures(t *testing.T) {
 
 			wantFailure(t, rg, rec, tt.status, tt.body, tt.logged)
 
-			if len(rg.keyCalls) != tt.keys || rg.writes() != tt.writes {
-				t.Errorf("created %d keys and made %d writes, want %d and %d", len(rg.keyCalls), rg.writes(), tt.keys, tt.writes)
+			if len(rg.issueCalls) != tt.issued || rg.writes() != tt.writes {
+				t.Errorf("issued %d keys and made %d writes, want %d and %d", len(rg.issueCalls), rg.writes(), tt.issued, tt.writes)
 			}
 
 			if len(rg.store.rows) != 0 {
 				t.Errorf("a failed create left %+v", rg.store.rows)
 			}
 		})
+	}
+}
+
+// TestCreateDoesNotLeakTheIssueFailure: a client is told only "internal error".
+// The cause of a failed issue is in the log and never in the response.
+func TestCreateDoesNotLeakTheIssueFailure(t *testing.T) {
+	t.Parallel()
+
+	rg := newRig(t)
+	rg.entropy = brokenReader{}
+
+	rec := rg.as(rg.signIn(userA, roleMember), http.MethodPost, collection, bodyAssistant)
+
+	if strings.Contains(rec.Body.String(), errEntropy.Error()) {
+		t.Errorf("the response carries the cause: %s", rec.Body)
+	}
+
+	if len(rg.logged) != 1 || !errors.Is(rg.logged[0], errEntropy) {
+		t.Errorf("logged %v, want one failure caused by %v", rg.logged, errEntropy)
 	}
 }

@@ -78,7 +78,7 @@ func marshal(t *testing.T, v any) string {
 // TestUserChoosesTheScopesOfTheAgentAndItsKey: a user (here with a session) sets
 // both lists freely; an absent list is the default bundle written out in full;
 // and a list that is present, even empty, is exactly what was asked for. The
-// agent's row, the key's row and the signed claim all carry the same list.
+// agent's row, the key's row and the response all carry the same list.
 func TestUserChoosesTheScopesOfTheAgentAndItsKey(t *testing.T) {
 	t.Parallel()
 
@@ -141,7 +141,7 @@ func TestUserChoosesTheScopesOfTheAgentAndItsKey(t *testing.T) {
 }
 
 // checkWrittenLists checks that what was written is the lists returned, as JSON,
-// that the signed claim is the key's list and the row's copy the same text, and
+// that the response's key list is the stored text, and
 // that a user's create names no creating agent.
 func checkWrittenLists(t *testing.T, rg *rig, response agents.CreateResponse, wantAgent, wantKey []string) {
 	t.Helper()
@@ -152,14 +152,9 @@ func checkWrittenLists(t *testing.T, rg *rig, response agents.CreateResponse, wa
 			written.Scopes, written.KeyScope, scope.List(wantAgent).JSON(), scope.List(wantKey).JSON())
 	}
 
-	verified, err := verifyToken(t, response.Key.Token, written.KeyJWK, "api_key")
-	if err != nil {
-		t.Fatalf("the token does not verify: %v", err)
-	}
-
-	claim := marshal(t, verified.claims[claimScope])
-	if claim != written.KeyScope {
-		t.Errorf("signed scope claim = %s, the row's copy = %s: they must be the same", claim, written.KeyScope)
+	if marshal(t, response.Key.Scopes) != written.KeyScope {
+		t.Errorf("the key's scopes = %s, the stored copy = %s: they must be the same",
+			marshal(t, response.Key.Scopes), written.KeyScope)
 	}
 
 	if written.CreatedBy != "" {
@@ -393,8 +388,8 @@ func TestAnAgentCreatesAgentsWithinItself(t *testing.T) {
 				t.Errorf("logged = %v, want one %s", rg.logged, test.wantCode)
 			}
 
-			if len(rg.keyCalls) != 0 || rg.writes() != 0 {
-				t.Errorf("a refused create made %d keys and %d writes", len(rg.keyCalls), rg.writes())
+			if len(rg.issueCalls) != 0 || rg.writes() != 0 {
+				t.Errorf("a refused create issued %d keys and %d writes", len(rg.issueCalls), rg.writes())
 			}
 		})
 	}
@@ -402,8 +397,8 @@ func TestAnAgentCreatesAgentsWithinItself(t *testing.T) {
 
 // checkDelegated checks a create by an agent that was allowed: the new agent is a
 // copy of the creator's, the key holds the list asked for, the write names the
-// creating agent so the store reads its scopes in the write, and the signed
-// claim is the list that was stored and returned.
+// creating agent so the store reads its scopes in the write, and the key
+// reports the list that was stored.
 func checkDelegated(t *testing.T, rg *rig, response agents.CreateResponse, creator scope.List, wantKey []string) {
 	t.Helper()
 
@@ -670,8 +665,8 @@ func TestKeysScopeBoundsEveryRoute(t *testing.T) {
 				t.Fatalf("status = %d (%s), want %d", rec.Code, rec.Body, test.want)
 			}
 
-			if test.want == no && (rg.writes() != 0 || len(rg.keyCalls) != 0) {
-				t.Errorf("a refused request made %d writes and %d keys", rg.writes(), len(rg.keyCalls))
+			if test.want == no && (rg.writes() != 0 || len(rg.issueCalls) != 0) {
+				t.Errorf("a refused request made %d writes and %d keys", rg.writes(), len(rg.issueCalls))
 			}
 		})
 	}
@@ -679,7 +674,7 @@ func TestKeysScopeBoundsEveryRoute(t *testing.T) {
 
 // TestACreatedKeyReadsBackAsTheScopesItWasGiven closes the loop: the key an
 // agent's create returns is accepted by the boundary and has exactly the scopes
-// it was given, so what is signed is what is enforced.
+// it was given, so what is stored is what is enforced.
 func TestACreatedKeyReadsBackAsTheScopesItWasGiven(t *testing.T) {
 	t.Parallel()
 
@@ -694,8 +689,8 @@ func TestACreatedKeyReadsBackAsTheScopesItWasGiven(t *testing.T) {
 	response := created(t, rec.Body.Bytes())
 	written := rg.store.calls[0].agent
 
-	// Store the row the way the database would, and present the returned token.
-	rg.keys.apiRows[written.KeyID] = storeKeyRow(written, rg)
+	// Store the row the way the database would (found by the hash that was written), and present the returned token.
+	rg.creds.keys[string(written.KeyHash)] = storeKeyRow(written, rg)
 
 	header := "Bearer " + response.Key.Token
 

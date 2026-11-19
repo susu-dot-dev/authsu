@@ -45,8 +45,12 @@ const (
 	// adminID and memberID are the accounts the tests sign in as.
 	adminID  = "00000000-0000-7000-8000-0000000000a1"
 	memberID = "00000000-0000-7000-8000-0000000000b2"
-	// someCode is a well-formed invitation code.
-	someCode = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+	// someCode is a well-formed invitation token: the prefix, and 43
+	// characters whose last one is canonical.
+	someCode = "susu_inv_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+	// sessionRowID and keyRowID are the ids of the secrets the tests issue.
+	sessionRowID = "00000000-0000-7000-8000-0000000000d1"
+	keyRowID     = "00000000-0000-7000-8000-0000000000d2"
 
 	roleAdmin  = "admin"
 	roleMember = "member"
@@ -59,6 +63,14 @@ const (
 	bodyUnauthenticated = `{"error":{"code":"unauthenticated","message":"not signed in"}}` + "\n"
 	bodyNotFound        = `{"error":{"code":"not_found","message":"no such route"}}` + "\n"
 	bodyInternal        = `{"error":{"code":"internal","message":"internal error"}}` + "\n"
+)
+
+// Fragments of the statements the credential reads and writes run, which the
+// fake Exec matches the first statement of a call against.
+const (
+	readSession = "JOIN sessions x"
+	readAPIKey  = "JOIN api_keys k" //nolint:gosec // SQL naming the api_keys table, not a credential
+	revokeToken = "UPDATE secrets"
 )
 
 // errDB is a cause the fakes inject. It must only ever reach the log.
@@ -225,44 +237,79 @@ func (h *harness) loggedCodes() []string {
 	return codes
 }
 
-// session is a signed-in caller: the key a login would have created.
+// session is a signed-in caller: the session a login would have issued.
 type session struct {
-	key    auth.Key
+	issued auth.Issued
 	userID string
 	cookie *http.Cookie
 }
 
-// newSession creates a real session key for userID, as login does, valid for
-// an hour.
+// newSession issues a real session token for userID, as login does, with the
+// real entropy and the fixed id sessionRowID.
 func newSession(t *testing.T, userID string) session {
 	t.Helper()
 
-	api, err := config.ParseOrigin(apiOrigin)
+	issued, err := auth.IssueSession(rand.Reader, func() string { return sessionRowID }, time.Now().Truncate(time.Second))
 	if err != nil {
-		t.Fatalf("api origin: %v", err)
+		t.Fatalf("issue session: %v", err)
 	}
 
-	key, err := auth.CreateSession(auth.IssuerFor(api), userID, time.Now().Add(time.Hour).Truncate(time.Second))
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
-
-	return session{key: key, userID: userID, cookie: requestCookie(auth.CookieName, key.JWT)}
+	return session{issued: issued, userID: userID, cookie: requestCookie(auth.CookieName, issued.Token)}
 }
 
 // agentRowID is an agent id for rows that name one.
 const agentRowID = "00000000-0000-7000-8000-0000000000a1"
 
-// activeKeyStep is the answer to the key lookup of the session boundary, with
-// the row exactly as D1 returns it: text as string, integers as int64.
-func (s session) activeKeyStep(role string) step {
-	return s.activeKeyRow([]any{s.key.JWK, s.userID, "", role, s.key.ExpiresAt.Unix(), "", ""})
+// activeSessionStep is the answer to the session lookup of the auth boundary,
+// with the row exactly as D1 returns it: text as string, integers as int64.
+func (s session) activeSessionStep(role string) step {
+	return s.activeSessionRow([]any{s.issued.ID, s.userID, role, s.issued.ExpiresAt.Unix()})
 }
 
-// activeKeyRow is activeKeyStep with a row of the test's own making, to feed
-// the boundary values D1 could produce but should not.
-func (s session) activeKeyRow(row []any) step {
-	return step{match: "FROM japikeys k", results: []store.Result{{Changes: 0, Rows: [][]any{row}}}, err: nil}
+// activeSessionRow is activeSessionStep with a row of the test's own making, to
+// feed the boundary values D1 could produce but should not.
+func (s session) activeSessionRow(row []any) step {
+	return step{match: readSession, results: []store.Result{{Changes: 0, Rows: [][]any{row}}}, err: nil}
+}
+
+// apiKey is an API key a test holds: what IssueAPIKey made and the headers
+// that present it.
+type apiKey struct {
+	issued  auth.Issued
+	headers map[string]string
+}
+
+// newAPIKey issues a real API key with the fixed id keyRowID.
+func newAPIKey(t *testing.T) apiKey {
+	t.Helper()
+
+	issued, err := auth.IssueAPIKey(rand.Reader, func() string { return keyRowID },
+		time.Now().Truncate(time.Second), auth.AgentKeyLifetime)
+	if err != nil {
+		t.Fatalf("issue API key: %v", err)
+	}
+
+	return apiKey{issued: issued, headers: bearer(issued.Token)}
+}
+
+// authorization is the headers of a request with that Authorization header.
+func authorization(value string) map[string]string {
+	return map[string]string{"Authorization": value}
+}
+
+// bearer is the headers of a request that presents token as an API key.
+func bearer(token string) map[string]string { return authorization("Bearer " + token) }
+
+// keyStep is the answer to the API key lookup of the auth boundary: the key's
+// own user, role and expiry, the agent it belongs to (or "" for none) with
+// that agent's stored scopes, and the key's own scope.
+func (k apiKey) keyStep(userID, role, agentID, agentScopes, keyScope string) step {
+	return k.keyRow([]any{k.issued.ID, userID, role, k.issued.ExpiresAt.Unix(), agentID, agentScopes, keyScope})
+}
+
+// keyRow is keyStep with a row of the test's own making.
+func (k apiKey) keyRow(row []any) step {
+	return step{match: readAPIKey, results: []store.Result{{Changes: 0, Rows: [][]any{row}}}, err: nil}
 }
 
 // rows is a one-statement answer with the given rows.
@@ -303,9 +350,9 @@ func batchOf(n int) []store.Result { return make([]store.Result, n) }
 
 // createdAgentBatch is the answer of an agent create's batch: the agent insert
 // returns the scope list it stored (RETURNING scopes, as D1 sends text), and the
-// key insert returns nothing.
+// key's secret and the key's own row return nothing.
 func createdAgentBatch(scopes string) []store.Result {
-	return []store.Result{{Changes: 1, Rows: [][]any{{scopes}}}, {Changes: 1, Rows: nil}}
+	return []store.Result{{Changes: 1, Rows: [][]any{{scopes}}}, {Changes: 1, Rows: nil}, {Changes: 1, Rows: nil}}
 }
 
 // passkey is a software authenticator: a fresh ES256 key and the credential id

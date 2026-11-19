@@ -21,8 +21,8 @@ import (
 // invalid_name), those of a missing configuration are auth's (not_configured)
 // and those of the database are the store's.
 const (
-	// CodeInvalidInvitation is also input.CodeInvalidInvitation: a code that
-	// is malformed (400) and a code that is not redeemable (403) are told
+	// CodeInvalidInvitation is also input.CodeInvalidInvitation: a token that
+	// is malformed (400) and a token that is not redeemable (403) are told
 	// apart by the status, and not by anything that reveals why.
 	CodeInvalidInvitation  = input.CodeInvalidInvitation
 	CodeChallengeFailed    = "registration_challenge_failed"
@@ -34,7 +34,9 @@ const (
 
 // beginBody is the body of POST /api/register/begin, as the client sent it.
 type beginBody struct {
-	InvitationCode string `json:"invitationCode"`
+	// InvitationToken is the invitation token. The member keeps its name,
+	// invitationCode, as the clients know it.
+	InvitationToken string `json:"invitationCode"`
 	// Name is the account name. It is also the display name: one value, so
 	// the user types it once.
 	Name string `json:"name"`
@@ -43,18 +45,18 @@ type beginBody struct {
 // ceremony is what begin and finish both bind a challenge to: the invitation
 // being redeemed and the name the account is to have.
 type ceremony struct {
-	code input.InvitationCode
-	name input.AccountName
+	token input.InvitationToken
+	name  input.AccountName
 }
 
 // associatedData is what the challenge's tag commits to besides its own bytes.
 func (c ceremony) associatedData() [][]byte {
-	return [][]byte{[]byte(c.code.String()), []byte(c.name.String())}
+	return [][]byte{[]byte(c.token.String()), []byte(c.name.String())}
 }
 
 // parseCeremony parses the two strings every request carries.
-func parseCeremony(rawCode, rawName string) (ceremony, error) {
-	code, err := input.ParseInvitationCode(rawCode)
+func parseCeremony(rawToken, rawName string) (ceremony, error) {
+	token, err := input.ParseInvitationToken(rawToken)
 	if err != nil {
 		return ceremony{}, err //nolint:wrapcheck // the parser's error is already the classified client error
 	}
@@ -62,11 +64,11 @@ func parseCeremony(rawCode, rawName string) (ceremony, error) {
 	name, err := input.ParseAccountName(rawName)
 
 	//nolint:wrapcheck // the parser's error is already the classified client error
-	return ceremony{code: code, name: name}, err
+	return ceremony{token: token, name: name}, err
 }
 
 func parseBegin(body beginBody) (ceremony, error) {
-	return parseCeremony(body.InvitationCode, body.Name)
+	return parseCeremony(body.InvitationToken, body.Name)
 }
 
 // creationOptions is PublicKeyCredentialCreationOptionsJSON, trimmed to what
@@ -123,7 +125,7 @@ func (h *handlers) begin(call *auth.Call) result.Result[httpapi.Response] {
 		Then(parseBegin).
 		Then(func(cmd ceremony) (creationOptions, error) {
 			return result.Of(call.Config()).
-				Check(func(config.Config) error { return h.checkInvitation(call, cmd.code, now) }).
+				Check(func(config.Config) error { return h.checkInvitation(call, cmd.token, now) }).
 				Then(func(cfg config.Config) (creationOptions, error) { return h.options(cfg, cmd, now) }).
 				Get()
 		}).
@@ -133,8 +135,8 @@ func (h *handlers) begin(call *auth.Call) result.Result[httpapi.Response] {
 // checkInvitation reports an unusable invitation as a client error. The cases
 // a client could otherwise tell apart (unknown, exhausted, revoked, expired) are
 // deliberately one answer. A failing lookup is the store's classified error.
-func (h *handlers) checkInvitation(call *auth.Call, code input.InvitationCode, now time.Time) error {
-	_, redeemable, err := h.store.RedeemableInvitationType(call.Request.Context, code, now)
+func (h *handlers) checkInvitation(call *auth.Call, token input.InvitationToken, now time.Time) error {
+	_, redeemable, err := h.store.RedeemableInvitationType(call.Request.Context, token, now)
 	if err != nil {
 		return err //nolint:wrapcheck // the store classifies its own failures
 	}
@@ -146,9 +148,9 @@ func (h *handlers) checkInvitation(call *auth.Call, code input.InvitationCode, n
 	return nil
 }
 
-// errNotRedeemable is the one answer to a code that cannot be redeemed.
+// errNotRedeemable is the one answer to a token that cannot be redeemed.
 func errNotRedeemable() *apierr.Error {
-	return apierr.New(apierr.Forbidden, CodeInvalidInvitation, "invitation code is not valid")
+	return apierr.New(apierr.Forbidden, CodeInvalidInvitation, "invitation token is not valid")
 }
 
 // options creates the challenge, whose nonce is the user handle, and returns the

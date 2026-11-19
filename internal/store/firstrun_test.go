@@ -5,6 +5,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -99,8 +100,14 @@ func TestFirstRunStateFailures(t *testing.T) {
 		func(s *store.Store) error { return lastErr(s.FirstRunState(context.Background())) })
 }
 
-// TestCreateFirstRunInvitation holds that the conditional insert's RETURNING is
-// the outcome: one row is "this call created it" and none is "the conditions
+// firstRunBatch is the outcome of the first-run batch: the secret insert, which
+// returns nothing, then the invitation insert, which returned rows.
+func firstRunBatch(rows ...[]any) outcome {
+	return outcome{results: []store.Result{{Changes: 0, Rows: nil}, {Changes: 0, Rows: rows}}, err: nil}
+}
+
+// TestCreateFirstRunInvitation holds that the second insert's RETURNING is the
+// outcome: one row is "this call created it" and none is "the conditions
 // refused it".
 func TestCreateFirstRunInvitation(t *testing.T) {
 	t.Parallel()
@@ -118,11 +125,12 @@ func TestCreateFirstRunInvitation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := newFake(returning(test.rows...))
-			code := mustCode(t, "first-run-secret")
+			fake := newFake(firstRunBatch(test.rows...))
+			token := mustInvitationToken(t, 2)
+			expires := now.Add(input.ExpiryHorizon)
 
 			created, err := fake.store().CreateFirstRunInvitation(
-				context.Background(), "inv-1", code, "First run: initial administrator", now)
+				context.Background(), "inv-1", token, "First run: initial administrator", expires, now)
 
 			checkErr(t, err, nil)
 
@@ -130,18 +138,35 @@ func TestCreateFirstRunInvitation(t *testing.T) {
 				t.Errorf("created = %v, want %v", created, test.created)
 			}
 
-			// The emptiness conditions are part of the insert, so two racing
-			// status checks cannot both create the invitation.
-			checkStatements(t, fake, wantStatement{
-				fragments: []string{
-					"INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at)",
-					"SELECT ?, ?, ?, ?, 1, ?",
-					"WHERE NOT EXISTS (SELECT 1 FROM invitations)",
-					"AND NOT EXISTS (SELECT 1 FROM users)",
-					"RETURNING id",
+			checkStatements(t, fake,
+				wantStatement{
+					fragments: []string{
+						"INSERT INTO secrets (id, kind, hash, expires_at, created_at)",
+						"SELECT ?, ?, ?, ?, ?",
+						// The emptiness conditions are part of the insert, so two
+						// racing status checks cannot both create the invitation.
+						"WHERE NOT EXISTS (SELECT 1 FROM invitations)",
+						"AND NOT EXISTS (SELECT 1 FROM users)",
+					},
+					args: []any{"inv-1", store.KindInvitation, token.Hash(), expires.Unix(), now.Unix()},
 				},
-				args: []any{"inv-1", code.Hash(), store.InvitationFirstRun, "First run: initial administrator", now.Unix()},
-			})
+				wantStatement{
+					fragments: []string{
+						"INSERT INTO invitations (id, kind, type, label, num_invites)",
+						"SELECT ?, ?, ?, ?, 1",
+						// The invitation is written only if this call's secret
+						// is there: the id is fresh, so only the statement before
+						// it can have written one, and the pair stands or falls
+						// together.
+						"WHERE EXISTS (SELECT 1 FROM secrets WHERE id = ? AND kind = ?)",
+						"RETURNING id",
+					},
+					args: []any{
+						"inv-1", store.KindInvitation, store.InvitationFirstRun, "First run: initial administrator",
+						"inv-1", store.KindInvitation,
+					},
+				},
+			)
 		})
 	}
 }
@@ -151,23 +176,12 @@ func TestCreateFirstRunInvitation(t *testing.T) {
 func TestCreateFirstRunInvitationDefects(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name string
-		rows [][]any
-	}{
-		{name: "two rows", rows: [][]any{row("inv-1"), row("inv-2")}},
-		{name: "the id is an integer", rows: [][]any{row(int64(1))}},
-		{name: "the id is NULL", rows: [][]any{row(nil)}},
-		{name: "a column too many", rows: [][]any{row("inv-1", "x")}},
-		{name: "an empty row", rows: [][]any{row()}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
+	for name, rows := range defectResults(row("inv-1"), "text") {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			created, err := newFake(returning(test.rows...)).store().
-				CreateFirstRunInvitation(context.Background(), "inv-1", mustCode(t, "x"), "", now)
+			created, err := newFake(firstRunBatch(rows...)).store().
+				CreateFirstRunInvitation(context.Background(), "inv-1", mustInvitationToken(t, 2), "", now, now)
 
 			checkErr(t, err, defectOf(store.CodeFirstRunCreateRejected))
 
@@ -178,13 +192,17 @@ func TestCreateFirstRunInvitationDefects(t *testing.T) {
 	}
 }
 
-// TestCreateFirstRunInvitationFailures holds how a failed batch is reported.
+// TestCreateFirstRunInvitationFailures holds how a failed batch is reported. A
+// conflict is a defect: the id is fresh, and a taken hash means a secret exists
+// without its invitation, which is the schema and the code disagreeing and not
+// something a client can resolve.
 func TestCreateFirstRunInvitationFailures(t *testing.T) {
 	t.Parallel()
 
-	runFailures(t, 1, store.CodeFirstRunCreateFailed, store.CodeFirstRunCreateRejected, firstRunDescription,
+	runDefectFailures(t, 2, store.CodeFirstRunCreateFailed, store.CodeFirstRunCreateRejected, firstRunDescription,
 		func(s *store.Store) error {
-			return lastErr(s.CreateFirstRunInvitation(context.Background(), "inv-1", mustCode(t, "x"), "", now))
+			return lastErr(s.CreateFirstRunInvitation(
+				context.Background(), "inv-1", mustInvitationToken(t, 2), "", now, now))
 		})
 }
 

@@ -16,8 +16,8 @@ const (
 	// MaxScopeListJSONBytes is the most the stored form of a ScopeList, the
 	// JSON array of its names, may be. It is the schema CHECKs
 	// `length(cast(scopes AS BLOB)) BETWEEN 1 AND 1024` on agents.scopes and
-	// `length(cast(scope AS BLOB)) BETWEEN 1 AND 1024` on japikeys.scope
-	// (migration 0005), which count bytes. The empty list, "[]", is two bytes,
+	// `length(cast(scope AS BLOB)) BETWEEN 1 AND 1024` on api_keys.scope
+	// (migration 0001), which count bytes. The empty list, "[]", is two bytes,
 	// so it satisfies them and needs no migration.
 	//
 	// The parser does not test it, because it cannot be reached: a list is

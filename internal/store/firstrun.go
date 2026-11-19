@@ -58,35 +58,91 @@ func (s *Store) FirstRunState(ctx context.Context) (FirstRunState, error) {
 	return state, err
 }
 
-// insertFirstRunQuery inserts the first-run invitation for a code. It reports
-// whether this call inserted it.
+// insertFirstRunSecretQuery is the first statement of the first-run batch: it
+// writes the secret of the first-run invitation, but only while there is no
+// invitation and no account at all.
 //
 // The emptiness conditions are part of the insert itself, so two racing status
-// checks cannot both create it: the database admits exactly one. RETURNING
-// makes the statement report its own outcome: one row means this call inserted
-// the invitation, no rows means the conditions refused it. Nothing is read back
-// afterwards, because a later read cannot tell this insert's row from one
-// written by another caller.
+// checks cannot both create it: D1 runs a batch to its end before the next
+// one starts, so the second sees the first's invitation and inserts nothing.
 //
-// Arguments, in order: id, code_hash, type, label, created_at.
-const insertFirstRunQuery = `
-INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at)
-SELECT ?, ?, ?, ?, 1, ?
+// Secrets of other kinds do not matter to the condition. Sessions and API keys
+// exist only for accounts, so while there is no account there are none, and a
+// secret of any kind never makes an invitation exist. What this insert must not
+// do is leave a secret behind without its invitation, which the next statement
+// prevents (see insertFirstRunInvitationQuery).
+//
+// Arguments, in order: id, kind, hash, expires_at, created_at.
+//
+//nolint:gosec // SQL naming the secrets table, not a credential
+const insertFirstRunSecretQuery = `
+INSERT INTO secrets (id, kind, hash, expires_at, created_at)
+SELECT ?, ?, ?, ?, ?
 WHERE NOT EXISTS (SELECT 1 FROM invitations)
-  AND NOT EXISTS (SELECT 1 FROM users)
+  AND NOT EXISTS (SELECT 1 FROM users)`
+
+// insertFirstRunInvitationQuery is the second statement of the first-run batch:
+// the invitation's own row, written only if the statement before it wrote this
+// call's secret. The id is fresh for every call, so a secret with this id and
+// kind exists only if the previous statement of this batch inserted it, and no
+// other caller's secret can satisfy the condition. The two inserts therefore
+// stand or fall together: when the conditions refused the secret there is
+// nothing for the invitation to attach to and it is not written, and when the
+// secret was written the invitation is, in the same transaction. Were the
+// invitation insert to fail on a constraint, the batch would roll the secret
+// back with it.
+//
+// RETURNING makes the statement report its own outcome: one row means this call
+// created the invitation, no rows means the conditions refused it. Nothing is
+// read back afterwards, because a later read cannot tell this insert's row from
+// one written by another caller.
+//
+// created_by is NULL: no account created it. num_invites is 1.
+//
+// Arguments, in order: id, kind, type, label, the secret's id, the secret's
+// kind.
+const insertFirstRunInvitationQuery = `
+INSERT INTO invitations (id, kind, type, label, num_invites)
+SELECT ?, ?, ?, ?, 1
+WHERE EXISTS (SELECT 1 FROM secrets WHERE id = ? AND kind = ?)
 RETURNING id`
 
-// CreateFirstRunInvitation inserts the single-use first-run invitation for code,
-// but only while there is no invitation and no account at all. It reports true
-// when this call inserted it, and false when the conditions refused it.
+// CreateFirstRunInvitation creates the single-use first-run invitation for the
+// token, but only while there is no invitation and no account at all. It
+// reports true when this call created it, and false when the conditions refused
+// it, in which case nothing was written.
+//
+// The secret and the invitation are one batch of two statements, the second
+// conditional on the first having written its row, so neither half exists
+// without the other. The invitation expires at expiresAt.
+//
+// The database never refuses a first-run create for a reason a client could
+// resolve, so a constraint failure of any kind is a defect on our side and is
+// reported as the operation's "_rejected" 500. That includes the token's hash
+// already being taken, which is only possible if a secret exists without its
+// invitation.
 func (s *Store) CreateFirstRunInvitation(
-	ctx context.Context, id string, code input.InvitationCode, label string, now time.Time,
+	ctx context.Context, id string, token input.InvitationToken, label string, expiresAt, now time.Time,
 ) (bool, error) {
 	o := op{failed: CodeFirstRunCreateFailed, rejected: CodeFirstRunCreateRejected, description: firstRunDescription}
 
-	_, created, err := find(ctx, s, o,
-		Statement{Query: insertFirstRunQuery, Args: []any{id, code.Hash(), InvitationFirstRun, label, now.Unix()}},
-		func(r *row) string { return r.text() })
+	results, err := s.run(ctx, o,
+		Statement{Query: insertFirstRunSecretQuery, Args: []any{
+			id, KindInvitation, token.Hash(), expiresAt.Unix(), now.Unix(),
+		}},
+		Statement{Query: insertFirstRunInvitationQuery, Args: []any{
+			id, KindInvitation, InvitationFirstRun, label, id, KindInvitation,
+		}},
+	)
+	if errors.Is(err, ErrConflict) {
+		return false, o.defect(err)
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	_, created, err := findRow(results[1].Rows, o, func(r *row) string { return r.text() })
 
 	return created, err
 }

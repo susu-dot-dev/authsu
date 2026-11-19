@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	parityCode = "e2e-parity-invitation-0123456789ABCDEFGHIJKLMN"
+	parityCode = "susu_inv_MsKRYvAFHoFnV-0eJ1k0K63n86_peHirPLW92Jr33k4"
 	parityID   = "00000000-0000-7000-8000-00000000c201"
 )
 

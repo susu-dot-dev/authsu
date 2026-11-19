@@ -54,9 +54,11 @@
 //
 // # What is not an input
 //
-// Values the server generates (ids, timestamps, invitation codes it issues,
-// signing keys) are not parsed here and stay plain types: they are correct by
-// construction, and wrapping them would only rename them. The one exception
-// is a generated value coming back from a client: an id in a URL or a cursor
-// is an input and is parsed as an ID, however it was originally generated.
+// Values the server generates (ids, timestamps, the tokens it issues) are not
+// parsed here and stay plain types: they are correct by construction, and
+// wrapping them would only rename them. The one exception is a generated value
+// coming back from a client: an id in a URL or a cursor is an input and is
+// parsed as an ID, however it was originally generated, and a token in a
+// cookie, a header or a request body is parsed as the one kind of token that
+// place accepts (InvitationToken, SessionToken, APIKeyToken).
 package input

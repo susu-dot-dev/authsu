@@ -17,10 +17,10 @@
 	"upload_source_maps": true,
 	/**
 	 * The two origins everything is derived from (docs/runbook.md, "Secrets and
-	 * variables"). API_ORIGIN is where this Worker is served; the session issuer
-	 * is derived from it. UI_ORIGIN is where the UI is served: passkey ceremonies
-	 * run on its pages, its host is the relying party ID, and it is the one
-	 * origin CORS allows. The relying party ID is permanent: a passkey is bound
+	 * variables"). API_ORIGIN is the API's own origin, where this Worker is
+	 * served. UI_ORIGIN is where the UI is served: passkey
+	 * ceremonies run on its pages, its host is the relying party ID, and it is
+	 * the one origin CORS allows. The relying party ID is permanent: a passkey is bound
 	 * to it, so changing UI_ORIGIN's host invalidates every registered passkey.
 	 * Set them to your deployment's real domains before the first registration
 	 * (make config-set-vars). `make dev` and the e2e tests override them with

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/invitations"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -222,28 +224,30 @@ type validCase struct {
 	body  string
 	label string
 	num   int64
-	// expires is the expiry asked for, nil for none.
-	expires *int64
+	// expires is the expiry the invitation must be stored and returned with:
+	// the one asked for, or the default, input.ExpiryHorizon after now.
+	expires int64
 }
 
 // validCreates are the shapes a create accepts, at the edge of each field.
 func validCreates() []validCase {
 	now := fixedNow().Unix()
 	horizon := int64(input.ExpiryHorizon / time.Second)
+	byDefault := now + horizon
 	twoByte := strings.Repeat("é", input.MaxInvitationLabelRunes)
 	fourByte := strings.Repeat("😀", input.MaxInvitationLabelRunes)
 
 	return []validCase{
-		{"only what is required", typed("1", "", ""), "", 1, nil},
-		{"empty label", typed("1", `""`, ""), "", 1, nil},
-		{"null expiry", typed("1", "", "null"), "", 1, nil},
-		{"every field", typed("3", text("November workshop"), secs(now+3600)), "November workshop", 3, new(now + 3600)},
-		{"most invites", typed("10000", "", ""), "", 10000, nil},
-		{"expires one second from now", typed("1", "", secs(now+1)), "", 1, new(now + 1)},
-		{"expires at the horizon", typed("1", "", secs(now+horizon)), "", 1, new(now + horizon)},
-		{"longest label in two-byte characters", typed("1", text(twoByte), ""), twoByte, 1, nil},
-		{"longest label in four-byte characters", typed("1", text(fourByte), ""), fourByte, 1, nil},
-		{"label with escapes", typed("1", text(`say \"hi\" \\ \u00e9`), ""), `say "hi" \ é`, 1, nil},
+		{"only what is required, so the default expiry", typed("1", "", ""), "", 1, byDefault},
+		{"empty label", typed("1", `""`, ""), "", 1, byDefault},
+		{"null expiry", typed("1", "", "null"), "", 1, byDefault},
+		{"every field", typed("3", text("November workshop"), secs(now+3600)), "November workshop", 3, now + 3600},
+		{"most invites", typed("10000", "", ""), "", 10000, byDefault},
+		{"expires one second from now", typed("1", "", secs(now+1)), "", 1, now + 1},
+		{"expires at the horizon", typed("1", "", secs(now+horizon)), "", 1, now + horizon},
+		{"longest label in two-byte characters", typed("1", text(twoByte), ""), twoByte, 1, byDefault},
+		{"longest label in four-byte characters", typed("1", text(fourByte), ""), fourByte, 1, byDefault},
+		{"label with escapes", typed("1", text(`say \"hi\" \\ \u00e9`), ""), `say "hi" \ é`, 1, byDefault},
 	}
 }
 
@@ -262,18 +266,14 @@ func (tt validCase) stored(t *testing.T, creator string) store.NewInvitation {
 		t.Fatalf("numInvites: %v", err)
 	}
 
-	want := store.NewInvitation{
-		ID: newInvID, CodeHash: hashOf(codeOf(sequence(0, invitations.CodeBytes))), Type: typeCustom,
-		Label: label, NumInvites: num, ExpiresAt: nil, CreatedBy: creator, CreatedAt: fixedNow(),
+	expiry, err := input.ParseExpiry(tt.expires, fixedNow())
+	if err != nil {
+		t.Fatalf("expiresAt: %v", err)
 	}
 
-	if tt.expires != nil {
-		expiry, err := input.ParseExpiry(*tt.expires, fixedNow())
-		if err != nil {
-			t.Fatalf("expiresAt: %v", err)
-		}
-
-		want.ExpiresAt = &expiry
+	want := store.NewInvitation{
+		ID: newInvID, TokenHash: hashOf(codeOf(sequence(0, secret.BodyBytes))), Type: typeCustom,
+		Label: label, NumInvites: num, ExpiresAt: expiry, CreatedBy: creator, CreatedAt: fixedNow(),
 	}
 
 	return want
@@ -283,13 +283,13 @@ func (tt validCase) stored(t *testing.T, creator string) store.NewInvitation {
 func (tt validCase) response(creator string) wireInvitation {
 	return wireInvitation{
 		ID: newInvID, Type: typeCustom, Label: tt.label, NumInvites: tt.num, Uses: 0, Status: statusActive,
-		ExpiresAt: tt.expires, RevokedAt: nil, CreatedBy: &creator, CreatedAt: fixedNow().Unix(),
+		ExpiresAt: &tt.expires, RevokedAt: nil, CreatedBy: &creator, CreatedAt: fixedNow().Unix(),
 	}
 }
 
 // TestCreateStoresTheHashAndReturnsTheRow: every valid shape reaches the store
-// with the parsed values, the hash of the code, the creating admin and the
-// clock; the response is 201 with the row and the code.
+// with the parsed values, the hash of the token, the creating admin and the
+// clock; the response is 201 with the row and the token (in "code").
 func TestCreateStoresTheHashAndReturnsTheRow(t *testing.T) {
 	t.Parallel()
 
@@ -320,7 +320,7 @@ func TestCreateStoresTheHashAndReturnsTheRow(t *testing.T) {
 			}
 
 			got := decode[wireCreated](t, rec)
-			if got.Code != codeOf(sequence(0, invitations.CodeBytes)) ||
+			if got.Code != codeOf(sequence(0, secret.BodyBytes)) ||
 				!sameInvitation(got.wireInvitation, tt.response(creator)) {
 				t.Errorf("response = %+v, want %+v", got, tt.response(creator))
 			}
@@ -345,7 +345,26 @@ func TestCreateResponseIsTheWireShape(t *testing.T) {
 
 	want := `{"id":"` + newInvID + `","type":"member","label":"November workshop","numInvites":3,"uses":0,` +
 		`"status":"active","expiresAt":` + secs(now+3600) + `,"createdBy":"` + adminID + `","createdAt":` + secs(now) + `,` +
-		`"code":"` + codeOf(sequence(0, invitations.CodeBytes)) + `"}` + "\n"
+		`"code":"` + codeOf(sequence(0, secret.BodyBytes)) + `"}` + "\n"
+
+	if rec.Code != http.StatusCreated || rec.Body.String() != want {
+		t.Errorf("response = %d\n%s\nwant\n%s", rec.Code, rec.Body.String(), want)
+	}
+}
+
+// TestCreateResponseWithoutAnExpiryHasTheDefault pins the body of a create that
+// names no expiry: expiresAt is still present, ten years out.
+func TestCreateResponseWithoutAnExpiryHasTheDefault(t *testing.T) {
+	t.Parallel()
+
+	harn := newHarness(t)
+	now := fixedNow().Unix()
+
+	rec := harn.asAdmin(http.MethodPost, collectionPath, typed("1", "", ""))
+
+	want := `{"id":"` + newInvID + `","type":"member","label":"","numInvites":1,"uses":0,` +
+		`"status":"active","expiresAt":` + secs(now+10*365*24*3600) + `,"createdBy":"` + adminID +
+		`","createdAt":` + secs(now) + `,"code":"` + codeOf(sequence(0, secret.BodyBytes)) + `"}` + "\n"
 
 	if rec.Code != http.StatusCreated || rec.Body.String() != want {
 		t.Errorf("response = %d\n%s\nwant\n%s", rec.Code, rec.Body.String(), want)
@@ -360,7 +379,7 @@ func TestCreateResponseIsTheStoredRow(t *testing.T) {
 	now := fixedNow().Unix()
 	stored := storedRow(func(r *store.Invitation) {
 		r.ID, r.Type, r.Label, r.NumInvites, r.Uses = "00000000-0000-7000-8000-0000000000dd", typeOther, "from the db", 9, 9
-		r.CreatedBy, r.ExpiresAt, r.CreatedAt = new("someone"), new(now+5), now-7
+		r.CreatedBy, r.ExpiresAt, r.CreatedAt = new("someone"), now+5, now-7
 	})
 
 	harn := newHarness(t)
@@ -378,7 +397,7 @@ func TestCreateResponseIsTheStoredRow(t *testing.T) {
 		t.Errorf("response = %d %+v, want %+v", rec.Code, got.wireInvitation, want)
 	}
 
-	if got.Code != codeOf(sequence(0, invitations.CodeBytes)) {
+	if got.Code != codeOf(sequence(0, secret.BodyBytes)) {
 		t.Errorf("code = %q", got.Code)
 	}
 }
@@ -411,10 +430,10 @@ func TestCreateShowsTheCodeOnce(t *testing.T) {
 	}
 
 	codes := []string{
-		codeOf(sequence(0, invitations.CodeBytes)), codeOf(sequence(invitations.CodeBytes, invitations.CodeBytes)),
+		codeOf(sequence(0, secret.BodyBytes)), codeOf(sequence(secret.BodyBytes, secret.BodyBytes)),
 	}
 
-	if len(codes[0]) != 43 || codes[0] == codes[1] {
+	if len(codes[0]) != len(tokenPrefix)+secret.BodyLen || codes[0] == codes[1] {
 		t.Fatalf("codes = %v", codes)
 	}
 
@@ -422,8 +441,8 @@ func TestCreateShowsTheCodeOnce(t *testing.T) {
 		wantCodeOnce(t, rec, harn.store.calls[i].created, codes[i])
 	}
 
-	if harn.entropy.taken != 2*invitations.CodeBytes {
-		t.Errorf("took %d entropy bytes, want %d", harn.entropy.taken, 2*invitations.CodeBytes)
+	if harn.entropy.taken != 2*secret.BodyBytes {
+		t.Errorf("took %d entropy bytes, want %d", harn.entropy.taken, 2*secret.BodyBytes)
 	}
 }
 
@@ -440,12 +459,94 @@ func wantCodeOnce(t *testing.T, rec *httptest.ResponseRecorder, stored store.New
 		t.Errorf("response code = %q, want %q", got, code)
 	}
 
-	if !bytes.Equal(stored.CodeHash, hashOf(code)) || len(stored.CodeHash) != 32 {
-		t.Errorf("stored hash %x", stored.CodeHash)
+	if !bytes.Equal(stored.TokenHash, hashOf(code)) || len(stored.TokenHash) != 32 {
+		t.Errorf("stored hash %x", stored.TokenHash)
 	}
 
-	if strings.Contains(fmt.Sprintf("%+v", stored), code) || bytes.Contains(stored.CodeHash, []byte(code)) {
+	if strings.Contains(fmt.Sprintf("%+v", stored), code) || bytes.Contains(stored.TokenHash, []byte(code)) {
 		t.Errorf("the store was given the plaintext code: %+v", stored)
+	}
+}
+
+// TestCreateTokenShape: the code is an invitation token, "susu_inv_" and 43
+// base64url characters, hashed whole (prefix included) for the store, and no
+// reading of the entropy beyond 32 bytes is made for it.
+func TestCreateTokenShape(t *testing.T) {
+	t.Parallel()
+
+	harn := newHarness(t)
+
+	rec := harn.asAdmin(http.MethodPost, collectionPath, validCreate)
+	got := decode[wireCreated](t, rec)
+
+	if !regexp.MustCompile(`^susu_inv_[A-Za-z0-9_-]{43}$`).MatchString(got.Code) {
+		t.Errorf("code = %q, want susu_inv_ and 43 base64url characters", got.Code)
+	}
+
+	parsed, err := input.ParseInvitationToken(got.Code)
+	if err != nil {
+		t.Fatalf("the code does not parse as an invitation token: %v", err)
+	}
+
+	sum := secret.Hash(got.Code)
+	stored := harn.store.calls[0].created.TokenHash
+
+	if !bytes.Equal(stored, sum[:]) || !bytes.Equal(stored, parsed.Hash()) {
+		t.Errorf("stored hash %x, want secret.Hash(code) %x", stored, sum)
+	}
+
+	if harn.entropy.taken != secret.BodyBytes {
+		t.Errorf("took %d entropy bytes, want %d", harn.entropy.taken, secret.BodyBytes)
+	}
+}
+
+// TestCreateDefaultExpiry: without expiresAt an invitation expires exactly
+// input.ExpiryHorizon after the request's clock reading, counted in whole
+// seconds, and that default passes the same parser as a chosen expiry for every
+// fraction of a second the clock may carry. A chosen expiry at the horizon is
+// accepted and one second past it is refused, whatever the fraction.
+func TestCreateDefaultExpiry(t *testing.T) {
+	t.Parallel()
+
+	horizon := int64(input.ExpiryHorizon / time.Second)
+	tenYears := int64(10 * 365 * 24 * 3600)
+
+	if horizon != tenYears {
+		t.Fatalf("the horizon is %d seconds, want ten years of 365 days (%d)", horizon, tenYears)
+	}
+
+	for _, fraction := range []time.Duration{0, 1, 500 * time.Millisecond, time.Second - 1} {
+		t.Run(fraction.String(), func(t *testing.T) {
+			t.Parallel()
+
+			now := fixedNow().Add(fraction)
+			wantExpiry := fixedNow().Unix() + tenYears
+
+			harn := newHarness(t)
+			harn.clock.now = now
+
+			rec := harn.asAdmin(http.MethodPost, collectionPath, validCreate)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+
+			created := harn.store.calls[0].created
+			if created.ExpiresAt.Unix() != wantExpiry || created.CreatedAt != now {
+				t.Errorf("stored expiry %d created %v, want %d and %v",
+					created.ExpiresAt.Unix(), created.CreatedAt, wantExpiry, now)
+			}
+
+			if got := decode[wireCreated](t, rec); got.ExpiresAt == nil || *got.ExpiresAt != wantExpiry {
+				t.Errorf("response expiresAt = %v, want %d", got.ExpiresAt, wantExpiry)
+			}
+
+			atHorizon := harn.asAdmin(http.MethodPost, collectionPath, typed("1", "", secs(wantExpiry)))
+			pastHorizon := harn.asAdmin(http.MethodPost, collectionPath, typed("1", "", secs(wantExpiry+1)))
+
+			if atHorizon.Code != http.StatusCreated || pastHorizon.Code != http.StatusBadRequest {
+				t.Errorf("at the horizon %d, past it %d, want 201 and 400", atHorizon.Code, pastHorizon.Code)
+			}
+		})
 	}
 }
 
@@ -482,10 +583,10 @@ func TestCreateExpiryFollowsTheSubSecondClock(t *testing.T) {
 	}
 }
 
-// TestCreateFailsWhenItCannotGenerateACode: an entropy source that fails or
+// TestCreateFailsWhenItCannotGenerateAToken: an entropy source that fails or
 // gives too little is the service's failure. Nothing is stored, no id is
 // issued, and the client sees a bare internal error with no cause.
-func TestCreateFailsWhenItCannotGenerateACode(t *testing.T) {
+func TestCreateFailsWhenItCannotGenerateAToken(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -495,7 +596,7 @@ func TestCreateFailsWhenItCannotGenerateACode(t *testing.T) {
 	}{
 		{"source fails", failingReader{}, errEntro},
 		{"source is empty", bytes.NewReader(nil), io.EOF},
-		{"source is one byte short", bytes.NewReader(sequence(0, invitations.CodeBytes-1)), io.ErrUnexpectedEOF},
+		{"source is one byte short", bytes.NewReader(sequence(0, secret.BodyBytes-1)), io.ErrUnexpectedEOF},
 		{"source fails after a partial read", io.MultiReader(bytes.NewReader(sequence(0, 8)), failingReader{}), errEntro},
 	}
 
@@ -515,7 +616,7 @@ func TestCreateFailsWhenItCannotGenerateACode(t *testing.T) {
 			}
 
 			if len(harn.store.calls) != 0 || harn.idCalls != 0 {
-				t.Errorf("a failed code was stored: %v, %d ids", harn.opsCalled(), harn.idCalls)
+				t.Errorf("a failed token was stored: %v, %d ids", harn.opsCalled(), harn.idCalls)
 			}
 		})
 	}
@@ -544,8 +645,8 @@ func TestCreateFailsWhenTheStoreDoes(t *testing.T) {
 
 			wantError(t, harn, rec, tt.status, tt.wireCode, tt.logCode)
 
-			if code := codeOf(sequence(0, invitations.CodeBytes)); strings.Contains(rec.Body.String(), code) {
-				t.Errorf("a failed create returned its code: %s", rec.Body.String())
+			if code := codeOf(sequence(0, secret.BodyBytes)); strings.Contains(rec.Body.String(), code) {
+				t.Errorf("a failed create returned its token: %s", rec.Body.String())
 			}
 		})
 	}

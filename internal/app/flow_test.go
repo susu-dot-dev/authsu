@@ -13,6 +13,7 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -31,7 +32,9 @@ const (
 	userArgHandle  = 1
 	userArgRole    = 2
 	userArgProfile = 3
-	userArgType    = 6
+	userArgHash    = 5
+	userArgKind    = 6
+	userArgType    = 7
 
 	credArgRowID    = 0
 	credArgID       = 1
@@ -42,14 +45,33 @@ const (
 )
 
 // Where the values are in the statements of a login (see store.CreateSession):
-// the flags update, then the session insert.
+// the flags update, the secret insert, then the session insert.
 const (
-	sessionArgKid           = 0
-	sessionArgKind          = 2
-	sessionArgJWK           = 3
-	sessionArgExpires       = 4
-	sessionArgGrant         = 5
-	sessionArgCredentialRow = 6
+	secretArgID      = 0
+	secretArgKind    = 1
+	secretArgHash    = 2
+	secretArgExpires = 3
+	secretArgCreated = 4
+
+	sessionArgID            = 0
+	sessionArgKind          = 1
+	sessionArgCredentialSub = 2
+	sessionArgCredentialRow = 3
+	sessionArgGrant         = 4
+)
+
+// Where the values are in the statements of an agent create (see
+// store.CreateAgent): the agent insert, the key's secret insert (laid out as
+// above), then the key's own row.
+const (
+	agentArgID     = 0
+	agentArgScopes = 2
+	agentArgOwner  = 4
+
+	keyArgID     = 0
+	keyArgKind   = 1
+	keyArgAgent  = 2
+	keyArgScopes = 3
 )
 
 const (
@@ -60,12 +82,10 @@ const (
 	pathSession        = "/api/session"
 	pathLogout         = "/api/logout"
 
-	readInvitation = "FROM invitations i"
+	readInvitation = "SELECT i.type AS type"
 	readCredential = "FROM credentials c"
 	writeAccount   = "INSERT INTO users"
 	writeSession   = "UPDATE credentials SET flags"
-	readKey        = "FROM japikeys k"
-	revokeKey      = "UPDATE japikeys"
 	registeredName = "Alice"
 )
 
@@ -244,6 +264,18 @@ func asBlob(arg any) []byte {
 	return blob
 }
 
+// checkInvitationLookup checks that the account write finds the invitation by
+// the hash of the whole token, as the kind of secret it is.
+func checkInvitationLookup(t *testing.T, user []any) {
+	t.Helper()
+
+	invitation := secret.Hash(someCode)
+	if !slices.Equal(asBlob(user[userArgHash]), invitation[:]) || user[userArgKind] != store.KindInvitation {
+		t.Errorf("hash and kind = %x, %v, want the invitation token's hash and %s",
+			user[userArgHash], user[userArgKind], store.KindInvitation)
+	}
+}
+
 // checkCeremonyValues checks the account batch's arguments against what the
 // passkey and the begin fixed, and against the types D1 takes.
 func checkCeremonyValues(t *testing.T, pk passkey, user, credential []any) {
@@ -266,6 +298,8 @@ func checkCeremonyValues(t *testing.T, pk passkey, user, credential []any) {
 	if user[userArgRole] != "admin" || user[userArgType] != store.InvitationFirstRun {
 		t.Errorf("role %v for type %v, want admin for first_run", user[userArgRole], user[userArgType])
 	}
+
+	checkInvitationLookup(t, user)
 
 	if user[userArgProfile] != `{"name":"`+registeredName+`"}` {
 		t.Errorf("profile = %v", user[userArgProfile])
@@ -351,33 +385,13 @@ func loginBegin(t *testing.T, h *harness) string {
 	return challenge
 }
 
-// kidOfToken reads the kid from the header of a JWT, without verifying it.
-func kidOfToken(t *testing.T, token string) string {
-	t.Helper()
-
-	header, _, found := strings.Cut(token, ".")
-	if !found {
-		t.Fatalf("token %q has no header", token)
-	}
-
-	var parsed struct {
-		Kid string `json:"kid"`
-	}
-
-	err := json.Unmarshal(unb64(t, header), &parsed)
-	if err != nil {
-		t.Fatalf("token header: %v", err)
-	}
-
-	return parsed.Kid
-}
-
 // loggedIn is what a login answered and wrote.
 type loggedIn struct {
 	// cookie is the session cookie the browser would send back.
 	cookie *http.Cookie
-	// args are the arguments of the session insert.
-	args []any
+	// secret and session are the arguments of the secret insert and of the
+	// session insert.
+	secret, session []any
 	// body is the answer.
 	UserID    string `json:"userId"`
 	Role      string `json:"role"`
@@ -416,7 +430,7 @@ func sessionCookieOf(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie 
 
 // checkLogin checks a login that was accepted and returns what it wrote: the
 // lookup was by the registered credential id, the batch is the flags of that
-// passkey and then the session, and the answer names the registered account
+// passkey, the session's secret and then the session, and the answer names the registered account
 // without the token in its body.
 func checkLogin(
 	t *testing.T, h *harness, rec *httptest.ResponseRecorder, pk passkey, account []store.Statement,
@@ -435,18 +449,20 @@ func checkLogin(
 	cookie := sessionCookieOf(t, rec)
 
 	batch := h.lastCall()
-	if len(batch) != 2 || batch[0].Args[0] != int64(0x05) || batch[0].Args[1] != account[1].Args[credArgRowID] {
-		t.Fatalf("login batch = %v, want the flags of the registered credential, then the session", batch)
+	if len(batch) != 3 || batch[0].Args[0] != int64(0x05) || batch[0].Args[1] != account[1].Args[credArgRowID] {
+		t.Fatalf("login batch = %v, want the flags of the registered credential, the secret, then the session", batch)
 	}
 
-	login := loggedIn{cookie: requestCookie(auth.CookieName, cookie.Value), args: batch[1].Args}
+	login := loggedIn{
+		cookie: requestCookie(auth.CookieName, cookie.Value), secret: batch[1].Args, session: batch[2].Args,
+	}
 
 	err := json.Unmarshal(rec.Body.Bytes(), &login)
 	if err != nil {
 		t.Fatalf("login body %q: %v", rec.Body, err)
 	}
 
-	wantUser, wantExpiry := account[0].Args[userArgID], login.args[sessionArgExpires]
+	wantUser, wantExpiry := account[0].Args[userArgID], login.secret[secretArgExpires]
 	if login.UserID != wantUser || login.Role != "admin" || login.ExpiresAt != wantExpiry {
 		t.Errorf("login = %+v, want the registered user, admin, expiring as written", login)
 	}
@@ -471,7 +487,7 @@ func TestLoginAndSessionFollowRegistration(t *testing.T) {
 	}
 
 	lookup := step{match: readCredential, results: rows(credentialRowOf(account)), err: nil}
-	session := step{match: writeSession, results: batchOf(2), err: nil}
+	session := step{match: writeSession, results: batchOf(3), err: nil}
 
 	rec, challenge := logIn(t, h, pk, lookup, session)
 	login := checkLogin(t, h, rec, pk, account)
@@ -480,10 +496,8 @@ func TestLoginAndSessionFollowRegistration(t *testing.T) {
 
 	// The boundary accepts the session from exactly what login wrote, typed as
 	// D1 returns it, and names the same account.
-	keyRow := []any{
-		login.args[sessionArgJWK], login.UserID, login.args[sessionArgCredentialRow], "admin", login.ExpiresAt, "", "",
-	}
-	stored := step{match: readKey, results: rows(keyRow), err: nil}
+	sessionRow := []any{login.secret[secretArgID], login.UserID, "admin", login.secret[secretArgExpires]}
+	stored := step{match: readSession, results: rows(sessionRow), err: nil}
 
 	h.expect(stored)
 
@@ -492,30 +506,34 @@ func TestLoginAndSessionFollowRegistration(t *testing.T) {
 		t.Fatalf("session = %d %s, want the registered user", rec.Code, rec.Body)
 	}
 
-	if read := h.lastCall()[0].Args; read[0] != login.args[sessionArgKid] || read[1] != store.KindSession {
-		t.Errorf("key read args = %v, want the session login wrote (%v) as a session", read, login.args[sessionArgKid])
+	// The lookup is by the hash of the token the cookie carries, which is the
+	// hash login stored, as a session, at an instant.
+	if read := h.lastCall()[0].Args; !slices.Equal(asBlob(read[0]), asBlob(login.secret[secretArgHash])) ||
+		read[1] != store.KindSession {
+		t.Errorf("lookup args = %v, want the hash login stored (%x) as a session", read, login.secret[secretArgHash])
 	}
 
-	// Logout ends exactly that key.
-	h.expect(stored, step{match: revokeKey, results: changes(1), err: nil})
+	// Logout ends exactly that session.
+	h.expect(stored, step{match: revokeToken, results: changes(1), err: nil})
 
 	rec = h.do(request{method: http.MethodPost, path: pathLogout, cookies: []*http.Cookie{login.cookie}})
 	if rec.Code != http.StatusNoContent || !clearsSession(rec.Result().Cookies()) {
 		t.Errorf("logout = %d %v, want 204 clearing the cookie", rec.Code, rec.Result().Cookies())
 	}
 
-	// The write binds the time, the kid and the key's owner, and no kind: it ends
-	// the key that was presented, whichever it is, and only if it is the user's.
-	checkRevokeArgs(t, h.lastCall()[0].Args, login.args[sessionArgKid], login.UserID)
+	// The write binds the time, the secret's id and the account that owns it,
+	// and no kind: it ends the credential that was presented, whichever it is,
+	// and only if it is the user's.
+	checkRevokeArgs(t, h.lastCall()[0].Args, login.secret[secretArgID], login.UserID)
 }
 
-// checkRevokeArgs holds the arguments of the logout write: the time, the key
-// that was presented and the user who owns it.
-func checkRevokeArgs(t *testing.T, args []any, kid, owner any) {
+// checkRevokeArgs holds the arguments of the logout write: the time, the id of
+// the secret that was presented and the user who owns it.
+func checkRevokeArgs(t *testing.T, args []any, id, owner any) {
 	t.Helper()
 
-	if len(args) != 3 || args[1] != kid || args[2] != owner {
-		t.Errorf("revoke args = %v, want the time, the presented key's kid %v and its owner %v", args, kid, owner)
+	if len(args) != 3 || args[1] != id || args[2] != owner {
+		t.Errorf("revoke args = %v, want the time, the presented secret's id %v and its owner %v", args, id, owner)
 	}
 }
 
@@ -542,38 +560,66 @@ func TestLoginReplayIsTheOne401(t *testing.T) {
 	}
 }
 
-// checkSessionRow checks the arguments of the session insert of a login: the
-// types the columns need, the values the ceremony fixed, and the sizes the
-// schema allows.
+// checkSessionRow checks the arguments of the secret and session inserts of a
+// login: the types the columns need, the values the ceremony fixed, the token
+// that went out in the cookie being the one whose hash was stored, and the
+// sizes the schema allows.
 func checkSessionRow(t *testing.T, login loggedIn, account []store.Statement, challenge string) {
 	t.Helper()
 
-	args := login.args
+	checkSessionSecret(t, login)
 
-	if args[sessionArgKid] != kidOfToken(t, login.cookie.Value) || args[sessionArgKind] != store.KindSession {
-		t.Errorf("kid, kind = %v, %v, want the token's %s and %s",
-			args[sessionArgKid], args[sessionArgKind], kidOfToken(t, login.cookie.Value), store.KindSession)
-	}
+	secretArgs, sessionArgs := login.secret, login.session
 
-	if args[1] != account[1].Args[credArgRowID] || args[sessionArgCredentialRow] != args[1] {
-		t.Errorf("credential row ids = %v and %v, want the registered passkey twice", args[1], args[sessionArgCredentialRow])
+	if sessionArgs[sessionArgCredentialSub] != account[1].Args[credArgRowID] ||
+		sessionArgs[sessionArgCredentialRow] != sessionArgs[sessionArgCredentialSub] {
+		t.Errorf("credential row ids = %v and %v, want the registered passkey twice",
+			sessionArgs[sessionArgCredentialSub], sessionArgs[sessionArgCredentialRow])
 	}
 
 	grant := sha256.Sum256(unb64(t, challenge))
-	if !slices.Equal(asBlob(args[sessionArgGrant]), grant[:]) {
-		t.Errorf("granted_from = %v, want the SHA-256 of the login challenge", args[sessionArgGrant])
-	}
-
-	if _, isInt := args[sessionArgExpires].(int64); !isInt {
-		t.Errorf("expires_at = %#v, want an int64", args[sessionArgExpires])
+	if !slices.Equal(asBlob(sessionArgs[sessionArgGrant]), grant[:]) {
+		t.Errorf("granted_from = %v, want the SHA-256 of the login challenge", sessionArgs[sessionArgGrant])
 	}
 
 	checkFits(t, []fit{
-		{"kid", `length\(kid\) = (\d+)`, args[sessionArgKid], true},
-		{"jwk", `length\(jwk\) <= (\d+)`, args[sessionArgJWK], false},
-		{"kind", `length\(kind\) BETWEEN 1 AND (\d+)`, args[sessionArgKind], false},
-		{"granted_from", `length\(granted_from\) = (\d+)`, args[sessionArgGrant], true},
+		{"secret id", `length\(id\) = (\d+)`, secretArgs[secretArgID], true},
+		{"hash", `length\(hash\) = (\d+)`, secretArgs[secretArgHash], true},
+		{"kind", `length\(kind\) BETWEEN 1 AND (\d+)`, secretArgs[secretArgKind], false},
+		{"granted_from", `length\(granted_from\) = (\d+)`, sessionArgs[sessionArgGrant], true},
 	})
+}
+
+// checkSessionSecret checks that the session's secret holds the hash of the
+// token the cookie carries, under the session kind and one id shared with the
+// session's own row, with times as the integers D1 takes.
+func checkSessionSecret(t *testing.T, login loggedIn) {
+	t.Helper()
+
+	secretArgs, sessionArgs := login.secret, login.session
+
+	token, err := input.ParseSessionToken(login.cookie.Value)
+	if err != nil {
+		t.Fatalf("the session cookie %q is not a session token: %v", login.cookie.Value, err)
+	}
+
+	if !slices.Equal(asBlob(secretArgs[secretArgHash]), token.Hash()) || secretArgs[secretArgKind] != store.KindSession ||
+		sessionArgs[sessionArgKind] != store.KindSession {
+		t.Errorf("hash, kinds = %x, %v, %v, want the token's hash and %s twice",
+			secretArgs[secretArgHash], secretArgs[secretArgKind], sessionArgs[sessionArgKind], store.KindSession)
+	}
+
+	if secretArgs[secretArgID] != sessionArgs[sessionArgID] || !uuidV7.MatchString(asText(secretArgs[secretArgID])) {
+		t.Errorf("ids = %v and %v, want one UUIDv7 for the secret and its session",
+			secretArgs[secretArgID], sessionArgs[sessionArgID])
+	}
+
+	times := map[string]any{"expires_at": secretArgs[secretArgExpires], "created_at": secretArgs[secretArgCreated]}
+	for name, arg := range times {
+		if _, isInt := arg.(int64); !isInt {
+			t.Errorf("%s = %#v, want an int64", name, arg)
+		}
+	}
 }
 
 // TestLoginFinishOutcomes crosses the credential lookup's answers, as D1 could
@@ -717,7 +763,7 @@ func TestRegisteredProfileIsServedAsJSON(t *testing.T) {
 			signedIn := newSession(t, adminID)
 			row := []any{memberID, roleMember, someID, profile, nil, int64(1_700_000_000)}
 
-			h.expect(signedIn.activeKeyStep(roleAdmin), step{match: "FROM users", results: rows(row), err: nil})
+			h.expect(signedIn.activeSessionStep(roleAdmin), step{match: "FROM users", results: rows(row), err: nil})
 
 			rec := h.do(request{method: http.MethodGet, path: "/api/user", cookies: []*http.Cookie{signedIn.cookie}})
 			if rec.Code != http.StatusOK {
@@ -745,51 +791,67 @@ func TestRegisteredProfileIsServedAsJSON(t *testing.T) {
 }
 
 // checkAgentBatch checks the batch of an agent create: the agent of the
-// signed-in owner and its api key, whose kid and expiry are the token's, with
-// the types and sizes the schema accepts.
-func checkAgentBatch(t *testing.T, batch []store.Statement, token string, expires int64) {
+// signed-in owner, its key's secret and the key's own row, whose hash is the
+// token's and whose expiry is the one reported, with the types and sizes the
+// schema accepts.
+func checkAgentBatch(t *testing.T, batch []store.Statement, created string, expires int64) {
 	t.Helper()
 
-	if len(batch) != 2 {
-		t.Fatalf("batch has %d statements, want the agent and its key", len(batch))
+	if len(batch) != 3 {
+		t.Fatalf("batch has %d statements, want the agent, its key's secret and its key", len(batch))
 	}
 
-	agent, key := batch[0].Args, batch[1].Args
+	agent, secretArgs, key := batch[0].Args, batch[1].Args, batch[2].Args
 
-	// agent: id, name, scopes, created_at, owner, limit. key: kid, agent id,
-	// kind, jwk, expires_at, agent id, scope, created_at.
-	if agent[4] != memberID || key[2] != store.KindAPIKey || key[1] != agent[0] || key[5] != agent[0] {
-		t.Errorf("agent args = %v, key args = %v, want the signed-in owner and an api_key of the new agent", agent, key)
+	if agent[agentArgOwner] != memberID || key[keyArgKind] != store.KindAPIKey || key[keyArgAgent] != agent[agentArgID] ||
+		secretArgs[secretArgKind] != store.KindAPIKey || key[keyArgID] != secretArgs[secretArgID] {
+		t.Errorf("agent args = %v, secret args = %v, key args = %v, want the signed-in owner and an api_key of the new agent",
+			agent, secretArgs, key)
 	}
 
-	if key[0] != kidOfToken(t, token) || key[4] != expires {
-		t.Errorf("key kid and expiry = %v, %v, want the token's %s and %d", key[0], key[4], kidOfToken(t, token), expires)
-	}
+	checkKeySecret(t, secretArgs, created, expires)
 
-	_, err := input.ParseID(asText(agent[0]))
-	if !uuidV7.MatchString(asText(agent[0])) || err != nil {
-		t.Errorf("agent id = %v, want a canonical UUIDv7 that the routes accept back: %v", agent[0], err)
+	for _, id := range []any{agent[agentArgID], secretArgs[secretArgID]} {
+		_, err := input.ParseID(asText(id))
+		if !uuidV7.MatchString(asText(id)) || err != nil {
+			t.Errorf("id = %v, want a canonical UUIDv7 that the routes accept back: %v", id, err)
+		}
 	}
 
 	checkFits(t, []fit{
-		{"kid", `length\(kid\) = (\d+)`, key[0], true},
-		{"jwk", `length\(jwk\) <= (\d+)`, key[3], false},
-		{"kind", `length\(kind\) BETWEEN 1 AND (\d+)`, key[2], false},
-		{"scope", `length\(cast\(scope AS BLOB\)\) BETWEEN 1 AND (\d+)`, key[6], false},
-		{"scopes", `length\(cast\(scopes AS BLOB\)\) BETWEEN 1 AND (\d+)`, agent[2], false},
+		{"hash", `length\(hash\) = (\d+)`, secretArgs[secretArgHash], true},
+		{"kind", `length\(kind\) BETWEEN 1 AND (\d+)`, key[keyArgKind], false},
+		{"scope", `length\(cast\(scope AS BLOB\)\) BETWEEN 1 AND (\d+)`, key[keyArgScopes], false},
+		{"scopes", `length\(cast\(scopes AS BLOB\)\) BETWEEN 1 AND (\d+)`, agent[agentArgScopes], false},
 	})
 }
 
+// checkKeySecret checks that the key's secret stores the hash of the token that
+// was returned and the expiry that was reported with it.
+func checkKeySecret(t *testing.T, secretArgs []any, created string, expires int64) {
+	t.Helper()
+
+	token, err := input.ParseAPIKeyToken(created)
+	if err != nil {
+		t.Fatalf("the token %q is not an API key token: %v", created, err)
+	}
+
+	if !slices.Equal(asBlob(secretArgs[secretArgHash]), token.Hash()) || secretArgs[secretArgExpires] != expires {
+		t.Errorf("hash and expiry = %x, %v, want the token's hash and %d", secretArgs[secretArgHash],
+			secretArgs[secretArgExpires], expires)
+	}
+}
+
 // TestAgentCreateWritesWhatTheSchemaAccepts crosses the agent create's batch
-// with the real key creation: the agent and its key are written for the
-// signed-in account with the types and sizes the schema accepts, and the token
-// that comes back once is not accepted as a session, not even when the database
-// were to answer a session read with the agent's own key.
+// with the real key issuing: the agent, its key's secret and its key are written
+// for the signed-in account with the types and sizes the schema accepts, and
+// the token that comes back once is not accepted as a session, which is refused
+// before the database is asked.
 func TestAgentCreateWritesWhatTheSchemaAccepts(t *testing.T) {
 	t.Parallel()
 
 	signedIn := newSession(t, memberID)
-	h := newHarness(t, fullEnv(), signedIn.activeKeyStep(roleMember),
+	h := newHarness(t, fullEnv(), signedIn.activeSessionStep(roleMember),
 		step{match: "INSERT INTO agents", results: createdAgentBatch(`["default:agent"]`), err: nil})
 
 	rec := h.do(request{
@@ -813,19 +875,23 @@ func TestAgentCreateWritesWhatTheSchemaAccepts(t *testing.T) {
 
 	checkAgentBatch(t, h.lastCall(), created.Key.Token, created.Key.ExpiresAt)
 
-	batch := h.lastCall()
-	key := batch[1].Args
-
-	// The agent's token is not a session, whatever the database answers.
-	agentRow := []any{key[3], memberID, "", roleMember, key[4], batch[0].Args[0], batch[0].Args[2]}
-
-	h.expect(step{match: readKey, results: rows(agentRow), err: nil})
+	// The agent's token is not a session, whatever the database would answer:
+	// the cookie parser refuses it, so there is no read at all.
+	calls := h.exec.callCount()
 
 	rec = h.do(request{
 		method: http.MethodGet, path: pathSession, cookies: []*http.Cookie{requestCookie(auth.CookieName, created.Key.Token)},
 	})
-	if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
-		t.Errorf("an api key as a session = %d %s, want the one 401", rec.Code, rec.Body)
+	if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated || h.exec.callCount() != calls {
+		t.Errorf("an api key as a session = %d %s after %d calls, want the one 401 with no read",
+			rec.Code, rec.Body, h.exec.callCount()-calls)
+	}
+
+	// And the session's own token is not an API key.
+	rec = h.do(request{method: http.MethodGet, path: "/api/agent", headers: bearer(signedIn.issued.Token)})
+	if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated || h.exec.callCount() != calls {
+		t.Errorf("a session as an api key = %d %s after %d calls, want the one 401 with no read",
+			rec.Code, rec.Body, h.exec.callCount()-calls)
 	}
 }
 
@@ -842,12 +908,12 @@ type bearerCreated struct {
 }
 
 // createAgentForBearer creates an agent as the signed-in member and returns the
-// response and the two statements of the batch the app wrote.
-func createAgentForBearer(t *testing.T) (*harness, bearerCreated, store.Statement, store.Statement) {
+// response and the three statements of the batch the app wrote.
+func createAgentForBearer(t *testing.T) (*harness, bearerCreated, []store.Statement) {
 	t.Helper()
 
 	signedIn := newSession(t, memberID)
-	h := newHarness(t, fullEnv(), signedIn.activeKeyStep(roleMember),
+	h := newHarness(t, fullEnv(), signedIn.activeSessionStep(roleMember),
 		step{match: "INSERT INTO agents", results: createdAgentBatch(`["default:agent"]`), err: nil})
 
 	rec := h.do(request{
@@ -864,25 +930,37 @@ func createAgentForBearer(t *testing.T) (*harness, bearerCreated, store.Statemen
 		t.Fatalf("body %q: %v", rec.Body, err)
 	}
 
-	batch := h.lastCall()
+	return h, created, h.lastCall()
+}
 
-	return h, created, batch[0], batch[1]
+// agentKeyRow is what D1 returns for the lookup of the key a create wrote: the
+// key's secret id and expiry, its owner, the agent's id and its stored scopes,
+// and the key's own scope, all as the batch bound them.
+func agentKeyRow(batch []store.Statement) []any {
+	agent, secretArgs, key := batch[0].Args, batch[1].Args, batch[2].Args
+
+	return []any{
+		secretArgs[secretArgID], memberID, roleMember, secretArgs[secretArgExpires],
+		agent[agentArgID], agent[agentArgScopes], key[keyArgScopes],
+	}
 }
 
 // TestAgentKeyIsAcceptedAsABearerWithTheScopesItWasGiven crosses the whole of
 // scopes with the real store SQL's types: the agent's key, created and written by
-// a create, is presented as a bearer token to a database that answers a read of
-// that key with the agent's stored scopes. It reads agents (the default agent
+// a create, is presented as a bearer token to a database that answers a lookup
+// of that key with the agent's stored scopes. It reads agents (the default agent
 // bundle) and cannot create them, and what the key's row stores as its scope is
-// the claim that was signed.
+// what it may do.
 func TestAgentKeyIsAcceptedAsABearerWithTheScopesItWasGiven(t *testing.T) {
 	t.Parallel()
 
-	h, created, agent, key := createAgentForBearer(t)
+	h, created, batch := createAgentForBearer(t)
+	agent, secretArgs, key := batch[0], batch[1], batch[2]
 
-	// The columns hold the JSON text of the lists that were returned and signed.
-	if agent.Args[2] != `["default:agent"]` || key.Args[6] != `["default:agent"]` {
-		t.Errorf("stored scopes = %v and %v, want the default agent bundle as JSON", agent.Args[2], key.Args[6])
+	// The columns hold the JSON text of the lists that were returned.
+	if agent.Args[agentArgScopes] != `["default:agent"]` || key.Args[keyArgScopes] != `["default:agent"]` {
+		t.Errorf("stored scopes = %v and %v, want the default agent bundle as JSON",
+			agent.Args[agentArgScopes], key.Args[keyArgScopes])
 	}
 
 	if !slices.Equal(created.Agent.Scopes, []string{"default:agent"}) ||
@@ -890,28 +968,32 @@ func TestAgentKeyIsAcceptedAsABearerWithTheScopesItWasGiven(t *testing.T) {
 		t.Errorf("returned scopes = %v and %v", created.Agent.Scopes, created.Key.Scopes)
 	}
 
-	// What D1 returns for the key's read: its owner, the agent's id and the
-	// agent's stored scopes, as text.
-	row := []any{key.Args[3], memberID, "", roleMember, key.Args[4], agent.Args[0], agent.Args[2]}
-	headers := map[string]string{"Authorization": "Bearer " + created.Key.Token}
+	row := agentKeyRow(batch)
+	headers := bearer(created.Key.Token)
 
-	// Reading agents: the key is read as an api_key, then the list runs.
-	h.expect(step{match: readKey, results: rows(row), err: nil}, step{match: "FROM agents", results: rows(), err: nil})
+	// Reading agents: the key is looked up as an api_key, then the list runs.
+	h.expect(step{match: readAPIKey, results: rows(row), err: nil}, step{match: "FROM agents", results: rows(), err: nil})
 	wantBearer(t, h, request{method: http.MethodGet, path: "/api/agent", headers: headers}, http.StatusOK, "")
+
+	// The lookup is by the hash the create stored.
+	read := h.exec.calls[len(h.exec.calls)-2][0].Args
+	if !slices.Equal(asBlob(read[0]), asBlob(secretArgs.Args[secretArgHash])) {
+		t.Errorf("lookup args = %v, want the hash the create stored", read)
+	}
 
 	// Creating needs agent:create and renaming agent:update, which the default
 	// agent bundle lacks: both are refused at the boundary, so the only database
-	// call is the key's own read. (An agent that held agent:update would still be
+	// call is the key's own lookup. (An agent that held agent:update would still be
 	// refused renaming, as agents are peers: that is a different code, and is
 	// pinned by the agents package.)
-	h.expect(step{match: readKey, results: rows(row), err: nil})
+	h.expect(step{match: readAPIKey, results: rows(row), err: nil})
 	wantBearer(t, h, request{method: http.MethodPost, path: "/api/agent", body: `{"name":"child"}`, headers: headers},
 		http.StatusForbidden, "insufficient_scope")
 
-	h.expect(step{match: readKey, results: rows(row), err: nil})
-	wantBearer(t, h, request{
-		method: http.MethodPatch, path: "/api/agent/" + asText(agent.Args[0]), body: `{"name":"x"}`, headers: headers,
-	}, http.StatusForbidden, "insufficient_scope")
+	h.expect(step{match: readAPIKey, results: rows(row), err: nil})
+	rename := "/api/agent/" + asText(agent.Args[agentArgID])
+	wantBearer(t, h, request{method: http.MethodPatch, path: rename, body: `{"name":"x"}`, headers: headers},
+		http.StatusForbidden, "insufficient_scope")
 
 	if got := apiKeyReads(h); got != 3 {
 		t.Errorf("api_key reads = %d, want 3 (list, create, rename): the bearer is never read as a session", got)
@@ -920,17 +1002,18 @@ func TestAgentKeyIsAcceptedAsABearerWithTheScopesItWasGiven(t *testing.T) {
 
 // TestAnAPIKeyEndsItself: logout is key:revoke_self, so the API key a request
 // presented can end itself, with no scope at all, through the real SQL: the
-// write binds the time, the key's own kid and its owner, and nothing about its kind. The
-// default agent bundle cannot revoke agents, and still can sign itself out.
+// write binds the time, the key's own secret id and its owner, and nothing about
+// its kind. The default agent bundle cannot revoke agents, and still can sign
+// itself out.
 func TestAnAPIKeyEndsItself(t *testing.T) {
 	t.Parallel()
 
-	h, created, agent, key := createAgentForBearer(t)
+	h, created, batch := createAgentForBearer(t)
 
-	row := []any{key.Args[3], memberID, "", roleMember, key.Args[4], agent.Args[0], agent.Args[2]}
-	headers := map[string]string{"Authorization": "Bearer " + created.Key.Token}
+	headers := bearer(created.Key.Token)
 
-	h.expect(step{match: readKey, results: rows(row), err: nil}, step{match: revokeKey, results: changes(1), err: nil})
+	h.expect(step{match: readAPIKey, results: rows(agentKeyRow(batch)), err: nil},
+		step{match: revokeToken, results: changes(1), err: nil})
 
 	rec := h.do(request{method: http.MethodPost, path: pathLogout, headers: headers})
 	if rec.Code != http.StatusNoContent {
@@ -938,9 +1021,9 @@ func TestAnAPIKeyEndsItself(t *testing.T) {
 	}
 
 	revoke := h.lastCall()[0]
-	if len(revoke.Args) != 3 || revoke.Args[1] != key.Args[0] || revoke.Args[2] != memberID ||
+	if len(revoke.Args) != 3 || revoke.Args[1] != batch[1].Args[secretArgID] || revoke.Args[2] != memberID ||
 		strings.Contains(revoke.Query, "kind") {
-		t.Errorf("revoke = %q %v, want the key's own kid and its owner, and no kind", revoke.Query, revoke.Args)
+		t.Errorf("revoke = %q %v, want the key's own id and its owner, and no kind", revoke.Query, revoke.Args)
 	}
 }
 
@@ -963,7 +1046,7 @@ func apiKeyReads(h *harness) int {
 	reads := 0
 
 	for _, call := range h.exec.calls {
-		if strings.Contains(call[0].Query, readKey) && call[0].Args[1] == store.KindAPIKey {
+		if strings.Contains(call[0].Query, readAPIKey) && call[0].Args[1] == store.KindAPIKey {
 			reads++
 		}
 	}

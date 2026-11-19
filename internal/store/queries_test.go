@@ -4,12 +4,14 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,8 +25,12 @@ import (
 // This file checks every query in the package without naming them: it reads the
 // package's own source and takes each constant whose name ends in "Query".
 // An operation added later is covered as soon as it follows that convention,
-// and a query that does not (built by concatenation, or named otherwise) fails
-// the first test here.
+// and a query that does not (named otherwise, or not a constant expression of
+// string literals and other string constants) fails the first test here.
+//
+// A query may be a concatenation of literals and other constants, such as the
+// shared predicate every resolve includes, and it is checked as the text the
+// database receives.
 
 // packageQueries returns the value of every ...Query constant of the package's
 // non-test source files, by name.
@@ -36,20 +42,38 @@ func packageQueries(t *testing.T) map[string]string {
 		t.Fatalf("read package directory: %v", err)
 	}
 
-	queries := map[string]string{}
+	consts := map[string]ast.Expr{}
 
 	for _, entry := range entries {
 		name := entry.Name()
 		if strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") {
-			fileQueries(t, name, queries)
+			fileConsts(t, name, consts)
 		}
+	}
+
+	queries := map[string]string{}
+
+	for name, expr := range consts {
+		if !strings.HasSuffix(name, "Query") {
+			continue
+		}
+
+		text, err := constText(expr, consts, nil)
+		if err != nil {
+			t.Errorf("%s must be a constant string expression, so that it can be checked: %v", name, err)
+
+			continue
+		}
+
+		queries[name] = text
 	}
 
 	return queries
 }
 
-// fileQueries adds the query constants of one source file.
-func fileQueries(t *testing.T, name string, into map[string]string) {
+// fileConsts adds the package-level constants of one source file that are given
+// a value, by name.
+func fileConsts(t *testing.T, name string, into map[string]ast.Expr) {
 	t.Helper()
 
 	file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
@@ -64,40 +88,152 @@ func fileQueries(t *testing.T, name string, into map[string]string) {
 		}
 
 		for _, spec := range gen.Specs {
-			if values, ok := spec.(*ast.ValueSpec); ok {
-				collectQueries(t, name, values, into)
+			values, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+
+			for i, ident := range values.Names {
+				if i < len(values.Values) {
+					into[ident.Name] = values.Values[i]
+				}
 			}
 		}
 	}
 }
 
-// collectQueries adds the query constants of one const spec.
-func collectQueries(t *testing.T, file string, spec *ast.ValueSpec, into map[string]string) {
-	t.Helper()
+var (
+	errNotConstant = errors.New("not a constant string expression")
+	errConstCycle  = errors.New("constant refers to itself")
+)
 
-	for i, name := range spec.Names {
-		if !strings.HasSuffix(name.Name, "Query") {
-			continue
+// constText evaluates a constant string expression: string literals, names of
+// other constants of the package, parentheses and "+". Anything else, such as a
+// function call, is refused: the query would then not be text a test can read.
+// seen holds the names being evaluated, to refuse a cycle.
+func constText(expr ast.Expr, consts map[string]ast.Expr, seen []string) (string, error) {
+	switch node := expr.(type) {
+	case *ast.BasicLit:
+		return literalText(node)
+	case *ast.ParenExpr:
+		return constText(node.X, consts, seen)
+	case *ast.Ident:
+		if slices.Contains(seen, node.Name) {
+			return "", fmt.Errorf("%w: %s", errConstCycle, node.Name)
 		}
 
-		var literal *ast.BasicLit
-
-		if i < len(spec.Values) {
-			literal, _ = spec.Values[i].(*ast.BasicLit)
+		value, ok := consts[node.Name]
+		if !ok {
+			return "", fmt.Errorf("%w: %s is not a constant of the package", errNotConstant, node.Name)
 		}
 
-		if literal == nil || literal.Kind != token.STRING {
-			t.Errorf("%s: %s must be a single string literal, so that it can be checked", file, name.Name)
+		return constText(value, consts, append(seen, node.Name))
+	case *ast.BinaryExpr:
+		return sumText(node, consts, seen)
+	default:
+		return "", fmt.Errorf("%w: %T", errNotConstant, expr)
+	}
+}
 
-			continue
-		}
+// literalText is the value of a string literal.
+func literalText(node *ast.BasicLit) (string, error) {
+	if node.Kind != token.STRING {
+		return "", fmt.Errorf("%w: literal %s", errNotConstant, node.Value)
+	}
 
-		text, err := strconv.Unquote(literal.Value)
+	text, err := strconv.Unquote(node.Value)
+	if err != nil {
+		return "", fmt.Errorf("unquote %s: %w", node.Value, err)
+	}
+
+	return text, nil
+}
+
+// sumText is the value of the concatenation of two constant strings.
+func sumText(node *ast.BinaryExpr, consts map[string]ast.Expr, seen []string) (string, error) {
+	if node.Op != token.ADD {
+		return "", fmt.Errorf("%w: operator %s", errNotConstant, node.Op)
+	}
+
+	left, err := constText(node.X, consts, seen)
+	if err != nil {
+		return "", err
+	}
+
+	right, err := constText(node.Y, consts, seen)
+	if err != nil {
+		return "", err
+	}
+
+	return left + right, nil
+}
+
+// TestConstText validates the evaluator the query checks rely on, including what
+// it refuses.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
+func TestConstText(t *testing.T) {
+	t.Parallel()
+
+	consts := map[string]ast.Expr{}
+
+	for name, source := range map[string]string{
+		"a": "`x ` + b", "b": "\"y\"", "c": "(a + \" z\")", "n": "1", "f": "g()", "m": "a - b",
+		"loop": "loop2", "loop2": "loop",
+	} {
+		expr, err := parser.ParseExpr(source)
 		if err != nil {
-			t.Fatalf("%s: unquote %s: %v", file, name.Name, err)
+			t.Fatalf("parse %q: %v", source, err)
 		}
 
-		into[name.Name] = text
+		consts[name] = expr
+	}
+
+	tests := []struct {
+		name string
+		want string
+		fail bool
+	}{
+		{name: "b", want: "y"},
+		{name: "a", want: "x y"},
+		{name: "c", want: "x y z"},
+		{name: "n", fail: true},
+		{name: "f", fail: true},
+		{name: "m", fail: true},
+		{name: "loop", fail: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := constText(consts[test.name], consts, nil)
+			if (err != nil) != test.fail || got != test.want {
+				t.Errorf("constText = %q, %v; want %q, failure %v", got, err, test.want, test.fail)
+			}
+		})
+	}
+
+	_, err := constText(&ast.Ident{Name: "missing"}, consts, nil)
+	if err == nil {
+		t.Error("an unknown constant was evaluated")
+	}
+
+	_, err = constText(&ast.BasicLit{Kind: token.STRING, Value: "`unterminated"}, consts, nil)
+	if err == nil {
+		t.Error("a malformed literal was evaluated")
+	}
+
+	_, err = constText(&ast.BinaryExpr{X: &ast.BasicLit{Kind: token.INT, Value: "1"}, Op: token.ADD,
+		Y: &ast.BasicLit{Kind: token.STRING, Value: "`a`"}}, consts, nil)
+	if err == nil {
+		t.Error("a sum with a non-string was evaluated")
+	}
+
+	_, err = constText(&ast.BinaryExpr{X: &ast.BasicLit{Kind: token.STRING, Value: "`a`"}, Op: token.ADD,
+		Y: &ast.BasicLit{Kind: token.INT, Value: "1"}}, consts, nil)
+	if err == nil {
+		t.Error("a sum with a non-string was evaluated")
 	}
 }
 
@@ -109,9 +245,14 @@ func TestQueriesAreFound(t *testing.T) {
 	queries := packageQueries(t)
 
 	for _, name := range []string{
-		"activeKeyQuery", "updateFlagsQuery", "insertSessionQuery", "revokeKeyQuery",
+		"insertSecretQuery", "resolveSessionQuery", "resolveAPIKeyQuery", "revokeSecretQuery",
+		"updateFlagsQuery", "insertSessionQuery",
 		"invitationQuery", "insertUserQuery", "insertCredentialQuery", "credentialQuery",
-		"firstRunStateQuery", "insertFirstRunQuery",
+		"firstRunStateQuery", "insertFirstRunSecretQuery", "insertFirstRunInvitationQuery",
+		"listInvitationsQuery", "readInvitationQuery", "insertInvitationQuery", "updateNumInvitesQuery",
+		"revokeInvitationSecretQuery",
+		"listUsersQuery", "getUserQuery", "revokeUserQuery", "revokeUserSecretsQuery", "revokeUserAgentsQuery",
+		"agentRevokeKeysQuery",
 	} {
 		if _, ok := queries[name]; !ok {
 			t.Errorf("query %s was not found", name)
@@ -120,11 +261,11 @@ func TestQueriesAreFound(t *testing.T) {
 }
 
 // mayDelete is the one place a row is deleted for real, and the table it may
-// delete from. Accounts, invitations, agents and keys are revoked and stay,
-// because the audit trail and the single-use guarantees depend on the rows
-// existing (see the migrations). An agent's labels are different: they are
-// mutable metadata its owner edits, with no authority to record (migration
-// 0006), and removing one deletes its row.
+// delete from. Accounts, invitations, agents, sessions and keys are revoked and
+// stay, because the audit trail and the single-use guarantees depend on the rows
+// existing (see the migration): a session's replay guard must outlive the
+// session. An agent's labels are different: they are mutable metadata its owner
+// edits, with no authority to record, and removing one deletes its row.
 //
 //nolint:gochecknoglobals // a fixed table shared by the tests below
 var mayDelete = map[string]string{"agentLabelRemoveQuery": "agent_labels"}
@@ -169,15 +310,35 @@ func TestNoQueryDeletes(t *testing.T) {
 
 // TestQueriesBindValuesTheCodeOwns holds that the values Go gives meaning to
 // are bound as arguments from their one definition and not repeated as
-// literals in SQL.
+// literals in SQL: the invitation type that is redeemable only once, and the
+// kind of every secret. The schema fixes each kind in a CHECK, which is a
+// different place and is held to the constants by TestKindsMatchTheMigration.
 func TestQueriesBindValuesTheCodeOwns(t *testing.T) {
 	t.Parallel()
 
 	for name, query := range packageQueries(t) {
-		for _, literal := range []string{"'first_run'", "'session'"} {
+		for _, literal := range []string{
+			"'" + store.InvitationFirstRun + "'", "'" + store.KindInvitation + "'",
+			"'" + store.KindSession + "'", "'" + store.KindAPIKey + "'",
+		} {
 			if strings.Contains(query, literal) {
 				t.Errorf("%s contains the literal %s; bind the constant instead", name, literal)
 			}
+		}
+	}
+}
+
+// TestQueriesNumberTheirParametersConsistently holds that no query mixes bare
+// and numbered placeholders, which SQLite would number after the highest
+// numbered one and which would silently shift the arguments, and that numbered
+// ones have no gap. A query built from the shared predicate is bare throughout.
+func TestQueriesNumberTheirParametersConsistently(t *testing.T) {
+	t.Parallel()
+
+	for name, query := range packageQueries(t) {
+		_, err := parameterCount(query)
+		if err != nil {
+			t.Errorf("%s: %v:\n%s", name, err, query)
 		}
 	}
 }
@@ -223,8 +384,8 @@ func TestColumnParsing(t *testing.T) {
 	}{
 		{name: "aliases", query: "SELECT a.x AS x, b.x AS y FROM t a JOIN u b",
 			lists: []string{"a.x AS x, b.x AS y"}, names: []string{"x", "y"}, problem: ""},
-		{name: "a bare column is its own name", query: "SELECT k.jwk, id FROM t k",
-			lists: []string{"k.jwk, id"}, names: []string{"jwk", "id"}, problem: ""},
+		{name: "a bare column is its own name", query: "SELECT k.scope, id FROM t k",
+			lists: []string{"k.scope, id"}, names: []string{"scope", "id"}, problem: ""},
 		{name: "commas and FROM inside parentheses and quotes",
 			query: "SELECT COALESCE(a, ', FROM') AS c, (SELECT 1 FROM z WHERE q = 'a,b') AS d FROM t",
 			lists: []string{"COALESCE(a, ', FROM') AS c, (SELECT 1 FROM z WHERE q = 'a,b') AS d"},
@@ -430,6 +591,122 @@ func lastTopLevelAs(item string) int {
 	return last
 }
 
+// placeholder matches a bound parameter: a bare ? or a numbered ?N.
+var placeholder = regexp.MustCompile(`\?(\d*)`)
+
+var (
+	errMixedPlaceholders = errors.New("bare and numbered placeholders are mixed")
+	errPlaceholderGap    = errors.New("numbered placeholders have a gap")
+)
+
+// parameterCount returns how many arguments a query binds. Bare placeholders
+// are counted one by one; numbered ones are one argument per number, and the
+// numbers must be 1 to n with no gap. Mixing the two is refused, since SQLite
+// numbers a bare ? after the highest number seen so far.
+func parameterCount(query string) (int, error) {
+	bare, highest := 0, 0
+	seen := map[int]bool{}
+
+	for _, match := range placeholder.FindAllStringSubmatch(query, -1) {
+		if match[1] == "" {
+			bare++
+
+			continue
+		}
+
+		number, err := strconv.Atoi(match[1])
+		if err != nil {
+			return 0, fmt.Errorf("placeholder %q: %w", match[0], err)
+		}
+
+		seen[number] = true
+		highest = max(highest, number)
+	}
+
+	switch {
+	case bare > 0 && len(seen) > 0:
+		return 0, errMixedPlaceholders
+	case bare > 0:
+		return bare, nil
+	}
+
+	for number := 1; number <= highest; number++ {
+		if !seen[number] {
+			return 0, fmt.Errorf("%w: ?%d is missing below ?%d", errPlaceholderGap, number, highest)
+		}
+	}
+
+	return highest, nil
+}
+
+// TestParameterCount validates the placeholder counting the checks below rely
+// on.
+func TestParameterCount(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		query   string
+		want    int
+		wantErr bool
+	}{
+		{name: "none", query: "SELECT 1", want: 0},
+		{name: "bare", query: "WHERE a = ? AND b = ?", want: 2},
+		{name: "numbered, one reused", query: "WHERE a = ?1 AND b = ?2 AND c > ?1", want: 2},
+		{name: "numbered in a different order", query: "SET a = ?3 WHERE b = ?1 AND c = ?2", want: 3},
+		{name: "a gap", query: "WHERE a = ?1 AND b = ?3", wantErr: true},
+		{name: "mixed", query: "WHERE a = ?1 AND b = ?", wantErr: true},
+		{name: "a number too large", query: "WHERE a = ?99999999999999999999", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := parameterCount(test.query)
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Errorf("parameterCount = %d, %v; want %d, error %v", got, err, test.want, test.wantErr)
+			}
+		})
+	}
+}
+
+// checkBatch is checkStatements for queries that number their
+// placeholders: the fake must have seen exactly one batch of the wanted
+// statements, each with the wanted fragments and the exact arguments, and each
+// binding as many arguments as its text has parameters.
+func checkBatch(t *testing.T, fake *fakeExec, want ...wantStatement) {
+	t.Helper()
+
+	if len(fake.calls) != 1 {
+		t.Fatalf("exec called %d times, want exactly one batch", len(fake.calls))
+	}
+
+	got := fake.calls[0]
+	if len(got) != len(want) {
+		t.Fatalf("batch has %d statements, want %d", len(got), len(want))
+	}
+
+	for i, expected := range want {
+		query := squash(got[i].Query)
+
+		for _, fragment := range expected.fragments {
+			if !strings.Contains(query, fragment) {
+				t.Errorf("statement %d lacks %q:\n%s", i, fragment, query)
+			}
+		}
+
+		if !reflect.DeepEqual(got[i].Args, expected.args) {
+			t.Errorf("statement %d args = %#v, want %#v", i, got[i].Args, expected.args)
+		}
+
+		count, err := parameterCount(query)
+		if err != nil || count != len(got[i].Args) {
+			t.Errorf("statement %d has %d parameters (%v) for %d args:\n%s", i, count, err, len(got[i].Args), query)
+		}
+	}
+}
+
 // errStopRecording ends an operation after the fake has recorded its statements.
 var errStopRecording = errors.New("stop after recording")
 
@@ -461,6 +738,8 @@ func largestPatch(t *testing.T) store.AgentPatch {
 //
 // A method added to the Store must be added here: TestEveryOperationIsListed
 // fails until it is.
+//
+//nolint:funlen // one line per operation; splitting it would only scatter the table
 func operations(t *testing.T) map[string]func(*store.Store) {
 	t.Helper()
 
@@ -471,16 +750,21 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 	invitation.ExpiresAt = invExpiry(t, now.Add(input.ExpiryHorizon).Unix(), now)
 
 	return map[string]func(*store.Store){
-		"ActiveKey": func(s *store.Store) { _, _, _ = s.ActiveKey(ctx, "kid", store.KindSession, farthest) },
+		"ResolveSession": func(s *store.Store) {
+			_, _, _ = s.ResolveSession(ctx, mustSessionToken(t, 3), farthest)
+		},
+		"ResolveAPIKey": func(s *store.Store) {
+			_, _, _ = s.ResolveAPIKey(ctx, mustAPIKeyToken(t, 3), farthest)
+		},
 		"CreateSession": func(s *store.Store) {
 			_ = s.CreateSession(ctx, store.NewSession{
-				KeyID: "kid", CredentialRowID: "cred", JWK: "{}", ExpiresAt: farthest, GrantedFrom: []byte{1},
+				ID: "id", Hash: hashOf(1), CredentialRowID: "cred", GrantedFrom: hashOf(2), ExpiresAt: farthest,
 				Flags: 0xff, CreatedAt: farthest,
 			})
 		},
-		"RevokeKey": func(s *store.Store) { _, _ = s.RevokeKey(ctx, "user", "kid", farthest) },
+		"RevokeSecret": func(s *store.Store) { _, _ = s.RevokeSecret(ctx, "user", "id", farthest) },
 		"RedeemableInvitationType": func(s *store.Store) {
-			_, _, _ = s.RedeemableInvitationType(ctx, mustCode(t, "code"), farthest)
+			_, _, _ = s.RedeemableInvitationType(ctx, mustInvitationToken(t, 3), farthest)
 		},
 		"CreateAccount": func(s *store.Store) {
 			_ = s.CreateAccount(ctx, newAccount(t, func(a *store.NewAccount) { a.Flags, a.CreatedAt = 0xff, farthest }))
@@ -488,14 +772,14 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		"CredentialByID": func(s *store.Store) { _, _, _ = s.CredentialByID(ctx, []byte{1}) },
 		"FirstRunState":  func(s *store.Store) { _, _ = s.FirstRunState(ctx) },
 		"CreateFirstRunInvitation": func(s *store.Store) {
-			_, _ = s.CreateFirstRunInvitation(ctx, "id", mustCode(t, "code"), "label", farthest)
+			_, _ = s.CreateFirstRunInvitation(ctx, "id", mustInvitationToken(t, 3), "label", farthest, farthest)
 		},
 		"ListInvitations": func(s *store.Store) { _, _ = s.ListInvitations(ctx) },
 		"CreateInvitation": func(s *store.Store) {
 			_, _ = s.CreateInvitation(ctx, invitation)
 		},
 		"UpdateNumInvites": func(s *store.Store) {
-			_, _, _ = s.UpdateNumInvites(ctx, invID(t), invNum(t, input.MaxNumInvites))
+			_, _, _ = s.UpdateNumInvites(ctx, invID(t), invNum(t, input.MaxNumInvites), farthest)
 		},
 		"RevokeInvitation": func(s *store.Store) { _, _ = s.RevokeInvitation(ctx, invID(t), farthest) },
 		"ListUsers":        func(s *store.Store) { _, _ = s.ListUsers(ctx) },
@@ -511,7 +795,7 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		"CreateAgent": func(s *store.Store) {
 			_, _ = s.CreateAgent(ctx, store.NewAgent{
 				ID: "id", Owner: "owner", Name: mustAgentName(t, "agent"), Scopes: "[]", KeyScope: "[]", MaxActive: 1 << 30,
-				KeyID: "kid", KeyJWK: "{}", KeyExpiresAt: farthest, CreatedAt: farthest,
+				KeyID: "key-id", KeyHash: hashOf(1), KeyExpiresAt: farthest, CreatedAt: farthest,
 				Labels: mustAgentLabelSet(t, longestLabelSet()...),
 			})
 		},

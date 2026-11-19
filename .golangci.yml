@@ -48,6 +48,7 @@ linters:
             - "**/internal/challenge/**"
             - "**/internal/config/**"
             - "**/internal/scope/**"
+            - "**/internal/secret/**"
           deny:
             - pkg: github.com/susu-dot-dev/authsu/internal/input
               desc: "foundation packages are the lowest layer and import nothing above it: no input, store, auth, feature or app"

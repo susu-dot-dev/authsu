@@ -129,29 +129,34 @@ SET revoked_at = COALESCE(revoked_at, CASE
 WHERE id = ?2
 RETURNING id, role, invitation_id, profile, revoked_at, created_at`
 
-// revokeUserKeysQuery revokes every key of the account, in the same batch as
-// revokeUserQuery and after it. Verification already refuses any key of a
-// revoked account (it reads users.revoked_at), so this is not what ends the
-// sessions. It keeps the keys table honest: a key listed later reads as
-// revoked, and a future kind of key whose verification forgot to check the
-// account would still be refused.
+// revokeUserSecretsQuery revokes every session and every API key of the
+// account, in the same batch as revokeUserQuery and after it. The keys of the
+// account's agents are among them: a key's user_id is its agent's owner.
+// Resolving already refuses any session or key of a revoked account (it reads
+// users.revoked_at), so this is not what ends them. It keeps the secrets table
+// honest: a secret listed later reads as revoked, and a future kind of secret
+// whose resolve forgot to check the account would still be refused.
 //
 // It applies only if the account is revoked once revokeUserQuery has run, so a
-// refused revocation (the last admin) changes no key. A key whose revocation is
-// already due keeps its time; one scheduled for later is brought forward.
+// refused revocation (the last admin) changes no secret. A secret whose
+// revocation is already due keeps its time; one scheduled for later is brought
+// forward. The account's invitations are not among them: an invitation belongs
+// to no account.
 //
 // Arguments, by number: ?1 revoked_at (unix seconds), ?2 user id.
-const revokeUserKeysQuery = `
-UPDATE japikeys
+const revokeUserSecretsQuery = `
+UPDATE secrets
 SET revoked_at = ?1
-WHERE user_id = ?2
+WHERE id IN (SELECT id FROM sessions WHERE user_id = ?2
+             UNION ALL
+             SELECT id FROM api_keys WHERE user_id = ?2)
   AND (revoked_at IS NULL OR revoked_at > ?1)
   AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)`
 
 // revokeUserAgentsQuery revokes every agent of the account, in the same batch
 // as revokeUserQuery and after it, because an agent's authority is borrowed
 // from its user (docs/agents_design.md). The agents' keys are already revoked
-// by revokeUserKeysQuery, which matches every key of the account; this keeps
+// by revokeUserSecretsQuery, which matches every key of the account; this keeps
 // the agents table honest, so an agent lists as revoked and cannot be renamed.
 //
 // It applies only if the account is revoked once revokeUserQuery has run, so a
@@ -166,7 +171,7 @@ WHERE user_id = ?2
   AND revoked_at IS NULL
   AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)`
 
-// RevokeUser revokes the account id, its keys and its agents, in that order, as
+// RevokeUser revokes the account id, its secrets and its agents, in that order, as
 // one batch, and returns the account as the write left it. adminRole is the
 // role the last-admin guard protects.
 //
@@ -189,7 +194,7 @@ func (s *Store) RevokeUser(ctx context.Context, id input.ID, adminRole string, n
 
 	results, err := s.run(ctx, o,
 		Statement{Query: revokeUserQuery, Args: []any{unix, id.String(), adminRole}},
-		Statement{Query: revokeUserKeysQuery, Args: []any{unix, id.String()}},
+		Statement{Query: revokeUserSecretsQuery, Args: []any{unix, id.String()}},
 		Statement{Query: revokeUserAgentsQuery, Args: []any{unix, id.String()}},
 	)
 	if errors.Is(err, ErrConflict) {

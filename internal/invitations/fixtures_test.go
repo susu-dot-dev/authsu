@@ -20,6 +20,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/invitations"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -124,13 +125,18 @@ func sequence(start byte, n int) []byte {
 	return out
 }
 
-// codeOf is the code a create returns for entropy bytes raw: base64url of the
-// bytes with no padding, computed here independently of the package.
-func codeOf(raw []byte) string { return base64.RawURLEncoding.EncodeToString(raw) }
+// tokenPrefix is how every invitation token starts, spelled out here and not
+// taken from internal/secret, so that changing it is noticed.
+const tokenPrefix = "susu_inv_"
 
-// hashOf is the SHA-256 of a code, which is what is stored.
-func hashOf(code string) []byte {
-	sum := sha256.Sum256([]byte(code))
+// codeOf is the token a create returns for entropy bytes raw: the prefix and
+// the base64url of the bytes with no padding, computed here independently of
+// the package.
+func codeOf(raw []byte) string { return tokenPrefix + base64.RawURLEncoding.EncodeToString(raw) }
+
+// hashOf is the SHA-256 of a token, which is what is stored.
+func hashOf(token string) []byte {
+	sum := secret.Hash(token)
 
 	return sum[:]
 }
@@ -181,23 +187,16 @@ func (f *fakeStore) CreateInvitation(_ context.Context, in store.NewInvitation) 
 		return *f.created, nil
 	}
 
-	row := store.Invitation{
+	return store.Invitation{
 		ID: in.ID, Type: in.Type, Label: in.Label.String(), NumInvites: in.NumInvites.Int64(), Uses: 0,
-		ExpiresAt: nil, RevokedAt: nil, CreatedBy: &in.CreatedBy, CreatedAt: in.CreatedAt.Unix(),
-	}
-
-	if in.ExpiresAt != nil {
-		expires := in.ExpiresAt.Unix()
-		row.ExpiresAt = &expires
-	}
-
-	return row, nil
+		ExpiresAt: in.ExpiresAt.Unix(), RevokedAt: nil, CreatedBy: &in.CreatedBy, CreatedAt: in.CreatedAt.Unix(),
+	}, nil
 }
 
 func (f *fakeStore) UpdateNumInvites(
-	_ context.Context, id input.ID, n input.NumInvites,
+	_ context.Context, id input.ID, n input.NumInvites, now time.Time,
 ) (store.Invitation, bool, error) {
-	f.calls = append(f.calls, storeCall{op: opUpdate, id: id.String(), n: n.Int64()})
+	f.calls = append(f.calls, storeCall{op: opUpdate, id: id.String(), n: n.Int64(), now: now})
 
 	if f.err != nil {
 		return store.Invitation{}, false, f.err
@@ -212,15 +211,24 @@ func (f *fakeStore) RevokeInvitation(_ context.Context, id input.ID, now time.Ti
 	return f.revoked, f.err
 }
 
-// fakeKeys is the key store the auth boundary reads sessions from.
-type fakeKeys struct {
-	rows map[string]store.ActiveKey
+// fakeCredentials is the credential store the auth boundary reads sessions
+// from, keyed by the session token.
+type fakeCredentials struct {
+	sessions map[string]store.ActiveSession
 }
 
-func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, _ time.Time) (store.ActiveKey, bool, error) {
-	row, ok := f.rows[kid]
+func (f *fakeCredentials) ResolveSession(
+	_ context.Context, token input.SessionToken, _ time.Time,
+) (store.ActiveSession, bool, error) {
+	row, ok := f.sessions[token.String()]
 
-	return row, ok && kind == store.KindSession, nil
+	return row, ok, nil
+}
+
+func (f *fakeCredentials) ResolveAPIKey(
+	context.Context, input.APIKeyToken, time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	return store.ActiveAPIKey{}, false, nil
 }
 
 // harness is one deployment under test: the real auth boundary over the routes,
@@ -228,7 +236,7 @@ func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, _ time.Time) (
 type harness struct {
 	t      *testing.T
 	store  *fakeStore
-	keys   *fakeKeys
+	creds  *fakeCredentials
 	clock  *clock
 	logged []*apierr.Error
 
@@ -245,9 +253,9 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 
 	harn := &harness{
-		t: t, store: &fakeStore{}, keys: &fakeKeys{rows: map[string]store.ActiveKey{}},
+		t: t, store: &fakeStore{}, creds: &fakeCredentials{sessions: map[string]store.ActiveSession{}},
 		clock:   &clock{now: fixedNow()},
-		entropy: &countingReader{reader: bytes.NewReader(sequence(0, 8*invitations.CodeBytes))},
+		entropy: &countingReader{reader: bytes.NewReader(sequence(0, 8*secret.BodyBytes))},
 	}
 
 	harn.deps = invitations.Deps{
@@ -271,36 +279,33 @@ func (h *harness) build() http.Handler {
 	}
 
 	return auth.Handler(invitations.Routes(h.deps), auth.Deps{
-		Keys:   h.keys,
-		Now:    time.Now,
-		Getenv: func(name string) string { return env[name] },
-		Log:    func(_ httpapi.Request, failure *apierr.Error) { h.logged = append(h.logged, failure) },
+		Credentials: h.creds,
+		Now:         time.Now,
+		Getenv:      func(name string) string { return env[name] },
+		Log:         func(_ httpapi.Request, failure *apierr.Error) { h.logged = append(h.logged, failure) },
 	})
 }
 
-// session creates a real session for owner with role and stores its row, as a
-// login would, and returns the cookie a browser sends back. The token's own
-// lifetime is measured against the wall clock by the verifier, so it is created
-// from the wall clock and not from the fixed test clock.
+// session issues a real session token for owner with role, registers it with
+// the fake credential store as a login would have, and returns the cookie a
+// browser sends back.
 func (h *harness) session(owner, role string) *http.Cookie {
 	h.t.Helper()
 
-	origin, err := config.ParseOrigin(apiOrigin)
+	// The entropy is a hash of the owner and role: distinct callers get distinct
+	// tokens, and a repeated caller gets the same one.
+	seed := sha256.Sum256([]byte(owner + "/" + role))
+
+	issued, err := auth.IssueSession(bytes.NewReader(seed[:]), func() string { return owner }, time.Now())
 	if err != nil {
-		h.t.Fatalf("origin: %v", err)
+		h.t.Fatalf("IssueSession: %v", err)
 	}
 
-	key, err := auth.CreateSession(auth.IssuerFor(origin), owner, time.Now().Add(time.Hour))
-	if err != nil {
-		h.t.Fatalf("CreateSession: %v", err)
+	h.creds.sessions[issued.Token] = store.ActiveSession{
+		ID: issued.ID, UserID: owner, Role: role, ExpiresAt: issued.ExpiresAt,
 	}
 
-	h.keys.rows[key.ID.String()] = store.ActiveKey{
-		JWK: []byte(key.JWK), UserID: owner, CredentialID: "", Role: role, ExpiresAt: key.ExpiresAt,
-	}
-
-	//nolint:gosec // a request cookie carries no attributes; G124 is about Set-Cookie
-	return &http.Cookie{Name: auth.CookieName, Value: key.JWT}
+	return auth.SessionCookie(issued)
 }
 
 // admin and member are the two callers: a session of an admin and of a member.
@@ -372,7 +377,7 @@ type wireInvitation struct {
 	NumInvites int64   `json:"numInvites"`
 	Uses       int64   `json:"uses"`
 	Status     string  `json:"status"`
-	ExpiresAt  *int64  `json:"expiresAt"`
+	ExpiresAt  *int64  `json:"expiresAt"` // a pointer, so a missing field is told from zero
 	RevokedAt  *int64  `json:"revokedAt"`
 	CreatedBy  *string `json:"createdBy"`
 	CreatedAt  int64   `json:"createdAt"`
@@ -453,11 +458,11 @@ func wantError(
 }
 
 // storedRow is an invitation row as the store returns it: five accounts allowed,
-// two used, no expiry, not revoked.
+// two used, expiring an hour after fixedNow, not revoked.
 func storedRow(mutate func(*store.Invitation)) store.Invitation {
 	row := store.Invitation{
 		ID: invID, Type: typeCustom, Label: "November workshop", NumInvites: 5, Uses: 2,
-		ExpiresAt: nil, RevokedAt: nil, CreatedBy: nil, CreatedAt: fixedNow().Unix() - 100,
+		ExpiresAt: fixedNow().Unix() + 3600, RevokedAt: nil, CreatedBy: nil, CreatedAt: fixedNow().Unix() - 100,
 	}
 
 	if mutate != nil {

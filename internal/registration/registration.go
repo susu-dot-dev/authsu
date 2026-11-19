@@ -1,12 +1,12 @@
 // Package registration implements POST /api/register/begin and
 // POST /api/register/finish, the two steps of passkey registration described in
-// docs/registration_design.md: turn an invitation code into an account and its
+// docs/registration_design.md: turn an invitation token into an account and its
 // first passkey, with no side effect until finish.
 //
-// Begin writes nothing. It checks the invitation as a courtesy (so a wrong code
+// Begin writes nothing. It checks the invitation as a courtesy (so a wrong token
 // fails before the user's biometric prompt) and returns the WebAuthn creation
 // options, with a challenge that is signed rather than stored: the invitation
-// code and the account name are bound into it, and its nonce is the user
+// token and the account name are bound into it, and its nonce is the user
 // handle. Finish is the one point of acceptance: it verifies the passkey and
 // the challenge, then creates the account and credential in one store
 // operation whose conditions enforce the invitation.
@@ -48,7 +48,7 @@ const (
 	// than a legitimate one could hold (a real one is under 1 KiB). It is the
 	// sum of what the members may legally be, with room for JSON syntax and
 	// escaping: id and rawId (1023 bytes each, base64url), clientDataJSON
-	// (2048) and attestationObject (4096) as base64url, the name and code, and
+	// (2048) and attestationObject (4096) as base64url, the name and invitation token, and
 	// the transports. Anything larger fails a member's own bound anyway, so
 	// refusing it here costs no honest client.
 	MaxFinishBody = 32 << 10
@@ -56,10 +56,10 @@ const (
 
 // Store is the part of the store registration uses. *store.Store satisfies it.
 type Store interface {
-	// RedeemableInvitationType returns the type of the invitation code names
+	// RedeemableInvitationType returns the type of the invitation the token names
 	// when it is redeemable at now, and false when it is not. It is advisory:
 	// CreateAccount decides.
-	RedeemableInvitationType(ctx context.Context, code input.InvitationCode, now time.Time) (string, bool, error)
+	RedeemableInvitationType(ctx context.Context, token input.InvitationToken, now time.Time) (string, bool, error)
 
 	// CreateAccount creates the account and its first passkey, and reports
 	// store.ErrConflict when the registration cannot stand.

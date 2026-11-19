@@ -2,147 +2,18 @@
 package input_test
 
 import (
-	"bytes"
-	"encoding/hex"
 	"math"
 	"math/big"
-	"regexp"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/input"
 )
 
-func parseInvitationCode(raw string) (string, error) {
-	return strAdapter(input.ParseInvitationCode, input.InvitationCode.String)(raw)
-}
-
-func invitationCodeCases() []parseCase {
-	limit := input.MaxInvitationCodeBytes
-
-	return []parseCase{
-		{"one character", "a", true},
-		{"typical 32-byte code", "x7Qk2m_Zp-0AbCdEfGhIjKlMnOpQrStUvWxYz012345", true},
-		{"whole alphabet", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", true},
-		{"exactly max", strings.Repeat("A", limit), true},
-		{"one over max", strings.Repeat("A", limit+1), false},
-		{"far over max", strings.Repeat("A", limit*16), false},
-		{"max with a refused character at the end", strings.Repeat("A", limit-1) + "=", false},
-		{"empty", "", false},
-		{"padding", "dGVzdA==", false},
-		{"standard base64 plus", "a+b", false},
-		{"standard base64 slash", "a/b", false},
-		{"dot (allowed in a token, not in a code)", "a.b", false},
-		{"space", "a b", false},
-		{"leading space", " abc", false},
-		{"trailing space", "abc ", false},
-		{"trailing newline", "abc\n", false},
-		{"NUL", "abc\x00", false},
-		{"tab", "a\tb", false},
-		{"multibyte letter", "caf\u00e9", false},
-		{"fullwidth letter", "\uff21", false},
-		{"zero width space", "ab\u200bcd", false},
-		{"invalid utf8", "ab\xffcd", false},
-		{"percent escape", "%41", false},
-		{"sql quote", "a'b", false},
-	}
-}
-
-func TestParseInvitationCode(t *testing.T) {
-	t.Parallel()
-	runStringTable(t, invitationCodeCases(), parseInvitationCode, input.CodeInvalidInvitation)
-}
-
-func TestInvitationCodeHash(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name string
-		code string
-		want string // hex SHA-256 of the code's ASCII bytes (sha256sum)
-	}{
-		{"abc", "abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
-		{"one character", "a", "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"},
-		{
-			"typical code is hashed as text, not base64-decoded",
-			"x7Qk2m_Zp-0AbCdEfGhIjKlMnOpQrStUvWxYz012345",
-			"835be29d8503fe3624c2a21c68ee8874d13e4799074d64a11bd44aa14aa377aa",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			code, err := input.ParseInvitationCode(tc.code)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			got := code.Hash()
-			if len(got) != 32 { // invitations.code_hash: length(code_hash) = 32
-				t.Fatalf("len(Hash()) = %d, want 32", len(got))
-			}
-
-			if hex.EncodeToString(got) != tc.want {
-				t.Errorf("Hash() = %x, want %s", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestInvitationCodeHashIsIndependentPerCall proves a caller that scribbles on
-// the returned slice cannot change what the next lookup hashes to.
-func TestInvitationCodeHashIsIndependentPerCall(t *testing.T) {
-	t.Parallel()
-
-	code, err := input.ParseInvitationCode("abc")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	first := code.Hash()
-	want := bytes.Clone(first)
-
-	for i := range first {
-		first[i] = 0
-	}
-
-	if !bytes.Equal(code.Hash(), want) {
-		t.Error("Hash() shares storage between calls")
-	}
-}
-
-func TestInvitationCodeHashDistinguishesCodes(t *testing.T) {
-	t.Parallel()
-
-	a, errA := input.ParseInvitationCode("abc")
-	b, errB := input.ParseInvitationCode("abd")
-
-	if errA != nil || errB != nil {
-		t.Fatal(errA, errB)
-	}
-
-	if bytes.Equal(a.Hash(), b.Hash()) {
-		t.Error("different codes hash alike")
-	}
-}
-
-var codePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
-
-func FuzzParseInvitationCode(f *testing.F) {
-	fuzzString(f, seedsOf(invitationCodeCases()), input.ParseInvitationCode, input.InvitationCode.String,
-		input.CodeInvalidInvitation, codePattern.MatchString)
-}
-
 func TestInvitationDescriptionsStateTheBounds(t *testing.T) {
 	t.Parallel()
 
-	_, err := parseInvitationCode("")
-	requireMentions(t, descriptionOf(t, err, input.CodeInvalidInvitation), input.MaxInvitationCodeBytes)
-
-	_, err = input.ParseNumInvites(0)
+	_, err := input.ParseNumInvites(0)
 	requireMentions(t, descriptionOf(t, err, input.CodeInvalidNumInvites), input.MaxNumInvites)
 }
 
@@ -356,12 +227,10 @@ func TestIntegerBoundsAreSafe(t *testing.T) {
 	t.Parallel()
 
 	bounds := map[string]int64{
-		"MaxNumInvites":          input.MaxNumInvites,
-		"MaxPageLimit":           input.MaxPageLimit,
-		"DefaultPageLimit":       input.DefaultPageLimit,
-		"MaxTokenBytes":          input.MaxTokenBytes,
-		"MaxInvitationCodeBytes": input.MaxInvitationCodeBytes,
-		"ExpiryHorizon seconds":  int64(input.ExpiryHorizon / time.Second),
+		"MaxNumInvites":         input.MaxNumInvites,
+		"MaxPageLimit":          input.MaxPageLimit,
+		"DefaultPageLimit":      input.DefaultPageLimit,
+		"ExpiryHorizon seconds": int64(input.ExpiryHorizon / time.Second),
 	}
 
 	for name, bound := range bounds {

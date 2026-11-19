@@ -19,7 +19,7 @@ import (
 
 // TestBeginSucceeds pins the whole response of a begin, byte for byte: the
 // options a browser is given, and that the challenge is the one the registration
-// key makes for this code and name, expiring after the TTL, with the nonce as the
+// key makes for this token and name, expiring after the TTL, with the nonce as the
 // user handle.
 func TestBeginSucceeds(t *testing.T) {
 	t.Parallel()
@@ -46,7 +46,7 @@ func TestBeginSucceeds(t *testing.T) {
 
 	wantQuietSuccess(t, r, rec)
 
-	if want := []redeemCall{{code: testCode, now: r.now}}; !slices.Equal(r.store.redeemed, want) {
+	if want := []redeemCall{wantRedeem(testCode, r.now)}; !slices.Equal(r.store.redeemed, want) {
 		t.Errorf("invitation lookups = %v, want %v", r.store.redeemed, want)
 	}
 
@@ -97,7 +97,7 @@ func TestBeginEchoesTheName(t *testing.T) {
 
 // TestBeginChallengesAreUnique: WebAuthn needs fresh entropy per challenge, and
 // the nonce (the user handle) is all the entropy a registration challenge has.
-// Many begins for the same code and name, at the same instant, never repeat a
+// Many begins for the same token and name, at the same instant, never repeat a
 // challenge or a user handle.
 func TestBeginChallengesAreUnique(t *testing.T) {
 	t.Parallel()
@@ -144,7 +144,7 @@ func TestBeginChallengesRepeatWithoutEntropy(t *testing.T) {
 }
 
 // TestBeginChallengeIsBoundAndExpires checks what the issued challenge opens
-// for, through the challenge package: this code and name, only this key, and
+// for, through the challenge package: this token and name, only this key, and
 // only until the TTL.
 func TestBeginChallengeIsBoundAndExpires(t *testing.T) {
 	t.Parallel()
@@ -163,12 +163,12 @@ func TestBeginChallengeIsBoundAndExpires(t *testing.T) {
 		at   time.Duration
 		ok   bool
 	}{
-		{"this code and name", cfg.RegistrationKey, this, 0, true},
+		{"this token and name", cfg.RegistrationKey, this, 0, true},
 		{"one second before the TTL", cfg.RegistrationKey, this, ttl - time.Second, true},
 		{"exactly the TTL", cfg.RegistrationKey, this, ttl, false},
-		{"another code", cfg.RegistrationKey, registrationAD(otherCode, testName), 0, false},
+		{"another token", cfg.RegistrationKey, registrationAD(otherCode, testName), 0, false},
 		{"another name", cfg.RegistrationKey, registrationAD(testCode, "Bob"), 0, false},
-		{"code and name swapped", cfg.RegistrationKey, registrationAD(testName, testCode), 0, false},
+		{"token and name swapped", cfg.RegistrationKey, registrationAD(testName, testCode), 0, false},
 		{"no associated data", cfg.RegistrationKey, nil, 0, false},
 		{"the login key", cfg.LoginKey, this, 0, false},
 	}
@@ -228,7 +228,7 @@ func refusedRequests() []beginFailure {
 		return malformed(name, body, codeInvalidName, msgInvalidName)
 	}
 
-	return []beginFailure{
+	cases := []beginFailure{
 		malformed("not JSON", "{", "invalid_json", "request body is not valid JSON"),
 		malformed("empty body", "", "empty_body", "request body is empty"),
 		malformed("unknown member", `{"invitationCode":"a","name":"b","role":"admin"}`,
@@ -236,23 +236,31 @@ func refusedRequests() []beginFailure {
 		malformed("wrong type", `{"invitationCode":7,"name":"b"}`, "invalid_field_type", "a field has the wrong type"),
 		malformed("repeated member", `{"invitationCode":"a","name":"b","name":"c"}`,
 			"duplicate_field", "request body repeats a field"),
-		badCode("missing code", `{"name":"b"}`),
-		badCode("code outside the alphabet", beginJSON("not a code", testName)),
-		badCode("code too long", beginJSON(strings.Repeat("a", 257), testName)),
+		badCode("missing token", `{"name":"b"}`),
 		badName("missing name", `{"invitationCode":"`+testCode+`"}`),
 		badName("name with a bidirectional override", beginJSON(testCode, "Al\u202eice")),
 		badName("name too long", beginJSON(testCode, strings.Repeat("n", 129))),
 		malformed("name is not UTF-8", `{"invitationCode":"`+testCode+`","name":"Ali`+"\xff"+`ce"}`,
 			"invalid_text", "request body has text that is not valid UTF-8"),
-		badCode("a bad code is reported before a bad name", beginJSON("", "")),
+		badCode("a bad token is reported before a bad name", beginJSON("", "")),
 	}
+
+	// Every kind of malformed token, with a name that is valid.
+	tokens := invalidInvitationTokens()
+	malformedTokens := make([]beginFailure, len(tokens))
+
+	for i, bad := range tokens {
+		malformedTokens[i] = badCode("invalid token: "+bad.name, beginJSON(bad.value, testName))
+	}
+
+	return slices.Concat(cases, malformedTokens)
 }
 
 // refusedByTheDatabase are the begins refused at or after the invitation lookup.
 func refusedByTheDatabase() []beginFailure {
 	return []beginFailure{
 		{
-			name: "invitation is not redeemable", setup: nil, body: beginJSON("unknown-code", testName),
+			name: "invitation is not redeemable", setup: nil, body: beginJSON(unknownCode, testName),
 			status: http.StatusForbidden, response: errorBody(codeInvalidInvitation, msgNotRedeemable),
 			logged: codeInvalidInvitation, reads: 1,
 		},

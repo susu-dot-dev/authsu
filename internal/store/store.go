@@ -51,7 +51,7 @@
 // # Inputs
 //
 // Values a client sent arrive as internal/input types, which cannot exist
-// unless valid. Values the server generated (ids, timestamps, JWK text, hashes,
+// unless valid. Values the server generated (ids, timestamps, secret hashes,
 // handles) arrive as plain types. The store holds no clock: now is always a
 // parameter.
 //
@@ -132,7 +132,7 @@ var (
 	ErrRejected = errors.New("write violates a schema rule")
 
 	// ErrNotFound means a lookup by key matched no row. Operations that report
-	// absence as a flag (ActiveKey) do not return it.
+	// absence as a flag (ResolveSession) do not return it.
 	ErrNotFound = errors.New("not found")
 )
 
@@ -354,7 +354,20 @@ func queryAll[T any](ctx context.Context, s *Store, o op, statement Statement, r
 
 // find is queryOne for a lookup whose absence is an answer and not an error.
 func find[T any](ctx context.Context, s *Store, o op, statement Statement, read func(*row) T) (T, bool, error) {
-	value, err := queryOne(ctx, s, o, statement, read)
+	results, err := s.run(ctx, o, statement)
+	if err != nil {
+		var zero T
+
+		return zero, false, err
+	}
+
+	return findRow(results[0].Rows, o, read)
+}
+
+// findRow is one for a statement whose absence of a row is an answer and not
+// an error: it reports whether the row was there.
+func findRow[T any](rows [][]any, o op, read func(*row) T) (T, bool, error) {
+	value, err := one(rows, o, read)
 	if errors.Is(err, ErrNotFound) {
 		var zero T
 

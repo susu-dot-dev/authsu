@@ -15,7 +15,7 @@ import (
 // have no regular row in schema_test.go: a CHECK that is only a lower limit, a
 // column with no CHECK at all (whose only bound is that JavaScript holds the
 // value exactly), and the text of a column Go writes a constant to. The label
-// and the code hash are already covered by schemaBounds.
+// and the token hash are already covered by schemaBounds.
 //
 // Each row reads one declaration out of the migrations (the whitespace-collapsed
 // text, see migrations) with a pattern whose capture groups are the limits it
@@ -83,13 +83,14 @@ func numInvitesUpperBound() invitationBound {
 	}
 }
 
-// expiresAtBound: expires_at has no CHECK (the pattern needs the comma straight
-// after INTEGER), so the only bound on it is Go's: no larger than a number
-// JavaScript holds exactly, even for a clock that is far ahead.
+// expiresAtBound: secrets.expires_at is NOT NULL and has no CHECK (the pattern
+// needs the comma straight after NOT NULL), so the only bound on it is Go's: no
+// larger than a number JavaScript holds exactly, even for a clock that is far
+// ahead.
 func expiresAtBound() invitationBound {
 	return invitationBound{
 		name:    "expires_at is an unconstrained integer and Go's largest is JavaScript-safe",
-		pattern: `expires_at INTEGER,`,
+		pattern: `expires_at INTEGER NOT NULL,`,
 		check: func(t *testing.T, _ []int64) string {
 			t.Helper()
 
@@ -140,7 +141,7 @@ func typeBound() invitationBound {
 }
 
 // TestInvitationBoundsFitTheSchema holds that every value the invitation
-// operations can send fits what the invitations table accepts.
+// operations can send fits what the invitations table and its secret accept.
 func TestInvitationBoundsFitTheSchema(t *testing.T) {
 	t.Parallel()
 
@@ -182,7 +183,7 @@ func TestInvitationBoundsFitTheSchema(t *testing.T) {
 func TestInvitationStoreSendsNothingLargerThanItsBounds(t *testing.T) {
 	t.Parallel()
 
-	fake := newFake(returning(invitationRow()))
+	fake := newFake(readLast(2)(invitationRow()))
 
 	invitation := newInvitation(t)
 	invitation.NumInvites = invNum(t, input.MaxNumInvites)
@@ -194,17 +195,17 @@ func TestInvitationStoreSendsNothingLargerThanItsBounds(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	args := fake.calls[0][0].Args
+	secretArgs, invitationArgs := fake.calls[0][0].Args, fake.calls[0][1].Args
 
-	if got, _ := args[4].(int64); got != input.MaxNumInvites || got > input.MaxSafeInteger {
-		t.Errorf("num_invites = %v", args[4])
+	if got, _ := invitationArgs[4].(int64); got != input.MaxNumInvites || got > input.MaxSafeInteger {
+		t.Errorf("num_invites = %v", invitationArgs[4])
 	}
 
-	if got, _ := args[3].(string); len(got) != input.MaxInvitationLabelRunes {
+	if got, _ := invitationArgs[3].(string); len(got) != input.MaxInvitationLabelRunes {
 		t.Errorf("label has %d bytes, want %d", len(got), input.MaxInvitationLabelRunes)
 	}
 
-	if got, _ := args[5].(int64); got != now.Add(input.ExpiryHorizon).Unix() || got > input.MaxSafeInteger {
-		t.Errorf("expires_at = %v", args[5])
+	if got, _ := secretArgs[3].(int64); got != now.Add(input.ExpiryHorizon).Unix() || got > input.MaxSafeInteger {
+		t.Errorf("expires_at = %v", secretArgs[3])
 	}
 }

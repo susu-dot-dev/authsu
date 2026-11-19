@@ -54,7 +54,7 @@ func TestTextBoundsFitTheSchema(t *testing.T) {
 
 	const (
 		profileMaxBytes   = 1024 // users.profile CHECK, migration 0001
-		agentNameMaxBytes = 1024 // agents.name CHECK, migration 0005
+		agentNameMaxBytes = 1024 // agents.name CHECK, migration 0001
 		maxRuneBytes      = 4
 		objectSyntax      = len(`{"name":""}`)
 		maxJSONExpansion  = 6 // "<" becomes \u003c in encoding/json

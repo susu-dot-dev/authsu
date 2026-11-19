@@ -39,7 +39,7 @@
 //   - The version byte lets the layout change later (to bind more data, say)
 //     without ambiguity about how to parse challenges still in flight. It is
 //     checked before the tag, so an unknown layout is never interpreted.
-//   - A fixed binary layout, not a JWT or JSON, keeps the challenge small and
+//   - A fixed binary layout, not a signed JSON token, keeps the challenge small and
 //     avoids parsing a general-purpose token format in a security-critical
 //     place.
 //

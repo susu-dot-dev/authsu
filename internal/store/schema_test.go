@@ -3,6 +3,7 @@ package store_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,7 +45,12 @@ type bound struct {
 	exact bool
 }
 
-// migrations returns the text of every migration, whitespace collapsed.
+// comment matches an SQL line comment. The migration has no string literal
+// holding "--", so cutting at it is exact.
+var comment = regexp.MustCompile(`--[^\n]*`)
+
+// migrations returns the text of every migration with its comments removed and
+// whitespace collapsed, so a pattern reads the declarations and never prose.
 func migrations(t *testing.T) string {
 	t.Helper()
 
@@ -61,7 +67,7 @@ func migrations(t *testing.T) string {
 			t.Fatalf("read %s: %v", path, err)
 		}
 
-		text.Write(raw)
+		text.WriteString(comment.ReplaceAllString(string(raw), ""))
 		text.WriteString("\n")
 	}
 
@@ -93,7 +99,7 @@ func worstNewAccount(t *testing.T) (string, string) {
 
 	err := fake.store().CreateAccount(context.Background(), store.NewAccount{
 		UserID: "u", UserHandle: []byte{1}, Role: "admin", Name: worstAccountName(t),
-		Code: mustCode(t, "c"), InvitationType: "member", CredentialRowID: "c", CredentialID: []byte{1},
+		Token: mustInvitationToken(t, 1), InvitationType: "member", CredentialRowID: "c", CredentialID: []byte{1},
 		PublicKey: []byte{1}, Flags: 0, AAGUID: strings.Repeat("0", 36), Transports: transports, CreatedAt: now,
 	})
 	if err != nil {
@@ -108,6 +114,12 @@ func worstNewAccount(t *testing.T) (string, string) {
 	return profile, metadata
 }
 
+// secretHashCheck is the CHECK of secrets.hash: a BLOB (length() counts a TEXT
+// value in characters) of exactly the length of a SHA-256.
+//
+//nolint:gosec // a pattern naming the hash column, not a credential
+const secretHashCheck = `CHECK \(typeof\(hash\) = 'blob' AND length\(hash\) = (\d+)\)`
+
 // schemaBounds lists every Go bound with the CHECK it must fit inside.
 func schemaBounds(t *testing.T) []bound {
 	t.Helper()
@@ -118,20 +130,25 @@ func schemaBounds(t *testing.T) []bound {
 		// Identifiers: every id column is length 36 of lowercase hex and dashes,
 		// which is exactly the canonical UUID form input.ID accepts.
 		{name: "id length", pattern: `length\(id\) = (\d+)`, lowest: input.IDLen, highest: input.IDLen, exact: true},
-		{name: "kid length", pattern: `length\(kid\) = (\d+)`, lowest: input.IDLen, highest: input.IDLen, exact: true},
 		{name: "id alphabet", pattern: `NOT GLOB '\*\[\^0-9a-f-\]\*'`, lowest: 0, highest: 0, exact: false},
 
 		// Inbound text.
 		{name: "agent name bytes", pattern: `length\(cast\(name AS BLOB\)\) BETWEEN (\d+) AND (\d+)`,
 			lowest: 1, highest: input.MaxAgentNameRunes * utf8.UTFMax, exact: false},
-		{name: "invitation label", pattern: `length\(label\) <= (\d+)`,
-			lowest: 0, highest: input.MaxInvitationLabelRunes, exact: false},
+		{name: "invitation label bytes",
+			pattern: `CHECK \(typeof\(label\) = 'text' AND instr\(label, char\(0\)\) = 0 ` +
+				`AND length\(cast\(label AS BLOB\)\) <= (\d+)\)`,
+			lowest: 0, highest: input.MaxInvitationLabelRunes * utf8.UTFMax, exact: false},
 		{name: "profile JSON of the longest escaped account name", pattern: `length\(profile\) <= (\d+)`,
 			lowest: 0, highest: len(profile), exact: false},
 
-		// The invitation code is stored as its hash.
-		{name: "invitation code hash", pattern: `length\(code_hash\) = (\d+)`,
-			lowest: 0, highest: len(mustCode(t, "x").Hash()), exact: true},
+		// Every secret is stored as the hash of its token, whatever its kind.
+		{name: "invitation token hash", pattern: secretHashCheck,
+			lowest: len(mustInvitationToken(t, 1).Hash()), highest: len(mustInvitationToken(t, 1).Hash()), exact: true},
+		{name: "session token hash", pattern: secretHashCheck,
+			lowest: len(mustSessionToken(t, 1).Hash()), highest: len(mustSessionToken(t, 1).Hash()), exact: true},
+		{name: "API key token hash", pattern: secretHashCheck,
+			lowest: len(mustAPIKeyToken(t, 1).Hash()), highest: len(mustAPIKeyToken(t, 1).Hash()), exact: true},
 
 		// What the authenticator reports. 1023 is webauthn's maxCredentialIDLen
 		// (WebAuthn section 4); the user handle is the registration challenge's
@@ -147,14 +164,15 @@ func schemaBounds(t *testing.T) []bound {
 				`AND json_valid\(metadata\) AND length\(metadata\) <= (\d+)\)`,
 			lowest: 0, highest: len(metadata), exact: false},
 
-		// The kind of a key is one of the two constants the store writes.
-		{name: "key kind", pattern: `length\(kind\) BETWEEN (\d+) AND (\d+)`,
-			lowest:  min(len(store.KindSession), len(store.KindAPIKey)),
-			highest: max(len(store.KindSession), len(store.KindAPIKey)), exact: false},
+		// The kind of a secret is one of the constants the store writes.
+		{name: "secret kind", pattern: `typeof\(kind\) = 'text' AND length\(kind\) BETWEEN (\d+) AND (\d+)`,
+			lowest:  min(len(store.KindInvitation), len(store.KindSession), len(store.KindAPIKey)),
+			highest: max(len(store.KindInvitation), len(store.KindSession), len(store.KindAPIKey)), exact: false},
 
-		// The session's grant is the hash of the login challenge.
-		{name: "login grant hash", pattern: `length\(granted_from\) = (\d+)`,
-			lowest: 0, highest: len(mustCode(t, "x").Hash()), exact: true},
+		// The session's grant is the hash of the login challenge: SHA-256, as
+		// auth.LoginGrant computes it.
+		{name: "login grant hash", pattern: `typeof\(granted_from\) = 'blob' AND length\(granted_from\) = (\d+)`,
+			lowest: sha256.Size, highest: sha256.Size, exact: true},
 	}
 }
 

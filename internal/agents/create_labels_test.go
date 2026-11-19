@@ -336,7 +336,7 @@ func TestCreateWithLabelsFailsWhole(t *testing.T) {
 			logged: agents.CodeLimit, keys: 1,
 		},
 		{
-			name: "the key cannot be created", prepare: func(rg *rig) { rg.keyErr = errKeyPair },
+			name: "the key cannot be issued", prepare: func(rg *rig) { rg.issueErr = errEntropy },
 			status: http.StatusInternalServerError, body: bodyInternal, logged: agents.CodeKeyFailed, keys: 1,
 		},
 	}
@@ -352,8 +352,8 @@ func TestCreateWithLabelsFailsWhole(t *testing.T) {
 
 			wantFailure(t, rg, rec, tt.status, tt.body, tt.logged)
 
-			if len(rg.keyCalls) != tt.keys {
-				t.Errorf("created %d keys, want %d", len(rg.keyCalls), tt.keys)
+			if len(rg.issueCalls) != tt.keys {
+				t.Errorf("issued %d keys, want %d", len(rg.issueCalls), tt.keys)
 			}
 
 			if len(rg.store.rows) != 0 {

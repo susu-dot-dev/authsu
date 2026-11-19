@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/challenge"
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/login"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -74,9 +77,9 @@ type finishCase struct {
 	// cause is an error the logged failure must wrap: the reason, which is in
 	// the log and never in the response.
 	cause error
-	// lookups, keys and writes are what the finish itself did: credential
-	// reads, session creations and session writes.
-	lookups, keys, writes int
+	// lookups, issues and writes are what the finish itself did: credential
+	// reads, session issuings and session writes.
+	lookups, issues, writes int
 }
 
 // refusal is a case answered with a client-visible code and message.
@@ -84,7 +87,7 @@ func refusal(name string, status int, code, message string) finishCase {
 	return finishCase{
 		name: name, raw: "", authn: nil, challenge: nil, edit: nil, rewrite: nil, between: nil, stranger: false,
 		status: status, body: errorBody(code, message), logged: code, cause: nil,
-		lookups: 0, keys: 0, writes: 0,
+		lookups: 0, issues: 0, writes: 0,
 	}
 }
 
@@ -126,8 +129,8 @@ func (c finishCase) because(cause error) finishCase { c.cause = cause; return c 
 // readCredential says the finish got as far as reading the credential.
 func (c finishCase) readCredential() finishCase { c.lookups = 1; return c }
 
-// createdKey says the finish got as far as creating the session key.
-func (c finishCase) createdKey() finishCase { c.keys = 1; return c }
+// issuedSession says the finish got as far as issuing the session token.
+func (c finishCase) issuedSession() finishCase { c.issues = 1; return c }
 
 // wroteSession says the finish got as far as writing the session.
 func (c finishCase) wroteSession() finishCase { c.writes = 1; return c }
@@ -289,14 +292,14 @@ func corruptStoredKeys() []finishCase {
 	}
 }
 
-// databaseFailures are failures of the database or of key creation. They are
+// databaseFailures are failures of the database or of session issuing. They are
 // the service's own fault, so each is answered as such, and none is the 401.
 func databaseFailures() []finishCase {
 	lookup := func(c finishCase, outcome error) finishCase {
 		return c.because(errDB).readCredential().afterBegin(func(r *rig) { r.store.lookupErr = outcome })
 	}
 	write := func(c finishCase, outcome error) finishCase {
-		return c.because(errDB).readCredential().createdKey().wroteSession().
+		return c.because(errDB).readCredential().issuedSession().wroteSession().
 			afterBegin(func(r *rig) { r.store.createErrs = []error{outcome} })
 	}
 
@@ -307,9 +310,15 @@ func databaseFailures() []finishCase {
 		lookup(defective("the credential lookup is a defect", store.CodeCredentialLookupRejected),
 			classified(apierr.Internal, store.CodeCredentialLookupRejected)),
 		lookup(defective("the credential lookup fails without being classified", codeInternal), errDB),
-		defective("a session key cannot be created", "session_create_failed").
-			because(errCreate).readCredential().createdKey().
-			afterBegin(func(r *rig) { r.createErr = errCreate }),
+		defective("a session cannot be issued", login.CodeSessionCreateFailed).
+			because(errIssue).readCredential().issuedSession().
+			afterBegin(func(r *rig) { r.issueErr = errIssue }),
+		defective("the entropy fails while the session is issued", login.CodeSessionCreateFailed).
+			because(errEntropy).readCredential().issuedSession().
+			afterBegin(func(r *rig) { r.entropy = brokenEntropy() }),
+		defective("the entropy ends early while the session is issued", login.CodeSessionCreateFailed).
+			because(io.ErrUnexpectedEOF).readCredential().issuedSession().
+			afterBegin(func(r *rig) { r.entropy = io.LimitReader(counterEntropy(), secret.BodyBytes-1) }),
 		write(refusal("the session write is unavailable", http.StatusServiceUnavailable,
 			store.CodeLoginAcceptFailed, msgUnavailable),
 			classified(apierr.Unavailable, store.CodeLoginAcceptFailed)),
@@ -373,8 +382,8 @@ func (c finishCase) request(t *testing.T, r *rig) string {
 
 // TestFinishFailures: every way a finish is refused, with the exact answer and
 // proof of which store calls it made. Everything that can be refused without the
-// database is refused before it, and a key is created only for an assertion that
-// verified.
+// database is refused before it, and a session is issued only for an assertion
+// that verified.
 func TestFinishFailures(t *testing.T) {
 	t.Parallel()
 
@@ -392,9 +401,9 @@ func TestFinishFailures(t *testing.T) {
 				t.Errorf("logged error %v does not wrap the cause %v", r.logged[0], tc.cause)
 			}
 
-			if len(r.store.looked) != tc.lookups || len(r.sessions) != tc.keys || len(r.store.created) != tc.writes {
-				t.Errorf("credential reads, session creations, session writes = %d, %d, %d; want %d, %d, %d",
-					len(r.store.looked), len(r.sessions), len(r.store.created), tc.lookups, tc.keys, tc.writes)
+			if len(r.store.looked) != tc.lookups || len(r.issues) != tc.issues || len(r.store.created) != tc.writes {
+				t.Errorf("credential reads, session issuings, session writes = %d, %d, %d; want %d, %d, %d",
+					len(r.store.looked), len(r.issues), len(r.store.created), tc.lookups, tc.issues, tc.writes)
 			}
 		})
 	}
@@ -533,21 +542,9 @@ func TestFinishSucceeds(t *testing.T) {
 			rec := r.post(login.PathFinish, mustJSON(body))
 
 			checkLoggedIn(t, r, rec, tc.user, tc.role)
-			checkSessionWrite(t, r, unb64(t, options.PublicKey.Challenge), tc.user, tc.flags)
+			checkSessionWrite(t, r, unb64(t, options.PublicKey.Challenge), tc.flags)
 		})
 	}
-}
-
-// apiOrigin is the configured API origin, which the session's issuer is made from.
-func apiOrigin(t *testing.T) config.Origin {
-	t.Helper()
-
-	origin, err := config.ParseOrigin(testAPI)
-	if err != nil {
-		t.Fatalf("origin: %v", err)
-	}
-
-	return origin
 }
 
 // checkLoggedIn checks the response of a login that was accepted: the body, the
@@ -555,11 +552,11 @@ func apiOrigin(t *testing.T) config.Origin {
 func checkLoggedIn(t *testing.T, r *rig, rec *httptest.ResponseRecorder, user, role string) {
 	t.Helper()
 
-	if len(r.keys) != 1 {
-		t.Fatalf("keys created = %d (response %d %s), want 1", len(r.keys), rec.Code, rec.Body)
+	if len(r.issued) != 1 {
+		t.Fatalf("sessions issued = %d (response %d %s), want 1", len(r.issued), rec.Code, rec.Body)
 	}
 
-	key := r.keys[0]
+	issued := r.issued[0]
 	expires := r.now.Add(auth.SessionLifetime).Unix()
 	wantBody := fmt.Sprintf(`{"userId":%q,"role":%q,"expiresAt":%d}`+"\n", user, role, expires)
 
@@ -567,7 +564,7 @@ func checkLoggedIn(t *testing.T, r *rig, rec *httptest.ResponseRecorder, user, r
 		t.Fatalf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), wantBody)
 	}
 
-	if strings.Contains(rec.Body.String(), key.JWT) {
+	if strings.Contains(rec.Body.String(), issued.Token) {
 		t.Error("the session token is in the response body: it belongs in the cookie alone")
 	}
 
@@ -583,13 +580,16 @@ func checkLoggedIn(t *testing.T, r *rig, rec *httptest.ResponseRecorder, user, r
 		t.Errorf("logged %v, want nothing", r.logged)
 	}
 
-	checkSessionCookie(t, rec, key)
+	checkSessionCookie(t, rec, issued)
 }
+
+// sessionTokenPattern is a session token: the prefix and a 43 character body.
+var sessionTokenPattern = regexp.MustCompile(`^susu_ses_[A-Za-z0-9_-]{43}$`)
 
 // checkSessionCookie checks the cookie by its attributes and by its exact wire
 // form: a session cookie that loses HttpOnly, Secure or the __Host- rules would
-// be a vulnerability, not a style choice.
-func checkSessionCookie(t *testing.T, rec *httptest.ResponseRecorder, key auth.Key) {
+// be a vulnerability, not a style choice. Its value is a session token.
+func checkSessionCookie(t *testing.T, rec *httptest.ResponseRecorder, issued auth.Issued) {
 	t.Helper()
 
 	cookies := rec.Result().Cookies()
@@ -597,52 +597,84 @@ func checkSessionCookie(t *testing.T, rec *httptest.ResponseRecorder, key auth.K
 		t.Fatalf("cookies = %v, want exactly one", cookies)
 	}
 
-	if !isSessionCookie(cookies[0], key) {
-		t.Errorf("cookie = %+v, want the __Host- session cookie for the key, HttpOnly, Secure, Lax, to %v",
-			cookies[0], key.ExpiresAt)
+	if !sessionTokenPattern.MatchString(cookies[0].Value) {
+		t.Errorf("cookie value = %q, want susu_ses_ and 43 characters", cookies[0].Value)
 	}
 
-	wantHeader := "__Host-session=" + key.JWT + "; Path=/; Expires=" + key.ExpiresAt.UTC().Format(http.TimeFormat) +
-		"; HttpOnly; Secure; SameSite=Lax"
+	if !isSessionCookie(cookies[0], issued) {
+		t.Errorf("cookie = %+v, want the __Host- session cookie for the token, HttpOnly, Secure, Lax, to %v",
+			cookies[0], issued.ExpiresAt)
+	}
+
+	wantHeader := "__Host-session=" + issued.Token + "; Path=/; Expires=" +
+		issued.ExpiresAt.UTC().Format(http.TimeFormat) + "; HttpOnly; Secure; SameSite=Lax"
 	if got := rec.Header().Get("Set-Cookie"); got != wantHeader {
 		t.Errorf("Set-Cookie = %q, want %q", got, wantHeader)
 	}
 }
 
-// checkSessionWrite checks what the login did with the store and with key
-// creation: one lookup by the credential id, one key for the account, and one
-// write carrying exactly what makes the login single use and auditable.
-func checkSessionWrite(t *testing.T, r *rig, challengeBytes []byte, user string, flags uint8) {
+// checkSessionWrite checks what the login did with the store and with session
+// issuing: one lookup by the credential id, one session issued at the clock's
+// time with the id source's first id, and one write carrying exactly what makes
+// the login single use and auditable: the hash of the cookie's token, never the
+// token.
+func checkSessionWrite(t *testing.T, r *rig, challengeBytes []byte, flags uint8) {
 	t.Helper()
 
 	if len(r.store.looked) != 1 || string(r.store.looked[0]) != string(testCredID()) {
 		t.Errorf("credential lookups = %q, want one for the credential id", r.store.looked)
 	}
 
+	issued := r.issued[0]
 	expires := r.now.Add(auth.SessionLifetime)
-	wantCall := sessionCall{issuer: auth.IssuerFor(apiOrigin(t)), userID: user, expires: expires}
 
-	if len(r.sessions) != 1 || r.sessions[0] != wantCall {
-		t.Errorf("session creations = %+v, want %+v", r.sessions, wantCall)
+	wantCall := issueCall{now: r.now, id: issued.ID}
+	if len(r.issues) != 1 || r.issues[0] != wantCall {
+		t.Errorf("session issuings = %+v, want %+v", r.issues, wantCall)
 	}
 
+	if issued.ID != fmt.Sprintf("00000000-0000-7000-8000-%012d", 1) || r.ids != 1 {
+		t.Errorf("session id = %q after %d ids, want the id source's first id, once", issued.ID, r.ids)
+	}
+
+	cookieHash := secret.Hash(issued.Token)
 	grant := sha256.Sum256(challengeBytes)
-	key := r.keys[0]
 	want := store.NewSession{
-		KeyID:           key.ID.String(),
+		ID:              issued.ID,
+		Hash:            cookieHash[:],
 		CredentialRowID: testCredRowID,
-		JWK:             key.JWK,
-		ExpiresAt:       expires,
 		GrantedFrom:     grant[:],
-		// The session is written with the scope that was signed into its token:
-		// the default:session bundle, spelled out so a change is deliberate.
-		Scope:     `["default:session"]`,
-		Flags:     flags,
-		CreatedAt: r.now,
+		Flags:           flags,
+		ExpiresAt:       expires,
+		CreatedAt:       r.now,
 	}
 
 	if len(r.store.created) != 1 || !reflect.DeepEqual(r.store.created[0], want) {
 		t.Errorf("session written = %+v\nwant              %+v", r.store.created, want)
+	}
+
+	if !issued.ExpiresAt.Equal(expires) {
+		t.Errorf("session expires %v, want %v: a login's lifetime from its own clock", issued.ExpiresAt, expires)
+	}
+
+	checkTokenFromEntropy(t, issued.Token)
+}
+
+// checkTokenFromEntropy checks that the token's random body came from the
+// entropy the login was given: the counter entropy's bytes each follow the
+// previous.
+func checkTokenFromEntropy(t *testing.T, token string) {
+	t.Helper()
+
+	body := unb64(t, strings.TrimPrefix(token, secret.Prefix(secret.TagSession)))
+	if len(body) != secret.BodyBytes {
+		t.Fatalf("token body is %d bytes, want %d", len(body), secret.BodyBytes)
+	}
+
+	for i := 1; i < len(body); i++ {
+		if body[i] != body[i-1]+1 {
+			t.Fatalf("token body %x does not come from the injected entropy", body)
+		}
 	}
 }
 
@@ -746,9 +778,10 @@ func TestFinishReplay(t *testing.T) {
 	}
 
 	got, want := r.store.created[1], r.store.created[0]
-	if string(got.GrantedFrom) != string(want.GrantedFrom) || got.KeyID == want.KeyID {
-		t.Errorf("replay wrote grant %x for key %s; the first wrote %x for %s: the grant must repeat and the key must not",
-			got.GrantedFrom, got.KeyID, want.GrantedFrom, want.KeyID)
+	if string(got.GrantedFrom) != string(want.GrantedFrom) || got.ID == want.ID || bytes.Equal(got.Hash, want.Hash) {
+		t.Errorf("replay wrote grant %x for session %s; the first wrote %x for %s: "+
+			"the grant must repeat and the session must not",
+			got.GrantedFrom, got.ID, want.GrantedFrom, want.ID)
 	}
 }
 
@@ -791,11 +824,11 @@ func TestFinishBodyLimitIsExact(t *testing.T) {
 	}
 }
 
-// isSessionCookie reports whether cookie is the session cookie for key, with
+// isSessionCookie reports whether cookie is the session cookie for issued, with
 // every attribute the __Host- prefix and the threat model require.
-func isSessionCookie(cookie *http.Cookie, key auth.Key) bool {
-	return cookie.Name == "__Host-session" && cookie.Value == key.JWT &&
+func isSessionCookie(cookie *http.Cookie, issued auth.Issued) bool {
+	return cookie.Name == "__Host-session" && cookie.Value == issued.Token &&
 		cookie.Path == "/" && cookie.Domain == "" && cookie.MaxAge == 0 &&
 		cookie.HttpOnly && cookie.Secure && cookie.SameSite == http.SameSiteLaxMode &&
-		cookie.Expires.Unix() == key.ExpiresAt.Unix()
+		cookie.Expires.Unix() == issued.ExpiresAt.Unix()
 }

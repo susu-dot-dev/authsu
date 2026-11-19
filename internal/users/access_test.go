@@ -51,6 +51,27 @@ func TestAccess(t *testing.T) {
 			status: http.StatusUnauthorized, body: bodyUnauthenticated, logged: "unauthenticated",
 		},
 		{
+			name: "an API key in the session cookie",
+			cookies: func(*rig) []*http.Cookie {
+				return []*http.Cookie{sessionCookie("susu_key_" + sessionBody)}
+			},
+			status: http.StatusUnauthorized, body: bodyUnauthenticated, logged: "unauthenticated",
+		},
+		{
+			name: "an invitation token in the session cookie",
+			cookies: func(*rig) []*http.Cookie {
+				return []*http.Cookie{sessionCookie("susu_inv_" + sessionBody)}
+			},
+			status: http.StatusUnauthorized, body: bodyUnauthenticated, logged: "unauthenticated",
+		},
+		{
+			name: "a well-formed session token no session has",
+			cookies: func(*rig) []*http.Cookie {
+				return []*http.Cookie{sessionCookie("susu_ses_" + sessionBody)}
+			},
+			status: http.StatusUnauthorized, body: bodyUnauthenticated, logged: "unauthenticated",
+		},
+		{
 			name: "a valid session beside a second session cookie",
 			cookies: func(rg *rig) []*http.Cookie {
 				good := rg.signIn(adminID, roleAdmin)
@@ -63,17 +84,17 @@ func TestAccess(t *testing.T) {
 			name: "a session the store no longer finds (revoked, expired or its account revoked)",
 			cookies: func(rg *rig) []*http.Cookie {
 				cookie := rg.signIn(adminID, roleAdmin)
-				clear(rg.keys.rows)
+				clear(rg.creds.rows)
 
 				return []*http.Cookie{cookie}
 			},
 			status: http.StatusUnauthorized, body: bodyUnauthenticated, logged: "unauthenticated",
 		},
 		{
-			name: "the key store is unavailable",
+			name: "the credential store is unavailable",
 			cookies: func(rg *rig) []*http.Cookie {
 				cookie := rg.signIn(adminID, roleAdmin)
-				rg.keys.err = errDB
+				rg.creds.err = errDB
 
 				return []*http.Cookie{cookie}
 			},
@@ -124,6 +145,51 @@ func TestAccess(t *testing.T) {
 	}
 }
 
+// TestMalformedSessionTokensAreNotLookedUp: a cookie that is not a session
+// token in the exact shape (another kind of token, a wrong length, padding,
+// surrounding whitespace, a non-canonical last character) is refused as signed
+// out before the credential store is read, so a stranger's input never costs a
+// query. (A client library may also drop or quote a value it cannot put in a
+// Cookie header; the cases are still refused, which is the point.)
+func TestMalformedSessionTokensAreNotLookedUp(t *testing.T) {
+	t.Parallel()
+
+	good := "susu_ses_" + sessionBody
+	last := len(good) - 1
+
+	cookies := map[string]string{
+		"an API key":                 "susu_key_" + sessionBody,
+		"an invitation token":        "susu_inv_" + sessionBody,
+		"an uppercase prefix":        "SUSU_SES_" + sessionBody,
+		"no prefix":                  sessionBody,
+		"a body one character short": good[:last],
+		"a body one character long":  good + "A",
+		"padding":                    good + "=",
+		"a leading space":            " " + good,
+		"a trailing space":           good + " ",
+		"a non-canonical last char":  good[:last] + "B",
+		"a NUL":                      good[:20] + "\x00" + good[21:],
+		"non-ASCII":                  good[:20] + "\u00e9" + good[22:],
+		"huge":                       "susu_ses_" + strings.Repeat("A", 3000),
+	}
+
+	for name, value := range cookies {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rg := newRig(t)
+			rec := rg.as(sessionCookie(value), http.MethodGet, collection)
+
+			wantResponse(t, rg, rec, http.StatusUnauthorized, bodyUnauthenticated, "unauthenticated")
+			wantCalls(t, rg.store.calls, nil)
+
+			if rg.creds.reads != 0 {
+				t.Errorf("credential store reads = %d, want 0", rg.creds.reads)
+			}
+		})
+	}
+}
+
 // expectedCall is the one call a route makes for an administrator: a revocation
 // carries the admin role and the clock, a read neither.
 func expectedCall(rt route, rg *rig) storeCall {
@@ -152,9 +218,9 @@ func TestRoleIsReadOnEveryRequest(t *testing.T) {
 		t.Fatalf("as an administrator = %d, want 200", got)
 	}
 
-	for kid, row := range rg.keys.rows {
+	for token, row := range rg.creds.rows {
 		row.Role = roleMember
-		rg.keys.rows[kid] = row
+		rg.creds.rows[token] = row
 	}
 
 	if got := send(); got != http.StatusForbidden {

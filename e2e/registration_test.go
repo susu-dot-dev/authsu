@@ -25,7 +25,6 @@ package e2e_test
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -46,34 +45,35 @@ const (
 	regCodeChal    = "invalid_challenge"
 	regCodeAccept  = "registration_accept_failed"
 
+	// regUnknownCode is a well-formed invitation token that nothing stores.
+	regUnknownCode = "susu_inv_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 	regNoRoleType = "e2e_no_role"
-	regNoRoleCode = "e2e-no-role-invitation-0123456789ABCDEFGHIJKLMN"
-	regSpareCode  = "e2e-spare-invitation-0123456789ABCDEFGHIJKLMNOPQ"
+	// Invitation tokens of their own, each a canonical "susu_inv_" token.
+	regNoRoleCode = "susu_inv_dFLNhvV0ciEeD06FuZjP7Ty-Og8cKv2K9NysZmJlzgw"
+	regSpareCode  = "susu_inv_edv2XbaMr24dSyI95lN8x7nAOloEjPObJbUYchtso2U"
 	regFirstRunID = "00000000-0000-7000-8000-00000000c001"
 )
 
-// regSeedInvitation inserts an invitation with its own code (hashed the way the
-// Worker hashes it) and the given type, cap and extra columns.
+// regSeedInvitation inserts an invitation whose token is code (stored as its
+// hash, the way the Worker stores it) with the given type, cap and state:
+// "revoked" revokes its secret at second 1, "expired" lets it expire at second 1.
 func regSeedInvitation(t *testing.T, id, code, kind string, numInvites int, extra string) {
 	t.Helper()
 
-	sum := sha256.Sum256([]byte(code))
-	query := "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at"
-	values := ") VALUES (?, ?, ?, 'e2e', ?, strftime('%s','now')"
+	seedSecret(t, id, kindInvitation, code)
 
 	switch extra {
 	case "":
 	case "revoked":
-		query += ", revoked_at"
-		values += ", 1"
+		seed(t, "UPDATE secrets SET revoked_at = 1 WHERE id = ?", id)
 	case "expired":
-		query += ", expires_at"
-		values += ", 1"
+		seed(t, "UPDATE secrets SET expires_at = 1 WHERE id = ?", id)
 	default:
 		t.Fatalf("unknown extra %q", extra)
 	}
 
-	seed(t, query+values+")", id, sum[:], kind, numInvites)
+	seed(t, "INSERT INTO invitations (id, type, label, num_invites) VALUES (?, ?, 'e2e', ?)", id, kind, numInvites)
 }
 
 // regSeedAdminAndFirstRun is the state of a registered first admin, as the
@@ -272,8 +272,8 @@ func TestRegistrationThenLogin(t *testing.T) {
 	get(t, pathSession, token).expect(t, "GET /api/session", http.StatusOK, "")
 
 	// The session belongs to the account registration created.
-	if got := claimsOf(t, token)["sub"]; got != pk.userID {
-		t.Errorf("session sub = %v, want %s", got, pk.userID)
+	if got := get(t, pathSession, token); !strings.Contains(got.body, `"userId":"`+pk.userID+`"`) {
+		t.Errorf("session = %s, want the account %s", got.body, pk.userID)
 	}
 
 	// A second login with the same passkey works too: registration left it reusable.
@@ -423,12 +423,9 @@ func TestRegistrationBeginRefusesInvitations(t *testing.T) {
 		setup func(t *testing.T)
 		code  string
 	}{
-		{"unknown well-formed code", func(*testing.T) {}, "unknown-code-0123456789abcdefghijklmnopqrstu"},
-		{"a code that differs from the secret by one character", func(*testing.T) {}, firstRunSecret[:len(firstRunSecret)-1] + "M"},
-		{"the secret in another case", func(*testing.T) {}, strings.ToLower(firstRunSecret)},
-		{"the secret with a character dropped", func(*testing.T) {}, firstRunSecret[1:]},
-		{"the secret with a character added", func(*testing.T) {}, firstRunSecret + "A"},
-		{"the hex of the secret hash", func(*testing.T) {}, frSecretHashHex()},
+		{"unknown well-formed token", func(*testing.T) {}, regUnknownCode},
+		{"a token that differs from the secret by one character", func(*testing.T) {}, firstRunSecret[:len(firstRunSecret)-1] + "M"},
+		{"the secret's body in lower case", func(*testing.T) {}, strings.ToLower(firstRunSecret)},
 		{
 			"revoked invitation",
 			func(t *testing.T) { t.Helper(); regSeedInvitation(t, idA, regSpareCode, "first_run", 1, "revoked") },
@@ -481,6 +478,158 @@ func TestRegistrationBeginRefusesInvitations(t *testing.T) {
 	}
 }
 
+// regTimeStates are the stored time states of an invitation's secret that
+// decide whether it can still be redeemed, each as the SQL that sets it. The
+// rule is the shared active predicate: not revoked as of now (revoked_at is a
+// time, so one scheduled for later has not happened) and expires_at > now (so it
+// is expired AT its expires_at, not after). A margin of an hour keeps the
+// "later" cases away from the second the request is made in.
+func regTimeStates() []struct {
+	name       string
+	sql        string
+	redeemable bool
+} {
+	return []struct {
+		name       string
+		sql        string
+		redeemable bool
+	}{
+		{"untouched", "SELECT 1", true},
+		{"expires in an hour", "UPDATE secrets SET expires_at = strftime('%s','now') + 3600 WHERE id = ?", true},
+		{"expires exactly now", "UPDATE secrets SET expires_at = strftime('%s','now') WHERE id = ?", false},
+		{"expired a second ago", "UPDATE secrets SET expires_at = strftime('%s','now') - 1 WHERE id = ?", false},
+		{"expires at zero", "UPDATE secrets SET expires_at = 0 WHERE id = ?", false},
+		{"expires at a negative time", "UPDATE secrets SET expires_at = -1 WHERE id = ?", false},
+		{"revoked a second ago", "UPDATE secrets SET revoked_at = strftime('%s','now') - 1 WHERE id = ?", false},
+		{"revoked exactly now", "UPDATE secrets SET revoked_at = strftime('%s','now') WHERE id = ?", false},
+		{"revoked in an hour, not yet in force", "UPDATE secrets SET revoked_at = strftime('%s','now') + 3600 WHERE id = ?", true},
+	}
+}
+
+// regApplyTimeState applies one of regTimeStates to the invitation id.
+func regApplyTimeState(t *testing.T, sql, id string) {
+	t.Helper()
+
+	if sql == "SELECT 1" {
+		return
+	}
+
+	seed(t, sql, id)
+}
+
+// TestRegistrationBeginHonoursInvitationTimes holds the time rule of an
+// invitation at begin, which reads the invitation through invitationQuery: an
+// invitation that expires exactly now or was revoked as of now is refused with
+// the one opaque 403, and one whose revocation is still scheduled is accepted.
+//
+//nolint:paralleltest // shares one database
+func TestRegistrationBeginHonoursInvitationTimes(t *testing.T) {
+	for _, state := range regTimeStates() {
+		t.Run(state.name, func(t *testing.T) {
+			reset(t)
+			regSeedInvitation(t, idInvitationA, regSpareCode, regNoRoleType, 1, "")
+			regApplyTimeState(t, state.sql, idInvitationA)
+
+			got := beginRegistration(t, regSpareCode, "Alice")
+
+			if state.redeemable {
+				got.expect(t, "begin", http.StatusOK, "")
+
+				return
+			}
+
+			got.expect(t, "begin", http.StatusForbidden, regCodeInvalid)
+			regExpectNothingWritten(t, "a refused begin")
+		})
+	}
+}
+
+// TestRegistrationFinishHonoursInvitationTimes holds the same rule at finish,
+// where the invitation is read again and then insertUserQuery decides in the
+// write itself: the invitation is valid when the ceremony begins and its stored
+// time state changes before it finishes, so the begin-time read cannot be what
+// refuses it. The invitation is of the "member" type, because only a type with
+// a role can finish. The refusal is the same opaque 403 as at begin, and a refused
+// finish creates no account and no passkey. (The interleaving where the state
+// changes between finish's read and its write is the race tests' job.)
+//
+//nolint:paralleltest // shares one database
+func TestRegistrationFinishHonoursInvitationTimes(t *testing.T) {
+	for _, state := range regTimeStates() {
+		t.Run(state.name, func(t *testing.T) {
+			reset(t)
+			regSeedInvitation(t, idInvitationA, regNoRoleCode, "member", 1, "")
+
+			body := regPrepareBody(t, regNoRoleCode, "Alice")
+
+			regApplyTimeState(t, state.sql, idInvitationA)
+
+			got := post(t, pathRegisterEnd, body, "")
+
+			if state.redeemable {
+				got.expect(t, "finish", http.StatusCreated, "")
+				expectCount(t, "users", "1")
+
+				return
+			}
+
+			got.expect(t, "finish", http.StatusForbidden, regCodeInvalid)
+			regExpectNothingWritten(t, "a refused finish")
+		})
+	}
+}
+
+// TestRegistrationBeginRefusesMalformedCodes: a code that is not an invitation
+// token (wrong length, wrong tag, wrong alphabet, not canonical) is refused by
+// the parser before any lookup, as 400 invalid_invitation, and nothing is
+// written. Tokens of the other kinds are refused here too: a session or an API
+// key is not an invitation.
+//
+//nolint:paralleltest // shares one database
+func TestRegistrationBeginRefusesMalformedCodes(t *testing.T) {
+	regOpenFirstRun(t)
+
+	prefix := tokenPrefix(tagInvitation)
+	body := firstRunSecret[len(prefix):]
+
+	tests := []struct{ name, code string }{
+		{"the secret with a character dropped", firstRunSecret[1:]},
+		{"the secret with its last character dropped", firstRunSecret[:len(firstRunSecret)-1]},
+		{"the secret with a character added", firstRunSecret + "A"},
+		{"the secret's body without the prefix", body},
+		{"the prefix alone", prefix},
+		{"the secret with a space before", " " + firstRunSecret},
+		{"the secret with a space after", firstRunSecret + " "},
+		{"the secret with a newline after", firstRunSecret + "\n"},
+		{"the secret with upper-case prefix", strings.ToUpper(prefix) + body},
+		{"the secret's body under the session tag", tokenPrefix(tagSession) + body},
+		{"the secret's body under the key tag", tokenPrefix(tagAPIKey) + body},
+		{"an unknown tag", "susu_xyz_" + body},
+		{"two underscores", "susu__inv_" + body},
+		{"a non-canonical last character", prefix + strings.Repeat("A", tokenBodyLen-1) + "B"},
+		{"a padding character", firstRunSecret[:len(firstRunSecret)-1] + "="},
+		{"a plus in the body", prefix + strings.Repeat("A", tokenBodyLen-2) + "+A"},
+		{"a slash in the body", prefix + strings.Repeat("A", tokenBodyLen-2) + "/A"},
+		{"the hex of the secret hash", frSecretHashHex()},
+		{"the base64 of the secret hash", b64(mustDecodeHex(t, frSecretHashHex()))},
+		{"the old shape: a long run of base64url characters", strings.Repeat("A", 256)},
+		{"one character", "A"},
+		{"3000 characters", strings.Repeat("A", 3000)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			beginRegistration(t, tt.code, "Alice").expect(t, "begin", http.StatusBadRequest, regCodeInvalid)
+			regExpectNothingWritten(t, tt.name)
+		})
+	}
+
+	// The refusals did not spend or disturb the first-run invitation.
+	options := mustBeginRegistration(t, firstRunSecret, "Alice")
+	post(t, pathRegisterEnd, newAuthenticator().finishBody(t, options, firstRunSecret, "Alice"), "").
+		expect(t, "the real secret afterwards", http.StatusCreated, "")
+}
+
 // TestRegistrationBeginParsesInputs covers the parsers' bounds at the exact
 // byte, through the real boundary, for the code and the name.
 //
@@ -494,7 +643,7 @@ func TestRegistrationBeginParsesInputs(t *testing.T) {
 		wantStatus int
 		wantCode   string
 	}{
-		// ---- codes: base64url alphabet, 1..256 bytes ----
+		// ---- codes: exactly "susu_inv_" and 43 canonical base64url characters ----
 		{"empty code", `{"invitationCode":"","name":"A"}`, 400, regCodeInvalid},
 		{"missing code", `{"name":"A"}`, 400, regCodeInvalid},
 		{"null code", `{"invitationCode":null,"name":"A"}`, 400, regCodeInvalid},
@@ -507,10 +656,12 @@ func TestRegistrationBeginParsesInputs(t *testing.T) {
 		{"code with NUL", `{"invitationCode":"ab\u0000cd","name":"A"}`, 400, regCodeInvalid},
 		{"code with a non-ASCII letter", `{"invitationCode":"abcé","name":"A"}`, 400, regCodeInvalid},
 		{"code with a fullwidth letter", `{"invitationCode":"ａｂｃ","name":"A"}`, 400, regCodeInvalid},
-		{"code of 256 bytes is well-formed but unknown", `{"invitationCode":"` + strings.Repeat("A", 256) + `","name":"A"}`, 403, regCodeInvalid},
+		{"a token of 43 characters is well-formed but unknown", `{"invitationCode":"` + regUnknownCode + `","name":"A"}`, 403, regCodeInvalid},
+		{"a token of 42 characters is malformed", `{"invitationCode":"` + regUnknownCode[:len(regUnknownCode)-1] + `","name":"A"}`, 400, regCodeInvalid},
+		{"a token of 44 characters is malformed", `{"invitationCode":"` + regUnknownCode + `A","name":"A"}`, 400, regCodeInvalid},
 		{"code of 257 bytes is malformed", `{"invitationCode":"` + strings.Repeat("A", 257) + `","name":"A"}`, 400, regCodeInvalid},
 		{"code of 3000 bytes is malformed", `{"invitationCode":"` + strings.Repeat("A", 3000) + `","name":"A"}`, 400, regCodeInvalid},
-		{"code of 1 byte is well-formed but unknown", `{"invitationCode":"A","name":"A"}`, 403, regCodeInvalid},
+		{"code of 1 byte is malformed", `{"invitationCode":"A","name":"A"}`, 400, regCodeInvalid},
 		{"code as a number", `{"invitationCode":123,"name":"A"}`, 400, "invalid_field_type"},
 		{"code as an array", `{"invitationCode":["a"],"name":"A"}`, 400, "invalid_field_type"},
 		{"code as an object", `{"invitationCode":{},"name":"A"}`, 400, "invalid_field_type"},
@@ -1140,7 +1291,7 @@ func TestRegistrationCrossCeremonyChallenge(t *testing.T) {
 			t.Errorf("a registration challenge logged in: %v", got.setCookies)
 		}
 
-		expectCount(t, "japikeys", "0")
+		expectCount(t, "sessions", "0")
 	})
 }
 
@@ -1760,32 +1911,6 @@ func TestRegistrationRequestEnvelope(t *testing.T) {
 			regExpectNothingWritten(t, tt.name)
 		})
 	}
-}
-
-// TestRegistrationBeginBodyCap checks the 4 KiB cap of begin: a name is at most
-// 128 bytes, so the cap is far above any honest body (the 6x worst case is 768).
-//
-//nolint:paralleltest // shares one database
-func TestRegistrationBeginBodyCap(t *testing.T) {
-	regOpenFirstRun(t)
-
-	pad := func(n int) []byte {
-		doc := `{"invitationCode":"` + firstRunSecret + `","name":"A"`
-		out := doc + strings.Repeat(" ", n-len(doc)-1) + "}"
-
-		return []byte(out)
-	}
-
-	post(t, pathRegisterBegin, pad(4<<10), "").expect(t, "begin at the 4 KiB cap", http.StatusOK, "")
-	post(t, pathRegisterBegin, pad(4<<10+1), "").expect(t, "begin one byte over", http.StatusRequestEntityTooLarge, codeBodyTooLarge)
-	post(t, pathRegisterBegin, bytes.Repeat([]byte("x"), 1<<20+1), "").
-		expect(t, "begin over 1 MiB", http.StatusRequestEntityTooLarge, codeBodyTooLarge)
-
-	// The worst-case honest body (128 bytes of '<', each written as \u003c by a
-	// browser's JSON.stringify? no: JSON.stringify writes '<' as is, but an
-	// escaping client may send 6x) is far below the cap.
-	worst := `{"invitationCode":"` + firstRunSecret + `","name":"` + strings.Repeat(`\u003c`, 128) + `"}`
-	post(t, pathRegisterBegin, []byte(worst), "").expect(t, "begin with a 6x-escaped name", http.StatusOK, "")
 }
 
 // TestRegistrationMethodsAndMedia covers the routes' HTTP contract.

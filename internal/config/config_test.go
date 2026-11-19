@@ -127,17 +127,16 @@ func TestParseOrigin(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		origin       string
-		wantHost     string
-		wantInsecure bool
-		wantErr      bool
+		origin   string
+		wantHost string
+		wantErr  bool
 	}{
 		"https":           {origin: "https://auth.example.com", wantHost: hostAPI},
 		"https with port": {origin: "https://auth.example.com:8443", wantHost: hostAPI},
-		"localhost http":  {origin: "http://localhost:8787", wantHost: hostLocalhost, wantInsecure: true},
-		"localhost bare":  {origin: "http://localhost", wantHost: hostLocalhost, wantInsecure: true},
+		"localhost http":  {origin: "http://localhost:8787", wantHost: hostLocalhost},
+		"localhost bare":  {origin: "http://localhost", wantHost: hostLocalhost},
 		// Only the host "localhost" may be insecure. A prefix match would let a
-		// lookalike host through, with an http issuer and so an http cookie.
+		// lookalike host through, so an http origin would be accepted for it.
 		"localhost subdomain lookalike": {origin: "http://localhost.evil.com", wantErr: true},
 		"localhost suffix lookalike":    {origin: "http://localhostx", wantErr: true},
 		"localhost lookalike with port": {origin: "http://localhost.evil.com:8787", wantErr: true},
@@ -183,7 +182,7 @@ func TestParseOrigin(t *testing.T) {
 				return
 			}
 
-			want := config.Origin{String: tt.origin, Host: tt.wantHost, Insecure: tt.wantInsecure}
+			want := config.Origin{String: tt.origin, Host: tt.wantHost}
 			if got != want {
 				t.Errorf("origin = %+v, want %+v", got, want)
 			}
@@ -287,11 +286,11 @@ func TestFirstRunSecret(t *testing.T) {
 	t.Parallel()
 
 	for name, secret := range map[string]string{
-		"missing":          "",
-		"short":            "a",
-		"generated":        strings.Repeat("Ab-_9", 8) + "xyz",
-		"not base64url":    "has a space\n+/=",
-		"longer than code": strings.Repeat("a", 300),
+		"missing":           "",
+		"short":             "a",
+		"generated":         strings.Repeat("Ab-_9", 8) + "xyz",
+		"not base64url":     "has a space\n+/=",
+		"longer than token": strings.Repeat("a", 300),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -305,7 +304,7 @@ func TestFirstRunSecret(t *testing.T) {
 }
 
 // TestFirstRunSecretReadsTheNamedSecret: only FIRST_RUN_SECRET is read, so the
-// root secret can never be mistaken for the first-run code.
+// root secret can never be mistaken for the first-run token.
 func TestFirstRunSecretReadsTheNamedSecret(t *testing.T) {
 	t.Parallel()
 

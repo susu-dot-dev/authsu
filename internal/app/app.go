@@ -69,15 +69,19 @@ func NewHandler(platform Platform) http.Handler {
 		[]auth.Route{healthRoute()},
 		firstrun.Routes(firstrun.Deps{Store: db, Now: time.Now, NewID: newID}),
 		registration.Routes(registration.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID}),
-		login.Routes(login.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, CreateSession: auth.CreateSession}),
+		login.Routes(login.Deps{
+			Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID, IssueSession: auth.IssueSession,
+		}),
 		session.Routes(session.Deps{Store: db, Now: time.Now}),
-		agents.Routes(agents.Deps{Store: db, Now: time.Now, NewID: newID, CreateKey: auth.CreateKey}),
+		agents.Routes(agents.Deps{
+			Store: db, Now: time.Now, NewID: newID, Entropy: rand.Reader, IssueAPIKey: auth.IssueAPIKey,
+		}),
 		invitations.Routes(invitations.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID}),
 		users.Routes(users.Deps{Store: db, Now: time.Now, Log: platform.Log}),
 	)
 
 	handler := auth.Handler(routes, auth.Deps{
-		Keys: db, Now: time.Now, Getenv: platform.Getenv, Log: platform.Log,
+		Credentials: db, Now: time.Now, Getenv: platform.Getenv, Log: platform.Log,
 	})
 
 	// CORS is outermost so a preflight is answered before routing, which would

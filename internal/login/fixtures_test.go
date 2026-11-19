@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/challenge"
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/login"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -36,9 +38,9 @@ var _ login.Store = (*store.Store)(nil)
 
 // Causes the tests inject. They are only ever in the log, never in a response.
 var (
-	errDB      = errors.New("INSERT INTO japikeys: database is on fire")
+	errDB      = errors.New("INSERT INTO secrets: database is on fire")
 	errEntropy = errors.New("entropy source is broken")
-	errCreate  = errors.New("key generation is broken")
+	errIssue   = errors.New("session issuing is broken")
 )
 
 const (
@@ -164,25 +166,37 @@ func (f *fakeStore) CreateSession(_ context.Context, session store.NewSession) e
 	return nil
 }
 
-// noKeys is the key store of a deployment under a route that needs no session:
-// reading it at all is a defect.
-type noKeys struct{ t *testing.T }
+// noCredentials is the credential store of a deployment under a route that
+// needs no session: resolving a token at all is a defect.
+type noCredentials struct{ t *testing.T }
 
-func (k noKeys) ActiveKey(context.Context, string, string, time.Time) (store.ActiveKey, bool, error) {
-	k.t.Error("an open route read the key store")
+func (c noCredentials) ResolveSession(
+	context.Context, input.SessionToken, time.Time,
+) (store.ActiveSession, bool, error) {
+	c.t.Error("an open route resolved a session")
 
-	return store.ActiveKey{}, false, nil
+	return store.ActiveSession{}, false, nil
 }
 
-// sessionCall is one call of the injected session creation.
-type sessionCall struct {
-	issuer  auth.Issuer
-	userID  string
-	expires time.Time
+func (c noCredentials) ResolveAPIKey(
+	context.Context, input.APIKeyToken, time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	c.t.Error("an open route resolved an API key")
+
+	return store.ActiveAPIKey{}, false, nil
+}
+
+// issueCall is one call of the injected session issuing: the time it was asked
+// for and the identifier it was given to use.
+type issueCall struct {
+	now time.Time
+	// id is what the id source returned for this call, "" when the issuing
+	// never asked for one (it failed first).
+	id string
 }
 
 // rig is one deployment under test: the real boundary and routes over a fake
-// store, with a clock, entropy and key creation the test controls.
+// store, with a clock, entropy and session issuing the test controls.
 type rig struct {
 	t       *testing.T
 	store   *fakeStore
@@ -191,11 +205,14 @@ type rig struct {
 	entropy io.Reader
 	// priv is the passkey's private key, the one the store has the public half of.
 	priv *ecdsa.PrivateKey
-	// createErr, when set, is what the injected session creation fails with.
-	createErr error
-	// sessions records every session creation, and keys the keys it made.
-	sessions []sessionCall
-	keys     []auth.Key
+	// issueErr, when set, is what the injected session issuing fails with.
+	issueErr error
+	// issues records every call of the session issuing, and issued the sessions
+	// it issued.
+	issues []issueCall
+	issued []auth.Issued
+	// ids is how many identifiers the id source has handed out.
+	ids int
 	// logged records every error the boundary turned into a response.
 	logged []*apierr.Error
 }
@@ -217,10 +234,10 @@ func newRig(t *testing.T) *rig {
 		env: map[string]string{
 			config.SecretHMAC: testSecret, config.VarAPIOrigin: testAPI, config.VarUIOrigin: testUI,
 		},
-		now:       testNow(),
-		entropy:   counterEntropy(),
-		priv:      priv,
-		createErr: nil, sessions: nil, keys: nil, logged: nil,
+		now:      testNow(),
+		entropy:  counterEntropy(),
+		priv:     priv,
+		issueErr: nil, issues: nil, issued: nil, ids: 0, logged: nil,
 	}
 }
 
@@ -288,39 +305,57 @@ func (r *rig) setCredential(change func(*store.Credential)) {
 	r.store.credentials[string(testCredID())] = credential
 }
 
-// createSession is the injected session creation: the real one, recorded, unless
+// newID is the injected id source: UUID-shaped ids that count up, so each
+// session of a test has its own and a test can tell them apart.
+func (r *rig) newID() string {
+	r.ids++
+
+	return fmt.Sprintf("00000000-0000-7000-8000-%012d", r.ids)
+}
+
+// issueSession is the injected session issuing: the real one, recorded, unless
 // the test made it fail.
-func (r *rig) createSession(issuer auth.Issuer, userID string, expires time.Time) (auth.Key, error) {
-	r.sessions = append(r.sessions, sessionCall{issuer: issuer, userID: userID, expires: expires})
+func (r *rig) issueSession(entropy io.Reader, newID func() string, now time.Time) (auth.Issued, error) {
+	call := issueCall{now: now, id: ""}
 
-	if r.createErr != nil {
-		return auth.Key{}, r.createErr
+	if r.issueErr != nil {
+		r.issues = append(r.issues, call)
+
+		return auth.Issued{}, r.issueErr
 	}
 
-	key, err := auth.CreateSession(issuer, userID, expires)
+	issued, err := auth.IssueSession(entropy, func() string {
+		call.id = newID()
+
+		return call.id
+	}, now)
+
+	r.issues = append(r.issues, call)
+
 	if err == nil {
-		r.keys = append(r.keys, key)
+		r.issued = append(r.issued, issued)
 	}
 
-	return key, err //nolint:wrapcheck // a test double passes the real function's result through
+	return issued, err //nolint:wrapcheck // a test double passes the real function's result through
 }
 
 func (r *rig) deps() login.Deps {
 	return login.Deps{
-		Store:         r.store,
-		Now:           func() time.Time { return r.now },
-		Entropy:       readerFunc(func(p []byte) (int, error) { return r.entropy.Read(p) }),
-		CreateSession: r.createSession,
+		Store:        r.store,
+		Now:          func() time.Time { return r.now },
+		Entropy:      readerFunc(func(p []byte) (int, error) { return r.entropy.Read(p) }),
+		NewID:        r.newID,
+		IssueSession: r.issueSession,
 	}
 }
 
 // handler is the real boundary over the real routes.
 func (r *rig) handler() http.Handler {
 	return auth.Handler(login.Routes(r.deps()), auth.Deps{
-		Keys:   noKeys{t: r.t},
-		Now:    func() time.Time { return r.now },
-		Getenv: r.getenv,
-		Log:    func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },
+		Credentials: noCredentials{t: r.t},
+		Now:         func() time.Time { return r.now },
+		Getenv:      r.getenv,
+		Log:         func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },
 	})
 }
 

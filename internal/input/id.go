@@ -4,8 +4,8 @@ package input
 const (
 	// IDLen is the length of an ID: the 8-4-4-4-12 text form. Every id column
 	// is checked with `length(id) = 36 AND id NOT GLOB '*[^0-9a-f-]*'`
-	// (users, credentials and invitations in migration 0001, japikeys.kid in
-	// 0002, agents in 0005), which this form satisfies exactly.
+	// (secrets, users, credentials, agents and the kind tables in migration
+	// 0001), which this form satisfies exactly.
 	IDLen = uuidLen
 )
 

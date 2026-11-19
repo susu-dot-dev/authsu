@@ -33,7 +33,7 @@ const (
 	// (500, a bare internal error to the client) and is meant to be alerted on.
 	CodeStoredCredentialInvalid = "stored_credential_invalid" //nolint:gosec // an error code, not a credential
 
-	// CodeSessionCreateFailed is a session key that could not be created.
+	// CodeSessionCreateFailed is a session token that could not be issued.
 	CodeSessionCreateFailed = "session_create_failed"
 )
 

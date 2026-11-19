@@ -2,7 +2,6 @@
 package app_test
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,6 +13,8 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
+	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -23,28 +24,26 @@ var errCheck = errors.New("D1_ERROR: CHECK constraint failed: SQLITE_CONSTRAINT_
 // uuidV7 is the canonical text of a version 7 UUID.
 var uuidV7 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
-const (
-	pathFirstRun      = "/api/first-run"
-	activeKeyFragment = "FROM japikeys k"
-	jwkMalformed      = `{"keys":"not an array"}`
-)
+const pathFirstRun = "/api/first-run"
 
 // TestSessionRowSeam is the seam between what D1 hands the Worker and what the
-// Go code can trust. The real session boundary, the real store and the real
-// route run over a fake database that answers with the key row exactly as D1
-// produces values (int64 for integers, string for text, []byte for blobs), and
-// then with values the JS side could produce but must never be believed:
-// float64 integers, NULL in a NOT NULL column, a blob where text belongs, a
-// row of the wrong width. Every one of those is a defect (500, a bare
-// "internal" to the client, the real code in the log), never a successful
-// sign-in and never a sign-out.
+// Go code can trust. The real auth boundary, the real store and the real
+// route run over a fake database that answers with the session row exactly as
+// D1 produces values (int64 for integers, string for text), and then with
+// values the JS side could produce but must never be believed: float64
+// integers, NULL in a NOT NULL column, a blob where text belongs, a row of the
+// wrong width. Every one of those is a defect (500, a bare "internal" to the
+// client, the real code in the log), never a successful sign-in and never a
+// sign-out.
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestSessionRowSeam(t *testing.T) {
 	t.Parallel()
 
+	rejected := []string{store.CodeSessionVerifyRejected}
+
 	tests := map[string]struct {
-		// row builds the database's answer from the session's key.
+		// row builds the database's answer from the session.
 		row func(s session) step
 		// wantStatus is the response status; wantBody is a fragment of the body,
 		// or the whole of an error body.
@@ -53,154 +52,99 @@ func TestSessionRowSeam(t *testing.T) {
 		wantLogged []string
 	}{
 		"member, as D1 produces it": {
-			row:        func(s session) step { return s.activeKeyStep(roleMember) },
+			row:        func(s session) step { return s.activeSessionStep(roleMember) },
 			wantStatus: http.StatusOK, wantBody: `"role":"member"`,
 		},
 		"admin, as D1 produces it": {
-			row:        func(s session) step { return s.activeKeyStep(roleAdmin) },
+			row:        func(s session) step { return s.activeSessionStep(roleAdmin) },
 			wantStatus: http.StatusOK, wantBody: `"role":"admin"`,
 		},
 		"expires_at as float64": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, float64(s.key.ExpiresAt.Unix()), "", ""})
+				expires := float64(s.issued.ExpiresAt.Unix())
+
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, expires})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"expires_at as text": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, "1900000000", "", ""})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, "1900000000"})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"expires_at NULL": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, nil, "", ""})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, nil})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"role NULL": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", nil, s.key.ExpiresAt.Unix(), "", ""})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, nil, s.issued.ExpiresAt.Unix()})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"role as a blob": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", []byte(roleAdmin), s.key.ExpiresAt.Unix(), "", ""})
+				return s.activeSessionRow([]any{
+					s.issued.ID, s.userID, []byte(roleAdmin), s.issued.ExpiresAt.Unix(),
+				})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
-		"jwk as a blob": {
+		"id as a blob": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{[]byte(s.key.JWK), s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", ""})
+				return s.activeSessionRow([]any{
+					[]byte(s.issued.ID), s.userID, roleMember, s.issued.ExpiresAt.Unix(),
+				})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"user_id as an integer": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, int64(7), "", roleMember, s.key.ExpiresAt.Unix(), "", ""})
+				return s.activeSessionRow([]any{s.issued.ID, int64(7), roleMember, s.issued.ExpiresAt.Unix()})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
-		},
-		"credential_id NULL": {
-			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, nil, roleMember, s.key.ExpiresAt.Unix(), "", ""})
-			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
-		},
-		"agent id NULL": {
-			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), nil, ""})
-			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
-		},
-		"agent scopes NULL": {
-			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", nil})
-			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
-		},
-		"agent scopes as a blob": {
-			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", []byte("[]")})
-			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
-		},
-		"a session whose row names an agent: the token has no actor": {
-			row: func(s session) step {
-				return s.activeKeyRow([]any{
-					s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), agentRowID, `["agent:read"]`,
-				})
-			},
-			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
-			wantLogged: []string{auth.CodeUnauthenticated},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"a column short": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), ""})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"a column too many": {
 			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "extra"})
+				return s.activeSessionRow([]any{
+					s.issued.ID, s.userID, roleMember, s.issued.ExpiresAt.Unix(), "extra",
+				})
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"no row: not active": {
 			row: func(session) step {
-				return step{match: activeKeyFragment, results: rows(), err: nil}
+				return step{match: readSession, results: rows(), err: nil}
 			},
 			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
 			wantLogged: []string{auth.CodeUnauthenticated},
 		},
 		"two rows": {
 			row: func(s session) step {
-				good := []any{s.key.JWK, s.userID, "", roleMember, s.key.ExpiresAt.Unix()}
+				good := []any{s.issued.ID, s.userID, roleMember, s.issued.ExpiresAt.Unix()}
 
-				return step{match: activeKeyFragment, results: rows(good, good), err: nil}
+				return step{match: readSession, results: rows(good, good), err: nil}
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"no result at all": {
 			row: func(session) step {
-				return step{match: activeKeyFragment, results: nil, err: nil}
+				return step{match: readSession, results: nil, err: nil}
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
-		},
-		"the row belongs to someone else": {
-			row: func(s session) step {
-				return s.activeKeyRow([]any{s.key.JWK, memberID, "", roleAdmin, s.key.ExpiresAt.Unix(), "", ""})
-			},
-			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
-			wantLogged: []string{auth.CodeUnauthenticated},
-		},
-		"stored key is not a JWK": {
-			row: func(s session) step {
-				return s.activeKeyRow([]any{jwkMalformed, s.userID, "", roleMember, s.key.ExpiresAt.Unix(), "", ""})
-			},
-			wantStatus: http.StatusServiceUnavailable,
-			wantBody:   `{"error":{"code":"session_verify_failed","message":"sessions are temporarily unavailable"}}` + "\n",
-			wantLogged: []string{store.CodeSessionVerifyFailed},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"database down": {
 			row: func(session) step {
-				return step{match: activeKeyFragment, results: nil, err: errDB}
+				return step{match: readSession, results: nil, err: errDB}
 			},
 			wantStatus: http.StatusServiceUnavailable,
 			wantBody:   `{"error":{"code":"session_verify_failed","message":"sessions are temporarily unavailable"}}` + "\n",
@@ -208,10 +152,9 @@ func TestSessionRowSeam(t *testing.T) {
 		},
 		"schema rule refused the read": {
 			row: func(session) step {
-				return step{match: activeKeyFragment, results: nil, err: store.Classify(errCheck)}
+				return step{match: readSession, results: nil, err: store.Classify(errCheck)}
 			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantLogged: []string{store.CodeSessionVerifyRejected},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 	}
 
@@ -229,7 +172,7 @@ func TestSessionRowSeam(t *testing.T) {
 			}
 
 			if got := h.exec.callCount(); got != 1 {
-				t.Errorf("Exec calls = %d, want the one key read", got)
+				t.Errorf("Exec calls = %d, want the one session lookup", got)
 			}
 
 			if got := h.loggedCodes(); !slices.Equal(got, tt.wantLogged) {
@@ -242,6 +185,148 @@ func TestSessionRowSeam(t *testing.T) {
 
 			if rec.Code == http.StatusOK {
 				assertWhoAmI(t, rec.Body.Bytes(), signedIn)
+			}
+		})
+	}
+}
+
+// TestAPIKeyRowSeam is TestSessionRowSeam for the lookup of an API key: the row
+// as D1 produces it is accepted, and every value it could produce but must
+// never be believed is a defect. The route is the agent list, which the key's
+// scope allows. (A stored scope that is damaged is not a defect: it reads as
+// empty and grants nothing, which the auth package pins.)
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
+func TestAPIKeyRowSeam(t *testing.T) {
+	t.Parallel()
+
+	const (
+		agentScopes = `["default:agent"]`
+		keyScope    = `["default:agent"]`
+	)
+
+	rejected := []string{store.CodeSessionVerifyRejected}
+
+	tests := map[string]struct {
+		row        func(k apiKey) step
+		wantStatus int
+		wantBody   string
+		wantLogged []string
+		// listed is whether the agent list is read after the lookup.
+		listed bool
+	}{
+		"a user's own key, as D1 produces it": {
+			row:        func(k apiKey) step { return k.keyStep(memberID, roleMember, "", "", keyScope) },
+			wantStatus: http.StatusOK, wantBody: `"agents":[]`, listed: true,
+		},
+		"an agent's key, as D1 produces it": {
+			row:        func(k apiKey) step { return k.keyStep(memberID, roleMember, agentRowID, agentScopes, keyScope) },
+			wantStatus: http.StatusOK, wantBody: `"agents":[]`, listed: true,
+		},
+		"expires_at as float64": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, roleMember, float64(k.issued.ExpiresAt.Unix()), "", "", keyScope})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"role NULL": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, nil, k.issued.ExpiresAt.Unix(), "", "", keyScope})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"id as a blob": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{[]byte(k.issued.ID), memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"agent id NULL": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), nil, "", keyScope})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"agent scopes NULL": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", nil, keyScope})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"agent scopes as a blob": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", []byte("[]"), keyScope})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"scope NULL": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", nil})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"a column short": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", ""})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"a column too many": {
+			row: func(k apiKey) step {
+				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope, "extra"})
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"no row: not active": {
+			row:        func(apiKey) step { return step{match: readAPIKey, results: rows(), err: nil} },
+			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+			wantLogged: []string{auth.CodeUnauthenticated},
+		},
+		"two rows": {
+			row: func(k apiKey) step {
+				good := []any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope}
+
+				return step{match: readAPIKey, results: rows(good, good), err: nil}
+			},
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
+		},
+		"database down": {
+			row:        func(apiKey) step { return step{match: readAPIKey, results: nil, err: errDB} },
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   `{"error":{"code":"session_verify_failed","message":"sessions are temporarily unavailable"}}` + "\n",
+			wantLogged: []string{store.CodeSessionVerifyFailed},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			key := newAPIKey(t)
+			script := []step{tt.row(key)}
+
+			if tt.listed {
+				script = append(script, step{match: "FROM agents", results: rows(), err: nil})
+			}
+
+			h := newHarness(t, fullEnv(), script...)
+
+			rec := h.do(request{method: http.MethodGet, path: "/api/agent", headers: key.headers})
+
+			if rec.Code != tt.wantStatus || !strings.Contains(rec.Body.String(), tt.wantBody) {
+				t.Errorf("= %d %s, want %d containing %q", rec.Code, rec.Body, tt.wantStatus, tt.wantBody)
+			}
+
+			if got := h.exec.callCount(); got != len(script) {
+				t.Errorf("Exec calls = %d, want %d", got, len(script))
+			}
+
+			if got := h.loggedCodes(); !slices.Equal(got, tt.wantLogged) {
+				t.Errorf("logged codes = %v, want %v", got, tt.wantLogged)
+			}
+
+			if strings.Contains(rec.Body.String(), errDB.Error()) {
+				t.Errorf("body leaks the cause: %s", rec.Body)
 			}
 		})
 	}
@@ -262,19 +347,19 @@ func assertWhoAmI(t *testing.T, body []byte, signedIn session) {
 		t.Fatalf("body %q: %v", body, err)
 	}
 
-	if got.UserID != signedIn.userID || got.ExpiresAt != signedIn.key.ExpiresAt.Unix() {
-		t.Errorf("body = %+v, want user %s expiring %d", got, signedIn.userID, signedIn.key.ExpiresAt.Unix())
+	if got.UserID != signedIn.userID || got.ExpiresAt != signedIn.issued.ExpiresAt.Unix() {
+		t.Errorf("body = %+v, want user %s expiring %d", got, signedIn.userID, signedIn.issued.ExpiresAt.Unix())
 	}
 }
 
-// TestSessionReadIsScoped: the key read the boundary makes names the token's
-// key id and the session kind, so an API key id presented as a session is not
-// found, and the time is now.
+// TestSessionReadIsScoped: the lookup the boundary makes is by the hash of the
+// token the cookie carries (the whole token, prefix included) and the session
+// kind, so an API key's secret is not found as a session, and the time is now.
 func TestSessionReadIsScoped(t *testing.T) {
 	t.Parallel()
 
 	signedIn := newSession(t, memberID)
-	h := newHarness(t, fullEnv(), signedIn.activeKeyStep(roleMember))
+	h := newHarness(t, fullEnv(), signedIn.activeSessionStep(roleMember))
 
 	rec := h.do(request{method: http.MethodGet, path: "/api/session", cookies: []*http.Cookie{signedIn.cookie}})
 	if rec.Code != http.StatusOK {
@@ -285,9 +370,11 @@ func TestSessionReadIsScoped(t *testing.T) {
 		t.Fatalf("calls = %v, want one single-statement read", h.exec.calls)
 	}
 
+	hash := secret.Hash(signedIn.issued.Token)
 	args := h.exec.calls[0][0].Args
-	if len(args) != 4 || args[0] != signedIn.key.ID.String() || args[1] != store.KindSession {
-		t.Errorf("args = %v, want kid %s and kind %s first", args, signedIn.key.ID, store.KindSession)
+
+	if len(args) != 4 || !slices.Equal(asBlob(args[0]), hash[:]) || args[1] != store.KindSession {
+		t.Errorf("args = %v, want the token's hash %x and kind %s first", args, hash, store.KindSession)
 	}
 
 	if _, isInt := args[2].(int64); !isInt || args[2] != args[3] {
@@ -392,7 +479,7 @@ func TestRolesAtTheRoutes(t *testing.T) {
 			t.Parallel()
 
 			signedIn := newSession(t, adminID)
-			script := append([]step{signedIn.activeKeyStep(tt.role)}, tt.after...)
+			script := append([]step{signedIn.activeSessionStep(tt.role)}, tt.after...)
 			h := newHarness(t, fullEnv(), script...)
 
 			rec := h.do(request{method: tt.method, path: tt.path, body: tt.body, cookies: []*http.Cookie{signedIn.cookie}})
@@ -430,7 +517,7 @@ func TestAgentsBelongToTheCaller(t *testing.T) {
 
 			signedIn := newSession(t, memberID)
 			h := newHarness(t, fullEnv(),
-				signedIn.activeKeyStep(roleMember),
+				signedIn.activeSessionStep(roleMember),
 				step{match: "FROM agents", results: rows(), err: nil},
 			)
 
@@ -472,19 +559,19 @@ func TestLogout(t *testing.T) {
 		wantLogged []string
 	}{
 		"revoked": {
-			write:      step{match: "UPDATE japikeys", results: changes(1), err: nil},
+			write:      step{match: revokeToken, results: changes(1), err: nil},
 			wantStatus: http.StatusNoContent, wantCookie: true,
 		},
 		"already revoked by another request": {
-			write:      step{match: "UPDATE japikeys", results: changes(0), err: nil},
+			write:      step{match: revokeToken, results: changes(0), err: nil},
 			wantStatus: http.StatusUnauthorized, wantLogged: []string{auth.CodeUnauthenticated},
 		},
 		"changed two rows": {
-			write:      step{match: "UPDATE japikeys", results: changes(2), err: nil},
+			write:      step{match: revokeToken, results: changes(2), err: nil},
 			wantStatus: http.StatusInternalServerError, wantLogged: []string{store.CodeSessionLogoutRejected},
 		},
 		"database down": {
-			write:      step{match: "UPDATE japikeys", results: nil, err: errDB},
+			write:      step{match: revokeToken, results: nil, err: errDB},
 			wantStatus: http.StatusServiceUnavailable, wantLogged: []string{store.CodeSessionLogoutFailed},
 		},
 	}
@@ -494,7 +581,7 @@ func TestLogout(t *testing.T) {
 			t.Parallel()
 
 			signedIn := newSession(t, memberID)
-			h := newHarness(t, fullEnv(), signedIn.activeKeyStep(roleMember), tt.write)
+			h := newHarness(t, fullEnv(), signedIn.activeSessionStep(roleMember), tt.write)
 
 			rec := h.do(request{method: http.MethodPost, path: "/api/logout", cookies: []*http.Cookie{signedIn.cookie}})
 
@@ -511,36 +598,43 @@ func TestLogout(t *testing.T) {
 			}
 
 			args := h.exec.calls[1][0].Args
-			if len(args) != 3 || args[1] != signedIn.key.ID.String() || args[2] != memberID {
-				t.Errorf("revoke args = %v, want the time, the presented key id and its owner, and no kind", args)
+			if len(args) != 3 || args[1] != signedIn.issued.ID || args[2] != memberID {
+				t.Errorf("revoke args = %v, want the time, the presented session's id and its owner, and no kind", args)
 			}
 		})
 	}
 }
 
 // TestCookieHandling: how the session cookie is read at the app level. Nothing
-// but exactly one well-formed token reaches the database, and none of these is
-// that.
+// but exactly one well-formed session token reaches the database, and none of
+// these is that.
 func TestCookieHandling(t *testing.T) {
 	t.Parallel()
 
 	good := newSession(t, memberID)
 	other := newSession(t, adminID)
+	key := newAPIKey(t)
 
 	named := func(value string) *http.Cookie { return requestCookie(auth.CookieName, value) }
 
 	tests := map[string]struct {
 		cookies []*http.Cookie
 	}{
-		"none":                   {cookies: nil},
-		"another cookie":         {cookies: []*http.Cookie{requestCookie("session", good.key.JWT)}},
-		"empty":                  {cookies: []*http.Cookie{named("")}},
-		"not a token":            {cookies: []*http.Cookie{named("not a token!")}},
-		"not a JWT":              {cookies: []*http.Cookie{named("abc")}},
-		"oversized":              {cookies: []*http.Cookie{named(strings.Repeat("a", 4097))}},
-		"two cookies":            {cookies: []*http.Cookie{good.cookie, other.cookie}},
-		"the same cookie twice":  {cookies: []*http.Cookie{good.cookie, good.cookie}},
-		"an empty one beside it": {cookies: []*http.Cookie{named(""), good.cookie}},
+		"none":                          {cookies: nil},
+		"another cookie":                {cookies: []*http.Cookie{requestCookie("session", good.issued.Token)}},
+		"empty":                         {cookies: []*http.Cookie{named("")}},
+		"not a token":                   {cookies: []*http.Cookie{named("not a token!")}},
+		"a prefix only":                 {cookies: []*http.Cookie{named("susu_ses_")}},
+		"an API key's token":            {cookies: []*http.Cookie{named(key.issued.Token)}},
+		"an invitation's token":         {cookies: []*http.Cookie{named(someCode)}},
+		"a token one character short":   {cookies: []*http.Cookie{named(good.issued.Token[:len(good.issued.Token)-1])}},
+		"a token one character long":    {cookies: []*http.Cookie{named(good.issued.Token + "A")}},
+		"a token that is not canonical": {cookies: []*http.Cookie{named(good.issued.Token[:len(good.issued.Token)-1] + "B")}},
+		"a token with whitespace":       {cookies: []*http.Cookie{named(" " + good.issued.Token)}},
+		"oversized":                     {cookies: []*http.Cookie{named(strings.Repeat("a", 4097))}},
+		"two cookies":                   {cookies: []*http.Cookie{good.cookie, other.cookie}},
+		"the same cookie twice":         {cookies: []*http.Cookie{good.cookie, good.cookie}},
+		"an empty one beside it":        {cookies: []*http.Cookie{named(""), good.cookie}},
 	}
 
 	for name, tt := range tests {
@@ -562,21 +656,75 @@ func TestCookieHandling(t *testing.T) {
 	}
 }
 
+// TestBearerHandling: how the Authorization header is read at the app level.
+// Nothing but exactly one well-formed API key token reaches the database, and
+// none of these is that: not a session's token, not the other kinds of
+// credential, not a token in any other form, and not a request that carries the
+// session cookie as well.
+func TestBearerHandling(t *testing.T) {
+	t.Parallel()
+
+	key := newAPIKey(t)
+	signedIn := newSession(t, memberID)
+	token := key.issued.Token
+
+	tests := map[string]struct {
+		headers map[string]string
+		cookies []*http.Cookie
+	}{
+		"a session's token":     {headers: bearer(signedIn.issued.Token)},
+		"an invitation's token": {headers: bearer(someCode)},
+		"another scheme":        {headers: authorization("Basic " + token)},
+		"no scheme":             {headers: authorization(token)},
+		"an empty token":        {headers: authorization("Bearer ")},
+		"two spaces":            {headers: authorization("Bearer  " + token)},
+		"a token that is not canonical": {
+			headers: bearer(token[:len(token)-1] + "B"),
+		},
+		"the cookie as well": {headers: key.headers, cookies: []*http.Cookie{signedIn.cookie}},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			// No script: none of these gets as far as the database.
+			h := newHarness(t, fullEnv())
+			rec := h.do(request{method: http.MethodGet, path: "/api/agent", headers: tt.headers, cookies: tt.cookies})
+
+			if rec.Code != http.StatusUnauthorized || rec.Body.String() != bodyUnauthenticated {
+				t.Errorf("= %d %s, want the one 401", rec.Code, rec.Body)
+			}
+
+			if got := h.exec.callCount(); got != 0 {
+				t.Errorf("Exec calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// firstRunToken is a well-formed first-run secret: an invitation token.
+//
+//nolint:gosec // a throwaway token that only the tests know
+const firstRunToken = "susu_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopA"
+
 // TestFirstRunCreatesTheInvitation: with the secret configured and an empty
 // database, the first status check creates the invitation. It is the one
 // write a stranger's request can cause, and it carries what the runtime
-// supplies: a UUIDv7 id (canonical text), the hash of the secret and not the
-// secret, the first-run type, and the current time as an integer.
+// supplies: a UUIDv7 id (canonical text) shared by the invitation's secret and
+// its row, the hash of the token and not the token, the first-run type, the
+// current time as an integer, and an expiry ten years on.
 func TestFirstRunCreatesTheInvitation(t *testing.T) {
 	t.Parallel()
 
-	secret := strings.Repeat("s", 43)
 	env := fullEnv()
-	env[config.SecretFirstRun] = secret
+	env[config.SecretFirstRun] = firstRunToken
+
+	created := []store.Result{{Changes: 1, Rows: nil}, {Changes: 1, Rows: [][]any{{someID}}}}
 
 	h := newHarness(t, env,
 		step{match: "has_users", results: rows([]any{int64(0), int64(0)}), err: nil},
-		step{match: "INSERT INTO invitations", results: rows([]any{someID}), err: nil},
+		step{match: "INSERT INTO secrets", results: created, err: nil},
 	)
 
 	before := time.Now().Unix()
@@ -587,25 +735,90 @@ func TestFirstRunCreatesTheInvitation(t *testing.T) {
 		t.Fatalf("= %d %s, want 200 %s", rec.Code, rec.Body, want)
 	}
 
-	args := h.exec.calls[1][0].Args
-	if len(args) != 5 {
-		t.Fatalf("insert args = %v, want 5", args)
-	}
+	checkFirstRunBatch(t, h.exec.calls[1], before, after)
 
-	id, _ := args[0].(string)
-	if !uuidV7.MatchString(id) {
-		t.Errorf("id = %q, want a canonical UUIDv7", id)
-	}
-
-	hash, _ := args[1].([]byte)
-	created, _ := args[4].(int64)
-
-	if len(hash) != sha256.Size || args[2] != store.InvitationFirstRun || created < before || created > after {
-		t.Errorf("args = %v, want a SHA-256 hash, type %s and a Unix time in [%d, %d]",
-			args, store.InvitationFirstRun, before, after)
-	}
-
-	if strings.Contains(rec.Body.String(), secret) {
+	if strings.Contains(rec.Body.String(), firstRunToken) {
 		t.Errorf("body leaks the secret: %s", rec.Body)
+	}
+}
+
+// checkFirstRunBatch checks the two statements of the first-run write: the
+// invitation's secret and its row, which share one id, and what each binds.
+func checkFirstRunBatch(t *testing.T, batch []store.Statement, before, after int64) {
+	t.Helper()
+
+	if len(batch) != 2 || len(batch[0].Args) != secretArgCreated+1 || len(batch[1].Args) != 6 {
+		t.Fatalf("insert batch = %v, want the secret (5 args) and the invitation (6 args)", batch)
+	}
+
+	secretArgs, invitationArgs := batch[0].Args, batch[1].Args
+
+	ids := []any{secretArgs[secretArgID], invitationArgs[0], invitationArgs[4]}
+	if !uuidV7.MatchString(asText(ids[0])) || !slices.Equal(ids, []any{ids[0], ids[0], ids[0]}) {
+		t.Errorf("ids = %v, want one canonical UUIDv7 throughout", ids)
+	}
+
+	hash := secret.Hash(firstRunToken)
+	if !slices.Equal(asBlob(secretArgs[secretArgHash]), hash[:]) {
+		t.Errorf("hash = %x, want the token's hash %x", secretArgs[secretArgHash], hash)
+	}
+
+	kinds := []any{secretArgs[secretArgKind], invitationArgs[1], invitationArgs[2]}
+	if want := []any{store.KindInvitation, store.KindInvitation, store.InvitationFirstRun}; !slices.Equal(kinds, want) {
+		t.Errorf("kinds and type = %v, want %v", kinds, want)
+	}
+
+	checkFirstRunTimes(t, secretArgs, before, after)
+}
+
+// checkFirstRunTimes checks that the first-run secret was created within
+// [before, after] and expires input.ExpiryHorizon later.
+func checkFirstRunTimes(t *testing.T, secretArgs []any, before, after int64) {
+	t.Helper()
+
+	createdAt, _ := secretArgs[secretArgCreated].(int64)
+	expires, _ := secretArgs[secretArgExpires].(int64)
+	horizon := int64(input.ExpiryHorizon / time.Second)
+
+	if createdAt < before || createdAt > after || expires != createdAt+horizon {
+		t.Errorf("created %d, expires %d, want a Unix time in [%d, %d] and an expiry %ds on",
+			createdAt, expires, before, after, horizon)
+	}
+}
+
+// TestFirstRunSecretMustBeAnInvitationToken: FIRST_RUN_SECRET is the first
+// invitation's token, so anything else is as good as no secret: the status
+// check reads the state, reports it missing and writes nothing.
+func TestFirstRunSecretMustBeAnInvitationToken(t *testing.T) {
+	t.Parallel()
+
+	secrets := map[string]string{
+		"unset":                             "",
+		"a random string of the old length": strings.Repeat("s", 43),
+		"a session's token":                 "susu_ses_" + strings.TrimPrefix(firstRunToken, "susu_inv_"),
+		"a token one character short":       firstRunToken[:len(firstRunToken)-1],
+		"a token that is not canonical":     firstRunToken[:len(firstRunToken)-1] + "B",
+		"a token with whitespace":           firstRunToken + "\n",
+	}
+
+	for name, value := range secrets {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			env := fullEnv()
+			env[config.SecretFirstRun] = value
+
+			h := newHarness(t, env, step{match: "has_users", results: rows([]any{int64(0), int64(0)}), err: nil})
+
+			rec := h.do(request{method: http.MethodGet, path: pathFirstRun})
+
+			if want := `{"status":"missing_secret"}` + "\n"; rec.Code != http.StatusOK || rec.Body.String() != want {
+				t.Errorf("= %d %s, want 200 %s", rec.Code, rec.Body, want)
+			}
+
+			if got := h.exec.callCount(); got != 1 {
+				t.Errorf("Exec calls = %d, want only the state read", got)
+			}
+		})
 	}
 }

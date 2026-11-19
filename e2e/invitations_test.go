@@ -13,7 +13,9 @@ package e2e_test
 //   - the conditional UPDATE ... RETURNING statements of the store (cap below
 //     uses, revoked, idempotent revoke) against real SQLite, and the use
 //     count, which is a subselect over users;
-//   - that no response ever carries the code or its hash;
+//   - that no response ever carries the code or its hash, that the code is a
+//     token of the invitation kind stored only as a hash, and that every
+//     invitation expires (ten years ahead unless the admin chooses less);
 //   - interleavings: concurrent PATCHes, concurrent revokes, a revoke racing
 //     registrations, all against the one real database.
 //
@@ -28,7 +30,6 @@ package e2e_test
 // any other value of a create body.
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -68,7 +69,7 @@ type invView struct {
 	NumInvites int64   `json:"numInvites"`
 	Uses       int64   `json:"uses"`
 	Status     string  `json:"status"`
-	ExpiresAt  *int64  `json:"expiresAt"`
+	ExpiresAt  int64   `json:"expiresAt"`
 	RevokedAt  *int64  `json:"revokedAt"`
 	CreatedBy  *string `json:"createdBy"`
 	CreatedAt  int64   `json:"createdAt"`
@@ -146,16 +147,16 @@ func invStored(t *testing.T, id string) string {
 }
 
 // invHashForms returns every textual form a code hash could leak in, for the
-// 32-byte code_hash of id: lower and upper hex, std and url base64 with and
+// 32-byte hash of the secret of invitation id: lower and upper hex, std and url base64 with and
 // without padding.
 func invHashForms(t *testing.T, id string) []string {
 	t.Helper()
 
-	raw := scalar(t, "SELECT hex(code_hash) FROM invitations WHERE id = ?", id)
+	raw := scalar(t, "SELECT hex(hash) FROM secrets WHERE id = ?", id)
 
 	hash, err := hex.DecodeString(raw)
 	if err != nil || len(hash) != sha256.Size {
-		t.Fatalf("code_hash of %s: %q %v", id, raw, err)
+		t.Fatalf("hash of %s: %q %v", id, raw, err)
 	}
 
 	return []string{
@@ -229,13 +230,29 @@ func invCollectKeys(body string, out *[]string) {
 	walk(value)
 }
 
-// invSeedAt inserts an invitation with explicit columns, for the status and
-// ordering tables. revoked and expires are NULL when nil.
+// invSeedAt inserts an invitation of type 'e2e_invite' with explicit columns,
+// for the status and ordering tables. expires is far in the future when nil
+// (every invitation expires), and revoked is NULL when nil. Its token is
+// random: the tests that need a code seed one themselves.
 func invSeedAt(t *testing.T, id string, numInvites int64, createdAt int64, expires, revoked *int64) {
 	t.Helper()
 
-	seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, expires_at, revoked_at, created_at) "+
-		"VALUES (?, randomblob(32), 'e2e_invite', 'seeded', ?, ?, ?, ?)", id, numInvites, expires, revoked, createdAt)
+	invInsert(t, id, "seeded", numInvites, createdAt, expires, revoked, nil)
+}
+
+// invInsert writes an invitation and its secret with every column explicit.
+func invInsert(t *testing.T, id, label string, numInvites, createdAt int64, expires, revoked *int64, createdBy *string) {
+	t.Helper()
+
+	expiresAt := int64(invUnixFar)
+	if expires != nil {
+		expiresAt = *expires
+	}
+
+	seed(t, "INSERT INTO secrets (id, kind, hash, expires_at, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		id, kindInvitation, tokenHash(newToken(tagInvitation)), expiresAt, revoked, createdAt)
+	seed(t, "INSERT INTO invitations (id, type, label, num_invites, created_by) VALUES (?, 'e2e_invite', ?, ?, ?)",
+		id, label, numInvites, createdBy)
 }
 
 // invUsersOf makes n accounts from the invitation, with ids from the family
@@ -330,7 +347,7 @@ func TestInvitationRoutesSpotCheckAccess(t *testing.T) {
 	}
 
 	expectCount(t, "invitations", rows)
-	expectCount(t, "invitations WHERE revoked_at IS NOT NULL", "0")
+	expectCount(t, "secrets WHERE kind = 'invitation' AND revoked_at IS NOT NULL", "0")
 
 	if got := invStored(t, idInvitationA); got != num {
 		t.Errorf("num_invites = %s after refused callers, want %s", got, num)
@@ -439,9 +456,24 @@ func TestInvitationCreateThenRegister(t *testing.T) {
 
 			invDecode(t, got.body, &created)
 
-			if created.Type != invitationType || created.Code == "" || created.Status != invStatusActive {
+			if created.Type != invitationType || created.Status != invStatusActive {
 				t.Fatalf("created = %+v", created)
 			}
+
+			// The code is a token of the invitation kind, shown here and nowhere
+			// else, and stored only as its hash under the invitation's own id.
+			expectToken(t, created.Code, tagInvitation)
+
+			stored := mustSecretOf(t, created.Code)
+			if stored.id != created.ID || stored.kind != kindInvitation || !stored.kindRow || stored.revoked {
+				t.Errorf("secret of the code = %+v, want an active invitation secret under %s", stored, created.ID)
+			}
+
+			if stored.expiresAt != created.ExpiresAt {
+				t.Errorf("stored expires_at = %d, response expiresAt = %d", stored.expiresAt, created.ExpiresAt)
+			}
+
+			expectStoredNowhere(t, created.Code)
 
 			user := registerWithCode(t, created.Code, "invited-"+invitationType)
 
@@ -452,6 +484,125 @@ func TestInvitationCreateThenRegister(t *testing.T) {
 			// The invitation is used up: a second registration is refused.
 			beginRegistration(t, created.Code, "again").expect(t, "second use", http.StatusForbidden, invCodeInvalidReg)
 		})
+	}
+}
+
+// TestInvitationExpiry: every invitation expires. A create that names no expiry
+// (or null) gets the horizon, ten years of 365 days from the Worker's clock, the
+// admin may choose any time up to that, and anything in the past, beyond the
+// horizon or not a Unix time is refused with nothing written. The response and
+// the list carry expiresAt every time, and it is the secret's own expires_at.
+//
+//nolint:paralleltest // shares one database
+func TestInvitationExpiry(t *testing.T) {
+	token := login(t, newAdmin(t))
+
+	const horizon = 10 * 365 * 24 * 3600
+
+	create := func(body string) reply {
+		return post(t, pathInvitation, []byte(`{"type":"member","numInvites":1`+body+`}`), token)
+	}
+
+	accepted := []struct {
+		name string
+		body string
+		// want is the expiry relative to the test's clock when the request was
+		// sent. A defaulted expiry may be later by the time the Worker's own
+		// clock has moved on, within lgClockSlack.
+		want func(sent int64) int64
+	}{
+		{"no expiresAt", ``, func(sent int64) int64 { return sent + horizon }},
+		{"null expiresAt", `,"expiresAt":null`, func(sent int64) int64 { return sent + horizon }},
+		{"a chosen expiry in an hour", `,"expiresAt":%d`, func(sent int64) int64 { return sent + 3600 }},
+		{"a chosen expiry at the horizon", `,"expiresAt":%d`, func(sent int64) int64 { return sent + horizon }},
+	}
+
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			sent := time.Now().Unix()
+			want := tt.want(sent)
+			body := tt.body
+
+			if strings.Contains(body, "%d") {
+				body = fmt.Sprintf(body, want)
+			}
+
+			got := create(body)
+			got.expect(t, "POST "+tt.name, http.StatusCreated, "")
+
+			var view invView
+
+			invDecode(t, got.body, &struct {
+				*invView
+
+				Code string `json:"code"`
+			}{invView: &view})
+
+			if !strings.Contains(got.body, `"expiresAt":`) {
+				t.Errorf("the create response has no expiresAt: %s", got.body)
+			}
+
+			// A defaulted expiry is the Worker's now plus the horizon; a chosen one
+			// is exactly what was chosen.
+			chosen := strings.Contains(tt.body, "%d")
+			slack := int64(lgClockSlack.Seconds())
+
+			switch {
+			case chosen && view.ExpiresAt != want:
+				t.Errorf("expiresAt = %d, want exactly the chosen %d", view.ExpiresAt, want)
+			case !chosen && (view.ExpiresAt < want || view.ExpiresAt > want+slack):
+				t.Errorf("expiresAt = %d, want the default %d (+%ds)", view.ExpiresAt, want, slack)
+			}
+
+			if stored := scalar(t, "SELECT expires_at FROM secrets WHERE id = ?", view.ID); stored != strconv.FormatInt(view.ExpiresAt, 10) {
+				t.Errorf("stored expires_at = %s, response %d", stored, view.ExpiresAt)
+			}
+
+			if listed := invFind(t, token, view.ID); listed.ExpiresAt != view.ExpiresAt {
+				t.Errorf("listed expiresAt = %d, created %d", listed.ExpiresAt, view.ExpiresAt)
+			}
+		})
+	}
+
+	rows := invRows(t)
+
+	refused := []struct{ name, body string }{
+		{"in the past", `,"expiresAt":1`},
+		{"zero", `,"expiresAt":0`},
+		{"negative", `,"expiresAt":-1`},
+		{"one second ago", `,"expiresAt":%d`},
+		{"a day past the horizon", `,"expiresAt":%d`},
+		{"far beyond the horizon", `,"expiresAt":99999999999`},
+		{"a string", `,"expiresAt":"2100"`},
+		{"a fraction", `,"expiresAt":1.5`},
+	}
+
+	for _, tt := range refused {
+		t.Run("refused: "+tt.name, func(t *testing.T) {
+			now := time.Now().Unix()
+			body := tt.body
+
+			switch tt.name {
+			case "one second ago":
+				body = fmt.Sprintf(body, now-1)
+			case "a day past the horizon":
+				body = fmt.Sprintf(body, now+horizon+24*3600)
+			}
+
+			got := create(body)
+			if got.status != http.StatusBadRequest {
+				t.Errorf("POST %s = %d %s, want 400", tt.name, got.status, got.body)
+			}
+
+			expectCount(t, "invitations", rows)
+		})
+	}
+
+	// Every listed invitation carries an expiry, the first-run one included.
+	for _, view := range invList(t, token) {
+		if view.ExpiresAt <= time.Now().Unix() {
+			t.Errorf("invitation %s lists expiresAt %d, want one in the future", view.ID, view.ExpiresAt)
+		}
 	}
 }
 
@@ -601,11 +752,8 @@ func TestInvitationListShape(t *testing.T) {
 	admin := newAdmin(t)
 	token := login(t, admin)
 
-	seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, expires_at, revoked_at, created_by, created_at) "+
-		"VALUES (?, randomblob(32), 'e2e_invite', 'full', 7, ?, 1700000000, ?, 1600000000)",
-		idInvitationA, invUnixFar, admin.userID)
-	seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
-		"VALUES (?, randomblob(32), 'e2e_invite', '', 2, 1500000000)", idInvitationB)
+	invInsert(t, idInvitationA, "full", 7, 1600000000, new(int64(invUnixFar)), new(int64(1700000000)), &admin.userID)
+	invInsert(t, idInvitationB, "", 2, 1500000000, nil, nil, nil)
 
 	got := get(t, pathInvitation, token)
 	if got.status != http.StatusOK {
@@ -644,8 +792,9 @@ func TestInvitationListShape(t *testing.T) {
 		return keys
 	}
 
+	// expiresAt is in both: every invitation expires.
 	wantFull := "createdAt,createdBy,expiresAt,id,label,numInvites,revokedAt,status,type,uses"
-	wantBare := "createdAt,id,label,numInvites,status,type,uses"
+	wantBare := "createdAt,expiresAt,id,label,numInvites,status,type,uses"
 
 	byID := map[string]map[string]any{}
 	for _, item := range items {
@@ -666,18 +815,18 @@ func TestInvitationListShape(t *testing.T) {
 
 	want := invView{
 		ID: idInvitationA, Type: "e2e_invite", Label: "full", NumInvites: 7, Uses: 0, Status: invStatusRevoked,
-		ExpiresAt: new(int64(invUnixFar)), RevokedAt: new(int64(1700000000)), CreatedBy: &admin.userID, CreatedAt: 1600000000,
+		ExpiresAt: invUnixFar, RevokedAt: new(int64(1700000000)), CreatedBy: &admin.userID, CreatedAt: 1600000000,
 	}
 
 	if full.ID != want.ID || full.Type != want.Type || full.Label != want.Label || full.NumInvites != want.NumInvites ||
 		full.Uses != want.Uses || full.Status != want.Status || full.CreatedAt != want.CreatedAt ||
-		deref(full.ExpiresAt) != deref(want.ExpiresAt) || deref(full.RevokedAt) != deref(want.RevokedAt) ||
+		full.ExpiresAt != want.ExpiresAt || deref(full.RevokedAt) != deref(want.RevokedAt) ||
 		derefS(full.CreatedBy) != derefS(want.CreatedBy) {
 		t.Errorf("A = %+v, want %+v", full, want)
 	}
 
 	// The raw JSON has numbers, not strings, for the integers.
-	for _, frag := range []string{`"numInvites":7`, `"uses":0`, `"revokedAt":1700000000`, `"createdAt":1600000000`} {
+	for _, frag := range []string{`"numInvites":7`, `"uses":0`, `"revokedAt":1700000000`, `"createdAt":1600000000`, `"expiresAt":4102444800`} {
 		if !strings.Contains(got.body, frag) {
 			t.Errorf("list lacks %s:\n%s", frag, got.body)
 		}
@@ -788,7 +937,7 @@ func TestInvitationListStatus(t *testing.T) {
 		{"expires_at negative is expired", 3, 0, false, new(int64(-5)), nil, invStatusExpired},
 		{"revoked", 3, 0, false, nil, new(past), invStatusRevoked},
 		{"revoked at 0 is revoked", 3, 0, false, nil, new(int64(0)), invStatusRevoked},
-		{"revoked at a future time is revoked", 3, 0, false, nil, new(future), invStatusRevoked},
+		{"revoked at a future time is still active", 3, 0, false, nil, new(future), invStatusActive},
 		{"revoked beats expired", 3, 0, false, new(past), new(past), invStatusRevoked},
 		{"revoked beats exhausted", 1, 1, false, nil, new(past), invStatusRevoked},
 		{"expired beats exhausted", 1, 1, false, new(past), nil, invStatusExpired},
@@ -833,7 +982,8 @@ func TestInvitationListStatus(t *testing.T) {
 }
 
 // TestInvitationFirstRunIsListed: the first-run invitation the first admin
-// redeemed is listed with its type, label, one use, exhausted, no creator.
+// redeemed is listed with its type, label, one use, exhausted, no creator, and
+// an expiry ten years after it was created.
 //
 //nolint:paralleltest // shares one database
 func TestInvitationFirstRunIsListed(t *testing.T) {
@@ -847,13 +997,19 @@ func TestInvitationFirstRunIsListed(t *testing.T) {
 
 	got := list[0]
 	if got.Type != "first_run" || got.NumInvites != 1 || got.Uses != 1 || got.Status != invStatusExhausted ||
-		got.CreatedBy != nil || got.RevokedAt != nil || got.ExpiresAt != nil || got.Label == "" {
+		got.CreatedBy != nil || got.RevokedAt != nil || got.Label == "" {
 		t.Errorf("first-run invitation = %+v", got)
+	}
+
+	if want := got.CreatedAt + 10*365*24*3600; got.ExpiresAt != want {
+		t.Errorf("first-run expiresAt = %d, want createdAt + 10 years = %d", got.ExpiresAt, want)
 	}
 }
 
 // TestInvitationsNeverExposeTheCode: no route answers with the code or its hash,
-// in any encoding, across every status the routes can produce.
+// in any encoding, across every status the routes can produce. The one place a
+// code is returned is the response that created the invitation, and it is
+// stored nowhere.
 //
 //nolint:paralleltest // shares one database
 func TestInvitationsNeverExposeTheCode(t *testing.T) {
@@ -862,8 +1018,8 @@ func TestInvitationsNeverExposeTheCode(t *testing.T) {
 
 	seedInvitation(t, idInvitationA, 5)
 
-	forms := slices.Concat(invHashForms(t, idInvitationA),
-		invHashForms(t, scalar(t, "SELECT id FROM invitations WHERE type = 'first_run'")))
+	firstRunID := scalar(t, "SELECT id FROM invitations WHERE type = 'first_run'")
+	forms := slices.Concat(invHashForms(t, idInvitationA), invHashForms(t, firstRunID))
 
 	// The first-run code itself is also something a response must never hold.
 	forms = append(forms, firstRunSecret)
@@ -886,6 +1042,23 @@ func TestInvitationsNeverExposeTheCode(t *testing.T) {
 
 	for name, got := range replies {
 		invAssertNoHash(t, name, got.body, forms)
+	}
+
+	// The code the create returned is not in any column of any table, and is in
+	// no response but that one.
+	var created struct {
+		Code string `json:"code"`
+	}
+
+	_ = json.Unmarshal([]byte(replies["create"].body), &created)
+
+	expectToken(t, created.Code, tagInvitation)
+	expectStoredNowhere(t, created.Code, firstRunSecret)
+
+	for name, got := range replies {
+		if name != "create" && strings.Contains(got.body, created.Code) {
+			t.Errorf("%s repeats the code the create returned: %s", name, got.body)
+		}
 	}
 }
 
@@ -1020,6 +1193,80 @@ func TestInvitationUpdateOutcomes(t *testing.T) {
 	}
 }
 
+// TestInvitationUpdateRevocationTime holds that a PATCH is refused once the
+// invitation's revocation has come (revoked_at <= now) and applied while it is
+// still scheduled for later, against the real SQL: the write's conditions and
+// its RETURNING verdict must agree. The state is set in the database, in the
+// Worker's clock terms (strftime), so "now" is the second the request is made
+// in; the cases that sit on the boundary use a margin the request cannot cross.
+//
+//nolint:paralleltest // shares one database
+func TestInvitationUpdateRevocationTime(t *testing.T) {
+	const (
+		secondsPerDay = 86400
+		margin        = 3600
+		notRevoked    = "NULL"
+	)
+
+	cases := []struct {
+		name    string
+		revoked string // SQL expression for secrets.revoked_at
+		status  int
+		code    string
+		wantNum string // num_invites afterwards
+	}{
+		{"never revoked", notRevoked, http.StatusOK, "", "9"},
+		{"revoked a day ago", "strftime('%s','now') - " + strconv.Itoa(secondsPerDay), http.StatusConflict, invCodeRevoked, "5"},
+		{"revoked a second ago", "strftime('%s','now') - 1", http.StatusConflict, invCodeRevoked, "5"},
+		{"revoked at second zero", "0", http.StatusConflict, invCodeRevoked, "5"},
+		{"revoked later, not yet in force", "strftime('%s','now') + " + strconv.Itoa(margin), http.StatusOK, "", "9"},
+		{"revoked far in the future", strconv.Itoa(invUnixFar), http.StatusOK, "", "9"},
+	}
+
+	token := login(t, newAdmin(t))
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			seed(t, "DELETE FROM invitations WHERE id = ?", idInvitationA)
+			seed(t, "DELETE FROM secrets WHERE id = ?", idInvitationA)
+			invSeedAt(t, idInvitationA, 5, 1000, nil, nil)
+			seed(t, "UPDATE secrets SET revoked_at = "+tt.revoked+" WHERE id = ?", idInvitationA)
+
+			got := invPatch(t, token, idInvitationA, `{"numInvites":9}`)
+			got.expect(t, "PATCH "+tt.name, tt.status, tt.code)
+
+			if stored := invStored(t, idInvitationA); stored != tt.wantNum {
+				t.Errorf("stored num_invites = %s, want %s", stored, tt.wantNum)
+			}
+
+			if tt.status == http.StatusOK && !strings.Contains(got.body, `"numInvites":9`) {
+				t.Errorf("PATCH body = %s, want the applied cap in the row it returns", got.body)
+			}
+		})
+	}
+
+	// The boundary itself: a revocation that is still scheduled lets a PATCH
+	// apply, and the same row is refused once the Worker's clock reaches it. Two
+	// seconds of margin keep the first request from straddling the boundary.
+	t.Run("revocation one second away is applied then refused", func(t *testing.T) {
+		seed(t, "DELETE FROM invitations WHERE id = ?", idInvitationA)
+		seed(t, "DELETE FROM secrets WHERE id = ?", idInvitationA)
+		invSeedAt(t, idInvitationA, 5, 1000, nil, nil)
+		seed(t, "UPDATE secrets SET revoked_at = strftime('%s','now') + 2 WHERE id = ?", idInvitationA)
+
+		invPatch(t, token, idInvitationA, `{"numInvites":6}`).expect(t, "PATCH with 2s left", http.StatusOK, "")
+
+		time.Sleep(2500 * time.Millisecond)
+
+		invPatch(t, token, idInvitationA, `{"numInvites":7}`).
+			expect(t, "PATCH after the revocation came", http.StatusConflict, invCodeRevoked)
+
+		if stored := invStored(t, idInvitationA); stored != "6" {
+			t.Errorf("stored num_invites = %s, want 6 (the second PATCH must not apply)", stored)
+		}
+	})
+}
+
 // TestInvitationUpdateNumInvitesBoundaries: every numeric form and type of
 // numInvites. Anything refused leaves the stored cap unchanged. The cap is 1 to
 // 10000, so 2^53-1 and above are refused by the cap, and forms that are not a
@@ -1124,44 +1371,6 @@ func TestInvitationUpdateNumInvitesBoundaries(t *testing.T) {
 	}
 }
 
-// TestInvitationUpdateBodyLimits: the body cap (4 KiB) and media type.
-//
-//nolint:paralleltest // shares one database
-func TestInvitationUpdateBodyLimits(t *testing.T) {
-	token := login(t, newAdmin(t))
-	seedInvitation(t, idInvitationA, 7)
-
-	cases := []struct {
-		name string
-		req  request
-		code string
-		want int
-	}{
-		{"just under the limit", request{body: []byte(`{"numInvites":5,"x":"` + strings.Repeat("a", 4000) + `"}`)}, codeUnknownField, 400},
-		{"over the limit", request{body: []byte(`{"numInvites":5,"x":"` + strings.Repeat("a", 5000) + `"}`)}, codeBodyTooLarge, 413},
-		{"much over the limit", request{body: bytes.Repeat([]byte(" "), 1<<20+10)}, codeBodyTooLarge, 413},
-		{"text/plain", request{body: []byte(`{"numInvites":5}`), headers: map[string]string{"Content-Type": "text/plain"}}, codeUnsupportedType, 415},
-		{"no content type", request{body: []byte(`{"numInvites":5}`), noType: true}, codeUnsupportedType, 415},
-		{"json with charset", request{body: []byte(`{"numInvites":5}`), headers: map[string]string{"Content-Type": "application/json; charset=utf-8"}}, "", 200},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			req := tt.req
-			req.method, req.path, req.token = http.MethodPatch, invItem(idInvitationA), token
-
-			got := send(t, req)
-			got.expect(t, "PATCH "+tt.name, tt.want, tt.code)
-
-			if tt.want != 200 {
-				if stored := invStored(t, idInvitationA); stored != "7" {
-					t.Errorf("stored = %s after a refused body, want 7", stored)
-				}
-			}
-		})
-	}
-}
-
 // TestInvitationPathIDs: a malformed id is refused 400 invalid_id once the
 // caller is known to be an admin (a signed-out caller is 401 whatever the id),
 // and a trailing segment is not a route.
@@ -1234,7 +1443,7 @@ func TestInvitationRevoke(t *testing.T) {
 		t.Fatalf("revoke body = %+v, want revoked at now (%d..%d), uses 2", view, before, after)
 	}
 
-	if stored := scalar(t, "SELECT revoked_at FROM invitations WHERE id = ?", idInvitationA); stored != strconv.FormatInt(*view.RevokedAt, 10) {
+	if stored := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", idInvitationA); stored != strconv.FormatInt(*view.RevokedAt, 10) {
 		t.Errorf("stored revoked_at = %s, response %d", stored, *view.RevokedAt)
 	}
 
@@ -1268,19 +1477,31 @@ func TestInvitationRevoke(t *testing.T) {
 	// A revoked invitation keeps its other facts and cannot be changed.
 	invPatch(t, token, idInvitationA, `{"numInvites":9}`).expect(t, "PATCH revoked", http.StatusConflict, invCodeRevoked)
 
-	// An invitation whose revoked_at is in the future (seeded) keeps that time:
-	// revoking never moves an existing time, earlier or later.
+	// An invitation whose revocation is scheduled for later (seeded) is brought
+	// forward: a revoke takes effect at once and never moves a time later.
 	invSeedAt(t, idInvitationB, 5, 1000, nil, new(int64(invUnixFar)))
 
+	before = time.Now().Unix()
 	got := del(t, invItem(idInvitationB), token)
-	got.expect(t, "DELETE preset revoked_at", http.StatusOK, "")
+	got.expect(t, "DELETE scheduled revoked_at", http.StatusOK, "")
 
-	if !strings.Contains(got.body, `"revokedAt":`+strconv.Itoa(invUnixFar)) {
-		t.Errorf("revoke of a preset revoked_at = %s, want it kept", got.body)
+	var revoked struct {
+		RevokedAt *int64 `json:"revokedAt"`
+		Status    string `json:"status"`
+	}
+
+	err := json.Unmarshal([]byte(got.body), &revoked)
+	if err != nil {
+		t.Fatalf("decode revoke response: %v (%s)", err, got.body)
+	}
+
+	if revoked.RevokedAt == nil || *revoked.RevokedAt < before || *revoked.RevokedAt > time.Now().Unix() ||
+		revoked.Status != invStatusRevoked {
+		t.Errorf("revoke of a scheduled revoked_at = %s, want it brought forward to now and revoked", got.body)
 	}
 
 	del(t, invItem(idMissing), token).expect(t, "DELETE unknown", http.StatusNotFound, invCodeNotFound)
-	expectCount(t, "invitations WHERE revoked_at IS NOT NULL", "2")
+	expectCount(t, "secrets WHERE kind = 'invitation' AND revoked_at IS NOT NULL", "2")
 }
 
 // ---- interleavings ---------------------------------------------------------------
@@ -1381,7 +1602,7 @@ func TestInvitationConcurrentRevokes(t *testing.T) {
 			times[*view.RevokedAt]++
 		}
 
-		stored := scalar(t, "SELECT revoked_at FROM invitations WHERE id = ?", idInvitationA)
+		stored := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", idInvitationA)
 
 		for at := range times {
 			if strconv.FormatInt(at, 10) != stored {
@@ -1414,7 +1635,7 @@ func TestInvitationRevokeRacesUpdates(t *testing.T) {
 
 		t.Logf("round %d: %v", round, invStatuses(replies))
 
-		revoked := scalar(t, "SELECT revoked_at FROM invitations WHERE id = ?", idInvitationA)
+		revoked := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", idInvitationA)
 		if revoked == "" {
 			t.Fatalf("round %d: the invitation is not revoked", round)
 		}
@@ -1537,20 +1758,18 @@ func TestInvitationRevokeClosesRegistration(t *testing.T) {
 	admin := newAdmin(t)
 	token := login(t, admin)
 
-	code := "e2e-second-first-run-code-0123456789ABCDEFG"
-	sum := sha256.Sum256([]byte(code))
+	code := regSpareCode
 
 	// A second first-run invitation, with a known code. It starts redeemable on
 	// its own terms (not revoked, not expired, under cap); the only thing that
 	// stops it is the existing account, which is first run's own rule.
-	seed(t, "INSERT INTO invitations (id, code_hash, type, label, num_invites, created_at) "+
-		"VALUES (?, ?, 'first_run', 'second', 3, strftime('%s','now'))", idInvitationA, sum[:])
+	regSeedInvitation(t, idInvitationA, code, "first_run", 3, "")
 
 	del(t, invItem(idInvitationA), token).expect(t, "revoke", http.StatusOK, "")
 
 	// Remove every account (and what hangs off it) so only the revocation can be
 	// what refuses the code from here on. Worker idle: nothing in flight.
-	seed(t, "DELETE FROM japikeys")
+	seed(t, "DELETE FROM sessions")
 	seed(t, "DELETE FROM credentials")
 	seed(t, "DELETE FROM users")
 
@@ -1560,7 +1779,7 @@ func TestInvitationRevokeClosesRegistration(t *testing.T) {
 
 	// Control: the same invitation unrevoked is redeemable, so the refusal above
 	// is the revocation and nothing else.
-	seed(t, "UPDATE invitations SET revoked_at = NULL WHERE id = ?", idInvitationA)
+	seed(t, "UPDATE secrets SET revoked_at = NULL WHERE id = ?", idInvitationA)
 
 	options := mustBeginRegistration(t, code, "Late")
 	auth := newAuthenticator()
@@ -1568,7 +1787,7 @@ func TestInvitationRevokeClosesRegistration(t *testing.T) {
 	finish := auth.finishBody(t, options, code, "Late")
 
 	// The ceremony is begun, then the invitation is revoked before finish.
-	seed(t, "UPDATE invitations SET revoked_at = strftime('%s','now') WHERE id = ?", idInvitationA)
+	seed(t, "UPDATE secrets SET revoked_at = strftime('%s','now') WHERE id = ?", idInvitationA)
 
 	post(t, pathRegisterEnd, finish, "").expect(t, "finish after revoke", http.StatusForbidden, invCodeInvalidReg)
 
@@ -1594,7 +1813,7 @@ func TestInvitationExpiredInvitation(t *testing.T) {
 
 	invDecode(t, got.body, &view)
 
-	if view.Status != invStatusExpired || view.NumInvites != 9 || view.ExpiresAt == nil || *view.ExpiresAt != past {
+	if view.Status != invStatusExpired || view.NumInvites != 9 || view.ExpiresAt != past {
 		t.Errorf("PATCH expired = %+v, want it still expired with cap 9", view)
 	}
 

@@ -10,8 +10,7 @@ import (
 
 // List is a credential's scopes exactly as written: scope and bundle names in
 // the order given. It is what an agent row and a key row store (as a JSON
-// array of strings, see JSON) and what a key's token carries as its scope
-// claim.
+// array of strings, see JSON).
 //
 // A List is not validated by being a List: Names is the strict way to make one
 // from names a client wrote, and Read is the lenient way to make one from text
@@ -48,7 +47,7 @@ func Names(names []string) result.Result[List] {
 	return result.Ok(List(slices.Clone(names)))
 }
 
-// JSON is the stored and signed form of the list: a JSON array of strings.
+// JSON is the stored form of the list: a JSON array of strings.
 // The empty list is "[]", never "" and never "null".
 func (l List) JSON() string {
 	names := []string(l)
@@ -84,31 +83,9 @@ func Read(stored string) List {
 	return List(names)
 }
 
-// FromClaim reads a token's scope claim as a list. The claim decoded from JSON
-// is an []any; anything that is not an array of strings is the empty list, so
-// a token whose claim is missing or the wrong shape grants nothing.
-func FromClaim(claim any) List {
-	items, ok := claim.([]any)
-	if !ok {
-		return List{}
-	}
-
-	names := make(List, 0, len(items))
-
-	for _, item := range items {
-		name, isString := item.(string)
-		if !isString {
-			return List{}
-		}
-
-		names = append(names, name)
-	}
-
-	return names
-}
-
-// Claim is the list as the value of a token's scope claim: a []string, which
-// JSON encodes as an array.
+// Claim is the list as a []string for a JSON response, which encodes as an
+// array. It is never nil, so the empty list is "[]" and never "null", and it is
+// a copy.
 func (l List) Claim() []string {
 	if l == nil {
 		return []string{}

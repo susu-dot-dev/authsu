@@ -1,55 +1,48 @@
-# Managing users
+# Managing users: design rationale
 
-Admins manage accounts through `/api/user`:
+> This document explains *why* account management is shaped the way it is. It is not a spec: the code is authoritative for what exists.
 
-| Route | Does |
-|---|---|
-| `GET /api/user` | Lists every account, revoked ones included, newest first. |
-| `GET /api/user/{id}` | Reads one account. |
-| `DELETE /api/user/{id}` | Revokes it. |
+Related: [permissions_design.md](permissions_design.md), [invitations_design.md](invitations_design.md), [secrets_design.md](secrets_design.md), [first_run_design.md](first_run_design.md)
 
-Every route requires a session (401) whose account is an admin (403 `forbidden`). The access rule is declared on the route and enforced by the auth boundary before the handler runs, and a malformed `{id}` is 400 `invalid_id` only for a caller the route lets in: a signed-out caller is 401 and a member is 403 whatever the id. An unknown id is 404 `user_not_found`. An account is shown as its id, role, the invitation it came from, its profile, a derived status (`active` or `revoked`), `revokedAt` when set, and `createdAt`. The WebAuthn user handle is never returned.
+Admins list accounts, read one, and revoke one. Every action requires an admin, enforced by the route boundary before any handler runs, so a signed-out caller and a member learn nothing about the accounts or what a valid id looks like. An account is shown with its role, the invitation it came from, its profile and whether it is active. The WebAuthn user handle is never shown.
 
-## Authorization: the role is read live, not carried in the token
+## The role is read live
 
-The role is not a claim in the session token. It is read from the `users` row on every request, in the same query that verifies the session (`ActiveKey` in `internal/store`, called from `internal/auth`).
+The role is never copied into a credential. It is read from the account on every request, in the same statement that resolves the credential.
 
-The obvious argument for a role claim is "avoid joining `users`". It does not hold here:
+The usual argument for carrying the role with the credential is to avoid reading the account. It does not hold here:
 
-- **The key row is read on every request regardless.** A session's private key is discarded after it signs its one token, so the only copy of the public key is the `japikeys` row. Verification cannot happen without that read, and it is also what makes revocation work.
-- **The join is on a primary key, in a query that runs anyway.** It adds no round trip, and round trips are what cost time on D1.
-- **A claim can only be stale.** Sessions last two weeks. A role or status change would have to be paired with "revoke every token of this user", and forgetting that step on any future change is a privilege-escalation bug. Reading live makes the database the only source of truth.
-- **Claims pay off with stateless verification**, which would mean no per-request read and no instant revocation (so no logout). That is a different system.
+- **The credential is read on every request regardless.** A token is random and carries nothing ([secrets_design.md](secrets_design.md)), so resolving it is a read, and that read is also what makes revocation work.
+- **Reading the account adds no round trip.** It is a join on its primary key, in a statement that runs anyway, and round trips are what cost time on D1.
+- **A copy can only be stale.** A credential lives for days or months. A role or status change would have to be paired with "revoke every credential of this user", and forgetting that step on any future change would be a privilege-escalation bug. Reading live makes the database the only source of truth.
 
-Caching the account has the same flaw in another form: an isolate's memory is short-lived and not shared, KV is eventually consistent, and any cache delays a revocation by its TTL. If latency ever matters, the lever is D1 read replication (check current Cloudflare documentation first), not a cache that weakens revocation.
-
-Enforcement is the same for every admin route: the route declares an admin scope (`user:read`, `user:revoke`), and the boundary authenticates, then requires the administrator role and the scope together, then runs the handler. A feature does no authentication of its own. There is no degraded mode: a missing dependency stops the Worker at start instead of answering 503 per request.
+Caching the account has the same flaw in another form: an isolate's memory is short-lived and not shared, KV is eventually consistent, and any cache delays a revocation by its lifetime. If latency ever matters, the lever is D1 read replication, not a cache that weakens revocation.
 
 ## Revoking
 
-`DELETE` is used because revocation is what `DELETE` means for invitations: it sets `revoked_at` and keeps the row ([invitations_design.md](invitations_design.md)). `PATCH` stays free for partial updates such as a role change.
+Revoking is what removing an account means in the product.
 
-- **Revoke, never delete.** The row stays for audit ("who was this?", "who came from this invitation?"). Deleting would cascade to credentials and keys.
-- **Idempotent.** Revoking twice succeeds and keeps the first time (`COALESCE`).
+- **Revoke, never delete.** The account stays for audit ("who was this?", "who came from this invitation?"). If an account is ever deleted, everything it owns goes with it, its credentials included ([secrets_design.md](secrets_design.md#deletion-goes-both-ways)).
+- **Revoking twice keeps the first time**, so a retry is safe.
 - **It takes effect at once, everywhere**, because it is checked where identity is established:
-  - session verification reads `users.revoked_at`, so every live session stops verifying on the next request;
-  - login does not find a revoked account's credentials, so it is refused exactly like an unknown credential, and the response does not reveal that the account exists;
-  - the session insert requires an active account, so an admin revoking between login's lookup and its write cannot leave a session behind.
-- **The account's keys are revoked in the same batch**, after the account. Verification already refuses them, so this is not what ends the sessions. It keeps the keys table honest, and protects any future kind of key whose verification forgets to look at the account.
+  - every credential resolves together with the account's standing, so each of the account's sessions and keys, and its agents' credentials, stops working on the next request;
+  - login does not find a revoked account's passkeys, so it is refused exactly like an unknown passkey, without revealing that the account exists;
+  - issuing any credential requires an active account, so an admin revoking between login's lookup and its write cannot leave a session behind.
+- **The account's credentials are revoked in the same write.** Resolving them already refuses them, so this is not what ends them. It keeps every credential's own state honest, and protects any future kind that forgets to look at the account.
 
 ### The last active admin cannot be revoked
 
-The only recovery from having no admin is wiping the database ([first_run_design.md](first_run_design.md)), so a revoke that would leave none is refused with 409 `user_last_admin` (`store.ErrLastAdmin`). This includes revoking yourself when you are the only admin.
+The only recovery from having no admin is wiping the database ([first_run_design.md](first_run_design.md)), so a revocation that would leave none is refused. That includes revoking yourself when you are the only admin.
 
-The check is part of the write, not a read before it. D1 has no interactive transaction, so two admins revoking each other at the same moment would each see the other as active and both writes would apply. As one statement, the second sees the first's revocation and is refused. The statement matches the row by id and `RETURNING` gives it back as it left it, so the outcome is read off the row (`revoked_at` set, or still NULL because the guard refused), with no second read to disagree with it. Only active admins count: a revoked admin, or an active account with another role, does not.
+The check is part of the write, not a read before it. D1 has no interactive transactions, so two admins revoking each other at the same moment would each see the other as active, and both writes would apply. As one statement, the second sees the first's revocation and is refused. The outcome is read from the row the statement wrote, so there is no second read to disagree with it. Only active admins count.
 
 ## Stored data is checked on the way out
 
-A profile is stored as JSON text that the schema does not constrain to an object, and registration always writes one. The response sends it as stored, so it is checked first: a profile that is not a JSON object, or not valid UTF-8, is logged as `user_profile_invalid`, naming the account, and the account is served with `{}`. The request does not fail. One corrupt row must not hide every other account from the admin who has to find and revoke them, and a revocation that was applied must not be reported as failed. (Invalid UTF-8 inside D1 is already replaced with U+FFFD before Go sees it, so it is served as that, which is valid text; the check cannot see it.)
+A profile is stored as text the database does not constrain, so before it is sent it is checked. A profile that is not what registration writes is logged, naming the account, and the account is served with an empty profile. The request does not fail: one corrupt row must not hide every other account from the admin who has to find and revoke it, and a revocation that was applied must not be reported as failed.
 
 ## What is not here
 
-- **No role changes.** There is no way to change a role. When there is, it needs the same last-admin guard, and no token invalidation, because the role is read live.
+- **No role changes.** When there are, they need the same last-admin guard, and no credential invalidation, because the role is read live.
 - **No un-revoke.** Revocation is final, as for invitations.
-- **No paging or filtering on the list.** It returns every account. Add them when the table is large enough to need it.
+- **No paging or filtering of the list.** Add them when there are enough accounts to need them.
 - **No per-session management.** Ending one user's sessions without revoking the account, and users listing their own sessions, are open questions in [login_design.md](login_design.md).

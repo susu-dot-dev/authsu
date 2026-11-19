@@ -8,7 +8,6 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
-	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/result"
@@ -26,7 +25,7 @@ const (
 	// CodeLimit is a create refused because the user already has
 	// MaxAgentsPerUser active agents, or has been revoked since signing in.
 	CodeLimit = "agent_limit_reached"
-	// CodeKeyFailed is the creation of an agent's key failing, before anything
+	// CodeKeyFailed is the issue of an agent's key failing, before anything
 	// was written.
 	CodeKeyFailed = "agent_key_failed"
 	// CodeNothingToChange is a PATCH that names nothing to change: no name, and
@@ -72,7 +71,8 @@ const MaxBody = 8 << 10
 // It panics when a dependency is nil.
 func Routes(deps Deps) []auth.Route {
 	for name, missing := range map[string]bool{
-		"Store": deps.Store == nil, "Now": deps.Now == nil, "NewID": deps.NewID == nil, "CreateKey": deps.CreateKey == nil,
+		"Store": deps.Store == nil, "Now": deps.Now == nil, "NewID": deps.NewID == nil, "Entropy": deps.Entropy == nil,
+		"IssueAPIKey": deps.IssueAPIKey == nil,
 	} {
 		if missing {
 			panic("agents: Deps." + name + " is required")
@@ -202,13 +202,14 @@ type CreateResponse struct {
 
 // Key is an API key as the response to a create shows it.
 type Key struct {
-	// ID is the key's kid.
+	// ID is the key's id, the identifier it is listed and revoked by.
 	ID string `json:"id"`
 
-	// Token is the bearer token. It is not stored and cannot be shown again.
+	// Token is the bearer token ("susu_key_..."). Only its hash is stored, so
+	// it cannot be shown again.
 	Token string `json:"token"`
 
-	// Scopes is the scope list signed into the token.
+	// Scopes is the key's scope list as stored, as written.
 	Scopes []string `json:"scopes"`
 
 	// ExpiresAt is when the key stops working, in Unix seconds.
@@ -269,8 +270,8 @@ func parseOptionalScopes(raw *[]string) result.Result[scope.List] {
 type creation struct {
 	agent store.NewAgent
 	token string
-	// keyScopes is what the response reports for the key: it is the list signed
-	// into the token, which is the one stored on the key's row.
+	// keyScopes is what the response reports for the key: the list stored on
+	// the key's row.
 	keyScopes scope.List
 	// scopes is what the response reports for the agent. It is set from the
 	// write's own result, never from the plan, because an agent's create copies
@@ -326,12 +327,12 @@ func resolveScopes(who auth.Principal, req request) result.Result[request] {
 	req.scopes = who.AgentScope
 
 	if req.keyScopes == nil {
-		req.keyScopes = who.KeyScope
+		req.keyScopes = who.Scope
 
 		return result.Ok(req)
 	}
 
-	if !req.keyScopes.SubsetOf(who.KeyScope) {
+	if !req.keyScopes.SubsetOf(who.Scope) {
 		return result.Fail[request](keyScopesExceeded())
 	}
 
@@ -370,7 +371,7 @@ func userScopes(req request) request {
 // conflict: the user already has MaxAgentsPerUser active agents, their account
 // was revoked after the request was authenticated, or the creating agent was
 // revoked (the write cannot tell which, and a revoked account has no session
-// to be told on). The id and the kid are fresh UUIDv7s, so no other constraint
+// to be told on). The id and the key id are fresh UUIDv7s, so no other constraint
 // can conflict. Any other failure is returned as it is.
 func limitReached(err error) error {
 	if errors.Is(err, store.ErrConflict) {
@@ -387,14 +388,10 @@ func atLimit(cause error) *apierr.Error {
 }
 
 // plan decides everything about the new agent that does not need the database:
-// its id and its first key. The key is created here, before the write, so a
-// failure to create it writes nothing.
-//
-// The token's subject is the user, and its actor names the agent
-// (docs/agents_design.md): a service that knows nothing about agents sees the
-// user, and one that does can tell the agent apart. The scopes are signed in as
-// the claim the boundary reads back. The user is the caller's, never the
-// request's.
+// its id and its first key. The key is issued here, before the write, so a
+// failure to issue it writes nothing. The key belongs to the agent through the
+// write, which stores it under the agent's id and the caller's user, never the
+// request's, and it lives auth.AgentKeyLifetime.
 //
 // When an agent is creating, its id goes to the store, which reads the new
 // agent's scopes from that agent's row in the write and ignores any list given
@@ -402,31 +399,24 @@ func atLimit(cause error) *apierr.Error {
 // even if the creating agent's scopes changed between the request being
 // verified and the write.
 func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
-	return result.Of(call.Config()).
-		Then(func(cfg config.Config) (creation, error) {
-			now := d.Now()
-			id := d.NewID()
-			owner := call.Principal.UserID
-			expires := now.Add(KeyLifetime)
+	now := d.Now()
+	id := d.NewID()
+	owner := call.Principal.UserID
 
-			key, err := d.CreateKey(auth.IssuerFor(cfg.API), auth.KeySpec{
-				Kind: auth.KindAPIKey, Subject: owner, Expires: expires, Scope: req.keyScopes,
-				Claims: map[string]any{"act": map[string]any{"sub": id}},
-			})
-			if err != nil {
-				return creation{}, apierr.Wrap(err, apierr.Internal, CodeKeyFailed, "internal error")
-			}
+	issued, err := d.IssueAPIKey(d.Entropy, d.NewID, now, auth.AgentKeyLifetime)
+	if err != nil {
+		return result.Fail[creation](apierr.Wrap(err, apierr.Internal, CodeKeyFailed, "internal error"))
+	}
 
-			return creation{
-				agent: store.NewAgent{
-					ID: id, Owner: owner, Name: req.name, Scopes: req.scopes.JSON(), KeyScope: key.Scope,
-					Labels: req.labels, CreatedBy: call.Principal.AgentID, MaxActive: MaxAgentsPerUser,
-					KeyID: key.ID.String(), KeyJWK: key.JWK, KeyExpiresAt: key.ExpiresAt, CreatedAt: now,
-				},
-				token:     key.JWT,
-				keyScopes: req.keyScopes,
-			}, nil
-		})
+	return result.Ok(creation{
+		agent: store.NewAgent{
+			ID: id, Owner: owner, Name: req.name, Scopes: req.scopes.JSON(), KeyScope: req.keyScopes.JSON(),
+			Labels: req.labels, CreatedBy: call.Principal.AgentID, MaxActive: MaxAgentsPerUser,
+			KeyID: issued.ID, KeyHash: issued.Hash, KeyExpiresAt: issued.ExpiresAt, CreatedAt: now,
+		},
+		token:     issued.Token,
+		keyScopes: req.keyScopes,
+	})
 }
 
 // respondCreated is the response to a create, built from what was written: the

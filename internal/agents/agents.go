@@ -27,7 +27,7 @@
 // can exceed what the user may do. An agent that holds agent:create is bounded
 // by itself: the new agent has the creating agent's scopes, and its key may hold
 // only entries of the creating key's own list. The response to a create carries
-// the agent's first key, once: only the public half is stored, so a lost key
+// the agent's first key, once: only the key's hash is stored, so a lost key
 // cannot be shown again. Agents are short-lived, and there is no rotation:
 // replace an agent by revoking it and creating another.
 //
@@ -41,6 +41,7 @@ package agents
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
@@ -49,17 +50,10 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// Limits on what a user may have.
-const (
-	// MaxAgentsPerUser is how many agents one user may have, revoked ones
-	// excluded. docs/agents_design.md calls for a per-user limit and leaves its
-	// value open; this is a starting value.
-	MaxAgentsPerUser = 25
-
-	// KeyLifetime is how long an agent's key lasts. Like a session it is fixed
-	// and never extended: an agent that outlives it is replaced.
-	KeyLifetime = 90 * 24 * time.Hour
-)
+// MaxAgentsPerUser is how many agents one user may have, revoked ones
+// excluded. docs/agents_design.md calls for a per-user limit and leaves its
+// value open; this is a starting value.
+const MaxAgentsPerUser = 25
 
 // DefaultScopes is the scope list a user's create gives an agent and its key
 // when the request names none: the default agent bundle. It is written out in
@@ -106,9 +100,13 @@ type Deps struct {
 	// NewID returns a fresh UUIDv7 in canonical text form.
 	NewID func() string
 
-	// CreateKey creates an API key (auth.CreateKey in production). It is a
-	// dependency so a test can make creation fail, which no valid request does.
-	CreateKey func(auth.Issuer, auth.KeySpec) (auth.Key, error)
+	// Entropy is the source of randomness a key's token is generated from
+	// (crypto/rand.Reader in production).
+	Entropy io.Reader
+
+	// IssueAPIKey issues an API key (auth.IssueAPIKey in production). It is a
+	// dependency so a test can make issuing fail, which no valid request does.
+	IssueAPIKey func(r io.Reader, newID func() string, now time.Time, lifetime time.Duration) (auth.Issued, error)
 }
 
 // Status is where an agent stands. It is derived from the row, never stored.

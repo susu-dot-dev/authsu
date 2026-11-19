@@ -3,6 +3,8 @@ package session_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,32 +13,29 @@ import (
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
-	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/session"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
 // *store.Store is what runs in production, so it must satisfy the interface the
-// routes write through and the boundary reads keys through.
+// routes write through and the boundary resolves credentials through.
 var (
-	_ session.Store  = (*store.Store)(nil)
-	_ auth.KeyReader = (*store.Store)(nil)
+	_ session.Store         = (*store.Store)(nil)
+	_ auth.CredentialReader = (*store.Store)(nil)
 )
 
 // Causes the tests inject. They are only ever in the log, never in a response.
 var (
-	errDB    = errors.New("UPDATE japikeys: database is on fire")
+	errDB    = errors.New("UPDATE secrets: database is on fire")
 	errPlain = errors.New("an error the store forgot to classify")
 )
 
 const (
-	testSecret  = "session-test-secret-0123456789ABCDEFGHIJKLMNOP"
-	apiOrigin   = "https://auth.example.com"
-	uiOrigin    = "https://example.com"
 	userID      = "00000000-0000-7000-8000-000000000002"
 	otherUserID = "00000000-0000-7000-8000-0000000000ff"
-	credential  = "00000000-0000-7000-8000-000000000001"
 	jsonType    = "application/json"
 
 	unavailableText = "sessions are temporarily unavailable"
@@ -49,7 +48,6 @@ const (
 // contract, and a cause never appears.
 const (
 	bodyUnauthenticated = `{"error":{"code":"unauthenticated","message":"not signed in"}}` + "\n"
-	bodyNotConfigured   = `{"error":{"code":"not_configured","message":"the service is not configured"}}` + "\n"
 	bodyVerifyFailed    = `{"error":{"code":"session_verify_failed",` +
 		`"message":"sessions are temporarily unavailable"}}` + "\n"
 	bodyLogoutFailed = `{"error":{"code":"session_logout_failed",` +
@@ -57,79 +55,135 @@ const (
 	bodyInternal = `{"error":{"code":"internal","message":"internal error"}}` + "\n"
 )
 
-// revokeCall is one call of RevokeKey.
+// revokeCall is one call of RevokeSecret.
 type revokeCall struct {
 	userID string
-	kid    string
+	id     string
 	now    time.Time
 }
 
 // fakeStore is the session store: it records every revocation and answers as it
 // is programmed to.
 type fakeStore struct {
-	// revoked is what RevokeKey reports; false is a session another
+	// revoked is what RevokeSecret reports; false is a secret another
 	// request revoked first.
 	revoked bool
-	// err, when set, is returned by RevokeKey.
+	// err, when set, is returned by RevokeSecret.
 	err error
 	// onRevoked runs when a revocation took effect, so the rest of the
-	// fake database can follow: a revoked session is no longer active.
-	onRevoked func(kid string)
+	// fake database can follow: a revoked secret is no longer active.
+	onRevoked func(id string)
 
 	calls []revokeCall
 }
 
-func (f *fakeStore) RevokeKey(_ context.Context, userID, kid string, now time.Time) (bool, error) {
-	f.calls = append(f.calls, revokeCall{userID: userID, kid: kid, now: now})
+func (f *fakeStore) RevokeSecret(_ context.Context, userID, id string, now time.Time) (bool, error) {
+	f.calls = append(f.calls, revokeCall{userID: userID, id: id, now: now})
 
 	if f.err != nil {
 		return false, f.err
 	}
 
 	if f.revoked && f.onRevoked != nil {
-		f.onRevoked(kid)
+		f.onRevoked(id)
 	}
 
 	return f.revoked, nil
 }
 
-// keyCall is one read of the key store.
-type keyCall struct {
-	kid, kind string
-	now       time.Time
+// resolveCall is one read of the credential store: what kind of token was
+// resolved, by its hash, and when.
+type resolveCall struct {
+	kind string
+	hash string
+	now  time.Time
 }
 
-// fakeKeys is the key store: rows by kid, as the database holds active
-// sessions, with a programmable failure.
-type fakeKeys struct {
-	rows  map[string]store.ActiveKey
-	err   error
-	calls []keyCall
+// held is a secret the fake database holds as active: exactly one of its
+// session and key is set.
+type held struct {
+	session store.ActiveSession
+	key     store.ActiveAPIKey
+	kind    string
 }
 
-func (f *fakeKeys) ActiveKey(_ context.Context, kid, kind string, now time.Time) (store.ActiveKey, bool, error) {
-	f.calls = append(f.calls, keyCall{kid: kid, kind: kind, now: now})
-
-	if f.err != nil {
-		return store.ActiveKey{}, false, f.err
+// id is the secret id of the row.
+func (h held) id() string {
+	if h.kind == auth.KindSession {
+		return h.session.ID
 	}
 
-	row, ok := f.rows[kid]
+	return h.key.ID
+}
 
-	return row, ok, nil
+// fakeCredentials is the credential store: the active secrets by the hash of
+// their token, as the database holds them, with a programmable failure. Each
+// resolution only finds a secret of its own kind, as the real ones do.
+type fakeCredentials struct {
+	rows  map[string]held
+	err   error
+	calls []resolveCall
+}
+
+func (f *fakeCredentials) ResolveSession(
+	_ context.Context, token input.SessionToken, now time.Time,
+) (store.ActiveSession, bool, error) {
+	f.calls = append(f.calls, resolveCall{kind: auth.KindSession, hash: string(token.Hash()), now: now})
+
+	if f.err != nil {
+		return store.ActiveSession{}, false, f.err
+	}
+
+	row, ok := f.rows[string(token.Hash())]
+	if !ok || row.kind != auth.KindSession {
+		return store.ActiveSession{}, false, nil
+	}
+
+	return row.session, true, nil
+}
+
+func (f *fakeCredentials) ResolveAPIKey(
+	_ context.Context, token input.APIKeyToken, now time.Time,
+) (store.ActiveAPIKey, bool, error) {
+	f.calls = append(f.calls, resolveCall{kind: auth.KindAPIKey, hash: string(token.Hash()), now: now})
+
+	if f.err != nil {
+		return store.ActiveAPIKey{}, false, f.err
+	}
+
+	row, ok := f.rows[string(token.Hash())]
+	if !ok || row.kind != auth.KindAPIKey {
+		return store.ActiveAPIKey{}, false, nil
+	}
+
+	return row.key, true, nil
+}
+
+// forget removes the active secret with this id, which is what revoking it does.
+func (f *fakeCredentials) forget(id string) {
+	for hash, row := range f.rows {
+		if row.id() == id {
+			delete(f.rows, hash)
+		}
+	}
 }
 
 // rig is one deployment under test: the real boundary and the real routes over
-// a fake key store and a fake session store.
+// a fake credential store and a fake session store.
 type rig struct {
 	t     *testing.T
 	store *fakeStore
-	keys  *fakeKeys
-	env   map[string]string
+	creds *fakeCredentials
 
 	// authNow is the boundary's clock and logoutNow the session routes'. They
 	// differ, so a test can tell which one a call used.
 	authNow, logoutNow time.Time
+
+	// entropy supplies the random bytes of every secret the rig issues, so
+	// each has its own token.
+	entropy io.Reader
+	// ids counts the ids the rig has handed out.
+	ids int
 
 	// logged records every error the boundary turned into a response.
 	logged []*apierr.Error
@@ -138,22 +192,46 @@ type rig struct {
 func newRig(t *testing.T) *rig {
 	t.Helper()
 
-	keys := &fakeKeys{rows: map[string]store.ActiveKey{}, err: nil, calls: nil}
+	creds := &fakeCredentials{rows: map[string]held{}, err: nil, calls: nil}
 
 	return &rig{
 		t: t,
 		store: &fakeStore{
 			revoked: true, err: nil, calls: nil,
-			onRevoked: func(kid string) { delete(keys.rows, kid) },
+			onRevoked: creds.forget,
 		},
-		keys: keys,
-		env: map[string]string{
-			config.SecretHMAC: testSecret, config.VarAPIOrigin: apiOrigin, config.VarUIOrigin: uiOrigin,
-		},
+		creds:     creds,
 		authNow:   time.Now(),
 		logoutNow: time.Date(2026, time.November, 17, 12, 30, 45, 987654321, time.UTC),
+		entropy:   counterEntropy(),
+		ids:       0,
 		logged:    nil,
 	}
+}
+
+// counterEntropy is deterministic entropy: each byte is the previous plus one.
+func counterEntropy() io.Reader {
+	next := byte(1)
+
+	return readerFunc(func(p []byte) (int, error) {
+		for i := range p {
+			p[i] = next
+			next++
+		}
+
+		return len(p), nil
+	})
+}
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// newID is the rig's id source: UUID-shaped ids that count up.
+func (r *rig) newID() string {
+	r.ids++
+
+	return fmt.Sprintf("00000000-0000-7000-8000-%012d", r.ids)
 }
 
 // routes are the session routes over the rig's fakes.
@@ -164,10 +242,10 @@ func (r *rig) routes() []auth.Route {
 // handler is the real boundary over the real routes.
 func (r *rig) handler() http.Handler {
 	return auth.Handler(r.routes(), auth.Deps{
-		Keys:   r.keys,
-		Now:    func() time.Time { return r.authNow },
-		Getenv: func(name string) string { return r.env[name] },
-		Log:    func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },
+		Credentials: r.creds,
+		Now:         func() time.Time { return r.authNow },
+		Getenv:      func(string) string { return "" },
+		Log:         func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },
 	})
 }
 
@@ -177,7 +255,9 @@ type request struct {
 	// contentType defaults to application/json; "-" sends none.
 	contentType string
 	cookies     []*http.Cookie
-	body        string
+	// authorization values are sent as Authorization headers.
+	authorization []string
+	body          string
 }
 
 // serve sends req to the boundary and returns the response.
@@ -198,6 +278,10 @@ func (r *rig) serve(req request) *httptest.ResponseRecorder {
 		httpReq.AddCookie(cookie)
 	}
 
+	for _, value := range req.authorization {
+		httpReq.Header.Add("Authorization", value)
+	}
+
 	rec := httptest.NewRecorder()
 	r.handler().ServeHTTP(rec, httpReq)
 
@@ -210,35 +294,58 @@ func requestCookie(name, value string) *http.Cookie {
 	return &http.Cookie{Name: name, Value: value}
 }
 
-// activeSession creates a real session of owner with role that expires at
-// expiresAt according to its stored row, stores its row as the database would
-// hold an active session, and returns the cookie a browser would send and the
-// kid.
+// bearer is the Authorization header value that presents token.
+func bearer(token string) string { return "Bearer " + token }
+
+// activeSession issues a real session of owner with role, stores its row as the
+// database would hold an active session that expires at expiresAt, and returns
+// the cookie a browser would send and the session's id.
 func (r *rig) activeSession(owner, role string, expiresAt time.Time) (*http.Cookie, string) {
 	r.t.Helper()
 
-	issuer := auth.IssuerFor(origin(r.t, apiOrigin))
-
-	key, err := auth.CreateSession(issuer, owner, r.authNow.Add(auth.SessionLifetime))
+	issued, err := auth.IssueSession(r.entropy, r.newID, r.authNow)
 	if err != nil {
-		r.t.Fatalf("CreateSession: %v", err)
+		r.t.Fatalf("IssueSession: %v", err)
 	}
 
-	r.keys.rows[key.ID.String()] = store.ActiveKey{
-		JWK: []byte(key.JWK), UserID: owner, CredentialID: credential, Role: role, ExpiresAt: expiresAt,
+	r.creds.rows[string(issued.Hash)] = held{
+		kind: auth.KindSession,
+		session: store.ActiveSession{
+			ID: issued.ID, UserID: owner, Role: role, ExpiresAt: expiresAt,
+		},
+		key: store.ActiveAPIKey{},
 	}
 
-	return requestCookie(auth.CookieName, key.JWT), key.ID.String()
+	return requestCookie(auth.CookieName, issued.Token), issued.ID
 }
 
-// origin parses an origin, which the test knows is valid.
-func origin(t *testing.T, value string) config.Origin {
-	t.Helper()
+// liveKey issues a real API key of owner with role, stores its row as the
+// database would hold an active key that expires at expiresAt, and returns the
+// token a client would present and the key's id. agentID is "" for a user's own
+// key.
+func (r *rig) liveKey(owner, role, agentID string, expiresAt time.Time) (string, string) {
+	r.t.Helper()
 
-	parsed, err := config.ParseOrigin(value)
+	issued, err := auth.IssueAPIKey(r.entropy, r.newID, r.authNow, auth.AgentKeyLifetime)
 	if err != nil {
-		t.Fatalf("origin: %v", err)
+		r.t.Fatalf("IssueAPIKey: %v", err)
 	}
 
-	return parsed
+	r.creds.rows[string(issued.Hash)] = held{
+		kind:    auth.KindAPIKey,
+		session: store.ActiveSession{},
+		key: store.ActiveAPIKey{
+			ID: issued.ID, UserID: owner, Role: role, ExpiresAt: expiresAt,
+			AgentID: agentID, AgentScopes: "", Scope: `["default:session"]`,
+		},
+	}
+
+	return issued.Token, issued.ID
+}
+
+// tokenHash is the hash the credential store resolves token by.
+func tokenHash(token string) string {
+	hash := secret.Hash(token)
+
+	return string(hash[:])
 }

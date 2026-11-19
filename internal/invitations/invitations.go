@@ -12,10 +12,11 @@
 // runs. The role is the one stored on the account, read on each request, so
 // demoting an admin takes effect at once.
 //
-// An invitation is identified by its id, never by its code. The code is shown
-// once, in the response to the POST that created it; only its hash is stored
-// (input.InvitationCode.Hash, the one place codes are hashed), so no route can
-// return it again.
+// An invitation is identified by its id, never by its token. The token
+// ("susu_inv_" and 43 base64url characters, see internal/secret) is shown once,
+// in the "code" field of the response to the POST that created it; only its
+// hash is stored (input.InvitationToken.Hash, the one place tokens are
+// hashed), so no route can return it again.
 //
 // Each request reads the clock once, and that reading is the request's "now":
 // the expiry a create is checked against, the time a revoke records and the
@@ -49,10 +50,6 @@ const (
 // anything that could only be an attempt to make the route read more.
 const MaxBody = 4 << 10
 
-// CodeBytes is the entropy of a generated code: 256 bits, which is 43
-// base64url characters, matching what docs/invitations_design.md assumes.
-const CodeBytes = 32
-
 // Store is the part of the database the routes use. *store.Store satisfies it.
 // Failures come back already classified (see the store package), and the routes
 // send them as they are.
@@ -63,7 +60,9 @@ type Store interface {
 	CreateInvitation(ctx context.Context, invitation store.NewInvitation) (store.Invitation, error)
 	// UpdateNumInvites sets the cap and returns the row as the write left it
 	// and whether it applied; store.ErrNotFound when there is no such row.
-	UpdateNumInvites(ctx context.Context, id input.ID, n input.NumInvites) (store.Invitation, bool, error)
+	UpdateNumInvites(
+		ctx context.Context, id input.ID, n input.NumInvites, now time.Time,
+	) (store.Invitation, bool, error)
 	// RevokeInvitation revokes as of now and returns the row as the write left
 	// it; store.ErrNotFound when there is no such row.
 	RevokeInvitation(ctx context.Context, id input.ID, now time.Time) (store.Invitation, error)
@@ -76,7 +75,7 @@ type Deps struct {
 	Store Store
 	// Now is the clock.
 	Now func() time.Time
-	// Entropy supplies the random bytes of a code (crypto/rand.Reader in
+	// Entropy supplies the random bytes of a token (crypto/rand.Reader in
 	// production).
 	Entropy io.Reader
 	// NewID returns a fresh UUIDv7 in canonical text form.

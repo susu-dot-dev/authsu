@@ -671,8 +671,8 @@ func TestUserListLarge(t *testing.T) {
 
 // ---- revoke --------------------------------------------------------------------------
 
-// usrSeedKeysFor gives user id a session row, two keys of one agent and an agent,
-// returning the kids and the agent id, all with fresh ids from family.
+// usrKeys are the secrets and the agent usrSeedKeys gives a user: a session and
+// two keys of one agent, with the agent, all with fresh ids from one family.
 type usrKeys struct {
 	session, key, otherKey string
 	agent                  string
@@ -687,17 +687,17 @@ func usrSeedKeys(t *testing.T, family, user string) usrKeys {
 
 	seedSession(t, out.session, user)
 	seedAgent(t, out.agent, user, "bot")
-	seedAgentKey(t, out.key, user, out.agent)
-	seedAgentKey(t, out.otherKey, user, out.agent)
+	seedAPIKey(t, out.key, user, out.agent)
+	seedAPIKey(t, out.otherKey, user, out.agent)
 
 	return out
 }
 
-// usrRevokedKeys is the number of revoked japikeys rows of user.
+// usrRevokedKeys is the number of revoked secrets (sessions and keys) of user.
 func usrRevokedKeys(t *testing.T, user string) string {
 	t.Helper()
 
-	return count(t, "japikeys WHERE user_id = ? AND revoked_at IS NOT NULL", user)
+	return count(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NOT NULL", user)
 }
 
 // TestUserRevoke: revoking a member answers 200 with the revoked view, revokes the
@@ -718,10 +718,10 @@ func TestUserRevoke(t *testing.T) {
 
 	// Expired and pre-revoked keys: a revoke keeps an earlier revocation and an
 	// already-due time, and brings a later one forward.
-	seed(t, "UPDATE japikeys SET revoked_at = 100 WHERE kid = ?", victim.otherKey)
-	seed(t, "UPDATE japikeys SET revoked_at = ? WHERE kid = ?", invUnixFar, victim.key)
+	seed(t, "UPDATE secrets SET revoked_at = 100 WHERE id = ?", victim.otherKey)
+	seed(t, "UPDATE secrets SET revoked_at = ? WHERE id = ?", invUnixFar, victim.key)
 
-	adminKeysBefore := count(t, "japikeys WHERE user_id = ? AND revoked_at IS NULL", admin.userID)
+	adminKeysBefore := count(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NULL", admin.userID)
 	usersBefore, credsBefore := count(t, "users"), count(t, "credentials")
 
 	before := time.Now().Unix()
@@ -747,27 +747,27 @@ func TestUserRevoke(t *testing.T) {
 
 	// Keys: all of the victim's are revoked; the pre-revoked one keeps 100, the
 	// far-future one is brought forward to now.
-	expectCount(t, "japikeys WHERE user_id = ? AND revoked_at IS NULL", "0", idUserB)
+	expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NULL", "0", idUserB)
 
-	if got := scalar(t, "SELECT revoked_at FROM japikeys WHERE kid = ?", victim.otherKey); got != "100" {
+	if got := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", victim.otherKey); got != "100" {
 		t.Errorf("earlier key revocation = %s, want 100 kept", got)
 	}
 
-	if got := scalar(t, "SELECT revoked_at FROM japikeys WHERE kid = ?", victim.key); got != revokedAt {
+	if got := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", victim.key); got != revokedAt {
 		t.Errorf("far-future key revocation = %s, want brought forward to %s", got, revokedAt)
 	}
 
-	if got := scalar(t, "SELECT revoked_at FROM japikeys WHERE kid = ?", victim.session); got != revokedAt {
-		t.Errorf("session key revoked_at = %s, want %s", got, revokedAt)
+	if got := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", victim.session); got != revokedAt {
+		t.Errorf("session revoked_at = %s, want %s", got, revokedAt)
 	}
 
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at = ?", "1", idUserB, revokedAt)
 
 	// Nobody else is touched.
 	expectCount(t, "users WHERE revoked_at IS NOT NULL", "1")
-	expectCount(t, "japikeys WHERE user_id = ? AND revoked_at IS NULL", "3", idUserC)
+	expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NULL", "3", idUserC)
 	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NULL", "1", idUserC)
-	expectCount(t, "japikeys WHERE user_id = ? AND revoked_at IS NULL", adminKeysBefore, admin.userID)
+	expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NULL", adminKeysBefore, admin.userID)
 
 	if usrRevokedKeys(t, idUserC) != "0" || bystander.agent == "" {
 		t.Errorf("a bystander's keys were revoked")
@@ -796,8 +796,8 @@ func TestUserRevoke(t *testing.T) {
 	}
 
 	// The second revoke does not touch keys or agents again.
-	if got := scalar(t, "SELECT revoked_at FROM japikeys WHERE kid = ?", victim.session); got != revokedAt {
-		t.Errorf("session key revoked_at moved to %s, want %s", got, revokedAt)
+	if got := scalar(t, "SELECT revoked_at FROM secrets WHERE id = ?", victim.session); got != revokedAt {
+		t.Errorf("session revoked_at moved to %s, want %s", got, revokedAt)
 	}
 
 	// A revoked account is still readable and listed, as revoked.
@@ -820,13 +820,13 @@ func TestUserRevokeLastAdminGuard(t *testing.T) {
 
 	seedSession(t, idN("0c60", 1), admin.userID)
 	seedAgent(t, idN("0c60", 2), admin.userID, "bot")
-	seedAgentKey(t, idN("0c60", 3), admin.userID, idN("0c60", 2))
+	seedAPIKey(t, idN("0c60", 3), admin.userID, idN("0c60", 2))
 
 	unchanged := func(t *testing.T, step string) {
 		t.Helper()
 
 		expectCount(t, "users WHERE id = ? AND revoked_at IS NOT NULL", "0", admin.userID)
-		expectCount(t, "japikeys WHERE user_id = ? AND revoked_at IS NOT NULL", "0", admin.userID)
+		expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NOT NULL", "0", admin.userID)
 		expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NOT NULL", "0", admin.userID)
 
 		if got := get(t, pathSession, token); got.status != http.StatusOK {
@@ -872,7 +872,7 @@ func TestUserRevokeLastAdminGuard(t *testing.T) {
 		seedSession(t, idN("0c63", 2), idN("0c63", 1))
 
 		usrRevoke(t, token, idN("0c63", 1)).expect(t, "DELETE the second admin", http.StatusOK, "")
-		expectCount(t, "japikeys WHERE user_id = ? AND revoked_at IS NOT NULL", "1", idN("0c63", 1))
+		expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at IS NOT NULL", "1", idN("0c63", 1))
 
 		// After which the first is the last again.
 		usrRevoke(t, token, admin.userID).expect(t, "DELETE the last admin again", http.StatusConflict, usrCodeLastAdmin)
@@ -941,7 +941,8 @@ func TestUserConcurrentRevokesOfOneMember(t *testing.T) {
 	token := login(t, newAdmin(t))
 
 	for round := range 4 {
-		seed(t, "DELETE FROM japikeys WHERE user_id = ?", idUserB)
+		seed(t, "DELETE FROM api_keys WHERE user_id = ?", idUserB)
+		seed(t, "DELETE FROM sessions WHERE user_id = ?", idUserB)
 		seed(t, "DELETE FROM agents WHERE user_id = ?", idUserB)
 		seed(t, "DELETE FROM users WHERE id = ?", idUserB)
 		seedUser(t, idUserB, roleMember)
@@ -965,7 +966,7 @@ func TestUserConcurrentRevokesOfOneMember(t *testing.T) {
 			}
 		}
 
-		expectCount(t, "japikeys WHERE user_id = ? AND revoked_at = ?", "3", idUserB, stored)
+		expectCount(t, ownedSecrets+" WHERE o.user_id = ? AND s.revoked_at = ?", "3", idUserB, stored)
 		expectCount(t, "agents WHERE user_id = ? AND revoked_at = ?", "1", idUserB, stored)
 	}
 }

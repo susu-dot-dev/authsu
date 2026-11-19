@@ -24,62 +24,69 @@ const (
 // invitation's type so Go can choose the role. Neither relies on it for
 // authorisation; insertUserQuery re-checks everything in the write.
 //
-// It returns the type of the invitation only when it is currently redeemable
-// (not revoked, not expired, under its cap, and, for first run, no account
-// exists yet), and no row otherwise.
+// The invitation is found by the hash of its token and its kind, through its
+// secret, and it is returned only when the secret is active
+// (activeSecretPredicate), it is under its cap and, for first run, no account
+// exists yet. Otherwise there is no row. The join to invitations is on the id
+// and the kind together, as the schema's foreign key is.
 //
-// Arguments: code_hash, now (unix seconds), first-run type.
+// Arguments, in order: hash, kind, now, now (unix seconds), first-run type.
 const invitationQuery = `
 SELECT i.type AS type
-FROM invitations i
-WHERE i.code_hash = ?
-  AND i.revoked_at IS NULL
-  AND (i.expires_at IS NULL OR i.expires_at > ?)
+FROM secrets s
+JOIN invitations i ON i.id = s.id AND i.kind = s.kind
+WHERE s.hash = ?
+  AND s.kind = ?
+  AND ` + activeSecretPredicate + `
   AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites
   AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))`
 
-// RedeemableInvitationType returns the type of the invitation code names when it
-// is redeemable at now: not revoked, not expired, under its cap and, for the
-// first-run type, while no account exists. It reports false otherwise, so an
-// unknown, spent, revoked or expired code are indistinguishable.
+// RedeemableInvitationType returns the type of the invitation the token names
+// when it is redeemable at now: not revoked, not expired, under its cap and, for
+// the first-run type, while no account exists. It reports false otherwise, so an
+// unknown, spent, revoked or expired token are indistinguishable.
 //
 // It is advisory: CreateAccount re-checks every condition in its write.
 func (s *Store) RedeemableInvitationType(
-	ctx context.Context, code input.InvitationCode, now time.Time,
+	ctx context.Context, token input.InvitationToken, now time.Time,
 ) (string, bool, error) {
 	o := op{failed: CodeInvitationCheckFailed, rejected: CodeInvitationCheckRejected,
 		description: "registration is temporarily unavailable"}
 
+	unix := now.Unix()
+
 	return find(ctx, s, o,
-		Statement{Query: invitationQuery, Args: []any{code.Hash(), now.Unix(), InvitationFirstRun}},
+		Statement{Query: invitationQuery, Args: []any{token.Hash(), KindInvitation, unix, unix, InvitationFirstRun}},
 		func(r *row) string { return r.text() })
 }
 
 // insertUserQuery creates the account, and is the point of acceptance. Its
 // authorisation checks are conditions of the insert itself, so the database
-// serialises them: two people finishing at once on a single-use code, or two
+// serialises them: two people finishing at once on a single-use token, or two
 // browsers racing to become the first admin, cannot both pass.
 //
-// The role is chosen by Go from the invitation's type and bound as a value. The
-// insert also requires the invitation to still have that type, so a type that
-// changed between the read and the write cannot get a role chosen for a
-// different one. The client supplies neither.
+// The invitation is matched as invitationQuery matches it (hash, kind, active
+// secret, cap, first-run rule), with one more condition: it must still have the
+// type the caller read. The role is chosen by Go from that type and bound as a
+// value, so a type that changed between the read and the write cannot get a role
+// chosen for a different one. The client supplies neither.
 //
 // If no invitation satisfies the conditions the insert matches nothing. A
 // conditional insert that matches nothing is not an error, so on its own it
 // would not roll the batch back; insertCredentialQuery's required reference to
 // the new user is what turns it into a failure.
 //
-// Arguments, in order: id, user_handle, role, profile, created_at, code_hash,
-// type, now, first-run type.
+// Arguments, in order: id, user_handle, role, profile, created_at, hash, kind,
+// type, now, now (unix seconds), first-run type.
 const insertUserQuery = `
 INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at)
 SELECT ?, ?, ?, i.id, ?, ?
-FROM invitations i
-WHERE i.code_hash = ?
+FROM secrets s
+JOIN invitations i ON i.id = s.id AND i.kind = s.kind
+WHERE s.hash = ?
+  AND s.kind = ?
   AND i.type = ?
-  AND i.revoked_at IS NULL
-  AND (i.expires_at IS NULL OR i.expires_at > ?)
+  AND ` + activeSecretPredicate + `
   AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites
   AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))`
 
@@ -126,10 +133,10 @@ type NewAccount struct {
 	// Name is the display name the registrant gave.
 	Name input.AccountName
 
-	// Code is the invitation being redeemed, and InvitationType the type the
+	// Token is the invitation being redeemed, and InvitationType the type the
 	// caller read for it with RedeemableInvitationType: the write refuses an
 	// invitation that no longer has that type.
-	Code           input.InvitationCode
+	Token          input.InvitationToken
 	InvitationType string
 
 	// CredentialRowID is the passkey's row id. CredentialID, PublicKey, Flags,
@@ -184,7 +191,7 @@ func (s *Store) CreateAccount(ctx context.Context, account NewAccount) error {
 	_, err = s.run(ctx, o,
 		Statement{Query: insertUserQuery, Args: []any{
 			account.UserID, account.UserHandle, account.Role, string(profileJSON), created,
-			account.Code.Hash(), account.InvitationType, created, InvitationFirstRun,
+			account.Token.Hash(), KindInvitation, account.InvitationType, created, created, InvitationFirstRun,
 		}},
 		Statement{Query: insertCredentialQuery, Args: []any{
 			account.CredentialRowID, account.CredentialID, account.UserHandle, account.PublicKey,

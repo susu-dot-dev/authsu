@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
@@ -92,13 +91,6 @@ func TestRoutesRequireEveryDependency(t *testing.T) {
 func TestStatus(t *testing.T) {
 	t.Parallel()
 
-	longest := strings.Repeat("k", input.MaxInvitationCodeBytes)
-
-	const (
-		short    = "k3Jx9Qp-Zr2_LmN8vB5tYcD1fGhWaX0"  // 31 characters, one short
-		shortest = "k3Jx9Qp-Zr2_LmN8vB5tYcD1fGhWaX0e" // 32 characters, the least
-	)
-
 	tests := []struct {
 		name string
 		// states are the answers of FirstRunState, in order.
@@ -143,45 +135,6 @@ func TestStatus(t *testing.T) {
 		{
 			name: "empty, no secret", states: []stateAnswer{reading(empty())}, secret: "",
 			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, secret one character short", states: []stateAnswer{reading(empty())}, secret: short,
-			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, secret with a character outside base64url", states: []stateAnswer{reading(empty())},
-			secret:     "k3Jx9Qp+Zr2/LmN8vB5tYcD1fGhWaXeUoIiS7dTqA0E=",
-			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, secret with a space inside", states: []stateAnswer{reading(empty())},
-			secret:     "k3Jx9Qp-Zr2_LmN8vB5tYcD1 fGhWaXeUoIiS7dTqA0E",
-			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, secret with a newline", states: []stateAnswer{reading(empty())},
-			secret:     shortest[:31] + "\n",
-			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, multibyte secret of 32 bytes", states: []stateAnswer{reading(empty())},
-			secret:     strings.Repeat("\u00e9", 16),
-			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, secret longer than an invitation code", states: []stateAnswer{reading(empty())},
-			secret:     longest + "k",
-			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, secret of the least length creates", states: []stateAnswer{reading(empty())}, secret: shortest,
-			create:     createAnswer{created: true, err: nil},
-			wantStatus: http.StatusOK, wantBody: bodyPending, wantCalls: []string{callState, callCreate}, wantSecretRead: true,
-		},
-		{
-			name: "empty, secret of the greatest length creates", states: []stateAnswer{reading(empty())}, secret: longest,
-			create:     createAnswer{created: true, err: nil},
-			wantStatus: http.StatusOK, wantBody: bodyPending, wantCalls: []string{callState, callCreate}, wantSecretRead: true,
 		},
 		{
 			name: "empty, valid secret creates", states: []stateAnswer{reading(empty())}, secret: validSecret,
@@ -291,8 +244,8 @@ func TestStatus(t *testing.T) {
 
 			wantSecretStays(t, rec.Header(), rec.Body.String(), tt.secret)
 
-			if rig.keys.calls != 0 {
-				t.Error("the key store was read for a route with no credential")
+			if rig.creds.calls != 0 {
+				t.Error("the credential store was read for a route with no credential")
 			}
 		})
 	}
@@ -307,7 +260,7 @@ func boolToInt(b bool) int {
 }
 
 // wantSecretStays fails when secret, or a piece of it, is anywhere in a
-// response: the code is an admin credential until the owner registers.
+// response: the token is an admin credential until the owner registers.
 func wantSecretStays(t *testing.T, headers http.Header, body, secret string) {
 	t.Helper()
 
@@ -333,8 +286,9 @@ func wantSecretStays(t *testing.T, headers http.Header, body, secret string) {
 }
 
 // TestCreatesTheInvitation checks what the insert is given: a fresh id, the
-// code, the label and the injected clock, and that each is taken from the
-// injected source exactly once.
+// token (and so its hash), the label, the creation time from the injected clock
+// and an expiry exactly input.ExpiryHorizon after it, and that each is taken
+// from the injected source exactly once.
 func TestCreatesTheInvitation(t *testing.T) {
 	t.Parallel()
 
@@ -347,14 +301,100 @@ func TestCreatesTheInvitation(t *testing.T) {
 		t.Fatalf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), bodyPending)
 	}
 
-	want := createCall{id: generatedID, code: validSecret, label: "First run: initial administrator", now: rig.now}
+	token, err := input.ParseInvitationToken(validSecret)
+	if err != nil {
+		t.Fatalf("the fixture secret does not parse: %v", err)
+	}
+
+	want := createCall{
+		id: generatedID, token: validSecret, hash: string(token.Hash()), label: "First run: initial administrator",
+		expiresAt: rig.now.Add(10 * 365 * 24 * time.Hour), now: rig.now,
+	}
 
 	if len(rig.store.creates) != 1 || rig.store.creates[0] != want {
 		t.Errorf("created %v, want %v", rig.store.creates, want)
 	}
 
+	if want.expiresAt.Sub(want.now) != input.ExpiryHorizon {
+		t.Errorf("the expiry is %v after now, want input.ExpiryHorizon", want.expiresAt.Sub(want.now))
+	}
+
 	if rig.ids != 1 || rig.clockReads != 1 {
 		t.Errorf("NewID called %d times and Now %d times, want once each", rig.ids, rig.clockReads)
+	}
+}
+
+// TestSecretMustBeAnInvitationToken: only a complete invitation token is a
+// usable FIRST_RUN_SECRET. Every other value is "missing secret": the store is
+// asked for the state once and never to create, and the secret is never
+// described in the response.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
+func TestSecretMustBeAnInvitationToken(t *testing.T) {
+	t.Parallel()
+
+	wholeBody := strings.TrimPrefix(validSecret, "susu_inv_")
+
+	tests := map[string]struct {
+		secret string
+		valid  bool
+	}{
+		"a token":                         {secret: validSecret, valid: true},
+		"another canonical token":         {secret: "susu_inv_" + strings.Repeat("A", 43), valid: true},
+		"unset":                           {secret: ""},
+		"random body without the prefix":  {secret: wholeBody},
+		"old-style 32 random characters":  {secret: "k3Jx9Qp-Zr2_LmN8vB5tYcD1fGhWaX0e"},
+		"a session token":                 {secret: "susu_ses_" + wholeBody},
+		"an API key":                      {secret: "susu_key_" + wholeBody},
+		"prefix only":                     {secret: "susu_inv_"},
+		"prefix without the underscore":   {secret: "susu_inv" + wholeBody},
+		"upper-case prefix":               {secret: "SUSU_INV_" + wholeBody},
+		"body of 42 characters":           {secret: validSecret[:len(validSecret)-1]},
+		"body of 44 characters":           {secret: validSecret + "A"},
+		"leading space":                   {secret: " " + validSecret},
+		"trailing space":                  {secret: validSecret + " "},
+		"trailing newline":                {secret: validSecret + "\n"},
+		"leading tab":                     {secret: "\t" + validSecret},
+		"carriage return":                 {secret: validSecret + "\r\n"},
+		"non-canonical last character":    {secret: validSecret[:len(validSecret)-1] + "F"},
+		"character outside base64url":     {secret: "susu_inv_" + wholeBody[:42] + "+"},
+		"padding":                         {secret: validSecret[:len(validSecret)-1] + "="},
+		"multibyte character in the body": {secret: "susu_inv_" + wholeBody[:41] + "\u00e9"},
+		"two tokens":                      {secret: validSecret + validSecret},
+		"a very long value":               {secret: strings.Repeat("k", 1<<16)},
+		"the prefix in the middle":        {secret: "x" + validSecret},
+		"NUL byte":                        {secret: validSecret + "\x00"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rig := newRig(t, reading(empty()))
+			rig.store.create = createAnswer{created: true, err: nil}
+			rig.env[config.SecretFirstRun] = tt.secret
+
+			rec := rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
+
+			wantBody, wantCalls := bodyMissing, []string{callState}
+			if tt.valid {
+				wantBody, wantCalls = bodyPending, []string{callState, callCreate}
+			}
+
+			if rec.Code != http.StatusOK || rec.Body.String() != wantBody {
+				t.Errorf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), wantBody)
+			}
+
+			if !slices.Equal(rig.store.calls, wantCalls) {
+				t.Errorf("store calls = %v, want %v", rig.store.calls, wantCalls)
+			}
+
+			if len(rig.logged) != 0 {
+				t.Errorf("logged = %v, want nothing: a bad secret is a status, not a failure", rig.logged)
+			}
+
+			wantSecretStays(t, rec.Header(), rec.Body.String(), tt.secret)
+		})
 	}
 }
 
@@ -480,8 +520,8 @@ func TestNeedsNoCredentialAndNoConfiguration(t *testing.T) {
 				t.Errorf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), bodyMissing)
 			}
 
-			if rig.keys.calls != 0 {
-				t.Error("the key store was read")
+			if rig.creds.calls != 0 {
+				t.Error("the credential store was read")
 			}
 
 			if len(rig.reads) != 1 || rig.reads[config.SecretFirstRun] != 1 {
@@ -529,16 +569,16 @@ func TestHTTPContract(t *testing.T) {
 
 // TestInvitationLabelIsOneTheSchemaAndTheParserAccept: the first-run label is
 // written straight to invitations.label and shown in the admin's list, so it
-// must fit the column's CHECK (read from the migrations' text) and be a label
+// must fit the column's CHECK in bytes (read from the migrations' text) and be a label
 // the invitation parser would accept from a person, which is what the rest of
 // the system assumes every label is.
 func TestInvitationLabelIsOneTheSchemaAndTheParserAccept(t *testing.T) {
 	t.Parallel()
 
-	limit := migrationLimits(t, `length\(label\) <= (\d+)`)[0]
+	limit := migrationLimits(t, `length\(cast\(label AS BLOB\)\) <= (\d+)`)[0]
 
-	if runes := utf8.RuneCountInString(firstrun.InvitationLabel); runes == 0 || runes > limit {
-		t.Errorf("the label is %d characters; the schema allows up to %d", runes, limit)
+	if size := len(firstrun.InvitationLabel); size == 0 || size > limit {
+		t.Errorf("the label is %d bytes; the schema allows up to %d", size, limit)
 	}
 
 	parsed, err := input.ParseInvitationLabel(firstrun.InvitationLabel)
