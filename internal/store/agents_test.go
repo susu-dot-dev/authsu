@@ -1191,11 +1191,14 @@ func revokeStatements() []wantStatement {
 		},
 		{
 			fragments: []string{
-				// The secrets of the agent's keys, found through api_keys under
-				// the owner as well.
+				// The secrets of the agent's keys, and of its OAuth grants and their
+				// access tokens, found under the owner as well.
 				"UPDATE secrets",
 				"SET revoked_at = ?1",
-				"WHERE id IN (SELECT id FROM api_keys WHERE agent_id = ?2 AND user_id = ?3)",
+				"WHERE id IN (SELECT id FROM api_keys WHERE agent_id = ?2 AND user_id = ?3 " +
+					"UNION ALL SELECT id FROM oauth_grants WHERE agent_id = ?2 AND user_id = ?3 " +
+					"UNION ALL SELECT t.id FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id " +
+					"WHERE g.agent_id = ?2 AND g.user_id = ?3)",
 				// A due revocation keeps its time; a later one is brought forward.
 				"AND (revoked_at IS NULL OR revoked_at > ?1)",
 				// Only once the agent is revoked, and only the owner's agent.

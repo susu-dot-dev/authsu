@@ -112,3 +112,6 @@ const AgentsFirstPage = agentsFirstPage
 
 // KeysFirstPage exposes the keys list's first page cursor bound.
 const KeysFirstPage = keysFirstPage
+
+// GrantsFirstPage exposes the grants list's first page cursor bound.
+const GrantsFirstPage = grantsFirstPage

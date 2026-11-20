@@ -21,12 +21,15 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/agents"
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
+	"github.com/susu-dot-dev/authsu/internal/fetch"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/invitations"
 	"github.com/susu-dot-dev/authsu/internal/keys"
 	"github.com/susu-dot-dev/authsu/internal/login"
+	"github.com/susu-dot-dev/authsu/internal/oauth"
 	"github.com/susu-dot-dev/authsu/internal/registration"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/session"
 	"github.com/susu-dot-dev/authsu/internal/store"
@@ -47,6 +50,10 @@ type Platform struct {
 	// Log records an error the HTTP boundary turned into a response, with the
 	// request it failed on.
 	Log httpapi.Logger
+	// Fetch sends an outbound HTTP request (the platform's fetch in
+	// production). It must not follow redirects; internal/fetch.GetJSON
+	// applies every other limit.
+	Fetch fetch.Doer
 }
 
 // NewHandler returns the Worker's HTTP handler. Every feature is built here
@@ -58,6 +65,7 @@ type Platform struct {
 func NewHandler(platform Platform) http.Handler {
 	for name, missing := range map[string]bool{
 		"Exec": platform.Exec == nil, "Getenv": platform.Getenv == nil, "Log": platform.Log == nil,
+		"Fetch": platform.Fetch == nil,
 	} {
 		if missing {
 			panic("app: Platform." + name + " is required")
@@ -82,6 +90,10 @@ func NewHandler(platform Platform) http.Handler {
 		}),
 		invitations.Routes(invitations.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID}),
 		users.Routes(users.Deps{Store: db, Now: time.Now, Log: platform.Log}),
+		oauth.Routes(oauth.Deps{
+			Store: db, Resources: resource.Select, Fetch: platform.Fetch, Now: time.Now, Entropy: rand.Reader,
+			NewID: newID, MaxAgents: agents.MaxAgentsPerUser, Log: platform.Log,
+		}),
 	)
 
 	handler := auth.Handler(routes, auth.Deps{
@@ -89,8 +101,14 @@ func NewHandler(platform Platform) http.Handler {
 	})
 
 	// CORS is outermost so a preflight is answered before routing, which would
-	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's.
-	return httpapi.CORS(func() string { return allowedOrigin(platform.Getenv) }, handler)
+	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's,
+	// with credentials; the OAuth paths a client calls from a browser on any
+	// origin are the public ones, without (oauth.PublicPaths); and the ones that
+	// are navigated to or called by servers get no CORS at all
+	// (oauth.NoCORSPaths).
+	paths := httpapi.CORSPaths{Public: oauth.PublicPaths(), None: oauth.NoCORSPaths()}
+
+	return httpapi.CORS(func() string { return allowedOrigin(platform.Getenv) }, paths, handler)
 }
 
 // newID returns a fresh UUIDv7 in canonical text form, the id of every row the

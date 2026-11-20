@@ -27,6 +27,6 @@ require (
 	modernc.org/memory v1.12.1 // indirect
 )
 
-replace github.com/syumai/workers-go => github.com/intentionally-left-nil/workers-go v0.0.0-20261118063143-b16bd8edf2e7
+replace github.com/syumai/workers-go => github.com/intentionally-left-nil/workers-go v0.0.0-20261119221031-41b9b6b8c032
 
 tool golang.org/x/vuln/cmd/govulncheck

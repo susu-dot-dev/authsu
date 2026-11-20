@@ -12,6 +12,10 @@
 //     clientDataJSON, and the relying party ID is its host. It is also the one
 //     origin allowed to call the API from a browser (see httpapi.CORS).
 //
+// The OAuth signing key, OAUTH_SIGNING_KEY, is not part of Config: it is read by
+// its own loader (LoadSigningKey), because parsing an RSA key is expensive
+// under wasm and only two handlers need it.
+//
 // The relying party ID and name are not settings: both are the host of
 // UI_ORIGIN, so there is nothing that can disagree with it.
 package config
@@ -87,12 +91,34 @@ func ParseOrigin(value string) (Origin, error) {
 		return Origin{}, fmt.Errorf("%w: %q", ErrOrigin, value)
 	}
 
-	localHTTP := parsed.Scheme == "http" && parsed.Hostname() == "localhost"
-	if parsed.Scheme != "https" && !localHTTP {
+	if parsed.Scheme != "https" && !LocalHTTP(parsed.Scheme, parsed.Hostname()) {
 		return Origin{}, fmt.Errorf("%w: %q", ErrOrigin, value)
 	}
 
 	return Origin{String: value, Host: parsed.Hostname()}, nil
+}
+
+// LocalHost is the one host plain http is accepted for: the developer's own
+// machine, never a network.
+const LocalHost = "localhost"
+
+// LocalHTTP reports whether a URL with this scheme and hostname is the
+// developer's own machine over plain http: the scheme "http" and the host
+// "localhost", compared whole, so "localhost.example.com" is not. It is the one
+// localhost rule: ParseOrigin accepts http origins by it, and everything else
+// that treats localhost differently (resource.Select, which picks the
+// development resource table, and the CIMD client_id rules) asks it or an
+// Origin's Local, so the allowances cannot drift apart. The caller has already
+// parsed the URL; this decides nothing about its port, path or userinfo.
+func LocalHTTP(scheme, hostname string) bool {
+	return scheme == "http" && hostname == LocalHost
+}
+
+// Local reports whether the origin is http://localhost, with or without a port:
+// the origins ParseOrigin accepts over plain http. It is false for an https
+// origin and for the zero Origin.
+func (o Origin) Local() bool {
+	return o.Host == LocalHost && strings.HasPrefix(o.String, "http://")
 }
 
 // bare reports whether u is a scheme, a host and an optional port, with
@@ -125,13 +151,14 @@ func validPort(u *url.URL) bool {
 const (
 	registrationContext = "authsu/registration-challenge/v1"
 	loginContext        = "authsu/login-challenge/v1"
+	oauthRequestContext = "authsu/oauth-request/v1"
 )
 
 // derivationContexts is the one registry of contexts. Adding a derived key to
 // Config means adding its context here, where the tests assert that no two
 // are equal: two keys that shared a context would be one key.
 func derivationContexts() []string {
-	return []string{registrationContext, loginContext}
+	return []string{registrationContext, loginContext, oauthRequestContext}
 }
 
 // Config is the deployment configuration for one request.
@@ -142,6 +169,10 @@ type Config struct {
 	// LoginKey signs and opens login challenges. It is derived from the root
 	// secret and is the key for no other purpose.
 	LoginKey []byte
+	// OAuthRequestKey seals and opens the pending authorization request that
+	// travels through the UI between /oauth/authorize and consent. It is derived
+	// from the root secret and is the key for no other purpose.
+	OAuthRequestKey []byte
 	// API is the origin this Worker is served from.
 	API Origin
 	// UI is the origin the UI is served from.
@@ -174,6 +205,7 @@ func Load(getenv func(string) string) (Config, error) {
 	return Config{
 		RegistrationKey: deriveKey(secret, registrationContext),
 		LoginKey:        deriveKey(secret, loginContext),
+		OAuthRequestKey: deriveKey(secret, oauthRequestContext),
 		API:             api,
 		UI:              ui,
 		RP:              webauthn.RelyingParty{ID: ui.Host, Origin: ui.String},

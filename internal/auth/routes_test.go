@@ -68,6 +68,22 @@ func withCredential(credential auth.Credential) []auth.Route {
 	return spoiled(func(r *auth.Route) { r.Credential = credential })
 }
 
+// withForm is a form route: a POST, which has a body to give a type to, with
+// credential and access as given.
+func withForm(credential auth.Credential, method string) []auth.Route {
+	return spoiled(func(r *auth.Route) {
+		r.Method, r.Media, r.Credential, r.Access = method, httpapi.MediaForm, credential, accessFor(credential)
+	})
+}
+
+func withMedia(media httpapi.Media) []auth.Route {
+	return spoiled(func(r *auth.Route) { r.Media = media })
+}
+
+func withErrors(format httpapi.ErrorFormat) []auth.Route {
+	return spoiled(func(r *auth.Route) { r.Errors = format })
+}
+
 func withMaxBody(maxBody int64) []auth.Route {
 	return spoiled(func(r *auth.Route) { r.MaxBody = maxBody })
 }
@@ -79,6 +95,10 @@ const (
 	saysWhole   = "whole {id} segment"
 	saysKind    = "Credential must be None or Authenticated"
 	saysMaxBody = "MaxBody must be from 0"
+	saysMedia   = "Media must be"
+	saysErrors  = "Errors must be"
+	saysForm    = "no CSRF defence"
+	saysNoBody  = "has no body"
 )
 
 // routeProblems are the mistakes in one route's declaration.
@@ -100,16 +120,22 @@ func routeProblems() map[string]struct {
 		"Access names no such scope": {
 			spoiled(func(r *auth.Route) { r.Access = auth.Needs("nope:read") }), "scope that does not exist",
 		},
-		"negative MaxBody":           {withMaxBody(-1), saysMaxBody},
-		"MaxBody over the default":   {withMaxBody(httpapi.DefaultMaxBody + 1), saysMaxBody},
-		"no method":                  {withMethod(""), saysMethod},
-		"lower-case method":          {withMethod("get"), saysMethod},
-		"OPTIONS is the preflight's": {withMethod(http.MethodOptions), saysMethod},
-		"CONNECT":                    {withMethod(http.MethodConnect), saysMethod},
-		"TRACE":                      {withMethod(http.MethodTrace), saysMethod},
-		"a method in the path":       {withPath("GET /x/{id}"), saysSlash},
-		"a host in the path":         {withPath("example.com/x"), saysSlash},
-		"empty path":                 {withPath(""), saysSlash},
+		"Media not known":             {withMedia(2), saysMedia},
+		"Errors not known":            {withErrors(2), saysErrors},
+		"a form on an Authenticated":  {withForm(auth.Authenticated, http.MethodPost), saysForm},
+		"a form PATCH, Authenticated": {withForm(auth.Authenticated, http.MethodPatch), saysForm},
+		"a form on a GET":             {withForm(auth.None, http.MethodGet), saysNoBody},
+		"a form on a HEAD":            {withForm(auth.None, http.MethodHead), saysNoBody},
+		"negative MaxBody":            {withMaxBody(-1), saysMaxBody},
+		"MaxBody over the default":    {withMaxBody(httpapi.DefaultMaxBody + 1), saysMaxBody},
+		"no method":                   {withMethod(""), saysMethod},
+		"lower-case method":           {withMethod("get"), saysMethod},
+		"OPTIONS is the preflight's":  {withMethod(http.MethodOptions), saysMethod},
+		"CONNECT":                     {withMethod(http.MethodConnect), saysMethod},
+		"TRACE":                       {withMethod(http.MethodTrace), saysMethod},
+		"a method in the path":        {withPath("GET /x/{id}"), saysSlash},
+		"a host in the path":          {withPath("example.com/x"), saysSlash},
+		"empty path":                  {withPath(""), saysSlash},
 	}
 }
 
@@ -243,6 +269,13 @@ func TestHandlerAcceptsEveryValidDeclaration(t *testing.T) {
 		"a path and its wildcard child": {route(get, "/m", none, 0), route(get, "/m/{id}", none, 0)},
 		"an exact root":                 {route(get, "/{$}", none, 0)},
 		"the root":                      {route(get, "/", none, 0)},
+		"a form POST that is None":      {withForm(auth.None, http.MethodPost)[0]},
+		"a form PUT that is None":       {withForm(auth.None, http.MethodPut)[0]},
+		"a form PATCH that is None":     {withForm(auth.None, http.MethodPatch)[0]},
+		"a form DELETE that is None":    {withForm(auth.None, http.MethodDelete)[0]},
+		"OAuth errors, Authenticated":   withErrors(httpapi.ErrorsOAuth),
+		"JSON media said out loud":      withMedia(httpapi.MediaJSON),
+		"API errors said out loud":      withErrors(httpapi.ErrorsAPI),
 		"every method": {
 			route("GET", "/m", none, 0), route("HEAD", "/m", none, 0), route("POST", "/m", none, 0),
 			route("PUT", "/m", none, 0), route("PATCH", "/m", none, 0), route("DELETE", "/m", none, 0),

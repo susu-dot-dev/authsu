@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/susu-dot-dev/authsu/internal/store"
@@ -18,14 +19,53 @@ import (
 // cascade through the trigger, a refused delete of an invitation with accounts)
 // is checked by the e2e tests against the real database.
 
-// kindTables is every kind of secret with the table that holds its own row.
-func kindTables() []struct{ table, kind string } {
-	return []struct{ table, kind string }{
-		{table: "invitations", kind: store.KindInvitation},
-		{table: "sessions", kind: store.KindSession},
-		{table: "api_keys", kind: store.KindAPIKey},
+// kindTables is every kind of secret with the table that holds its own row, and
+// the table whose delete trigger removes its secret: its own, except for an
+// access token, which the trigger of its grant removes. D1 refuses a delete
+// whose triggers nest too deep, and a trigger of its own for each of the five
+// kinds is one too many there (see the migration, "Why only four triggers").
+func kindTables() []struct{ table, kind, trigger string } {
+	return []struct{ table, kind, trigger string }{
+		{table: "invitations", kind: store.KindInvitation, trigger: "invitations"},
+		{table: "sessions", kind: store.KindSession, trigger: "sessions"},
+		{table: "api_keys", kind: store.KindAPIKey, trigger: "api_keys"},
+		{table: tableOAuthGrants, kind: store.KindOAuthGrant, trigger: tableOAuthGrants},
+		{table: "oauth_access_tokens", kind: store.KindOAuthAccess, trigger: tableOAuthGrants},
 	}
 }
+
+// deleteTrigger is the text of the trigger on table that deletes the secrets of
+// the rows deleted with it, as the migration's text reads once its comments are
+// removed and its whitespace collapsed. A grant's trigger deletes its access
+// token's secret too, which is the one thing its table's own row has no trigger
+// for.
+func deleteTrigger(table string) string {
+	head := `CREATE TRIGGER ` + table + `_delete_secret AFTER DELETE ON ` + table + ` BEGIN `
+	own := `DELETE FROM secrets WHERE id = OLD.id AND kind = '`
+
+	for _, test := range kindTables() {
+		if test.table != table {
+			continue
+		}
+
+		text := head + own + test.kind + `';`
+		if table == tableOAuthGrants {
+			text += ` DELETE FROM secrets WHERE kind = '` + store.KindOAuthAccess +
+				`' AND id IN (SELECT id FROM oauth_access_tokens WHERE grant_id = OLD.id);`
+		}
+
+		return text + ` END;`
+	}
+
+	panic("no kind for table " + table)
+}
+
+// tableOAuthGrants is the table whose trigger deletes both OAuth secrets.
+const tableOAuthGrants = "oauth_grants"
+
+// maxDeleteTriggers is how many triggers that delete a secret D1 lets the schema
+// have: see kindTables.
+const maxDeleteTriggers = 4
 
 // tableBody returns the text of a CREATE TABLE statement's column list, from the
 // migration with comments removed and whitespace collapsed.
@@ -66,10 +106,15 @@ func TestKindsMatchTheMigration(t *testing.T) {
 				t.Errorf("%s is not bound to its secret by the id and the kind together:\n%s", test.table, body)
 			}
 
-			trigger := `CREATE TRIGGER ` + test.table + `_delete_secret AFTER DELETE ON ` + test.table +
-				` BEGIN DELETE FROM secrets WHERE id = OLD.id AND kind = '` + test.kind + `'; END;`
-			if !regexp.MustCompile(regexp.QuoteMeta(trigger)).MatchString(text) {
-				t.Errorf("no trigger %q in the migrations", trigger)
+			// The trigger that removes the kind's secret deletes only a secret of
+			// that kind, whichever table's trigger it is.
+			if !strings.Contains(text, deleteTrigger(test.trigger)) {
+				t.Errorf("no trigger %q in the migrations", deleteTrigger(test.trigger))
+			}
+
+			own := regexp.MustCompile(`CREATE TRIGGER ` + test.table + `_delete_secret`)
+			if test.table != test.trigger && own.MatchString(text) {
+				t.Errorf("%s has a trigger of its own, which is one more than D1 allows", test.table)
 			}
 		})
 	}
@@ -91,8 +136,9 @@ func TestKindsAreTheOnlyOnes(t *testing.T) {
 	}
 
 	triggers := regexp.MustCompile(`CREATE TRIGGER \w+_delete_secret AFTER DELETE ON`).FindAllString(text, -1)
-	if len(triggers) != len(kindTables()) {
-		t.Errorf("%d delete triggers, want one for each of the %d kinds", len(triggers), len(kindTables()))
+	if len(triggers) != maxDeleteTriggers {
+		t.Errorf("%d delete triggers, want %d: one for each kind but the access token, which has its grant's",
+			len(triggers), maxDeleteTriggers)
 	}
 
 	seen := map[string]bool{}

@@ -49,6 +49,9 @@ linters:
             - "**/internal/config/**"
             - "**/internal/scope/**"
             - "**/internal/secret/**"
+            - "**/internal/resource/**"
+            - "**/internal/jws/**"
+            - "**/internal/fetch/**"
           deny:
             - pkg: github.com/susu-dot-dev/authsu/internal/input
               desc: "foundation packages are the lowest layer and import nothing above it: no input, store, auth, feature or app"
@@ -73,6 +76,8 @@ linters:
             - pkg: github.com/susu-dot-dev/authsu/internal/agents
               desc: "foundation packages are the lowest layer and import nothing above it: no input, store, auth, feature or app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
+              desc: "foundation packages are the lowest layer and import nothing above it: no input, store, auth, feature or app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
               desc: "foundation packages are the lowest layer and import nothing above it: no input, store, auth, feature or app"
         input:
           files:
@@ -100,6 +105,8 @@ linters:
               desc: "input holds the parsers of inbound values and sits just above the foundation: it imports only the foundation, nothing above it"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "input holds the parsers of inbound values and sits just above the foundation: it imports only the foundation, nothing above it"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "input holds the parsers of inbound values and sits just above the foundation: it imports only the foundation, nothing above it"
         store:
           files:
             - "**/internal/store/**"
@@ -124,6 +131,8 @@ linters:
               desc: "store holds all SQL and sits below auth and the features: it imports only input and the foundation"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "store holds all SQL and sits below auth and the features: it imports only input and the foundation"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "store holds all SQL and sits below auth and the features: it imports only input and the foundation"
         auth:
           files:
             - "**/internal/auth/**"
@@ -146,6 +155,8 @@ linters:
               desc: "auth is the route boundary and sits below the features: it never imports a feature or app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "auth is the route boundary and sits below the features: it never imports a feature or app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "auth is the route boundary and sits below the features: it never imports a feature or app"
         feature-registration:
           files:
             - "**/internal/registration/**"
@@ -165,6 +176,8 @@ linters:
             - pkg: github.com/susu-dot-dev/authsu/internal/agents
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         feature-login:
           files:
@@ -186,6 +199,8 @@ linters:
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         feature-session:
           files:
             - "**/internal/session/**"
@@ -205,6 +220,8 @@ linters:
             - pkg: github.com/susu-dot-dev/authsu/internal/agents
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         feature-firstrun:
           files:
@@ -226,6 +243,8 @@ linters:
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         feature-invitations:
           files:
             - "**/internal/invitations/**"
@@ -245,6 +264,8 @@ linters:
             - pkg: github.com/susu-dot-dev/authsu/internal/agents
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         feature-users:
           files:
@@ -266,6 +287,8 @@ linters:
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         feature-agents:
           files:
             - "**/internal/agents/**"
@@ -286,6 +309,8 @@ linters:
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         feature-keys:
           files:
             - "**/internal/keys/**"
@@ -305,6 +330,30 @@ linters:
             - pkg: github.com/susu-dot-dev/authsu/internal/users
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
             - pkg: github.com/susu-dot-dev/authsu/internal/agents
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/oauth
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+        feature-oauth:
+          files:
+            - "**/internal/oauth/**"
+          deny:
+            - pkg: github.com/susu-dot-dev/authsu/internal/app
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/registration
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/login
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/session
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/firstrun
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/invitations
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/users
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/agents
+              desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
+            - pkg: github.com/susu-dot-dev/authsu/internal/keys
               desc: "a feature imports only auth, store, input and the foundation: never another feature, and never app"
         only-the-worker-imports-app:
           files:

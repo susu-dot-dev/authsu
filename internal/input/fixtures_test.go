@@ -16,6 +16,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 )
 
 // parseCase is one row of a string-parser table.
@@ -468,4 +469,101 @@ func migrationNumbers(t *testing.T, pattern string) []int {
 	}
 
 	return numbers
+}
+
+// The two resource tables a parser of the OAuth request is tried against.
+func productionTable() resource.Table  { return resource.Select("https://auth.example.com") }
+func developmentTable() resource.Table { return resource.Select("http://localhost:8787") }
+
+// resourceEntry is the one entry of the production table.
+func resourceEntry(t *testing.T) resource.Entry {
+	t.Helper()
+
+	entry, ok := productionTable().Lookup(resource.ProductionURL)
+	if !ok {
+		t.Fatal("the production table has no entry for its own URL")
+	}
+
+	return entry
+}
+
+// tableCase is one row of a table whose outcome depends on the resource table:
+// whether the input is accepted with the production table and with the
+// development one.
+type tableCase struct {
+	name      string
+	in        string
+	prod, dev bool
+}
+
+// same is a tableCase that has one outcome in both tables.
+func same(name, in string, ok bool) tableCase { return tableCase{name, in, ok, ok} }
+
+// casesFor returns the parseCases of one table.
+func casesFor(rows []tableCase, development bool) []parseCase {
+	cases := make([]parseCase, 0, len(rows))
+
+	for _, row := range rows {
+		ok := row.prod
+		if development {
+			ok = row.dev
+		}
+
+		cases = append(cases, parseCase{row.name, row.in, ok})
+	}
+
+	return cases
+}
+
+// fuzzInvariants is the fuzz target of a parser whose accepted set has no
+// simpler description than its code. Any input it accepts must return itself
+// from String, parse again to an equal value and satisfy accepted, a statement
+// of what is true of every accepted value; any input it refuses must carry the
+// type's code and fixed description.
+func fuzzInvariants[T comparable](
+	f *testing.F, seeds []string, parse func(string) (T, error), str func(T) string, code string,
+	accepted func(t *testing.T, raw string),
+) {
+	f.Helper()
+
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	_, probe := parse("\x00\xff\x00")
+	if probe == nil {
+		f.Fatal("the probe input was accepted")
+	}
+
+	description := probeDescription(probe)
+
+	f.Fuzz(func(t *testing.T, raw string) {
+		value, err := parse(raw)
+		if err != nil {
+			requireFixedRefusal(t, err, code, description)
+
+			return
+		}
+
+		if str(value) != raw {
+			t.Fatalf("String() = %q, want %q", str(value), raw)
+		}
+
+		again, err := parse(raw)
+		if err != nil || again != value {
+			t.Fatalf("re-parse of %q = %v, %v; want the same value", raw, again, err)
+		}
+
+		accepted(t, raw)
+	})
+}
+
+// partial fixes the first argument of a two-argument parser.
+func partial[A, B, T any](parse func(A, B) (T, error), first A) func(B) (T, error) {
+	return func(second B) (T, error) { return parse(first, second) }
+}
+
+// withTable fixes the table of a parser that takes one.
+func withTable[T any](parse func(string, resource.Table) (T, error), table resource.Table) func(string) (T, error) {
+	return func(raw string) (T, error) { return parse(raw, table) }
 }

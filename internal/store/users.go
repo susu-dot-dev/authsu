@@ -129,11 +129,12 @@ SET revoked_at = COALESCE(revoked_at, CASE
 WHERE id = ?2
 RETURNING id, role, invitation_id, profile, revoked_at, created_at`
 
-// revokeUserSecretsQuery revokes every session and every API key of the
-// account, in the same batch as revokeUserQuery and after it. The keys of the
-// account's agents are among them: a key's user_id is its agent's owner.
-// Resolving already refuses any session or key of a revoked account (it reads
-// users.revoked_at), so this is not what ends them. It keeps the secrets table
+// revokeUserSecretsQuery revokes every session, every API key and every OAuth
+// grant of the account, with the grants' access tokens, in the same batch as
+// revokeUserQuery and after it. The keys and grants of the account's agents are
+// among them: a key's or grant's user_id is its agent's owner. Resolving already
+// refuses any session or key of a revoked account (it reads users.revoked_at),
+// and so does introspection of an access token, so this is not what ends them. It keeps the secrets table
 // honest: a secret listed later reads as revoked, and a future kind of secret
 // whose resolve forgot to check the account would still be refused.
 //
@@ -149,7 +150,11 @@ UPDATE secrets
 SET revoked_at = ?1
 WHERE id IN (SELECT id FROM sessions WHERE user_id = ?2
              UNION ALL
-             SELECT id FROM api_keys WHERE user_id = ?2)
+             SELECT id FROM api_keys WHERE user_id = ?2
+             UNION ALL
+             SELECT id FROM oauth_grants WHERE user_id = ?2
+             UNION ALL
+             SELECT t.id FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id WHERE g.user_id = ?2)
   AND (revoked_at IS NULL OR revoked_at > ?1)
   AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)`
 

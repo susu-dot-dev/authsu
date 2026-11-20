@@ -144,6 +144,27 @@ func TestDefaultAgentGrantsNoAdminScope(t *testing.T) {
 	}
 }
 
+// TestGrantScopesAreForPeopleNotAgents: an agent never holds the scopes that
+// read or end OAuth grants, whatever default:agent grows to hold, and a login
+// session and a user's own keys do.
+func TestGrantScopesAreForPeopleNotAgents(t *testing.T) {
+	t.Parallel()
+
+	for _, grant := range []scope.Scope{scope.GrantRead, scope.GrantRevoke} {
+		for bundle, want := range map[string]bool{
+			scope.DefaultSession: true,
+			scope.DefaultUser:    true,
+			scope.DefaultAgent:   false,
+		} {
+			members, _ := scope.Bundle(bundle)
+
+			if got := slices.Contains(members, grant); got != want {
+				t.Errorf("%s holds %s = %v, want %v", bundle, grant, got, want)
+			}
+		}
+	}
+}
+
 func TestBundlesDoNotContainBundles(t *testing.T) {
 	t.Parallel()
 
@@ -171,6 +192,8 @@ func TestIsAdmin(t *testing.T) {
 		{"user revoke", scope.UserRevoke, true},
 		{"agent create", scope.AgentCreate, false},
 		{"key revoke", scope.KeyRevoke, false},
+		{"grant read", scope.GrantRead, false},
+		{"grant revoke", scope.GrantRevoke, false},
 		{"unknown scope", "nope:read", false},
 		{"a bundle is not an admin scope", scope.DefaultSession, false},
 		{"empty", "", false},
@@ -196,6 +219,8 @@ func TestKnown(t *testing.T) {
 	}{
 		{"agent:read", true},
 		{"user:revoke", true},
+		{"grant:read", true},
+		{"grant:revoke", true},
 		{"default:user", true},
 		{"default:session", true},
 		{"default:agent", true},

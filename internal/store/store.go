@@ -330,6 +330,26 @@ func all[T any](rows [][]any, o op, read func(*row) T) ([]T, error) {
 	return out, nil
 }
 
+// paged cuts the rows of a keyset page that asked for one row more than it
+// returns (size plus one): fewer than that is the last page, with no cursor; the
+// extra row only says there is a next page, whose cursor is the id of the last
+// row that is kept. More rows than were asked for is the database not doing what
+// the query says, which is a defect. id names a row's id, the sort key.
+func paged[T any](o op, rows []T, size int, id func(T) string) ([]T, string, error) {
+	wanted := size + 1
+
+	switch {
+	case len(rows) > wanted:
+		return nil, "", o.defect(fmt.Errorf("%w: %d rows, want at most %d", errRowCount, len(rows), wanted))
+	case len(rows) < wanted:
+		return rows, "", nil
+	default:
+		rows = rows[:size]
+
+		return rows, id(rows[len(rows)-1]), nil
+	}
+}
+
 // queryOne runs one statement and decodes its single row (see one).
 func queryOne[T any](ctx context.Context, s *Store, o op, statement Statement, read func(*row) T) (T, error) {
 	results, err := s.run(ctx, o, statement)

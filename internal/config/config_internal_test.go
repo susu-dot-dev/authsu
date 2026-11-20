@@ -47,7 +47,7 @@ func TestDeriveKey(t *testing.T) {
 func TestDerivationContextsAreDistinct(t *testing.T) {
 	t.Parallel()
 
-	if got := len(derivationContexts()); got != 2 {
+	if got := len(derivationContexts()); got != 3 {
 		t.Fatalf("registry has %d contexts; update this test and Config together", got)
 	}
 
@@ -79,6 +79,7 @@ func TestDerivationContextsAreRegistered(t *testing.T) {
 	for name, context := range map[string]string{
 		"registration": registrationContext,
 		"login":        loginContext,
+		"oauth":        oauthRequestContext,
 	} {
 		if !registered[context] {
 			t.Errorf("%s context %q is not in derivationContexts()", name, context)

@@ -2,6 +2,7 @@
 package app_test
 
 import (
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -25,6 +26,16 @@ type inventoryRoute struct {
 	path   string
 	// session is true when the route requires a session cookie.
 	session bool
+	// public is true when the route is in the credential-less CORS policy:
+	// any origin may call it, and none gets credentials.
+	public bool
+	// noCORS is true when the route has no CORS policy at all: it is navigated
+	// to or called by servers, and no origin, the UI's included, is answered
+	// with a CORS header.
+	noCORS bool
+	// form is true when the route takes application/x-www-form-urlencoded and
+	// answers in the RFC 6749 error format: the token endpoints.
+	form bool
 	// body is a request body that a route needing no credential refuses (or
 	// answers) without touching the database.
 	body string
@@ -37,7 +48,85 @@ type inventoryRoute struct {
 	wantCalls int
 }
 
+// formType is the media type of a route that takes a form.
+const formType = "application/x-www-form-urlencoded"
+
+// request is the request to send to the route: its body, and the media type it
+// takes, with the extra headers.
+func (r inventoryRoute) request(headers map[string]string) request {
+	out := map[string]string{}
+	maps.Copy(out, headers)
+
+	if r.form {
+		out["Content-Type"] = formType
+	}
+
+	return request{method: r.method, path: r.path, body: r.body, headers: out}
+}
+
 func inventory() []inventoryRoute {
+	return slices.Concat(coreInventory(), oauthInventory())
+}
+
+// oauthInventory is the OAuth routes of the inventory.
+func oauthInventory() []inventoryRoute {
+	return []inventoryRoute{
+		{
+			method: http.MethodGet, path: "/.well-known/oauth-authorization-server", public: true,
+			wantStatus: http.StatusOK, wantBody: `"issuer":"` + apiOrigin + `"`,
+		},
+		{
+			method: http.MethodGet, path: "/.well-known/openid-configuration", public: true,
+			wantStatus: http.StatusOK, wantBody: `"id_token_signing_alg_values_supported":["RS256"]`,
+		},
+		{
+			method: http.MethodGet, path: "/.well-known/jwks.json", public: true,
+			wantStatus: http.StatusOK, wantBody: `{"keys":[{"kty":"RSA"`,
+		},
+		{
+			// An authorization request with nothing in it is the UI's error page.
+			method: http.MethodGet, path: "/oauth/authorize", noCORS: true,
+			wantStatus: http.StatusFound, wantBody: "",
+		},
+		{
+			method: http.MethodGet, path: "/api/oauth/request",
+			wantStatus: http.StatusBadRequest, wantBody: `"code":"invalid_oauth_request"`,
+		},
+		{
+			method: http.MethodPost, path: "/api/oauth/consent", session: true,
+			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+		},
+		// The token endpoints take a form and no credential: an empty one is the
+		// client's mistake, answered in the RFC 6749 format.
+		{
+			method: http.MethodPost, path: "/oauth/token", public: true, form: true,
+			wantStatus: http.StatusBadRequest, wantBody: `"error":"invalid_request"`,
+		},
+		{
+			method: http.MethodPost, path: "/oauth/revoke", public: true, form: true,
+			wantStatus: http.StatusBadRequest, wantBody: `"error":"invalid_request"`,
+		},
+		{
+			method: http.MethodPost, path: "/oauth/introspect", form: true, noCORS: true,
+			wantStatus: http.StatusBadRequest, wantBody: `"error":"invalid_request"`,
+		},
+		{
+			method: http.MethodGet, path: "/api/grant", session: true,
+			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+		},
+		{
+			method: http.MethodGet, path: "/api/grant/" + someID, session: true,
+			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+		},
+		{
+			method: http.MethodDelete, path: "/api/grant/" + someID, session: true,
+			wantStatus: http.StatusUnauthorized, wantBody: bodyUnauthenticated,
+		},
+	}
+}
+
+// coreInventory is every other route of the inventory.
+func coreInventory() []inventoryRoute {
 	const (
 		emptyObject  = `{}`
 		invalidField = `"error":{"code":"invalid_`
@@ -121,7 +210,7 @@ func TestEveryRouteIsRouted(t *testing.T) {
 			t.Parallel()
 
 			h := newHarness(t, fullEnv(), route.script...)
-			rec := h.do(request{method: route.method, path: route.path, body: route.body})
+			rec := h.do(route.request(nil))
 
 			if rec.Code != route.wantStatus {
 				t.Errorf("status = %d, want %d: %s", rec.Code, route.wantStatus, rec.Body)
@@ -307,10 +396,13 @@ func TestCredentialIsJudgedBeforeAPathID(t *testing.T) {
 	}
 }
 
-// TestUnsafeRoutesRequireJSON: the CSRF defence is wired to every route that
-// takes a method other than GET: a request without application/json is a 415
-// before any credential check, even with an empty body.
-func TestUnsafeRoutesRequireJSON(t *testing.T) {
+// TestUnsafeRoutesRequireTheirMediaType: the CSRF defence is wired to every route
+// that takes a method other than GET: a request without the media type the route
+// takes is a 415 before any credential check, even with an empty body. A route
+// takes application/json, except the token endpoints, which take a form and no
+// credential, so that a cookie can mean nothing there, and which answer in the
+// RFC 6749 format.
+func TestUnsafeRoutesRequireTheirMediaType(t *testing.T) {
 	t.Parallel()
 
 	for _, route := range inventory() {
@@ -318,8 +410,21 @@ func TestUnsafeRoutesRequireJSON(t *testing.T) {
 			continue
 		}
 
-		for _, contentType := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"} {
-			t.Run(route.method+" "+pathPattern(route.path)+" "+contentType, func(t *testing.T) {
+		wrong := []string{"", "text/plain", formType, "multipart/form-data"}
+		wantBody := `"unsupported_media_type"`
+
+		if route.form {
+			wrong = []string{"", "text/plain", jsonType, "multipart/form-data"}
+			wantBody = `"error":"invalid_request"`
+		}
+
+		for _, contentType := range wrong {
+			label := contentType
+			if contentType == "" {
+				label = "no content type"
+			}
+
+			t.Run(route.method+" "+pathPattern(route.path)+" "+label, func(t *testing.T) {
 				t.Parallel()
 
 				h := newHarness(t, fullEnv())
@@ -330,9 +435,8 @@ func TestUnsafeRoutesRequireJSON(t *testing.T) {
 
 				rec := h.do(req)
 
-				if rec.Code != http.StatusUnsupportedMediaType ||
-					!strings.Contains(rec.Body.String(), `"unsupported_media_type"`) {
-					t.Errorf("= %d %s, want 415 unsupported_media_type", rec.Code, rec.Body)
+				if rec.Code != http.StatusUnsupportedMediaType || !strings.Contains(rec.Body.String(), wantBody) {
+					t.Errorf("= %d %s, want 415 containing %s", rec.Code, rec.Body, wantBody)
 				}
 
 				if got := h.exec.callCount(); got != 0 {
@@ -396,6 +500,19 @@ func TestBodyLimits(t *testing.T) {
 		"user list":         {http.MethodGet, "/api/user", 1024, unauth, nil},
 		"user get":          {http.MethodGet, "/api/user/" + someID, 1024, unauth, nil},
 		"user revoke":       {http.MethodDelete, "/api/user/" + someID, 1024, unauth, nil},
+
+		"oauth metadata":       {http.MethodGet, "/.well-known/oauth-authorization-server", 1024, http.StatusOK, nil},
+		"openid configuration": {http.MethodGet, "/.well-known/openid-configuration", 1024, http.StatusOK, nil},
+		"key set":              {http.MethodGet, "/.well-known/jwks.json", 1024, http.StatusOK, nil},
+		"oauth authorize":      {http.MethodGet, "/oauth/authorize", 8 << 10, http.StatusFound, nil},
+		"oauth request":        {http.MethodGet, "/api/oauth/request", 8 << 10, http.StatusBadRequest, nil},
+		"oauth consent":        {http.MethodPost, "/api/oauth/consent", 12 << 10, unauth, nil},
+		"oauth token":          {http.MethodPost, "/oauth/token", 8 << 10, http.StatusBadRequest, nil},
+		"oauth revoke":         {http.MethodPost, "/oauth/revoke", 4 << 10, http.StatusBadRequest, nil},
+		"oauth introspect":     {http.MethodPost, "/oauth/introspect", 2 << 10, http.StatusBadRequest, nil},
+		"grant list":           {http.MethodGet, "/api/grant", 1 << 10, unauth, nil},
+		"grant get":            {http.MethodGet, "/api/grant/" + someID, 1 << 10, unauth, nil},
+		"grant revoke":         {http.MethodDelete, "/api/grant/" + someID, 1 << 10, unauth, nil},
 	}
 
 	t.Run("every route has a row", func(t *testing.T) {
@@ -422,15 +539,18 @@ func TestBodyLimits(t *testing.T) {
 			t.Parallel()
 
 			h := newHarness(t, fullEnv(), tt.script...)
+			headers := mediaHeaders(tt.path)
 
-			rec := h.do(request{method: tt.method, path: tt.path, body: strings.Repeat(" ", tt.limit)})
+			rec := h.do(request{method: tt.method, path: tt.path, body: strings.Repeat(" ", tt.limit), headers: headers})
 			if rec.Code != tt.atLimit {
 				t.Errorf("body of %d bytes: status = %d, want %d: %s", tt.limit, rec.Code, tt.atLimit, rec.Body)
 			}
 
-			rec = h.do(request{method: tt.method, path: tt.path, body: strings.Repeat(" ", tt.limit+1)})
-			if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), `"body_too_large"`) {
-				t.Errorf("body of %d bytes: = %d %s, want 413 body_too_large", tt.limit+1, rec.Code, rec.Body)
+			wantBody := overLimitBody(tt.path)
+
+			rec = h.do(request{method: tt.method, path: tt.path, body: strings.Repeat(" ", tt.limit+1), headers: headers})
+			if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), wantBody) {
+				t.Errorf("body of %d bytes: = %d %s, want 413 containing %s", tt.limit+1, rec.Code, rec.Body, wantBody)
 			}
 
 			if got := h.exec.callCount(); got != len(tt.script) {
@@ -438,6 +558,31 @@ func TestBodyLimits(t *testing.T) {
 			}
 		})
 	}
+}
+
+// mediaHeaders is the Content-Type header a route takes, when it is not JSON.
+func mediaHeaders(path string) map[string]string {
+	if isForm(path) {
+		return map[string]string{"Content-Type": formType}
+	}
+
+	return map[string]string{}
+}
+
+// isForm reports whether the route at path takes a form.
+func isForm(path string) bool {
+	return slices.ContainsFunc(inventory(), func(route inventoryRoute) bool { return route.form && route.path == path })
+}
+
+// overLimitBody is what a body over a route's cap is answered with: the detailed
+// code, except on the endpoints that answer in the RFC 6749 format, which has no
+// room for it.
+func overLimitBody(path string) string {
+	if path == "/oauth/authorize" || isForm(path) {
+		return `"error":"invalid_request"`
+	}
+
+	return `"body_too_large"`
 }
 
 // TestNoneRoutes: what each route that needs no credential does, through the

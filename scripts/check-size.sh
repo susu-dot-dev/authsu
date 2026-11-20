@@ -26,7 +26,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MAX_WASM_BYTES="${MAX_WASM_BYTES:-3400000}"
+# Budget history: 3.0 MB, 3.3 MB, 3.4 MB (agents), now 4.2 MB for the OAuth
+# authorization server. It grew from 3.06 MB to 3.95 MB: the RS256 signer and the
+# PKCS#8 key parse link crypto/rsa and crypto/x509, whose PKCS#8 parser pulls in
+# crypto/internal/fips140/mldsa (about 270 KB, linked only because x509 can parse
+# an ML-DSA key); the rest is the oauth feature, its parsers, store queries and
+# the outbound fetch client. The budget stays about 250 KB above the build, as the
+# earlier ones did.
+MAX_WASM_BYTES="${MAX_WASM_BYTES:-4200000}"
 TOP="${TOP:-15}"
 
 # Heavy packages that are NOT in the baseline build, so seeing one linked means

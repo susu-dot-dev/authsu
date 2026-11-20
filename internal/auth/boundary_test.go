@@ -529,7 +529,7 @@ func kindCases() []boundaryCase {
 	wrongForCookie := unauthenticated(0, input.CodeInvalidSessionToken)
 	wrongForBearer := unauthenticated(0, input.CodeInvalidAPIKey).viaKey()
 
-	return []boundaryCase{
+	base := []boundaryCase{
 		rowOf("kind: a session token as a bearer", pathMe, asBearer(sessionToken), wrongForBearer),
 		row("kind: an API key in the session cookie", pathMe, inCookie(keyToken), wrongForCookie),
 		rowOf("kind: an invitation token as a bearer", pathMe, asBearer(invitation), wrongForBearer),
@@ -543,6 +543,25 @@ func kindCases() []boundaryCase {
 				return secret.Prefix(secret.TagSession) + strings.TrimPrefix(keyToken(r), secret.Prefix(secret.TagAPIKey))
 			}), unauthenticated(1, logNotActive)),
 	}
+
+	// An OAuth code, refresh token or access token is a bearer secret for the
+	// OAuth endpoints only. Presented to authsu's own API, as a bearer or in the
+	// cookie, it is refused by its shape before the store is read, so a grant
+	// carries no authsu scopes and cannot call the management API.
+	oauthTags := []secret.Tag{secret.TagOAuthCode, secret.TagOAuthRefresh, secret.TagOAuthAccess}
+	cases := make([]boundaryCase, 0, len(base)+2*len(oauthTags))
+	cases = append(cases, base...)
+
+	for _, tag := range oauthTags {
+		oauthToken := func(r *rig) string { return r.foreign(tag) }
+
+		cases = append(cases,
+			rowOf("kind: an OAuth "+string(tag)+" token as a bearer", pathMe, asBearer(oauthToken), wrongForBearer),
+			row("kind: an OAuth "+string(tag)+" token in the session cookie", pathMe, inCookie(oauthToken), wrongForCookie),
+		)
+	}
+
+	return cases
 }
 
 // inactiveCases are well-formed tokens of the right kind that the store does

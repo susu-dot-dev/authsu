@@ -20,11 +20,13 @@ package e2e_test
 // attached to another kind's secret, and no two tables can claim one secret),
 // interleaving's database half (deletes from either side leave no secret
 // without its row and no row without its secret) and type/bound confusion (a
-// hash is exactly 32 bytes of BLOB, never text).
+// hash is exactly 32 bytes of BLOB, never text). The OAuth kinds are held by
+// TestSchemaOAuthGrants and TestSchemaOAuthAccessTokens.
 
 import (
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -177,7 +179,7 @@ func TestSchemaSecretsAreBounded(t *testing.T) {
 		want bool // refused
 	}{
 		{"a well-formed secret", good(func([]any) {}), false},
-		{"a kind this schema has no table for (Go owns the set)", good(func(a []any) { a[1] = "oauth_grant" }), false},
+		{"a kind this schema has no table for (Go owns the set)", good(func(a []any) { a[1] = "no_such_kind" }), false},
 		{"a revoked secret", good(func(a []any) { a[4] = int64(0) }), false},
 		{"an id of 35 characters", good(func(a []any) { a[0] = idN("0f30", 3)[1:] }), true},
 		{"an id in upper case", good(func(a []any) { a[0] = strings.ToUpper(idN("0f30", 3)) }), true},
@@ -423,5 +425,341 @@ func TestSchemaDeletionGoesBothWays(t *testing.T) {
 
 		intact(t, idInvitationB)
 		expectCount(t, "invitations WHERE id = ? AND created_by IS NULL", "1", idInvitationB)
+	})
+}
+
+// oauthSchemaWorld resets the deployment and seeds what a grant needs: schemaWorld
+// and an agent of the account idUserB.
+func oauthSchemaWorld(t *testing.T) {
+	t.Helper()
+
+	schemaWorld(t)
+	seedAgent(t, idAgentA, idUserB, "bot")
+}
+
+// insertOAuthGrant is a grant's row with every column given: id, kind, user_id,
+// agent_id, client_id, client_name, redirect_uri, resource, scope, code_challenge,
+// nonce, auth_time, granted_from.
+const insertOAuthGrant = "INSERT INTO oauth_grants (id, kind, user_id, agent_id, client_id, client_name, redirect_uri, " +
+	"resource, scope, code_challenge, nonce, auth_time, granted_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+// oauthGrantArgs are the arguments of a well-formed grant, id idN("0f50", 1), for
+// insertOAuthGrant, changed by mutate.
+func oauthGrantArgs(mutate func(args []any)) []any {
+	args := []any{
+		idN("0f50", 1), kindOAuthGrant, idUserB, idAgentA, "https://client.example/app", "Client",
+		"https://client.example/cb", "https://api.susu.dev/mcp", "mcp:read openid", strings.Repeat("c", 43), "n-1",
+		int64(1_700_000_000), tokenHash("a pending request"),
+	}
+
+	mutate(args)
+
+	return args
+}
+
+// seedOAuthGrant inserts the secret and the row of a grant with the id, for the
+// agent of the account idUserB. Its granted_from is distinct for every id.
+func seedOAuthGrant(t *testing.T, id string) {
+	t.Helper()
+
+	seedSecret(t, id, kindOAuthGrant, newToken("code"))
+	seed(t, insertOAuthGrant, oauthGrantArgs(func(a []any) { a[0], a[12] = id, tokenHash(id) })...)
+}
+
+// seedOAuthAccess inserts the secret and the row of the access token of the grant.
+func seedOAuthAccess(t *testing.T, id, grant string) {
+	t.Helper()
+
+	seedSecret(t, id, kindOAuthAccess, newToken("at"))
+	seed(t, "INSERT INTO oauth_access_tokens (id, grant_id, scope) VALUES (?, ?, ?)", id, grant, "mcp:read")
+}
+
+// TestSchemaOAuthGrants: the backstop CHECKs of oauth_grants against the real
+// SQLite, each at its bound and one past it: free text is bounded in bytes and
+// refuses NUL (length() on TEXT stops at one), the challenge is exactly 43
+// characters, the nonce is nullable but never empty, the consent hash is a BLOB
+// of 32 bytes and unique, and the user, the agent and the session's time are
+// required.
+//
+//nolint:paralleltest // shares one database
+func TestSchemaOAuthGrants(t *testing.T) {
+	oauthSchemaWorld(t)
+
+	seedSecret(t, idN("0f50", 1), kindOAuthGrant, newToken("code"))
+
+	// A grant with the same consent hash as the one seeded, to collide with.
+	seedSecret(t, idN("0f50", 2), kindOAuthGrant, newToken("code"))
+	seed(t, insertOAuthGrant, oauthGrantArgs(func(a []any) {
+		a[0], a[12] = idN("0f50", 2), tokenHash(idN("0f50", 2))
+	})...)
+
+	text := func(column int, value any) []any { return oauthGrantArgs(func(a []any) { a[column] = value }) }
+
+	// The positions of the columns in oauthGrantArgs.
+	const (
+		kind = iota + 1
+		user
+		agent
+		clientID
+		clientName
+		redirect
+		resourceColumn
+		scope
+		challenge
+		nonce
+		authTime
+		granted
+	)
+
+	tests := []struct {
+		name string
+		args []any
+		want bool // refused
+	}{
+		{"a well-formed grant", oauthGrantArgs(func([]any) {}), false},
+		{"no nonce", text(nonce, nil), false},
+		{"a client_id of 512 bytes", text(clientID, strings.Repeat("a", 512)), false},
+		{"a client_id of 513 bytes", text(clientID, strings.Repeat("a", 513)), true},
+		{"an empty client_id", text(clientID, ""), true},
+		{"a client_id of a NUL then megabytes", text(clientID, "a\x00"+strings.Repeat("b", 4096)), true},
+		{"a client_id that is a blob", text(clientID, []byte("https://client.example/app")), true},
+		{"no client_id", text(clientID, nil), true},
+		{"a client_name of 128 bytes", text(clientName, strings.Repeat("a", 128)), false},
+		{"a client_name of 128 two-byte letters is 256 bytes", text(clientName, strings.Repeat("é", 128)), true},
+		{"a client_name of 129 bytes", text(clientName, strings.Repeat("a", 129)), true},
+		{"an empty client_name", text(clientName, ""), true},
+		{"a redirect_uri of 512 bytes", text(redirect, strings.Repeat("a", 512)), false},
+		{"a redirect_uri of 513 bytes", text(redirect, strings.Repeat("a", 513)), true},
+		{"a redirect_uri holding NUL", text(redirect, "https://a\x00.example"), true},
+		{"a resource of 128 bytes", text(resourceColumn, strings.Repeat("a", 128)), false},
+		{"a resource of 129 bytes", text(resourceColumn, strings.Repeat("a", 129)), true},
+		{"an empty resource", text(resourceColumn, ""), true},
+		{"a scope of 256 bytes", text(scope, strings.Repeat("a", 256)), false},
+		{"a scope of 257 bytes", text(scope, strings.Repeat("a", 257)), true},
+		{"an empty scope", text(scope, ""), true},
+		{"only a NUL as the scope", text(scope, "\x00"), true},
+		{"a challenge of 43 characters", text(challenge, strings.Repeat("c", 43)), false},
+		{"a challenge of 42 characters", text(challenge, strings.Repeat("c", 42)), true},
+		{"a challenge of 44 characters", text(challenge, strings.Repeat("c", 44)), true},
+		{"no challenge", text(challenge, nil), true},
+		{"a nonce of 128 bytes", text(nonce, strings.Repeat("n", 128)), false},
+		{"a nonce of 129 bytes", text(nonce, strings.Repeat("n", 129)), true},
+		{"an empty nonce", text(nonce, ""), true},
+		{"a nonce holding NUL", text(nonce, "a\x00b"), true},
+		{"no session time", text(authTime, nil), true},
+		{"a consent hash of 31 bytes", text(granted, tokenHash("x")[:31]), true},
+		{"a consent hash of 33 bytes", text(granted, append(tokenHash("x"), 0)), true},
+		{"a consent hash that is text of 32 characters", text(granted, strings.Repeat("a", 32)), true},
+		{"no consent hash", text(granted, nil), true},
+		{"a consent that was already used", text(granted, tokenHash(idN("0f50", 2))), true},
+		{"no account", text(user, nil), true},
+		{"an account that does not exist", text(user, idMissing), true},
+		{"no agent", text(agent, nil), true},
+		{"an agent that does not exist", text(agent, idMissing), true},
+		{"the api_key kind", text(kind, kindAPIKey), true},
+		{"a kind in another case", text(kind, "OAUTH_GRANT"), true},
+		{"an id of 35 characters", oauthGrantArgs(func(a []any) { a[0] = idN("0f50", 1)[1:] }), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := refused(t, insertOAuthGrant, tt.args...); got != tt.want {
+				t.Errorf("refused = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("a grant's row attaches only to a grant's secret", func(t *testing.T) {
+		for _, secretKind := range []string{kindInvitation, kindSession, kindAPIKey, kindOAuthAccess} {
+			id := idN("0f51", 1)
+			seedSecret(t, id, secretKind, newToken("code"))
+
+			args := oauthGrantArgs(func(a []any) { a[0], a[12] = id, tokenHash(secretKind) })
+			if !refused(t, insertOAuthGrant, args...) {
+				t.Errorf("a grant row on a %s secret was accepted", secretKind)
+			}
+
+			seed(t, "DELETE FROM secrets WHERE id = ?", id)
+		}
+	})
+}
+
+// TestSchemaOAuthAccessTokens: a grant has at most one access token, which is a
+// secret of its own kind, and it lives and dies with its grant.
+//
+//nolint:paralleltest // shares one database
+func TestSchemaOAuthAccessTokens(t *testing.T) {
+	oauthSchemaWorld(t)
+
+	grant, other := idN("0f60", 1), idN("0f60", 2)
+
+	seedOAuthGrant(t, grant)
+	seedOAuthGrant(t, other)
+	seedOAuthAccess(t, idN("0f60", 3), grant)
+
+	const insert = "INSERT INTO oauth_access_tokens (id, kind, grant_id, scope) VALUES (?, ?, ?, ?)"
+
+	t.Run("one row per grant", func(t *testing.T) {
+		seedSecret(t, idN("0f60", 4), kindOAuthAccess, newToken("at"))
+
+		tests := []struct {
+			name string
+			args []any
+			want bool // refused
+		}{
+			{"a second token for a grant that has one", []any{idN("0f60", 4), kindOAuthAccess, grant, "mcp:read"}, true},
+			{"a first token for a grant that has none", []any{idN("0f60", 4), kindOAuthAccess, other, "mcp:read"}, false},
+			{"a token for a grant that does not exist", []any{idN("0f60", 4), kindOAuthAccess, idMissing, "mcp:read"}, true},
+			{"a token for no grant", []any{idN("0f60", 4), kindOAuthAccess, nil, "mcp:read"}, true},
+			{"a token with the grant's kind", []any{idN("0f60", 4), kindOAuthGrant, other, "mcp:read"}, true},
+			{"a token under the secret of a grant", []any{other, kindOAuthAccess, grant, "mcp:read"}, true},
+			{"a token with another kind", []any{idN("0f60", 4), kindAPIKey, other, "mcp:read"}, true},
+			{"a token the same row twice", []any{idN("0f60", 3), kindOAuthAccess, other, "mcp:read"}, true},
+		}
+
+		// The token's scope is bounded as the grant's is, in bytes, and is never
+		// empty, NUL-bearing or not text.
+		scope := func(value any) []any { return []any{idN("0f60", 4), kindOAuthAccess, other, value} }
+
+		scopeTests := []struct {
+			name string
+			args []any
+			want bool
+		}{
+			{"a scope of 256 bytes", scope(strings.Repeat("s", 256)), false},
+			{"a scope of 257 bytes", scope(strings.Repeat("s", 257)), true},
+			{"a scope of 256 bytes that are 128 characters", scope(strings.Repeat("\u00e9", 128)), false},
+			{"a scope of 258 bytes that are 129 characters", scope(strings.Repeat("\u00e9", 129)), true},
+			{"an empty scope", scope(""), true},
+			{"a scope with a NUL", scope("mcp:read\x00"), true},
+			{"no scope", scope(nil), true},
+			{"a scope that is a BLOB", scope([]byte("mcp:read")), true},
+		}
+
+		for _, tt := range slices.Concat(tests, scopeTests) {
+			if got := refused(t, insert, tt.args...); got != tt.want {
+				t.Errorf("%s: refused = %v, want %v", tt.name, got, tt.want)
+			}
+		}
+
+		// The secret was only there for the rows above, which are all rolled back.
+		seed(t, "DELETE FROM secrets WHERE id = ?", idN("0f60", 4))
+	})
+
+	t.Run("deleting the access token's secret keeps the grant", func(t *testing.T) {
+		seed(t, "DELETE FROM secrets WHERE id = ?", idN("0f60", 3))
+
+		expectCount(t, "oauth_access_tokens WHERE id = ?", "0", idN("0f60", 3))
+		expectCount(t, "oauth_grants WHERE id = ?", "1", grant)
+		expectCount(t, "secrets WHERE id = ?", "1", grant)
+		expectNoOrphanSecrets(t)
+	})
+
+	// The row alone has no delete trigger: D1 refuses a delete whose triggers
+	// nest too deep, and a fifth trigger for the fifth kind is one too many (see
+	// the migration, "Why only four triggers"). Its secret is left, inert, with
+	// no row to be an access token with. Nothing deletes the row alone; the
+	// secret's own delete takes the row with it.
+	t.Run("deleting the access token's row alone leaves an inert secret", func(t *testing.T) {
+		seedOAuthAccess(t, idN("0f60", 5), grant)
+
+		seed(t, "DELETE FROM oauth_access_tokens WHERE id = ?", idN("0f60", 5))
+
+		expectCount(t, "secrets WHERE id = ?", "1", idN("0f60", 5))
+		expectCount(t, "secrets WHERE id = ?", "1", grant)
+
+		seed(t, "DELETE FROM secrets WHERE id = ?", idN("0f60", 5))
+		expectNoOrphanSecrets(t)
+	})
+
+	t.Run("deleting a grant deletes its access token and both secrets", func(t *testing.T) {
+		seedOAuthAccess(t, idN("0f60", 6), grant)
+
+		seed(t, "DELETE FROM oauth_grants WHERE id = ?", grant)
+
+		for _, id := range []string{grant, idN("0f60", 6)} {
+			expectCount(t, "secrets WHERE id = ?", "0", id)
+		}
+
+		expectCount(t, "oauth_access_tokens WHERE grant_id = ?", "0", grant)
+		expectCount(t, "secrets WHERE id = ?", "1", other)
+		expectNoOrphanSecrets(t)
+	})
+
+	t.Run("deleting a grant's secret deletes the grant and its access token", func(t *testing.T) {
+		seedOAuthAccess(t, idN("0f60", 7), other)
+
+		seed(t, "DELETE FROM secrets WHERE id = ?", other)
+
+		expectCount(t, "oauth_grants WHERE id = ?", "0", other)
+		expectCount(t, "secrets WHERE id = ?", "0", idN("0f60", 7))
+		expectNoOrphanSecrets(t)
+	})
+}
+
+// TestSchemaOAuthDeletionCascades: a delete that starts above a grant, an agent's
+// or a user's, removes its grants, their access tokens and the secrets behind
+// them, and no other agent's or user's.
+//
+//nolint:paralleltest // shares one database
+func TestSchemaOAuthDeletionCascades(t *testing.T) {
+	const (
+		agentGrant, agentAccess = "0f70", "0f71"
+		userGrant, userAccess   = "0f72", "0f73"
+	)
+
+	seedWorld := func(t *testing.T) {
+		t.Helper()
+
+		oauthSchemaWorld(t)
+		seedUser(t, idUserC, roleMember)
+		seedAgent(t, idAgentB, idUserC, "other bot")
+
+		// A grant and its access token of the agent idAgentA, and another of
+		// the bystander's agent.
+		seedOAuthGrant(t, idN(agentGrant, 1))
+		seedOAuthAccess(t, idN(agentAccess, 1), idN(agentGrant, 1))
+
+		seedSecret(t, idN(userGrant, 1), kindOAuthGrant, newToken("code"))
+		seed(t, insertOAuthGrant, oauthGrantArgs(func(a []any) {
+			a[0], a[2], a[3], a[12] = idN(userGrant, 1), idUserC, idAgentB, tokenHash("bystander")
+		})...)
+		seedOAuthAccess(t, idN(userAccess, 1), idN(userGrant, 1))
+	}
+
+	bystander := []string{idN(userGrant, 1), idN(userAccess, 1)}
+
+	t.Run("deleting an agent deletes its grants", func(t *testing.T) {
+		seedWorld(t)
+
+		seed(t, "DELETE FROM agents WHERE id = ?", idAgentA)
+
+		for _, id := range []string{idN(agentGrant, 1), idN(agentAccess, 1)} {
+			expectCount(t, "secrets WHERE id = ?", "0", id)
+		}
+
+		for _, id := range bystander {
+			expectCount(t, "secrets WHERE id = ?", "1", id)
+		}
+
+		expectNoOrphanSecrets(t)
+	})
+
+	t.Run("deleting a user deletes its grants", func(t *testing.T) {
+		seedWorld(t)
+
+		seed(t, "DELETE FROM users WHERE id = ?", idUserB)
+
+		for _, id := range []string{idN(agentGrant, 1), idN(agentAccess, 1)} {
+			expectCount(t, "secrets WHERE id = ?", "0", id)
+		}
+
+		expectCount(t, "oauth_grants WHERE user_id = ?", "0", idUserB)
+
+		for _, id := range bystander {
+			expectCount(t, "secrets WHERE id = ?", "1", id)
+		}
+
+		expectNoOrphanSecrets(t)
 	})
 }

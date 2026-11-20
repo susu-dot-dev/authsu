@@ -1,5 +1,6 @@
 // Package secret generates and hashes the bearer secrets authsu issues:
-// invitations, sessions and API keys.
+// invitations, sessions, API keys and the OAuth authorization code, refresh
+// token and access token.
 //
 // # The token
 //
@@ -51,6 +52,17 @@ const (
 	TagInvitation Tag = "inv"
 	TagSession    Tag = "ses"
 	TagAPIKey     Tag = "key"
+
+	// TagOAuthCode is an OAuth authorization code, before it is exchanged
+	// ("susu_code_"). The grant it belongs to keeps its id and becomes a
+	// refresh token at the exchange.
+	TagOAuthCode Tag = "code"
+	// TagOAuthRefresh is an OAuth refresh token ("susu_rt_"): the same grant
+	// secret as the code it replaces, under the same id.
+	TagOAuthRefresh Tag = "rt"
+	// TagOAuthAccess is an OAuth access token ("susu_at_"), presented to a
+	// resource server and read back by introspection.
+	TagOAuthAccess Tag = "at"
 )
 
 // Sizes of a token body.

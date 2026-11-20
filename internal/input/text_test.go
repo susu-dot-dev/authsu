@@ -25,8 +25,16 @@ func labelSpec() textSpec {
 	return textSpec{max: input.MaxInvitationLabelRunes, runes: true, allowEmpty: true, identifying: false}
 }
 
+func clientNameSpec() textSpec {
+	return textSpec{max: input.MaxClientNameBytes, runes: false, allowEmpty: false, identifying: true}
+}
+
 func parseAccountName(raw string) (string, error) {
 	return strAdapter(input.ParseAccountName, input.AccountName.String)(raw)
+}
+
+func parseClientName(raw string) (string, error) {
+	return strAdapter(input.ParseClientName, input.ClientName.String)(raw)
 }
 
 func parseAgentName(raw string) (string, error) {
@@ -44,6 +52,11 @@ func parseLabel(raw string) (string, error) {
 func TestParseAccountName(t *testing.T) {
 	t.Parallel()
 	runStringTable(t, textCases(accountNameSpec()), parseAccountName, input.CodeInvalidName)
+}
+
+func TestParseClientName(t *testing.T) {
+	t.Parallel()
+	runStringTable(t, textCases(clientNameSpec()), parseClientName, input.CodeInvalidClientName)
 }
 
 func TestParseAgentName(t *testing.T) {
@@ -99,6 +112,7 @@ func TestTextDescriptionsStateTheBound(t *testing.T) {
 		max   int
 	}{
 		{"account name", parseAccountName, input.CodeInvalidName, input.MaxAccountNameBytes},
+		{"client name", parseClientName, input.CodeInvalidClientName, input.MaxClientNameBytes},
 		{"agent name", parseAgentName, input.CodeInvalidAgentName, input.MaxAgentNameRunes},
 		{"key name", parseKeyName, input.CodeInvalidKeyName, input.MaxKeyNameRunes},
 		{"label", parseLabel, input.CodeInvalidLabel, input.MaxInvitationLabelRunes},
@@ -121,12 +135,13 @@ func TestZeroTextValuesAreEmpty(t *testing.T) {
 
 	var (
 		name  input.AccountName
+		named input.ClientName
 		agent input.AgentName
 		key   input.KeyName
 		label input.InvitationLabel
 	)
 
-	if name.String() != "" || agent.String() != "" || key.String() != "" || label.String() != "" {
+	if named.String() != "" || name.String() != "" || agent.String() != "" || key.String() != "" || label.String() != "" {
 		t.Error("zero values are not empty")
 	}
 }
@@ -134,6 +149,11 @@ func TestZeroTextValuesAreEmpty(t *testing.T) {
 func FuzzParseAccountName(f *testing.F) {
 	fuzzString(f, seedsOf(textCases(accountNameSpec())), input.ParseAccountName, input.AccountName.String,
 		input.CodeInvalidName, textOracle(accountNameSpec()))
+}
+
+func FuzzParseClientName(f *testing.F) {
+	fuzzString(f, seedsOf(textCases(clientNameSpec())), input.ParseClientName, input.ClientName.String,
+		input.CodeInvalidClientName, textOracle(clientNameSpec()))
 }
 
 func FuzzParseAgentName(f *testing.F) {

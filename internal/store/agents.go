@@ -556,9 +556,13 @@ RETURNING id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
    FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels`
 
-// agentRevokeKeysQuery revokes the secret of every key of an agent, in the same
-// batch as agentRevokeQuery and after it. It applies only if the agent is
-// revoked once agentRevokeQuery has run, and only to keys of that owner's agent.
+// agentRevokeKeysQuery revokes the secret of every key of an agent, and of every
+// OAuth grant it holds with the grant's access token, in the same batch as
+// agentRevokeQuery and after it. Introspection already refuses the access token
+// of a revoked agent's grant (it reads agents.revoked_at), so this is not what
+// ends it; it keeps the secrets table honest and lists the grant as revoked. It
+// applies only if the agent is revoked once agentRevokeQuery has run, and only to
+// keys and grants of that owner's agent.
 // A secret whose revocation is already due keeps its time; one scheduled for
 // later is brought forward.
 //
@@ -566,16 +570,21 @@ RETURNING id, name, scopes, revoked_at, created_at,
 const agentRevokeKeysQuery = `
 UPDATE secrets
 SET revoked_at = ?1
-WHERE id IN (SELECT id FROM api_keys WHERE agent_id = ?2 AND user_id = ?3)
+WHERE id IN (SELECT id FROM api_keys WHERE agent_id = ?2 AND user_id = ?3
+             UNION ALL
+             SELECT id FROM oauth_grants WHERE agent_id = ?2 AND user_id = ?3
+             UNION ALL
+             SELECT t.id FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id
+             WHERE g.agent_id = ?2 AND g.user_id = ?3)
   AND (revoked_at IS NULL OR revoked_at > ?1)
   AND EXISTS (SELECT 1 FROM agents WHERE id = ?2 AND user_id = ?3 AND revoked_at IS NOT NULL)`
 
-// RevokeAgent revokes one of the user's agents and every key it holds, as one
-// batch, and returns the agent as the write left it. Revoking an agent that is
-// already revoked succeeds and keeps the earlier time, so the call is
-// idempotent. Other agents of the same user are not touched. It returns
-// ErrNotFound when the user has no such agent, in which case no key is touched
-// either.
+// RevokeAgent revokes one of the user's agents and every key and OAuth grant it
+// holds (with the grants' access tokens), as one batch, and returns the agent as
+// the write left it. Revoking an agent that is already revoked succeeds and keeps
+// the earlier time, so the call is idempotent. Other agents of the same user are
+// not touched. It returns ErrNotFound when the user has no such agent, in which
+// case no key or grant is touched either.
 //
 // As for PatchAgent, a constraint failure of any kind is a defect.
 func (s *Store) RevokeAgent(ctx context.Context, owner string, id input.ID, now time.Time) (Agent, error) {

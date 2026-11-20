@@ -6,8 +6,11 @@
 // each request Handler does, in this order:
 //
 //  1. Everything httpapi does first: the method (405 with Allow), the
-//     Content-Type of an unsafe method (415), and the body up to the route's
-//     MaxBody (413). Nothing below runs for a request that fails here.
+//     Content-Type of an unsafe method (415: the route's Media, which is JSON
+//     unless it declares a form), and the body and query string up to the
+//     route's MaxBody (413). Nothing below runs for a request that fails here.
+//     Every failure, this step's and the later ones, is written in the route's
+//     Errors format.
 //  2. For an Authenticated route: reads the credential, which is either the
 //     one __Host-session cookie (a session) or an "Authorization: Bearer"
 //     token (an API key) and never both. Each carrier accepts exactly one kind
@@ -146,6 +149,17 @@ type Route struct {
 	// MaxBody caps the request body in bytes. Zero means
 	// httpapi.DefaultMaxBody, which is also the most a route may ask for.
 	MaxBody int64
+	// Media is the Content-Type an unsafe request must carry: the zero value,
+	// httpapi.MediaJSON, or httpapi.MediaForm for the standard OAuth endpoints.
+	// A form is a CORS-safelisted type, so it gives no CSRF defence: a route
+	// that declares it must be None, so that no cookie can make a forged
+	// cross-site request mean anything, and must be a method with a body. A GET
+	// or HEAD reads no body and leaves it unset.
+	Media httpapi.Media
+	// Errors is the format of every failure of the route, the boundary's
+	// included: the zero value, httpapi.ErrorsAPI, or httpapi.ErrorsOAuth for
+	// the RFC 6749 format (see httpapi.OAuthError).
+	Errors httpapi.ErrorFormat
 	// Credential says what the caller must present. It must be set.
 	Credential Credential
 	// Access says what an authenticated caller must have to use the route:
@@ -177,6 +191,10 @@ type Call struct {
 	cfg       config.Config
 	cfgErr    error
 	cfgLoaded bool
+
+	signing       config.SigningKey
+	signingErr    error
+	signingLoaded bool
 }
 
 // ID returns the parsed value of the route's {id} wildcard. It was parsed
@@ -206,6 +224,24 @@ func (c *Call) Config() (config.Config, error) {
 	}
 
 	return c.cfg, c.cfgErr
+}
+
+// SigningKey returns the OAuth signing key, loading it on first use and
+// remembering the outcome for the rest of the request. It is separate from
+// Config because parsing an RSA key is expensive under wasm, so only the
+// handlers that sign or publish with it pay for it. A missing or invalid key is
+// 503 not_configured, with the reason only in the log, like the rest of the
+// configuration.
+func (c *Call) SigningKey() (config.SigningKey, error) {
+	if !c.signingLoaded {
+		key, err := config.LoadSigningKey(c.Getenv)
+
+		c.signing = key
+		c.signingErr = apierr.Wrap(err, apierr.Unavailable, CodeNotConfigured, "the service is not configured")
+		c.signingLoaded = true
+	}
+
+	return c.signing, c.signingErr
 }
 
 // Deps are the collaborators of Handler. All are required.
@@ -242,7 +278,9 @@ func methods() []string {
 // dependency, an unknown method, a path that does not start with "/", a nil
 // Handle, a Credential that is not None or Authenticated (including one that
 // was never set), an Access that is not declared on an Authenticated route or
-// is set on a None route, a MaxBody that is negative or above
+// is set on a None route, a Media or Errors that does not exist, a form Media
+// on a route that is Authenticated or that is a GET or HEAD, a MaxBody that is
+// negative or above
 // httpapi.DefaultMaxBody, the same method and path twice, a wildcard that is
 // not a whole {name} segment or that appears twice in a path, and a path the
 // ServeMux itself refuses. It panics, rather than returning an error, because a
@@ -261,7 +299,9 @@ func Handler(routes []Route, deps Deps) http.Handler {
 		byMethod := make(map[string]httpapi.MethodRoute, len(group.routes))
 
 		for method, route := range group.routes {
-			byMethod[method] = httpapi.MethodRoute{Handler: router.handler(route, group.wildcards), MaxBody: route.MaxBody}
+			byMethod[method] = httpapi.MethodRoute{
+				Handler: router.handler(route, group.wildcards), MaxBody: route.MaxBody, Media: route.Media, Errors: route.Errors,
+			}
 		}
 
 		mux.Handle(path, httpapi.ServeRoutes(deps.Log, group.wildcards, byMethod))
@@ -336,6 +376,26 @@ func routeProblem(route Route) string {
 		return "Credential must be None or Authenticated"
 	case route.MaxBody < 0 || route.MaxBody > httpapi.DefaultMaxBody:
 		return "MaxBody must be from 0 to httpapi.DefaultMaxBody"
+	}
+
+	return mediaProblem(route)
+}
+
+// mediaProblem describes what is wrong with a route's Media or Errors, or
+// returns "" and goes on to the route's Access. A form body is no CSRF defence,
+// so a form route may not rely on a cookie; and a method with no body has no
+// media type to declare.
+func mediaProblem(route Route) string {
+	switch {
+	case route.Media != httpapi.MediaJSON && route.Media != httpapi.MediaForm:
+		return "Media must be httpapi.MediaJSON or httpapi.MediaForm"
+	case route.Errors != httpapi.ErrorsAPI && route.Errors != httpapi.ErrorsOAuth:
+		return "Errors must be httpapi.ErrorsAPI or httpapi.ErrorsOAuth"
+	case route.Media != httpapi.MediaForm:
+	case route.Credential != None:
+		return "a form Media is no CSRF defence, so the route must be None"
+	case route.Method == http.MethodGet || route.Method == http.MethodHead:
+		return "a GET or HEAD has no body, so Media does not apply"
 	}
 
 	return accessProblem(route)
@@ -423,6 +483,7 @@ func (r *router) newCall(req httpapi.Request) *Call {
 	return &Call{
 		Request: req, Principal: Principal{}, Getenv: r.getenv, id: input.ID{}, hasID: false,
 		cfg: config.Config{}, cfgErr: nil, cfgLoaded: false,
+		signing: config.SigningKey{}, signingErr: nil, signingLoaded: false,
 	}
 }
 

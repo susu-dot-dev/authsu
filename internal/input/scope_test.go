@@ -147,12 +147,16 @@ func TestZeroScopeListIsEmpty(t *testing.T) {
 func TestScopeListBoundsFitTheSchema(t *testing.T) {
 	t.Parallel()
 
-	for _, column := range []string{"scopes", "scope"} {
-		limits := migrationNumbers(t, `length\(cast\(`+column+` AS BLOB\)\) BETWEEN 1 AND (\d+)`)
+	// Each column is found in its own table: oauth_grants.scope has the CHECK of
+	// api_keys.scope with a bound of its own, for the OAuth scopes of a grant.
+	for _, held := range []struct{ table, column string }{{"agents", "scopes"}, {"api_keys", "scope"}} {
+		limits := migrationNumbers(t,
+			`CREATE TABLE `+held.table+` \(.*?length\(cast\(`+held.column+` AS BLOB\)\) BETWEEN 1 AND (\d+)`)
 		last := limits[len(limits)-1]
 
 		if input.MaxScopeListJSONBytes > last {
-			t.Errorf("MaxScopeListJSONBytes %d is over the %s CHECK of %d bytes", input.MaxScopeListJSONBytes, column, last)
+			t.Errorf("MaxScopeListJSONBytes %d is over the %s CHECK of %d bytes",
+				input.MaxScopeListJSONBytes, held.column, last)
 		}
 	}
 }

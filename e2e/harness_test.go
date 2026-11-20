@@ -15,6 +15,10 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -81,9 +85,20 @@ const (
 	envFileName = "e2e.env"
 
 	envFilePerm = 0o600
+
+	// signingKeyBits is the size of the OAUTH_SIGNING_KEY the Worker under test
+	// is started with: the smallest the Worker accepts, as `make
+	// config-set-signing-key` generates.
+	signingKeyBits = 2048
 )
 
 var errNotReady = errors.New("worker not ready")
+
+// signingKey is the OAUTH_SIGNING_KEY the Worker under test was started with in
+// this process (the value of the variable, as the Worker reads it). It is
+// generated per run and set by writeEnvFile before any test runs; a test never
+// uses it except to assert that no response ever carries it.
+var signingKey string //nolint:gochecknoglobals // process-wide fixture shared by all e2e tests
 
 // worker is the running Worker under test.
 type worker struct {
@@ -154,17 +169,26 @@ func run(m *testing.M) int {
 // writeEnvFile writes the secrets and variables the Worker under test is
 // configured with to dir, in the dotenv format wrangler's --env-file reads, and
 // returns its path. The API origin depends on the port the Worker listens on,
-// so both origins are parameters.
+// so both origins are parameters. The OAUTH_SIGNING_KEY is generated afresh on
+// every call, in the encoding `make config-set-signing-key` writes.
 func writeEnvFile(dir, apiOrigin, uiOrigin string) (string, error) {
 	err := os.MkdirAll(dir, 0o700)
 	if err != nil {
 		return "", fmt.Errorf("create %s: %w", dir, err)
 	}
 
+	key, err := newSigningKey()
+	if err != nil {
+		return "", err
+	}
+
+	signingKey = key
+
 	path := filepath.Join(dir, envFileName)
 
 	contents := "FIRST_RUN_SECRET=" + firstRunSecret + "\n" +
 		"AUTH_HMAC_SECRET=" + authHMACSecret + "\n" +
+		"OAUTH_SIGNING_KEY=" + key + "\n" +
 		"API_ORIGIN=" + apiOrigin + "\n" +
 		"UI_ORIGIN=" + uiOrigin + "\n"
 
@@ -174,6 +198,22 @@ func writeEnvFile(dir, apiOrigin, uiOrigin string) (string, error) {
 	}
 
 	return path, nil
+}
+
+// newSigningKey returns a fresh RSA private key as the Worker reads it: PKCS#8
+// DER, base64url without padding, on one line.
+func newSigningKey() (string, error) {
+	key, err := rsa.GenerateKey(rand.Reader, signingKeyBits)
+	if err != nil {
+		return "", fmt.Errorf("generate signing key: %w", err)
+	}
+
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return "", fmt.Errorf("encode signing key: %w", err)
+	}
+
+	return base64.RawURLEncoding.EncodeToString(der), nil
 }
 
 // serve starts wrangler, waits for the Worker, runs the tests, and always tears

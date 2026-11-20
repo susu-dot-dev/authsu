@@ -15,6 +15,12 @@ const (
 	KindInvitation = "invitation"
 	KindSession    = "session"
 	KindAPIKey     = "api_key"
+
+	// KindOAuthGrant is an OAuth grant: the authorization code, then the refresh
+	// token that replaces it under the same id. KindOAuthAccess is the access
+	// token of a grant, of which a grant has at most one.
+	KindOAuthGrant  = "oauth_grant"
+	KindOAuthAccess = "oauth_access"
 )
 
 // Error codes of the secret operations. They are stable: clients and dashboards

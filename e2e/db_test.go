@@ -163,17 +163,22 @@ const (
 	tableSecrets     = "secrets"
 	tableUsers       = "users"
 	tableInvitations = "invitations"
+
+	tableOAuthGrants = "oauth_grants"
+	tableOAuthAccess = "oauth_access_tokens"
 )
 
 // tables are every table a test may leave rows in, in the order that empties
-// them without a foreign key ever blocking a delete: a kind's own tables first,
+// them without a foreign key ever blocking a delete: a kind's own tables first
+// (an access token before its grant),
 // then the owners they point at, and last the secrets that no kind row holds
 // any more. users go before invitations because users.invitation_id has no
 // ON DELETE action. Deleting a session or a key also deletes its secret (a
 // trigger), so by the time secrets is emptied it only removes strays.
 func tables() []string {
 	return []string{
-		tableKeys, tableLabels, tableAgents, tableSessions, tableCredentials, tableUsers, tableInvitations, tableSecrets,
+		tableOAuthAccess, tableOAuthGrants, tableKeys, tableLabels, tableAgents, tableSessions, tableCredentials,
+		tableUsers, tableInvitations, tableSecrets,
 	}
 }
 
