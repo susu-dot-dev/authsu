@@ -10,9 +10,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -26,7 +28,9 @@ import (
 // read of the boundary reads, and every value written fits the schema's CHECK.
 
 // Where the values are in the statements the account batch binds (see
-// store.CreateAccount): the user insert, then the credential insert.
+// store.CreateAccount): the first-run invitation's secret and row, then the user
+// insert, then the credential insert. The statements after the first two are
+// what accountOf returns.
 const (
 	userArgID      = 0
 	userArgHandle  = 1
@@ -82,9 +86,11 @@ const (
 	pathSession        = "/api/session"
 	pathLogout         = "/api/logout"
 
-	readInvitation = "SELECT i.type AS type"
+	readInvitation = "SELECT type FROM ("
 	readCredential = "FROM credentials c"
-	writeAccount   = "INSERT INTO users"
+	// writeAccount is the first statement of the account batch, which is
+	// the one a step matches: the first-run invitation's secret insert.
+	writeAccount   = "INSERT INTO secrets (id, kind, hash, expires_at, created_at)"
 	writeSession   = "UPDATE credentials SET flags"
 	registeredName = "Alice"
 )
@@ -130,8 +136,10 @@ func jsonString(t *testing.T, text string) string {
 }
 
 // register runs a whole registration of pk under name, with the one outcome the
-// account write answers with, and returns the response and the two statements
-// the batch carried.
+// account write answers with, and returns the response and the user and passkey
+// statements of the batch the write carried (the first-run invitation's two
+// inserts, which precede them, are read from h.lastCall by the test that checks
+// them).
 func register(t *testing.T, h *harness, pk *passkey, name string, write step) (int, string, []store.Statement) {
 	t.Helper()
 
@@ -143,12 +151,28 @@ func register(t *testing.T, h *harness, pk *passkey, name string, write step) (i
 		method: http.MethodPost, path: pathRegisterFinish, body: pk.registrationBody(t, challenge, someCode, name),
 	})
 
-	return rec.Code, rec.Body.String(), h.lastCall()
+	return rec.Code, rec.Body.String(), accountOf(h.lastCall())
 }
+
+// accountBatchLen is the number of statements of the account write: the
+// first-run invitation's secret and row, the user and the passkey.
+const accountBatchLen = 4
 
 // accepted is the answer of the account write when it took effect.
 func accepted() step {
-	return step{match: writeAccount, results: batchOf(2), err: nil}
+	return step{match: writeAccount, results: batchOf(accountBatchLen), err: nil}
+}
+
+// accountOf is the user and passkey statements of an account batch, which every
+// check of what registration wrote reads, without the first-run invitation's
+// two inserts that precede them. A batch of any other length is returned
+// unchanged, so a test fails on its length and not on an index.
+func accountOf(batch []store.Statement) []store.Statement {
+	if len(batch) != accountBatchLen {
+		return batch
+	}
+
+	return batch[accountBatchLen-2:]
 }
 
 // credentialRowOf is the row the credential lookup answers for what a
@@ -212,6 +236,12 @@ func TestRegistrationWritesWhatTheSchemaAndLoginExpect(t *testing.T) {
 		t.Fatalf("register finish = %d %s, batch of %d statements", status, body, len(batch))
 	}
 
+	t.Run("the first-run invitation's inserts", func(t *testing.T) {
+		t.Parallel()
+
+		checkFirstRunInserts(t, h.lastCall())
+	})
+
 	user, credential := batch[0].Args, batch[1].Args
 
 	t.Run("the values the ceremony fixed", func(t *testing.T) {
@@ -248,6 +278,98 @@ func TestRegistrationWritesWhatTheSchemaAndLoginExpect(t *testing.T) {
 			{"invitation type", `length\(type\) BETWEEN 1 AND (\d+)`, user[userArgType], false},
 		})
 	})
+}
+
+// checkFirstRunInserts checks the two statements that open an account batch,
+// which create the first-run invitation when the registering token is the
+// configured first-run secret on an empty database. They are sent with every
+// registration and decide for themselves, so what is held here is what they
+// carry: one fresh UUIDv7 shared by the invitation's secret and its row and
+// distinct from the user's, the hash and kind of the presented token, an expiry
+// ExpiryHorizon after the account's creation time, the first-run type and a
+// label that fits the schema, and the configured secret's hash (NULL here, as no
+// FIRST_RUN_SECRET is set).
+func checkFirstRunInserts(t *testing.T, batch []store.Statement) {
+	t.Helper()
+
+	if len(batch) != accountBatchLen {
+		t.Fatalf("batch has %d statements, want %d", len(batch), accountBatchLen)
+	}
+
+	secretArgs, invitationArgs, user := batch[0].Args, batch[1].Args, batch[2].Args
+
+	if len(secretArgs) != 7 || len(invitationArgs) != 6 {
+		t.Fatalf("first-run inserts bind %d and %d arguments, want 7 and 6", len(secretArgs), len(invitationArgs))
+	}
+
+	checkFirstRunIDs(t, secretArgs, invitationArgs, user)
+	checkFirstRunHashes(t, secretArgs)
+	checkFirstRunValues(t, secretArgs, invitationArgs)
+
+	checkFits(t, []fit{
+		{"first-run invitation id", `CHECK \(length\(id\) = (\d+)`, secretArgs[0], true},
+		{"first-run invitation label", `length\(cast\(label AS BLOB\)\) <= (\d+)`, invitationArgs[3], false},
+		{"first-run invitation type", `length\(type\) BETWEEN 1 AND (\d+)`, invitationArgs[2], false},
+	})
+}
+
+// checkFirstRunIDs checks that the secret and its row share one canonical
+// UUIDv7 that is not the user's.
+func checkFirstRunIDs(t *testing.T, secretArgs, invitationArgs, user []any) {
+	t.Helper()
+
+	ids := []any{secretArgs[0], invitationArgs[0], invitationArgs[4]}
+	if !uuidV7.MatchString(asText(ids[0])) || !slices.Equal(ids, []any{ids[0], ids[0], ids[0]}) {
+		t.Errorf("ids = %v, want one canonical UUIDv7 throughout", ids)
+	}
+
+	if ids[0] == user[userArgID] {
+		t.Errorf("the first-run invitation shares the user's id %v", ids[0])
+	}
+}
+
+// checkFirstRunHashes checks that the secret row is the presented token's hash,
+// the way the account's own lookup finds it, that the same hash is what the
+// configured one is compared to, and that no configured hash was sent.
+func checkFirstRunHashes(t *testing.T, secretArgs []any) {
+	t.Helper()
+
+	presented := secret.Hash(someCode)
+	if !slices.Equal(asBlob(secretArgs[2]), presented[:]) || !slices.Equal(asBlob(secretArgs[5]), presented[:]) {
+		t.Errorf("secret hashes = %x and %x, want the presented token's hash %x", secretArgs[2], secretArgs[5], presented)
+	}
+
+	if secretArgs[6] != nil {
+		t.Errorf("configured first-run hash = %v, want NULL: none is configured", secretArgs[6])
+	}
+}
+
+// checkFirstRunValues checks the kinds, the type, the label and the expiry.
+func checkFirstRunValues(t *testing.T, secretArgs, invitationArgs []any) {
+	t.Helper()
+
+	for name, got := range map[string]any{
+		"secret kind": secretArgs[1], "invitation kind": invitationArgs[1], "referenced kind": invitationArgs[5],
+	} {
+		if got != store.KindInvitation {
+			t.Errorf("%s = %v, want %s", name, got, store.KindInvitation)
+		}
+	}
+
+	if invitationArgs[2] != store.InvitationFirstRun {
+		t.Errorf("type = %v, want %s", invitationArgs[2], store.InvitationFirstRun)
+	}
+
+	if label := asText(invitationArgs[3]); label != registration.FirstRunLabel {
+		t.Errorf("label = %q, want %q", label, registration.FirstRunLabel)
+	}
+
+	created, _ := secretArgs[secretArgCreated].(int64)
+	expires, _ := secretArgs[secretArgExpires].(int64)
+
+	if horizon := int64(input.ExpiryHorizon / time.Second); expires != created+horizon {
+		t.Errorf("expires %d, created %d, want an expiry %ds after the creation time", expires, created, horizon)
+	}
 }
 
 // asText is an argument that must be text, as a string.

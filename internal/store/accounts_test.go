@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -37,7 +38,7 @@ func TestRedeemableInvitationType(t *testing.T) {
 
 			fake := newFake(returning(test.rows...))
 
-			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), now)
+			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), nil, now)
 
 			checkErr(t, err, nil)
 
@@ -71,7 +72,7 @@ func TestRedeemableInvitationTypeDefects(t *testing.T) {
 
 			fake := newFake(returning(test.rows...))
 
-			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), now)
+			got, found, err := fake.store().RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), nil, now)
 
 			checkErr(t, err, defectOf(store.CodeInvitationCheckRejected))
 
@@ -82,32 +83,64 @@ func TestRedeemableInvitationTypeDefects(t *testing.T) {
 	}
 }
 
+// redeemFragments are the conditions of the invitation lookup, in order: first
+// the stored invitation, found by its secret's hash and kind (the kind is an
+// argument, never a literal), active by the one shared predicate, under its cap
+// and, for first run, while no account exists; then the invitation that has not
+// been created yet, which is the configured first-run secret on a database with
+// no invitation and no account.
+func redeemFragments() []string {
+	return []string{
+		"SELECT type FROM (",
+		"SELECT i.type AS type FROM secrets s",
+		"JOIN invitations i ON i.id = s.id AND i.kind = s.kind",
+		"WHERE s.hash = ?",
+		"AND s.kind = ?",
+		"AND " + activeFragment,
+		"AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites",
+		"AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))",
+		"UNION ALL SELECT ? AS type WHERE ? = ?",
+		"AND NOT EXISTS (SELECT 1 FROM invitations) AND NOT EXISTS (SELECT 1 FROM users)",
+	}
+}
+
 // TestRedeemableInvitationTypeStatement pins the conditions that make a token
-// redeemable and the arguments in placeholder order. The invitation is found by
-// its secret's hash and kind (the kind is an argument, never a literal), the
-// secret must be active by the one shared predicate, and the first-run type is
-// an argument too.
+// redeemable and the arguments in placeholder order, for a deployment with a
+// first-run secret and for one without: with none the configured hash is NULL,
+// which equals nothing, so only a stored invitation is found.
 func TestRedeemableInvitationTypeStatement(t *testing.T) {
 	t.Parallel()
 
-	fake := newFake(returning())
 	token := mustInvitationToken(t, 1)
+	configured := mustInvitationToken(t, 2)
 
-	_, _, err := fake.store().RedeemableInvitationType(context.Background(), token, now)
-	checkErr(t, err, nil)
+	tests := []struct {
+		name     string
+		firstRun *input.InvitationToken
+		want     any
+	}{
+		{name: "no first-run secret is configured", firstRun: nil, want: nil},
+		{name: "a first-run secret is configured", firstRun: &configured, want: configured.Hash()},
+	}
 
-	checkStatements(t, fake, wantStatement{
-		fragments: []string{
-			"SELECT i.type AS type FROM secrets s",
-			"JOIN invitations i ON i.id = s.id AND i.kind = s.kind",
-			"WHERE s.hash = ?",
-			"AND s.kind = ?",
-			"AND " + activeFragment,
-			"AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites",
-			"AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))",
-		},
-		args: []any{token.Hash(), store.KindInvitation, now.Unix(), now.Unix(), store.InvitationFirstRun},
-	})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(returning())
+
+			_, _, err := fake.store().RedeemableInvitationType(context.Background(), token, test.firstRun, now)
+			checkErr(t, err, nil)
+
+			checkStatements(t, fake, wantStatement{
+				fragments: redeemFragments(),
+				args: []any{
+					token.Hash(), store.KindInvitation, now.Unix(), now.Unix(), store.InvitationFirstRun,
+					store.InvitationFirstRun, token.Hash(), test.want,
+				},
+			})
+		})
+	}
 }
 
 // TestRedeemableInvitationTypeFailures holds how a failed batch is reported.
@@ -116,7 +149,7 @@ func TestRedeemableInvitationTypeFailures(t *testing.T) {
 
 	runFailures(t, 1, store.CodeInvitationCheckFailed, store.CodeInvitationCheckRejected, registrationDescription,
 		func(s *store.Store) error {
-			return lastErr2(s.RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), now))
+			return lastErr2(s.RedeemableInvitationType(context.Background(), mustInvitationToken(t, 1), nil, now))
 		})
 }
 
@@ -130,6 +163,7 @@ func newAccount(t *testing.T, edit func(*store.NewAccount)) store.NewAccount {
 		Token: mustInvitationToken(t, 1), InvitationType: "member",
 		CredentialRowID: "cred-row-1", CredentialID: []byte{4, 5}, PublicKey: []byte{6, 7, 8}, Flags: 0x45,
 		AAGUID: aaguid, Transports: []string{"usb"}, CreatedAt: now,
+		FirstRunID: "first-run-1", FirstRunLabel: "First run", FirstRunExpiresAt: farFuture,
 	}
 
 	if edit != nil {
@@ -144,10 +178,12 @@ func metadataOf(transports string) string {
 	return `{"fmt":"none","aaguid":"` + aaguid + `","transports":` + transports + `}`
 }
 
-// TestCreateAccountStatements pins the batch registration writes: the user
-// insert carrying the invitation's conditions, then the credential insert
-// that fails the batch when the first matched nothing; the JSON columns the
-// store builds; and every argument in placeholder order.
+// TestCreateAccountStatements pins the batch registration writes: the two
+// inserts that create the first-run invitation when the configured secret is
+// presented on an empty database, the user insert carrying the invitation's
+// conditions, then the credential insert that fails the batch when the user
+// insert matched nothing; the JSON columns the store builds; and every argument
+// in placeholder order.
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestCreateAccountStatements(t *testing.T) {
@@ -168,14 +204,31 @@ func TestCreateAccountStatements(t *testing.T) {
 		"INSERT INTO credentials (id, credential_id, user_id, public_key, flags, metadata, created_at)",
 		"(SELECT id FROM users WHERE user_handle = ?)",
 	}
+	firstRunSecretFragments := []string{
+		"INSERT INTO secrets (id, kind, hash, expires_at, created_at) SELECT ?, ?, ?, ?, ?",
+		"WHERE ? = ?",
+		"AND NOT EXISTS (SELECT 1 FROM invitations)",
+		"AND NOT EXISTS (SELECT 1 FROM users)",
+	}
+	firstRunInvitationFragments := []string{
+		"INSERT INTO invitations (id, kind, type, label, num_invites) SELECT ?, ?, ?, ?, 1",
+		"WHERE EXISTS (SELECT 1 FROM secrets WHERE id = ? AND kind = ?)",
+	}
+
+	configured := mustInvitationToken(t, 1)
 
 	tests := []struct {
 		name     string
 		edit     func(*store.NewAccount)
 		profile  string
 		metadata string
+		// configuredHash is the argument for the configured first-run hash.
+		configuredHash any
 	}{
 		{name: "a member with one transport", profile: `{"name":"Ann"}`, metadata: metadataOf(`["usb"]`)},
+		{name: "the presented token is the configured first-run secret",
+			edit:    func(a *store.NewAccount) { a.FirstRun = &configured },
+			profile: `{"name":"Ann"}`, metadata: metadataOf(`["usb"]`), configuredHash: configured.Hash()},
 		{name: "no transports reported is an empty array",
 			edit:    func(a *store.NewAccount) { a.Transports = nil },
 			profile: `{"name":"Ann"}`, metadata: metadataOf(`[]`)},
@@ -201,13 +254,27 @@ func TestCreateAccountStatements(t *testing.T) {
 			t.Parallel()
 
 			account := newAccount(t, test.edit)
-			fake := newFake(applied(2))
+			fake := newFake(applied(4))
 
 			checkErr(t, fake.store().CreateAccount(context.Background(), account), nil)
 
 			created := now.Unix()
 
 			checkStatements(t, fake,
+				wantStatement{
+					fragments: firstRunSecretFragments,
+					args: []any{
+						"first-run-1", store.KindInvitation, account.Token.Hash(), farFuture.Unix(), created,
+						account.Token.Hash(), test.configuredHash,
+					},
+				},
+				wantStatement{
+					fragments: firstRunInvitationFragments,
+					args: []any{
+						"first-run-1", store.KindInvitation, store.InvitationFirstRun, "First run",
+						"first-run-1", store.KindInvitation,
+					},
+				},
 				wantStatement{
 					fragments: userFragments,
 					args: []any{
@@ -248,7 +315,7 @@ func TestCreateAccountEncodingFailure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := newFake(applied(2))
+			fake := newFake(applied(4))
 			calls := 0
 
 			s := store.NewWithMarshal(fake.exec, func(_ any) ([]byte, error) {
@@ -281,7 +348,7 @@ func TestCreateAccountEncodingFailure(t *testing.T) {
 func TestCreateAccountFailures(t *testing.T) {
 	t.Parallel()
 
-	runFailures(t, 2, store.CodeRegistrationAcceptFailed, store.CodeRegistrationAcceptRejected, registrationDescription,
+	runFailures(t, 4, store.CodeRegistrationAcceptFailed, store.CodeRegistrationAcceptRejected, registrationDescription,
 		func(s *store.Store) error { return passErr(s.CreateAccount(context.Background(), newAccount(t, nil))) })
 }
 

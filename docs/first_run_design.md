@@ -30,7 +30,22 @@ Instead of a special "if you know the secret, you may become admin" path, the se
 
 This is what satisfies goal 3. From registration's point of view, the first admin redeems an invitation like anyone else, and every property argued for in the invitation design comes along: a single point of acceptance, no shadow users, and the role taken from the invitation rather than the client.
 
-It also shapes the experience. The bootstrap page needs no account-creation flow of its own. Its whole job is to get the owner to the point where the invitation exists and they hold its token, then hand them to the normal registration page.
+It also shapes the experience. The bootstrap page needs no account-creation flow of its own, and nothing has to create the invitation beforehand. Its whole job is to get the owner to the point where the secret is configured and they hold its token, then hand them to the normal registration page.
+
+### The invitation is created by the registration that redeems it
+
+The first-run invitation is not stored in advance. It comes into being in the same write as the first account, and that write is registration's point of acceptance ([registration_design.md](registration_design.md#the-point-of-acceptance)).
+
+The reason is that nothing else needs it to exist earlier. The invitation is the hash of a token the server already holds in its configuration, so storing it ahead of time records nothing that registration cannot derive on the spot. Creating it earlier would need a request to create it, and the only requests that exist before the owner registers are ones anyone can make. Making one of those perform a write was a trade the earlier design accepted ("a write on what looks like a read"). Creating the invitation inside the registration removes the trade instead of arguing for it: the status route only reads, and the only request that ever writes is one that presents the token.
+
+The write is conditional exactly as the old creation was, and its conditions are in the statements, not in a read before them:
+
+- the presented token is the configured first-run secret, and
+- the database has no invitation and no account at all.
+
+When both hold, the batch creates the invitation's secret, then its row, then the account that redeems it, then the account's passkey, each statement conditional on the one before. If any statement matches nothing, the passkey insert fails on its missing account and the whole batch rolls back, the invitation included, so a registration that fails leaves nothing behind. When the conditions do not hold, which is every registration after the first and every registration with any other token, the two creating statements insert nothing and the batch is the ordinary redemption of a stored invitation.
+
+Registration's `begin` accepts the same token in the same case, as an advisory read, so a wrong secret still fails before the passkey prompt.
 
 ## The owner's journey
 
@@ -41,7 +56,7 @@ The setup page is a view of the server's bootstrap state, not a wizard with its 
 | State | Meaning |
 |-------|---------|
 | missing secret | The owner still has to configure something. |
-| invitation pending | The first-run invitation exists and is waiting to be redeemed. |
+| invitation pending | The secret is configured and the system is empty, so registering with it will create the first account. (A stored first-run invitation that has not been redeemed reads the same.) |
 | invitation accepted | An account exists, so setup is over. |
 
 Because the server's state is authoritative, the owner can close the tab, reload, switch machines, or come back tomorrow, and the page picks up at the right step. The single exception is the secret value itself, discussed below.
@@ -59,25 +74,25 @@ Registration also needs a permanent signing key, `AUTH_HMAC_SECRET` ([registrati
 Setting a secret redeploys the Worker. The page does not ask the owner to come back and confirm: it keeps polling, and as soon as the new configuration is live it moves on. The owner runs a command in their terminal and the browser tab advances by itself.
 
 - **A rollout is not instantaneous.** Briefly, some requests may reach the old version, so the page treats the status as something that can move back and forth during that window.
-- **Creation happens during a status check.** The first check that sees the secret configured, with an empty system, creates the first-run invitation. A write on what looks like a read is a deliberate trade: the write is idempotent, derived entirely from server configuration, and reveals nothing. It keeps the page a simple poller. It does not matter whose request triggers it, even a stranger's, because it only records the hash of a token the stranger does not have.
+- **The status check only reads.** It creates nothing. "Pending" is a statement about configuration and an empty system, which is what the owner is waiting for, and nothing in the database has to change for it to become true.
 
-The check works from one snapshot: whether any account exists and whether a first-run invitation exists are read together, so the two answers describe the same instant. An account means "accepted", and the secret is not even consulted. A first-run invitation means "pending". Only when neither exists is the secret read, and it must be a well-formed invitation token, or the status stays "missing secret".
+The check works from one snapshot: whether any account exists, whether any invitation exists and whether a first-run invitation exists are read together, so the answers describe the same instant. An account means "accepted", and the secret is not even consulted. A first-run invitation means "pending". An invitation of any other kind with no first-run invitation and no account means setup can never finish (see "Recovery is a wipe"). Only when the database has no invitation at all is the secret read, and it must be a well-formed invitation token to read "pending", or the status stays "missing secret".
 
 ### The secret has to survive until registration
 
 This is the one piece of state the server cannot help with, and the most likely way for setup to go wrong.
 
-Worker secrets are write-only: once set, neither wrangler nor the dashboard shows the value again, and the server never returns it either. So the browser that generated it is the only place it exists, apart from whatever the owner copied. If it is lost after the invitation has been created, which happens within seconds of deploying the secret, the owner cannot recover it. Setting a new value does not help, because the invitation is already tied to the old one (see "Closing the hole").
+Worker secrets are write-only: once set, neither wrangler nor the dashboard shows the value again, and the server never returns it either. So the browser that generated it is the only place it exists, apart from whatever the owner copied. If it is lost, the owner cannot recover it. Setting a new value is possible while nothing has been stored, because the invitation is created from whatever the secret is when the owner registers. Once an invitation exists, setting a new value does not help, because the invitation is already tied to the old one (see "Closing the hole").
 
 - **If the value is not available** (a different browser, cleared storage, a secret set out of band), ask the owner to paste the value they deployed rather than failing.
-- **If the pasted value is wrong**, registration's early, advisory invitation check refuses it before any passkey prompt, and the page can say plainly that the fix is to wipe the database and redeploy.
+- **If the pasted value is wrong**, registration's early, advisory invitation check refuses it before any passkey prompt, and the page can say plainly that the value does not match the one deployed.
 
 ### Step 3: handing off to registration
 
-Once the invitation is pending, the page sends the owner to the ordinary registration page, carrying the token, for example `/register?first-run=true#<token>`.
+Once the status is pending, the page sends the owner to the ordinary registration page, carrying the token, for example `/register?first-run=true#<token>`.
 
 - **The token travels in the fragment.** Fragments are never sent to the server and do not appear in `Referer`. The registration page reads it and immediately removes it from the address bar and history. It is a short-lived admin credential, so keeping it out of logs, history and shoulder-surfing range is worth the effort.
-- **The first-run hint is cosmetic.** It lets the registration page tailor its copy. The server ignores it entirely: first-run handling is decided by the invitation the token resolves to, never by what the client claims.
+- **The first-run hint is cosmetic.** It lets the registration page tailor its copy. The server ignores it entirely: first-run handling is decided by whether the token is the configured secret on an empty system, never by what the client claims.
 
 From here, registration is exactly the flow in [registration_design.md](registration_design.md). If two browsers race at this point, its single point of acceptance admits exactly one.
 
@@ -89,13 +104,17 @@ After registration, the status is permanently "accepted", and the setup page jus
 
 The hole closes in two stages, each enforced by facts in the database, not by operator action.
 
-**Stage 1: once an invitation exists, no first-run invitation can be created.** The server creates it only when there are no invitations and no accounts at all, and that condition can never be true again. The condition is part of the write itself, so two racing status checks cannot both create it. A consequence: changing `FIRST_RUN_SECRET` after creation does nothing, because the invitation is tied to the old token's hash. That is deliberate, and it is why keeping the generated value matters so much. Supporting "I lost or changed the secret" would mean reopening the hole based on current configuration, which is exactly the persistent back door this design avoids.
+**Stage 1: once an invitation exists, no first-run invitation can be created.** The first-run invitation is created only when there are no invitations and no accounts at all, and that condition can never be true again. The condition is part of the write itself, so two racing registrations cannot both create it. A consequence: changing `FIRST_RUN_SECRET` after the invitation exists does nothing, because the invitation is tied to the old token's hash. That is deliberate. Supporting "I lost or changed the secret" after that point would mean reopening the hole based on current configuration, which is exactly the persistent back door this design avoids.
 
-**Stage 2: once any account exists, the first-run invitation is dead.** Single use covers the normal case. The first-run invitation adds a stronger condition: it is redeemable only while there are no accounts at all. Single use is a property of the invitation, while "no accounts" is a property of the whole system, and requiring both keeps the path closed however the database came to have accounts. Once an account exists, the status check stops consulting the secret, so a `FIRST_RUN_SECRET` left in the deployment forever is inert.
+Since the invitation is created by the registration and not before it, the first admin's registration and the creation of the invitation are one event: there is no window in which an invitation exists that nobody has redeemed unless a registration was refused after the invitation was written, and a refused registration writes nothing at all, because the batch rolls back.
+
+**Stage 2: once any account exists, the first-run invitation is dead.** Single use covers the normal case. The first-run invitation adds a stronger condition: it is redeemable only while there are no accounts at all. Single use is a property of the invitation, while "no accounts" is a property of the whole system, and requiring both keeps the path closed however the database came to have accounts. Once an account exists, neither the status check nor registration lets the secret create or redeem anything, so a `FIRST_RUN_SECRET` left in the deployment forever is inert.
 
 ### Recovery is a wipe
 
-If the owner loses the secret mid-bootstrap, changes it after creation, or gets into any other odd state, the answer is to wipe the database and redeploy. Before the first admin exists there is nothing of value to preserve, every recovery path would be a way to reopen the hole, and handling none of them keeps the mechanism small enough to reason about completely. The page's job is to make wiping and redeploying the clearly signposted answer.
+If the owner loses the secret after the first-run invitation exists, or gets into any other odd state, the answer is to wipe the database and redeploy. Before the first admin exists there is nothing of value to preserve, every recovery path would be a way to reopen the hole, and handling none of them keeps the mechanism small enough to reason about completely. The page's job is to make wiping and redeploying the clearly signposted answer.
+
+A first-run invitation can exist without an account only if it was created by something other than a registration, such as a hand-edited database, or if it has since been revoked or has expired. It reads "pending" and registration refuses its token. That is the same dead end and the same answer.
 
 The server detects one such state itself: a database with an invitation of another kind but no account, where no first-run invitation can ever be created. It says so explicitly, telling the owner to wipe and redeploy, rather than reporting "missing secret" and leaving them to set a secret again forever.
 
@@ -103,8 +122,9 @@ The server detects one such state itself: a database with an invitation of anoth
 
 | Threat | Answer |
 |--------|--------|
-| Someone finds the site before the owner sets up | Without the token they cannot see or redeem anything. Triggering the creation gains them nothing. |
+| Someone finds the site before the owner sets up | Without the token they cannot see or redeem anything. The status route only reads, and no other request creates the invitation unless it presents the token. |
 | Someone guesses the secret | It is a browser-generated random token, so guessing is infeasible. |
 | Someone learns the secret before the owner registers | They could become admin. To learn it they must already control the deployment's configuration or the owner's browser, which is outside the trust boundary. The practical defence is that the guided flow makes the window minutes long. |
 | The secret leaks after setup | Inert: the system has accounts, so first run is closed. |
-| Two browsers race to become admin | Registration's single point of acceptance admits exactly one. |
+| Two browsers race to become admin | Registration's single point of acceptance admits exactly one, and the creation of the invitation is part of that write, so they cannot both create it. |
+| Someone presents a token that is not the secret | It is compared to the configured secret in the write itself. Anything else is refused as an unknown token and creates nothing. |

@@ -770,16 +770,15 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		},
 		"RevokeSecret": func(s *store.Store) { _, _ = s.RevokeSecret(ctx, "user", "id", farthest) },
 		"RedeemableInvitationType": func(s *store.Store) {
-			_, _, _ = s.RedeemableInvitationType(ctx, mustInvitationToken(t, 3), farthest)
+			_, _, _ = s.RedeemableInvitationType(ctx, mustInvitationToken(t, 3), nil, farthest)
 		},
 		"CreateAccount": func(s *store.Store) {
-			_ = s.CreateAccount(ctx, newAccount(t, func(a *store.NewAccount) { a.Flags, a.CreatedAt = 0xff, farthest }))
+			_ = s.CreateAccount(ctx, newAccount(t, func(a *store.NewAccount) {
+				a.Flags, a.CreatedAt, a.FirstRunExpiresAt = 0xff, farthest, farthest
+			}))
 		},
-		"CredentialByID": func(s *store.Store) { _, _, _ = s.CredentialByID(ctx, []byte{1}) },
-		"FirstRunState":  func(s *store.Store) { _, _ = s.FirstRunState(ctx) },
-		"CreateFirstRunInvitation": func(s *store.Store) {
-			_, _ = s.CreateFirstRunInvitation(ctx, "id", mustInvitationToken(t, 3), "label", farthest, farthest)
-		},
+		"CredentialByID":  func(s *store.Store) { _, _, _ = s.CredentialByID(ctx, []byte{1}) },
+		"FirstRunState":   func(s *store.Store) { _, _ = s.FirstRunState(ctx) },
 		"ListInvitations": func(s *store.Store) { _, _ = s.ListInvitations(ctx) },
 		"CreateInvitation": func(s *store.Store) {
 			_, _ = s.CreateInvitation(ctx, invitation)

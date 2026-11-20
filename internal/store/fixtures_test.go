@@ -30,6 +30,12 @@ import (
 //nolint:gochecknoglobals // a fixed clock shared by the table tests
 var now = time.Unix(1_700_000_123, 0)
 
+// farFuture is an expiry well after now, for the first-run invitation a write
+// is offered. It is distinct from now so a swapped argument is visible.
+//
+//nolint:gochecknoglobals // a fixed time shared by the table tests
+var farFuture = time.Unix(1_900_000_456, 0)
+
 // activeFragment is the text of the one predicate every query that decides
 // whether a presented secret may be used includes, and that takes now twice.
 // It is written out here on purpose: changing what "active" means is a change

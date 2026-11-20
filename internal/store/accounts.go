@@ -22,33 +22,54 @@ const (
 // invitationQuery looks up an invitation for begin and finish. It is a plain
 // read: begin uses it as an advisory check, and finish uses it to learn the
 // invitation's type so Go can choose the role. Neither relies on it for
-// authorisation; insertUserQuery re-checks everything in the write.
+// authorisation; CreateAccount's write re-checks everything.
 //
-// The invitation is found by the hash of its token and its kind, through its
+// An invitation is found by the hash of its token and its kind, through its
 // secret, and it is returned only when the secret is active
 // (activeSecretPredicate), it is under its cap and, for first run, no account
 // exists yet. Otherwise there is no row. The join to invitations is on the id
 // and the kind together, as the schema's foreign key is.
 //
-// Arguments, in order: hash, kind, now, now (unix seconds), first-run type.
+// The first-run invitation need not be stored yet: the registration that
+// redeems it creates it (see insertFirstRunSecretQuery). So the query also finds
+// the first-run type for a token that is the configured first-run secret while
+// the database has no invitation and no account, which is exactly when that
+// write creates it. The configured secret's hash is NULL when none is
+// configured, and a comparison with NULL never holds, so then only a stored
+// invitation is found.
+//
+// Arguments, in order: hash, kind, now, now (unix seconds), first-run type,
+// first-run type, hash, configured first-run hash.
 const invitationQuery = `
-SELECT i.type AS type
-FROM secrets s
-JOIN invitations i ON i.id = s.id AND i.kind = s.kind
-WHERE s.hash = ?
-  AND s.kind = ?
-  AND ` + activeSecretPredicate + `
-  AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites
-  AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))`
+SELECT type FROM (
+  SELECT i.type AS type
+  FROM secrets s
+  JOIN invitations i ON i.id = s.id AND i.kind = s.kind
+  WHERE s.hash = ?
+    AND s.kind = ?
+    AND ` + activeSecretPredicate + `
+    AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites
+    AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))
+  UNION ALL
+  SELECT ? AS type
+  WHERE ? = ?
+    AND NOT EXISTS (SELECT 1 FROM invitations)
+    AND NOT EXISTS (SELECT 1 FROM users)
+)`
 
 // RedeemableInvitationType returns the type of the invitation the token names
 // when it is redeemable at now: not revoked, not expired, under its cap and, for
 // the first-run type, while no account exists. It reports false otherwise, so an
 // unknown, spent, revoked or expired token are indistinguishable.
 //
+// firstRun is the configured first-run token, or nil when none is configured. A
+// token equal to it is redeemable as the first-run invitation while the
+// database has no invitation and no account, though no invitation is stored
+// yet: CreateAccount creates it.
+//
 // It is advisory: CreateAccount re-checks every condition in its write.
 func (s *Store) RedeemableInvitationType(
-	ctx context.Context, token input.InvitationToken, now time.Time,
+	ctx context.Context, token input.InvitationToken, firstRun *input.InvitationToken, now time.Time,
 ) (string, bool, error) {
 	o := op{failed: CodeInvitationCheckFailed, rejected: CodeInvitationCheckRejected,
 		description: "registration is temporarily unavailable"}
@@ -56,9 +77,68 @@ func (s *Store) RedeemableInvitationType(
 	unix := now.Unix()
 
 	return find(ctx, s, o,
-		Statement{Query: invitationQuery, Args: []any{token.Hash(), KindInvitation, unix, unix, InvitationFirstRun}},
+		Statement{Query: invitationQuery, Args: []any{
+			token.Hash(), KindInvitation, unix, unix, InvitationFirstRun,
+			InvitationFirstRun, token.Hash(), configuredHash(firstRun),
+		}},
 		func(r *row) string { return r.text() })
 }
+
+// configuredHash is the hash of the configured first-run token, or nil (SQL
+// NULL, which equals nothing) when none is configured.
+func configuredHash(firstRun *input.InvitationToken) any {
+	if firstRun == nil {
+		return nil
+	}
+
+	return firstRun.Hash()
+}
+
+// insertFirstRunSecretQuery is the first statement of CreateAccount's batch: it
+// writes the secret of the first-run invitation, but only when the registering
+// token is the configured first-run secret and the database has no invitation
+// and no account at all.
+//
+// The conditions are part of the insert itself, so two registrations racing to
+// become the first admin cannot both create it: D1 runs a batch to its end
+// before the next one starts, so the second sees the first's invitation and
+// inserts nothing. When the conditions do not hold it inserts nothing, which is
+// the normal case of every registration after the first.
+//
+// Secrets of other kinds do not matter to the condition. Sessions and API keys
+// exist only for accounts, so while there is no account there are none, and a
+// secret of any kind never makes an invitation exist. What this insert must not
+// do is leave a secret behind without its invitation, which the next statement
+// prevents (see insertFirstRunInvitationQuery).
+//
+// Arguments, in order: id, kind, hash, expires_at, created_at, hash,
+// configured first-run hash.
+//
+//nolint:gosec // SQL naming the secrets table, not a credential
+const insertFirstRunSecretQuery = `
+INSERT INTO secrets (id, kind, hash, expires_at, created_at)
+SELECT ?, ?, ?, ?, ?
+WHERE ? = ?
+  AND NOT EXISTS (SELECT 1 FROM invitations)
+  AND NOT EXISTS (SELECT 1 FROM users)`
+
+// insertFirstRunInvitationQuery is the second statement of CreateAccount's
+// batch: the invitation's own row, written only if the statement before it
+// wrote this call's secret. The id is fresh for every call, so a secret with
+// this id and kind exists only if the previous statement of this batch inserted
+// it, and no other caller's secret can satisfy the condition. The two inserts
+// therefore stand or fall together: when the conditions refused the secret
+// there is nothing for the invitation to attach to and it is not written, and
+// when the secret was written the invitation is, in the same transaction.
+//
+// created_by is NULL: no account created it. num_invites is 1.
+//
+// Arguments, in order: id, kind, type, label, the secret's id, the secret's
+// kind.
+const insertFirstRunInvitationQuery = `
+INSERT INTO invitations (id, kind, type, label, num_invites)
+SELECT ?, ?, ?, ?, 1
+WHERE EXISTS (SELECT 1 FROM secrets WHERE id = ? AND kind = ?)`
 
 // insertUserQuery creates the account, and is the point of acceptance. Its
 // authorisation checks are conditions of the insert itself, so the database
@@ -139,6 +219,15 @@ type NewAccount struct {
 	Token          input.InvitationToken
 	InvitationType string
 
+	// FirstRun is the configured first-run token, or nil when none is
+	// configured. When Token equals it and no invitation or account exists, the
+	// write creates the first-run invitation (expiring at FirstRunExpiresAt,
+	// labelled FirstRunLabel, with the id FirstRunID) before redeeming it.
+	FirstRun          *input.InvitationToken
+	FirstRunID        string
+	FirstRunLabel     string
+	FirstRunExpiresAt time.Time
+
 	// CredentialRowID is the passkey's row id. CredentialID, PublicKey, Flags,
 	// AAGUID (in its canonical text form) and Transports are what the
 	// authenticator reported.
@@ -156,6 +245,14 @@ type NewAccount struct {
 
 // CreateAccount creates the account and its passkey in one batch, with the
 // invitation's conditions in the write itself (see insertUserQuery).
+//
+// The batch starts with the first-run invitation's two inserts, which take
+// effect only for the configured first-run secret on an empty database (see
+// insertFirstRunSecretQuery). They are what lets the first admin register
+// without anything having created the invitation beforehand, and they are in
+// the same batch as the user insert so the invitation exists exactly when its
+// account does: if the user insert matches nothing, the credential insert
+// fails and the whole batch, the invitation included, rolls back.
 //
 // It returns ErrConflict when the registration cannot stand: the invitation
 // was used up, revoked, expired or is not of the type the caller read, the
@@ -189,6 +286,14 @@ func (s *Store) CreateAccount(ctx context.Context, account NewAccount) error {
 	created := account.CreatedAt.Unix()
 
 	_, err = s.run(ctx, o,
+		Statement{Query: insertFirstRunSecretQuery, Args: []any{
+			account.FirstRunID, KindInvitation, account.Token.Hash(), account.FirstRunExpiresAt.Unix(), created,
+			account.Token.Hash(), configuredHash(account.FirstRun),
+		}},
+		Statement{Query: insertFirstRunInvitationQuery, Args: []any{
+			account.FirstRunID, KindInvitation, InvitationFirstRun, account.FirstRunLabel,
+			account.FirstRunID, KindInvitation,
+		}},
 		Statement{Query: insertUserQuery, Args: []any{
 			account.UserID, account.UserHandle, account.Role, string(profileJSON), created,
 			account.Token.Hash(), KindInvitation, account.InvitationType, created, created, InvitationFirstRun,

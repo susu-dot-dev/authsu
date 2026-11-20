@@ -3,16 +3,13 @@ package firstrun_test
 
 import (
 	"net/http"
-	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
-	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -50,19 +47,13 @@ func TestRoutesRequireEveryDependency(t *testing.T) {
 	t.Parallel()
 
 	complete := newRig(t)
-	deps := firstrun.Deps{
-		Store: complete.store,
-		Now:   func() time.Time { return complete.now },
-		NewID: func() string { return generatedID },
-	}
+	deps := firstrun.Deps{Store: complete.store}
 
 	tests := []struct {
 		name   string
 		mutate func(*firstrun.Deps)
 	}{
 		{name: "no store", mutate: func(d *firstrun.Deps) { d.Store = nil }},
-		{name: "no clock", mutate: func(d *firstrun.Deps) { d.Now = nil }},
-		{name: "no id source", mutate: func(d *firstrun.Deps) { d.NewID = nil }},
 	}
 
 	for _, tt := range tests {
@@ -84,134 +75,80 @@ func TestRoutesRequireEveryDependency(t *testing.T) {
 }
 
 // TestStatus covers every state the database can be in with every state of the
-// secret, and what each leads to: the exact store calls, the exact response,
-// and whether the secret was consulted.
+// secret, and what each leads to: the exact response, whether the secret was
+// consulted, and that the route reads the database exactly once and writes
+// nothing (the store has no write to call).
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestStatus(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		// states are the answers of FirstRunState, in order.
-		states []stateAnswer
+		name   string
+		state  store.FirstRunState
 		secret string
-		create createAnswer
 
 		wantStatus int
 		wantBody   string
-		// wantCalls are the store calls, in order.
-		wantCalls []string
 		// wantSecretRead is whether FIRST_RUN_SECRET may be read at all.
 		wantSecretRead bool
-		// wantCode is the code of the error the boundary logs, "" for none.
-		wantCode string
 	}{
 		// Once an account exists, setup is over: the secret is not consulted, so
 		// one left in the deployment forever is inert.
 		{
-			name: "users, no invitation, secret set", states: []stateAnswer{reading(usersOnly())}, secret: validSecret,
-			wantStatus: http.StatusOK, wantBody: bodyAccepted, wantCalls: []string{callState},
+			name: "users, no invitation, secret set", state: usersOnly(), secret: validSecret,
+			wantStatus: http.StatusOK, wantBody: bodyAccepted,
 		},
 		{
-			name: "users and invitation, secret set", states: []stateAnswer{reading(usersAndInvitation())}, secret: validSecret,
-			wantStatus: http.StatusOK, wantBody: bodyAccepted, wantCalls: []string{callState},
+			name: "users and first-run invitation, secret set", state: usersAndInvitation(), secret: validSecret,
+			wantStatus: http.StatusOK, wantBody: bodyAccepted,
 		},
 		{
-			name: "users, secret not set", states: []stateAnswer{reading(usersOnly())}, secret: "",
-			wantStatus: http.StatusOK, wantBody: bodyAccepted, wantCalls: []string{callState},
-		},
-		// An invitation is waiting: nothing to create, so the secret is not
-		// consulted either, and changing it later does nothing.
-		{
-			name: "invitation exists, secret set", states: []stateAnswer{reading(invited())}, secret: validSecret,
-			wantStatus: http.StatusOK, wantBody: bodyPending, wantCalls: []string{callState},
+			name: "users and another invitation, secret set", state: usersAndOtherInvitation(), secret: validSecret,
+			wantStatus: http.StatusOK, wantBody: bodyAccepted,
 		},
 		{
-			name: "invitation exists, secret since changed to garbage", states: []stateAnswer{reading(invited())}, secret: "x",
-			wantStatus: http.StatusOK, wantBody: bodyPending, wantCalls: []string{callState},
+			name: "users, secret not set", state: usersOnly(), secret: "",
+			wantStatus: http.StatusOK, wantBody: bodyAccepted,
 		},
-		// Nothing exists, so the status depends on the secret.
+		// A first-run invitation is waiting: the secret is not consulted, and
+		// changing it later does nothing.
 		{
-			name: "empty, no secret", states: []stateAnswer{reading(empty())}, secret: "",
-			wantStatus: http.StatusOK, wantBody: bodyMissing, wantCalls: []string{callState}, wantSecretRead: true,
-		},
-		{
-			name: "empty, valid secret creates", states: []stateAnswer{reading(empty())}, secret: validSecret,
-			create:     createAnswer{created: true, err: nil},
-			wantStatus: http.StatusOK, wantBody: bodyPending, wantCalls: []string{callState, callCreate}, wantSecretRead: true,
-		},
-		// The insert is refused: someone else got there between the read and
-		// the write. The state is read again to say what happened, and the
-		// answer is never "missing secret", because the secret is fine.
-		{
-			name: "refused, a concurrent request created the invitation", secret: validSecret,
-			states:     []stateAnswer{reading(empty()), reading(invited())},
-			create:     createAnswer{created: false, err: nil},
-			wantStatus: http.StatusOK, wantBody: bodyPending, wantCalls: []string{callState, callCreate, callState},
-			wantSecretRead: true,
+			name: "first-run invitation exists, secret set", state: invited(), secret: validSecret,
+			wantStatus: http.StatusOK, wantBody: bodyPending,
 		},
 		{
-			name: "refused, an account appeared", secret: validSecret,
-			states:     []stateAnswer{reading(empty()), reading(usersOnly())},
-			create:     createAnswer{created: false, err: nil},
-			wantStatus: http.StatusOK, wantBody: bodyAccepted, wantCalls: []string{callState, callCreate, callState},
-			wantSecretRead: true,
+			name: "first-run invitation exists, secret since changed to garbage", state: invited(), secret: "x",
+			wantStatus: http.StatusOK, wantBody: bodyPending,
 		},
 		{
-			name: "refused, the invitation was created and redeemed", secret: validSecret,
-			states:     []stateAnswer{reading(empty()), reading(usersAndInvitation())},
-			create:     createAnswer{created: false, err: nil},
-			wantStatus: http.StatusOK, wantBody: bodyAccepted, wantCalls: []string{callState, callCreate, callState},
-			wantSecretRead: true,
+			name: "first-run invitation exists, secret since removed", state: invited(), secret: "",
+			wantStatus: http.StatusOK, wantBody: bodyPending,
 		},
-		// Refused, and nothing first-run exists: an invitation of another type
-		// is in a database with no account, so no first-run invitation can ever
-		// be created. Setting the secret again would not help, so the status is
-		// not "missing secret".
+		// Nothing exists, so the status depends on the secret: with a valid one,
+		// registering with it creates the invitation, so setup is pending.
 		{
-			name: "refused, blocked by an invitation of another type", secret: validSecret,
-			states:     []stateAnswer{reading(empty()), reading(empty())},
-			create:     createAnswer{created: false, err: nil},
-			wantStatus: http.StatusConflict, wantBody: bodyBlocked, wantCalls: []string{callState, callCreate, callState},
-			wantSecretRead: true, wantCode: firstrun.CodeBlocked,
-		},
-		// Failures of the store pass through as the store classified them.
-		{
-			name: "the first read fails", secret: validSecret,
-			states:     []stateAnswer{{state: empty(), err: unavailable(store.CodeFirstRunCheckFailed)}},
-			wantStatus: http.StatusServiceUnavailable, wantBody: errorBody(store.CodeFirstRunCheckFailed, unavailableText),
-			wantCalls: []string{callState}, wantCode: store.CodeFirstRunCheckFailed,
+			name: "empty, no secret", state: empty(), secret: "",
+			wantStatus: http.StatusOK, wantBody: bodyMissing, wantSecretRead: true,
 		},
 		{
-			name: "the first read is malformed", secret: validSecret,
-			states: []stateAnswer{{
-				state: empty(),
-				err:   apierr.Wrap(errDB, apierr.Internal, store.CodeFirstRunCheckRejected, "internal error"),
-			}},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantCalls: []string{callState}, wantCode: store.CodeFirstRunCheckRejected,
+			name: "empty, invalid secret", state: empty(), secret: "x",
+			wantStatus: http.StatusOK, wantBody: bodyMissing, wantSecretRead: true,
 		},
 		{
-			name: "the insert fails", secret: validSecret, states: []stateAnswer{reading(empty())},
-			create:     createAnswer{created: false, err: unavailable(store.CodeFirstRunCreateFailed)},
-			wantStatus: http.StatusServiceUnavailable, wantBody: errorBody(store.CodeFirstRunCreateFailed, unavailableText),
-			wantCalls: []string{callState, callCreate}, wantSecretRead: true, wantCode: store.CodeFirstRunCreateFailed,
+			name: "empty, valid secret", state: empty(), secret: validSecret,
+			wantStatus: http.StatusOK, wantBody: bodyPending, wantSecretRead: true,
+		},
+		// An invitation of another type and no account: no first-run invitation
+		// can ever be created, so no secret helps. It is told apart from
+		// "missing secret", which would send the owner to set it again forever.
+		{
+			name: "another invitation and no account, secret set", state: otherInvited(), secret: validSecret,
+			wantStatus: http.StatusConflict, wantBody: bodyBlocked,
 		},
 		{
-			name: "the insert is rejected by the schema", secret: validSecret, states: []stateAnswer{reading(empty())},
-			create: createAnswer{
-				created: false, err: apierr.Wrap(errDB, apierr.Internal, store.CodeFirstRunCreateRejected, "internal error"),
-			},
-			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
-			wantCalls: []string{callState, callCreate}, wantSecretRead: true, wantCode: store.CodeFirstRunCreateRejected,
-		},
-		{
-			name: "the read after a refusal fails", secret: validSecret,
-			states:     []stateAnswer{reading(empty()), {state: empty(), err: unavailable(store.CodeFirstRunCheckFailed)}},
-			create:     createAnswer{created: false, err: nil},
-			wantStatus: http.StatusServiceUnavailable, wantBody: errorBody(store.CodeFirstRunCheckFailed, unavailableText),
-			wantCalls: []string{callState, callCreate, callState}, wantSecretRead: true, wantCode: store.CodeFirstRunCheckFailed,
+			name: "another invitation and no account, no secret", state: otherInvited(), secret: "",
+			wantStatus: http.StatusConflict, wantBody: bodyBlocked,
 		},
 	}
 
@@ -219,8 +156,7 @@ func TestStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rig := newRig(t, tt.states...)
-			rig.store.create = tt.create
+			rig := newRig(t, reading(tt.state))
 			rig.env[config.SecretFirstRun] = tt.secret
 
 			rec := rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
@@ -229,19 +165,15 @@ func TestStatus(t *testing.T) {
 				t.Errorf("response = %d %q, want %d %q", rec.Code, rec.Body.String(), tt.wantStatus, tt.wantBody)
 			}
 
-			if !slices.Equal(rig.store.calls, tt.wantCalls) {
-				t.Errorf("store calls = %v, want %v", rig.store.calls, tt.wantCalls)
+			if rig.store.calls != 1 {
+				t.Errorf("FirstRunState called %d times, want once", rig.store.calls)
 			}
 
 			if got := rig.reads[config.SecretFirstRun]; (got != 0) != tt.wantSecretRead {
 				t.Errorf("FIRST_RUN_SECRET read %d times, want a read: %t", got, tt.wantSecretRead)
 			}
 
-			wantCode := tt.wantCode
-			if len(rig.logged) != boolToInt(wantCode != "") || (wantCode != "" && rig.logged[0].Code != wantCode) {
-				t.Errorf("logged = %v, want one %q", rig.logged, wantCode)
-			}
-
+			wantBlockedLogged(t, rig, tt.wantStatus == http.StatusConflict)
 			wantSecretStays(t, rec.Header(), rec.Body.String(), tt.secret)
 
 			if rig.creds.calls != 0 {
@@ -251,12 +183,76 @@ func TestStatus(t *testing.T) {
 	}
 }
 
-func boolToInt(b bool) int {
-	if b {
-		return 1
+// wantBlockedLogged checks that the one failure the boundary logged is the
+// blocked database's when blocked, and that nothing was logged otherwise.
+func wantBlockedLogged(t *testing.T, rig *rig, blocked bool) {
+	t.Helper()
+
+	if !blocked {
+		if len(rig.logged) != 0 {
+			t.Errorf("logged = %v, want nothing", rig.logged)
+		}
+
+		return
 	}
 
-	return 0
+	if len(rig.logged) != 1 || rig.logged[0].Code != firstrun.CodeBlocked {
+		t.Errorf("logged = %v, want one %q", rig.logged, firstrun.CodeBlocked)
+	}
+}
+
+// TestStoreFailures holds that a failed read passes through as the store
+// classified it, with its fixed message, and never as a status.
+func TestStoreFailures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+		wantCode   string
+	}{
+		{
+			name: "the read fails", err: unavailable(store.CodeFirstRunCheckFailed),
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   errorBody(store.CodeFirstRunCheckFailed, unavailableText), wantCode: store.CodeFirstRunCheckFailed,
+		},
+		{
+			name:       "the read is malformed",
+			err:        apierr.Wrap(errDB, apierr.Internal, store.CodeFirstRunCheckRejected, "internal error"),
+			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantCode: store.CodeFirstRunCheckRejected,
+		},
+		{
+			// A store error that quoted its arguments: the boundary still sends
+			// only the fixed message.
+			name:       "the failure quotes the secret in its cause",
+			err:        apierr.Wrap(errLeaky, apierr.Unavailable, store.CodeFirstRunCheckFailed, unavailableText),
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   errorBody(store.CodeFirstRunCheckFailed, unavailableText), wantCode: store.CodeFirstRunCheckFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rig := newRig(t, stateAnswer{state: empty(), err: tt.err})
+			rig.env[config.SecretFirstRun] = validSecret
+
+			rec := rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
+
+			if rec.Code != tt.wantStatus || rec.Body.String() != tt.wantBody {
+				t.Errorf("response = %d %q, want %d %q", rec.Code, rec.Body.String(), tt.wantStatus, tt.wantBody)
+			}
+
+			if len(rig.logged) != 1 || rig.logged[0].Code != tt.wantCode {
+				t.Errorf("logged = %v, want one %q", rig.logged, tt.wantCode)
+			}
+
+			wantSecretStays(t, rec.Header(), rec.Body.String(), validSecret)
+		})
+	}
 }
 
 // wantSecretStays fails when secret, or a piece of it, is anywhere in a
@@ -285,51 +281,9 @@ func wantSecretStays(t *testing.T, headers http.Header, body, secret string) {
 	}
 }
 
-// TestCreatesTheInvitation checks what the insert is given: a fresh id, the
-// token (and so its hash), the label, the creation time from the injected clock
-// and an expiry exactly input.ExpiryHorizon after it, and that each is taken
-// from the injected source exactly once.
-func TestCreatesTheInvitation(t *testing.T) {
-	t.Parallel()
-
-	rig := newRig(t, reading(empty()))
-	rig.env[config.SecretFirstRun] = validSecret
-	rig.store.create = createAnswer{created: true, err: nil}
-
-	rec := rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
-	if rec.Code != http.StatusOK || rec.Body.String() != bodyPending {
-		t.Fatalf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), bodyPending)
-	}
-
-	token, err := input.ParseInvitationToken(validSecret)
-	if err != nil {
-		t.Fatalf("the fixture secret does not parse: %v", err)
-	}
-
-	want := createCall{
-		id: generatedID, token: validSecret, hash: string(token.Hash()), label: "First run: initial administrator",
-		expiresAt: rig.now.Add(10 * 365 * 24 * time.Hour), now: rig.now,
-	}
-
-	if len(rig.store.creates) != 1 || rig.store.creates[0] != want {
-		t.Errorf("created %v, want %v", rig.store.creates, want)
-	}
-
-	if want.expiresAt.Sub(want.now) != input.ExpiryHorizon {
-		t.Errorf("the expiry is %v after now, want input.ExpiryHorizon", want.expiresAt.Sub(want.now))
-	}
-
-	if rig.ids != 1 || rig.clockReads != 1 {
-		t.Errorf("NewID called %d times and Now %d times, want once each", rig.ids, rig.clockReads)
-	}
-}
-
 // TestSecretMustBeAnInvitationToken: only a complete invitation token is a
-// usable FIRST_RUN_SECRET. Every other value is "missing secret": the store is
-// asked for the state once and never to create, and the secret is never
-// described in the response.
-//
-//nolint:funlen // the case table is the test; splitting it would only scatter the cases
+// usable FIRST_RUN_SECRET. Every other value is "missing secret", and the secret
+// is never described in the response.
 func TestSecretMustBeAnInvitationToken(t *testing.T) {
 	t.Parallel()
 
@@ -371,22 +325,17 @@ func TestSecretMustBeAnInvitationToken(t *testing.T) {
 			t.Parallel()
 
 			rig := newRig(t, reading(empty()))
-			rig.store.create = createAnswer{created: true, err: nil}
 			rig.env[config.SecretFirstRun] = tt.secret
 
 			rec := rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
 
-			wantBody, wantCalls := bodyMissing, []string{callState}
+			wantBody := bodyMissing
 			if tt.valid {
-				wantBody, wantCalls = bodyPending, []string{callState, callCreate}
+				wantBody = bodyPending
 			}
 
 			if rec.Code != http.StatusOK || rec.Body.String() != wantBody {
 				t.Errorf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), wantBody)
-			}
-
-			if !slices.Equal(rig.store.calls, wantCalls) {
-				t.Errorf("store calls = %v, want %v", rig.store.calls, wantCalls)
 			}
 
 			if len(rig.logged) != 0 {
@@ -394,89 +343,6 @@ func TestSecretMustBeAnInvitationToken(t *testing.T) {
 			}
 
 			wantSecretStays(t, rec.Header(), rec.Body.String(), tt.secret)
-		})
-	}
-}
-
-// TestNothingIsGeneratedUnlessCreating checks that the id and the clock are used
-// only for an insert that is attempted.
-func TestNothingIsGeneratedUnlessCreating(t *testing.T) {
-	t.Parallel()
-
-	for _, state := range []store.FirstRunState{usersOnly(), usersAndInvitation(), invited(), empty()} {
-		rig := newRig(t, reading(state))
-
-		rec := rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rec.Code)
-		}
-
-		if rig.ids != 0 || rig.clockReads != 0 || len(rig.store.creates) != 0 {
-			t.Errorf("state %+v: ids %d, clock reads %d, inserts %v, want none",
-				state, rig.ids, rig.clockReads, rig.store.creates)
-		}
-	}
-}
-
-// TestRefusedInsertIsNotRetried checks that a refusal is
-// final: the route does not retry, so a deployment cannot be made to insert
-// twice.
-func TestRefusedInsertIsNotRetried(t *testing.T) {
-	t.Parallel()
-
-	rig := newRig(t, reading(empty()), reading(empty()))
-	rig.env[config.SecretFirstRun] = validSecret
-
-	rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
-
-	if len(rig.store.creates) != 1 {
-		t.Errorf("inserts = %d, want 1", len(rig.store.creates))
-	}
-}
-
-// TestSecretIsNotInAnyResponse checks the one rule of the route with a secret
-// that is a live admin credential: it is in no body and no header, on success
-// and failure, even when the store's own failure mentions it.
-func TestSecretIsNotInAnyResponse(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		states []stateAnswer
-		create createAnswer
-	}{
-		{name: "created", states: []stateAnswer{reading(empty())}, create: createAnswer{created: true, err: nil}},
-		{
-			name: "refused", states: []stateAnswer{reading(empty()), reading(invited())},
-			create: createAnswer{created: false, err: nil},
-		},
-		{
-			name: "blocked", states: []stateAnswer{reading(empty()), reading(empty())},
-			create: createAnswer{created: false, err: nil},
-		},
-		{
-			// A store error that quoted its arguments: the boundary still sends
-			// only the fixed message.
-			name: "the insert fails with the secret in its cause", states: []stateAnswer{reading(empty())},
-			create: createAnswer{
-				created: false,
-				err: apierr.Wrap(errLeaky, apierr.Unavailable,
-					store.CodeFirstRunCreateFailed, unavailableText),
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			rig := newRig(t, tt.states...)
-			rig.store.create = tt.create
-			rig.env[config.SecretFirstRun] = validSecret
-
-			rec := rig.serve(request{method: http.MethodGet, cookies: nil, body: "", contentType: ""})
-
-			wantSecretStays(t, rec.Header(), rec.Body.String(), validSecret)
 		})
 	}
 }
@@ -560,29 +426,9 @@ func TestHTTPContract(t *testing.T) {
 					rec.Code, rec.Header().Get("Allow"), tt.wantStatus, tt.wantAllow)
 			}
 
-			if len(rig.store.calls) != 0 || len(rig.reads) != 0 {
-				t.Errorf("a refused request did work: store %v, env %v", rig.store.calls, rig.reads)
+			if rig.store.calls != 0 || len(rig.reads) != 0 {
+				t.Errorf("a refused request did work: store calls %d, env %v", rig.store.calls, rig.reads)
 			}
 		})
-	}
-}
-
-// TestInvitationLabelIsOneTheSchemaAndTheParserAccept: the first-run label is
-// written straight to invitations.label and shown in the admin's list, so it
-// must fit the column's CHECK in bytes (read from the migrations' text) and be a label
-// the invitation parser would accept from a person, which is what the rest of
-// the system assumes every label is.
-func TestInvitationLabelIsOneTheSchemaAndTheParserAccept(t *testing.T) {
-	t.Parallel()
-
-	limit := migrationLimits(t, `length\(cast\(label AS BLOB\)\) <= (\d+)`)[0]
-
-	if size := len(firstrun.InvitationLabel); size == 0 || size > limit {
-		t.Errorf("the label is %d bytes; the schema allows up to %d", size, limit)
-	}
-
-	parsed, err := input.ParseInvitationLabel(firstrun.InvitationLabel)
-	if err != nil || parsed.String() != firstrun.InvitationLabel {
-		t.Errorf("the parser does not accept the first-run label as it is: %v", err)
 	}
 }

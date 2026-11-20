@@ -98,7 +98,7 @@ type Result struct {
 	//
 	// A statement that returns rows can report its own outcome in them, which
 	// is the one way to learn why a conditional write did nothing without a
-	// second, separate read: see CreateFirstRunInvitation.
+	// second, separate read: see updateNumInvitesQuery.
 	Rows [][]any
 }
 

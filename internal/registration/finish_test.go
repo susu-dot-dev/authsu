@@ -33,6 +33,9 @@ const (
 
 	userID1 = "00000000-0000-7000-8000-000000000001"
 	rowID2  = "00000000-0000-7000-8000-000000000002"
+	// firstRunID3 is the id offered for the first-run invitation: the third id
+	// finish asks for, after the user's and the passkey's.
+	firstRunID3 = "00000000-0000-7000-8000-000000000003"
 )
 
 // Where the parts of a challenge are (see package challenge).
@@ -599,6 +602,12 @@ func TestFinishSucceeds(t *testing.T) {
 				AAGUID:          tc.aaguid,
 				Transports:      tc.transports,
 				CreatedAt:       r.now,
+				// No first-run secret is configured in this rig, but what a
+				// write would need to create the invitation is always offered.
+				FirstRun:          nil,
+				FirstRunID:        firstRunID3,
+				FirstRunLabel:     registration.FirstRunLabel,
+				FirstRunExpiresAt: r.now.Add(input.ExpiryHorizon),
 			}
 
 			if len(r.store.created) != 1 || !sameAccount(r.store.created[0], wantAccount) {

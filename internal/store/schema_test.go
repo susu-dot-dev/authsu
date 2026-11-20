@@ -95,12 +95,13 @@ func worstNewAccount(t *testing.T) (string, string) {
 		transports[i] = strings.Repeat(`"`, 32)
 	}
 
-	fake := newFake(applied(2))
+	fake := newFake(applied(4))
 
 	err := fake.store().CreateAccount(context.Background(), store.NewAccount{
 		UserID: "u", UserHandle: []byte{1}, Role: "admin", Name: worstAccountName(t),
 		Token: mustInvitationToken(t, 1), InvitationType: "member", CredentialRowID: "c", CredentialID: []byte{1},
 		PublicKey: []byte{1}, Flags: 0, AAGUID: strings.Repeat("0", 36), Transports: transports, CreatedAt: now,
+		FirstRunID: "f", FirstRunLabel: "l", FirstRunExpiresAt: now,
 	})
 	if err != nil {
 		t.Fatalf("create worst-case account: %v", err)
@@ -108,8 +109,9 @@ func worstNewAccount(t *testing.T) (string, string) {
 
 	statements := fake.calls[0]
 
-	profile, _ := statements[0].Args[3].(string)
-	metadata, _ := statements[1].Args[5].(string)
+	// The batch is the first-run secret and invitation, the user, the passkey.
+	profile, _ := statements[2].Args[3].(string)
+	metadata, _ := statements[3].Args[5].(string)
 
 	return profile, metadata
 }
