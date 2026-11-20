@@ -32,7 +32,7 @@ make help    # every target
 
 Run the Worker through `make dev`, not `npx wrangler dev`: the Makefile applies migrations and overrides the relying party with `localhost` values, which Wrangler on its own does not.
 
-**Schema changes before the first production release:** nothing has shipped yet, so every schema change goes into the existing `migrations/0001_schema.sql`, edited in place (run `make db-reset` to pick it up locally). Do not add `0002` and later migrations until we start shipping to production; the append-only migration rules in [docs/DATABASE.md](docs/DATABASE.md) and [docs/runbook.md](docs/runbook.md) apply from that point on.
+**Schema changes:** migrations are append-only. Once a migration has been committed it is never edited; every schema change is a new, numbered migration file in `migrations/`. See [docs/DATABASE.md](docs/DATABASE.md) for the conventions and [docs/runbook.md](docs/runbook.md) for applying them to a deployment.
 
 ## Documentation
 
