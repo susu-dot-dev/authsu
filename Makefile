@@ -145,11 +145,12 @@ dev: migrate-local ## Run the Worker locally on :8787 (local D1, UI origin on :3
 	npx wrangler dev --local --port $(DEV_PORT) --persist-to $(DEV_STATE) $(DEV_ORIGIN_VARS)
 
 # ---- configuration ----------------------------------------------------------
-# AUTH_HMAC_SECRET and OAUTH_SIGNING_KEY (secrets) and API_ORIGIN, UI_ORIGIN (vars).
+# AUTH_HMAC_SECRET, OAUTH_SIGNING_KEY and FIRST_RUN_SECRET (secrets) and API_ORIGIN,
+# UI_ORIGIN (vars).
 # See docs/runbook.md, "Secrets and variables". scripts/config.sh does the work.
 
 .PHONY: config-get
-config-get: ## Show API_ORIGIN and UI_ORIGIN, whether AUTH_HMAC_SECRET and OAUTH_SIGNING_KEY are set (never their values)
+config-get: ## Show API_ORIGIN and UI_ORIGIN, whether AUTH_HMAC_SECRET, OAUTH_SIGNING_KEY and FIRST_RUN_SECRET are set (never their values)
 	@./scripts/config.sh get
 
 .PHONY: config-set-vars
@@ -169,6 +170,10 @@ config-set-secret: ## Generate AUTH_HMAC_SECRET and upload it (ARGS=--local for 
 .PHONY: config-set-signing-key
 config-set-signing-key: ## Generate OAUTH_SIGNING_KEY (RSA 2048) and upload it (ARGS=--local for .dev.vars; CONFIRM_SIGNING_KEY_ROTATE=1 to replace)
 	@./scripts/config.sh set-signing-key $(ARGS)
+
+.PHONY: config-set-first-run-secret
+config-set-first-run-secret: ## Generate FIRST_RUN_SECRET (an invitation token), upload it and print it once (ARGS=--local for .dev.vars; CONFIRM_FIRST_RUN_ROTATE=1 to replace)
+	@./scripts/config.sh set-first-run-secret $(ARGS)
 
 # ---- end-to-end tests -------------------------------------------------------
 # Runs the real Worker: the prebuilt wasm under `wrangler dev` (workerd with a

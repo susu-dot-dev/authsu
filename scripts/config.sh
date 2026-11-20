@@ -12,6 +12,10 @@
 #   config.sh set-signing-key          generate OAUTH_SIGNING_KEY (an RSA 2048 private
 #                                      key) and upload it
 #   config.sh set-signing-key --local  write it to .dev.vars instead of Cloudflare
+#   config.sh set-first-run-secret     generate FIRST_RUN_SECRET (a complete invitation
+#                                      token), upload it and print it once
+#   config.sh set-first-run-secret --local
+#                                      write it to .dev.vars instead of Cloudflare
 #   config.sh setup-local              create .dev.vars with AUTH_HMAC_SECRET,
 #                                      OAUTH_SIGNING_KEY and FIRST_RUN_SECRET, unless
 #                                      it already exists
@@ -37,6 +41,7 @@ WRANGLER="${WRANGLER:-npx wrangler}"
 
 SECRET=AUTH_HMAC_SECRET
 SIGNING_KEY=OAUTH_SIGNING_KEY
+FIRST_RUN=FIRST_RUN_SECRET
 VARS=(API_ORIGIN UI_ORIGIN)
 
 # Registration refuses a secret shorter than this (registration.MinSecretLen).
@@ -172,6 +177,7 @@ cmd_get() {
   echo "Secrets (encrypted, set on Cloudflare; their values can never be read back):"
   report_secret "$SECRET" "make config-set-secret"
   report_secret "$SIGNING_KEY" "make config-set-signing-key"
+  report_secret "$FIRST_RUN" "make config-set-first-run-secret; only needed until the first admin registers"
 
   echo
   if [ -f "$DEV_VARS" ]; then
@@ -289,6 +295,44 @@ cmd_set_signing_key() {
   echo "$SIGNING_KEY uploaded. Setting a secret deploys a new version of the Worker."
 }
 
+# generate_first_run_secret prints a complete invitation token: "susu_inv_" and
+# the same 43 base64url characters a secret has (input.ParseInvitationToken).
+generate_first_run_secret() {
+  printf 'susu_inv_%s' "$(generate_secret)"
+}
+
+# cmd_set_first_run_secret generates FIRST_RUN_SECRET and uploads it. Unlike the
+# other secrets it is printed, once and only after the upload succeeded, because
+# it is the invitation token the owner registers the first admin with and
+# Cloudflare cannot return it. With --local it goes to $DEV_VARS, which holds it.
+cmd_set_first_run_secret() {
+  local target=remote arg value
+  for arg in "$@"; do
+    case $arg in
+      --local) target=local ;;
+      *) usage ;;
+    esac
+  done
+
+  value="$(generate_first_run_secret)"
+
+  if [ "$target" = local ]; then
+    set_local "$FIRST_RUN" "$value" CONFIRM_FIRST_RUN_ROTATE
+    return
+  fi
+
+  if secret_present "$FIRST_RUN" && [ -z "${CONFIRM_FIRST_RUN_ROTATE:-}" ]; then
+    die "$FIRST_RUN is already set. A value set after the first registration does nothing, and one set before it replaces the token you registered with. Re-run with CONFIRM_FIRST_RUN_ROTATE=1 if that is intended."
+  fi
+
+  # The value goes over stdin, so it is never in argv or the process list.
+  printf '%s\n' "$value" | $WRANGLER secret put "$FIRST_RUN"
+  echo "$FIRST_RUN uploaded. Setting a secret deploys a new version of the Worker."
+  echo
+  echo "Register the first admin with this invitation token. It is shown only now:"
+  echo "  $value"
+}
+
 # set_local NAME VALUE CONFIRM_VAR -> writes NAME into $DEV_VARS, replacing a
 # line already there and leaving every other line alone. The file is created
 # 0600. An existing NAME is replaced only when the variable CONFIRM_VAR is set.
@@ -322,7 +366,7 @@ cmd_setup_local() {
   # 43 base64url characters a secret has (input.ParseInvitationToken).
   local hmac first key
   hmac="$(generate_secret)"
-  first="susu_inv_$(generate_secret)"
+  first="$(generate_first_run_secret)"
   key="$(generate_signing_key)"
   [ "${#key}" -ge "$MIN_SIGNING_KEY_LEN" ] || die "openssl did not produce a signing key"
 
@@ -339,6 +383,7 @@ main() {
     set-vars) cmd_set_vars "$@" ;;
     set-secret) cmd_set_secret "$@" ;;
     set-signing-key) cmd_set_signing_key "$@" ;;
+    set-first-run-secret) cmd_set_first_run_secret "$@" ;;
     setup-local) cmd_setup_local ;;
     -h | --help | help) usage 0 ;;
     *) usage ;;

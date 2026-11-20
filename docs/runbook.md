@@ -21,7 +21,7 @@ Which names exist, what each is for and what happens when one is missing is part
 
 ### Helper commands
 
-`scripts/config.sh`, through `make`, manages the deployment's own configuration. `make config-get` shows what is set (secret names only: their values cannot be read back), `AUTH_HMAC_SECRET` and `OAUTH_SIGNING_KEY` alike.
+`scripts/config.sh`, through `make`, manages the deployment's own configuration. `make config-get` shows what is set (secret names only: their values cannot be read back), `AUTH_HMAC_SECRET`, `OAUTH_SIGNING_KEY` and `FIRST_RUN_SECRET` alike.
 
 | Command | What it does |
 |---|---|
@@ -30,15 +30,18 @@ Which names exist, what each is for and what happens when one is missing is part
 | `make config-set-secret ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev` |
 | `make config-set-signing-key` | Generates an RSA 2048 key with `openssl` and uploads it as `OAUTH_SIGNING_KEY` with `wrangler secret put`, which deploys a new version (see [The OAuth signing key](#the-oauth-signing-key)) |
 | `make config-set-signing-key ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev` |
+| `make config-set-first-run-secret` | Generates a `FIRST_RUN_SECRET` in the invitation token shape (`susu_inv_` and 43 base64url characters), uploads it with `wrangler secret put`, which deploys a new version, and prints it once, after the upload succeeds. It is the token the first admin registers with and Cloudflare cannot return it, so save it. Refuses to replace an existing one unless `CONFIRM_FIRST_RUN_ROTATE=1` |
+| `make config-set-first-run-secret ARGS=--local` | The same, but writes `.dev.vars` (mode 0600) for `make dev`, and prints nothing |
 | `make setup-local` | Creates `.dev.vars` (mode 0600) with a generated `AUTH_HMAC_SECRET`, a generated `OAUTH_SIGNING_KEY` and a `FIRST_RUN_SECRET` in the invitation token shape (`susu_inv_` and 43 base64url characters), only if the file does not exist. An existing file is never read or changed: delete it to regenerate, or add a missing key with `make config-set-signing-key ARGS=--local` |
 | `make config-set-secret ARGS=--stdin` | Uploads a secret you supply on stdin instead of generating one |
 
 A secret is passed to Wrangler on stdin, so it is never on a command line, never printed and never written to disk (except by `--local`, which is the point).
 
-Three changes cannot be undone, so the helpers refuse them unless you opt in:
+These changes cannot be undone, so the helpers refuse them unless you opt in:
 
 - Replacing an existing `AUTH_HMAC_SECRET` (`CONFIRM_SECRET_ROTATE=1`). Ceremonies begun but not finished, and authorization requests waiting for approval, are invalidated.
 - Replacing an existing `OAUTH_SIGNING_KEY` (`CONFIRM_SIGNING_KEY_ROTATE=1`, for `--local` too). Every ID token already issued stops verifying.
+- Replacing an existing `FIRST_RUN_SECRET` (`CONFIRM_FIRST_RUN_ROTATE=1`, for `--local` too). Before the first registration it replaces the token you would register with; after the first invitation exists it does nothing at all ([first_run_design.md](first_run_design.md#closing-the-hole)).
 - Changing the host of a non-`localhost` `UI_ORIGIN` (`CONFIRM_RP_ID_CHANGE=1`). The relying party ID is that host and a passkey is bound to it, so this invalidates every registered passkey. Changing `API_ORIGIN` invalidates neither passkeys nor credentials.
 
 `set-vars` also checks that both values are bare origins (an `https://` origin with no path, query or user info, lower case; `http` only for localhost). Set them before the first registration, and never leave a value in `wrangler.jsonc` that you do not control.
@@ -73,7 +76,7 @@ Conventions for writing migrations are in [DATABASE.md](DATABASE.md). Applying t
 - **Always pass `--local`** for anything that is not a deliberate remote migration. Local and e2e use the same `DB` binding name as production but are simulated.
 - **Remote migrations are applied by hand.** Neither CI nor Workers Builds applies them, so apply a new migration to the target database before deploying code that needs it.
   - **Production:** `npx wrangler d1 migrations apply DB --remote`.
-- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. Once we ship to production, a migration on `main` is append-only and the fix is a new migration. Until the first production release nothing has been applied to a remote database, so schema changes are edited into `0001_schema.sql` in place (see the README).
+- **Iterating on an unmerged migration.** Wrangler records applied migrations by filename in `d1_migrations` and never re-runs or re-checks one, so editing a migration that is already applied to a database is silently ignored there. Do that iteration against the local database (`make db-reset`, then `make migrate-local`), never a remote one. A migration that has been committed is append-only, and the fix is a new migration.
 - The `database_id` in `wrangler.jsonc` is an identifier, not a secret.
 
 ## Deploying
