@@ -136,7 +136,9 @@ func (h *handlers) begin(call *auth.Call) result.Result[httpapi.Response] {
 // a client could otherwise tell apart (unknown, exhausted, revoked, expired) are
 // deliberately one answer. A failing lookup is the store's classified error.
 func (h *handlers) checkInvitation(call *auth.Call, token input.InvitationToken, now time.Time) error {
-	_, redeemable, err := h.store.RedeemableInvitationType(call.Request.Context, token, now)
+	firstRun := input.FirstRunSecret(call.Getenv)
+
+	_, redeemable, err := h.store.RedeemableInvitationType(call.Request.Context, token, firstRun, now)
 	if err != nil {
 		return err //nolint:wrapcheck // the store classifies its own failures
 	}

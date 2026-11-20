@@ -6,10 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +19,7 @@ import (
 )
 
 // *store.Store is what runs in production, so it must satisfy the interface the
-// route reads and writes through.
+// route reads through.
 var _ firstrun.Store = (*store.Store)(nil)
 
 // Causes the tests inject. They are only ever in the log, never in a response.
@@ -33,7 +29,7 @@ var (
 	errCredsRead = errors.New("the credential store was read")
 	// errLeaky is a store failure that quotes the secret, as a careless driver
 	// message might.
-	errLeaky = errors.New("INSERT INTO invitations ... " + validSecret)
+	errLeaky = errors.New("SELECT EXISTS ... " + validSecret)
 )
 
 const (
@@ -42,30 +38,34 @@ const (
 	validBody = "k3Jx9Qp-Zr2_LmN8vB5tYcD1fGhWaXeUoIiS7dTqA0E"
 	// validSecret is a complete invitation token, a valid FIRST_RUN_SECRET.
 	validSecret = "susu_inv_" + validBody
-	generatedID = "01990000-0000-7000-8000-00000000abcd"
 	jsonType    = "application/json"
 
 	unavailableText = "first-run status is temporarily unavailable"
 )
 
-// The names of the store calls in a call log.
-const (
-	callState  = "state"
-	callCreate = "create"
-)
-
 // The snapshots the database can be in.
-func empty() store.FirstRunState {
-	return store.FirstRunState{HasUsers: false, HasFirstRunInvitation: false}
-}
+func empty() store.FirstRunState { return store.FirstRunState{} }
+
+// invited is a database with a first-run invitation and no account.
 func invited() store.FirstRunState {
-	return store.FirstRunState{HasUsers: false, HasFirstRunInvitation: true}
+	return store.FirstRunState{HasInvitations: true, HasFirstRunInvitation: true}
 }
-func usersOnly() store.FirstRunState {
-	return store.FirstRunState{HasUsers: true, HasFirstRunInvitation: false}
-}
+
+// otherInvited is a database with an invitation of another type and no account.
+func otherInvited() store.FirstRunState { return store.FirstRunState{HasInvitations: true} }
+
+// usersOnly is a database with an account and no invitation at all.
+func usersOnly() store.FirstRunState { return store.FirstRunState{HasUsers: true} }
+
+// usersAndInvitation is a database with an account and a first-run invitation.
 func usersAndInvitation() store.FirstRunState {
-	return store.FirstRunState{HasUsers: true, HasFirstRunInvitation: true}
+	return store.FirstRunState{HasUsers: true, HasInvitations: true, HasFirstRunInvitation: true}
+}
+
+// usersAndOtherInvitation is a database with an account and an invitation of
+// another type.
+func usersAndOtherInvitation() store.FirstRunState {
+	return store.FirstRunState{HasUsers: true, HasInvitations: true}
 }
 
 // reading is a successful FirstRunState answer.
@@ -104,35 +104,17 @@ type stateAnswer struct {
 	err   error
 }
 
-// createAnswer is what CreateFirstRunInvitation returns.
-type createAnswer struct {
-	created bool
-	err     error
-}
-
-// createCall is one call of CreateFirstRunInvitation.
-type createCall struct {
-	id        string
-	token     string
-	hash      string
-	label     string
-	expiresAt time.Time
-	now       time.Time
-}
-
 // fakeStore is the first-run store. FirstRunState answers from a script, one
 // answer per call in order, and a call past the script is a test failure: the
-// number of reads is part of the behaviour. Every call is recorded in order.
+// number of reads is part of the behaviour.
 type fakeStore struct {
-	t       *testing.T
-	states  []stateAnswer
-	create  createAnswer
-	calls   []string
-	creates []createCall
+	t      *testing.T
+	states []stateAnswer
+	calls  int
 }
 
 func (f *fakeStore) FirstRunState(context.Context) (store.FirstRunState, error) {
-	f.calls = append(f.calls, callState)
+	f.calls++
 
 	if len(f.states) == 0 {
 		f.t.Error(errNotScript)
@@ -144,17 +126,6 @@ func (f *fakeStore) FirstRunState(context.Context) (store.FirstRunState, error) 
 	f.states = f.states[1:]
 
 	return answer.state, answer.err
-}
-
-func (f *fakeStore) CreateFirstRunInvitation(
-	_ context.Context, id string, token input.InvitationToken, label string, expiresAt, now time.Time,
-) (bool, error) {
-	f.calls = append(f.calls, callCreate)
-	f.creates = append(f.creates, createCall{
-		id: id, token: token.String(), hash: string(token.Hash()), label: label, expiresAt: expiresAt, now: now,
-	})
-
-	return f.create.created, f.create.err
 }
 
 // deadCredentials is the credential store of a boundary that must never read
@@ -187,10 +158,8 @@ type rig struct {
 	now   time.Time
 
 	// reads counts reads of each environment name.
-	reads map[string]int
-	// ids counts calls of NewID and clock reads counts calls of Now.
-	ids, clockReads int
-	logged          []*apierr.Error
+	reads  map[string]int
+	logged []*apierr.Error
 }
 
 // newRig is a deployment whose database answers states in order.
@@ -199,7 +168,7 @@ func newRig(t *testing.T, states ...stateAnswer) *rig {
 
 	return &rig{
 		t:     t,
-		store: &fakeStore{t: t, states: states, create: createAnswer{created: false, err: nil}, calls: nil, creates: nil},
+		store: &fakeStore{t: t, states: states, calls: 0},
 		creds: &deadCredentials{calls: 0},
 		env:   map[string]string{},
 		now:   time.Date(2026, time.November, 17, 9, 15, 30, 123456789, time.UTC),
@@ -209,19 +178,7 @@ func newRig(t *testing.T, states ...stateAnswer) *rig {
 
 // routes are the first-run routes over the rig's fakes.
 func (r *rig) routes() []auth.Route {
-	return firstrun.Routes(firstrun.Deps{
-		Store: r.store,
-		Now: func() time.Time {
-			r.clockReads++
-
-			return r.now
-		},
-		NewID: func() string {
-			r.ids++
-
-			return generatedID
-		},
-	})
+	return firstrun.Routes(firstrun.Deps{Store: r.store})
 }
 
 // handler is the real boundary over the real routes.
@@ -270,47 +227,4 @@ func (r *rig) serve(req request) *httptest.ResponseRecorder {
 	r.handler().ServeHTTP(rec, httpReq)
 
 	return rec
-}
-
-// migrationLimits reads the numbers a CHECK of the migrations states, by a
-// pattern whose capture groups are the numbers, over the migrations' text with
-// whitespace collapsed. A pattern that matches nothing fails the test, so a
-// reworded migration is noticed.
-func migrationLimits(t *testing.T, pattern string) []int {
-	t.Helper()
-
-	paths, err := filepath.Glob("../../migrations/*.sql")
-	if err != nil || len(paths) == 0 {
-		t.Fatalf("no migrations found: %v", err)
-	}
-
-	var text strings.Builder
-
-	for _, path := range paths {
-		raw, err := os.ReadFile(path) //nolint:gosec // the paths are a glob of the repository's own migrations
-		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
-		}
-
-		text.Write(raw)
-		text.WriteString("\n")
-	}
-
-	match := regexp.MustCompile(pattern).FindStringSubmatch(strings.Join(strings.Fields(text.String()), " "))
-	if match == nil {
-		t.Fatalf("no CHECK matches %s; was the migration text changed?", pattern)
-	}
-
-	limits := make([]int, 0, len(match)-1)
-
-	for _, captured := range match[1:] {
-		number, err := strconv.Atoi(captured)
-		if err != nil {
-			t.Fatalf("limit %q: %v", captured, err)
-		}
-
-		limits = append(limits, number)
-	}
-
-	return limits
 }

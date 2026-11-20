@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"strings"
 
+	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 )
 
@@ -60,6 +61,23 @@ func ParseInvitationToken(raw string) (InvitationToken, error) {
 	v, err := parseToken(raw, secret.TagInvitation, CodeInvalidInvitation, descInvalidInvitation)
 
 	return InvitationToken{v: v}, err
+}
+
+// FirstRunSecret returns the configured FIRST_RUN_SECRET as an invitation
+// token, or nil when it is unset or is not exactly a token
+// (ParseInvitationToken): "susu_inv_" and 43 canonical base64url characters. The
+// value is never trimmed or corrected, and a rejected one is never described, so
+// the secret cannot leak through an error or a log line.
+//
+// It is the one place that decides whether a deployment has a usable first-run
+// secret, so that the status route and registration cannot disagree about it.
+func FirstRunSecret(getenv func(string) string) *InvitationToken {
+	token, err := ParseInvitationToken(config.FirstRunSecret(getenv))
+	if err != nil {
+		return nil
+	}
+
+	return &token
 }
 
 // String returns the token exactly as it was parsed.

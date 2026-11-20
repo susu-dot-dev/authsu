@@ -118,6 +118,8 @@ The account and its first passkey are created together, because an account with 
 
 The new account's role is copied from the invitation in the same write. The client has no say in it, and this is how the first-run invitation produces the first admin with no admin-specific logic in registration.
 
+The first-run invitation is the one invitation that need not exist when `finish` runs: it is created by the same batch, ahead of the account, when the presented token is the configured first-run secret and the database has no invitation and no account ([first_run_design.md](first_run_design.md#the-invitation-is-created-by-the-registration-that-redeems-it)). Registration holds no first-run logic of its own for this. It passes the configured token to the store along with the registration, `begin`'s advisory check accepts it in the same case, and the conditions are statements of the write. Because it is one batch, a registration that is refused leaves no invitation behind.
+
 ## Verification
 
 What `finish` accepts is deliberately narrow, and everything outside it fails closed:

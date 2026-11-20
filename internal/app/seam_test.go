@@ -9,11 +9,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/config"
-	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -708,87 +706,40 @@ func TestBearerHandling(t *testing.T) {
 //nolint:gosec // a throwaway token that only the tests know
 const firstRunToken = "susu_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopA"
 
-// TestFirstRunCreatesTheInvitation: with the secret configured and an empty
-// database, the first status check creates the invitation. It is the one
-// write a stranger's request can cause, and it carries what the runtime
-// supplies: a UUIDv7 id (canonical text) shared by the invitation's secret and
-// its row, the hash of the token and not the token, the first-run type, the
-// current time as an integer, and an expiry ten years on.
-func TestFirstRunCreatesTheInvitation(t *testing.T) {
+// TestFirstRunStatusWritesNothing: with the secret configured and an empty
+// database, the status check says "pending" and only reads: it is one Exec call
+// of one statement, which is a SELECT. The first-run invitation is created by
+// the registration that redeems the secret, never by a request a stranger can
+// make.
+func TestFirstRunStatusWritesNothing(t *testing.T) {
 	t.Parallel()
 
 	env := fullEnv()
 	env[config.SecretFirstRun] = firstRunToken
 
-	created := []store.Result{{Changes: 1, Rows: nil}, {Changes: 1, Rows: [][]any{{someID}}}}
-
 	h := newHarness(t, env,
-		step{match: "has_users", results: rows([]any{int64(0), int64(0)}), err: nil},
-		step{match: "INSERT INTO secrets", results: created, err: nil},
+		step{match: "has_users", results: rows([]any{int64(0), int64(0), int64(0)}), err: nil},
 	)
 
-	before := time.Now().Unix()
 	rec := h.do(request{method: http.MethodGet, path: pathFirstRun})
-	after := time.Now().Unix()
 
 	if want := `{"status":"invitation_pending"}` + "\n"; rec.Code != http.StatusOK || rec.Body.String() != want {
 		t.Fatalf("= %d %s, want 200 %s", rec.Code, rec.Body, want)
 	}
 
-	checkFirstRunBatch(t, h.exec.calls[1], before, after)
+	calls := h.exec.calls
+	if len(calls) != 1 || len(calls[0]) != 1 || !strings.HasPrefix(strings.TrimSpace(calls[0][0].Query), "SELECT") {
+		t.Errorf("Exec calls = %v, want one call of one SELECT", calls)
+	}
 
 	if strings.Contains(rec.Body.String(), firstRunToken) {
 		t.Errorf("body leaks the secret: %s", rec.Body)
 	}
 }
 
-// checkFirstRunBatch checks the two statements of the first-run write: the
-// invitation's secret and its row, which share one id, and what each binds.
-func checkFirstRunBatch(t *testing.T, batch []store.Statement, before, after int64) {
-	t.Helper()
-
-	if len(batch) != 2 || len(batch[0].Args) != secretArgCreated+1 || len(batch[1].Args) != 6 {
-		t.Fatalf("insert batch = %v, want the secret (5 args) and the invitation (6 args)", batch)
-	}
-
-	secretArgs, invitationArgs := batch[0].Args, batch[1].Args
-
-	ids := []any{secretArgs[secretArgID], invitationArgs[0], invitationArgs[4]}
-	if !uuidV7.MatchString(asText(ids[0])) || !slices.Equal(ids, []any{ids[0], ids[0], ids[0]}) {
-		t.Errorf("ids = %v, want one canonical UUIDv7 throughout", ids)
-	}
-
-	hash := secret.Hash(firstRunToken)
-	if !slices.Equal(asBlob(secretArgs[secretArgHash]), hash[:]) {
-		t.Errorf("hash = %x, want the token's hash %x", secretArgs[secretArgHash], hash)
-	}
-
-	kinds := []any{secretArgs[secretArgKind], invitationArgs[1], invitationArgs[2]}
-	if want := []any{store.KindInvitation, store.KindInvitation, store.InvitationFirstRun}; !slices.Equal(kinds, want) {
-		t.Errorf("kinds and type = %v, want %v", kinds, want)
-	}
-
-	checkFirstRunTimes(t, secretArgs, before, after)
-}
-
-// checkFirstRunTimes checks that the first-run secret was created within
-// [before, after] and expires input.ExpiryHorizon later.
-func checkFirstRunTimes(t *testing.T, secretArgs []any, before, after int64) {
-	t.Helper()
-
-	createdAt, _ := secretArgs[secretArgCreated].(int64)
-	expires, _ := secretArgs[secretArgExpires].(int64)
-	horizon := int64(input.ExpiryHorizon / time.Second)
-
-	if createdAt < before || createdAt > after || expires != createdAt+horizon {
-		t.Errorf("created %d, expires %d, want a Unix time in [%d, %d] and an expiry %ds on",
-			createdAt, expires, before, after, horizon)
-	}
-}
-
 // TestFirstRunSecretMustBeAnInvitationToken: FIRST_RUN_SECRET is the first
 // invitation's token, so anything else is as good as no secret: the status
-// check reads the state, reports it missing and writes nothing.
+// check reads the state and reports it missing.
 func TestFirstRunSecretMustBeAnInvitationToken(t *testing.T) {
 	t.Parallel()
 
@@ -808,7 +759,7 @@ func TestFirstRunSecretMustBeAnInvitationToken(t *testing.T) {
 			env := fullEnv()
 			env[config.SecretFirstRun] = value
 
-			h := newHarness(t, env, step{match: "has_users", results: rows([]any{int64(0), int64(0)}), err: nil})
+			h := newHarness(t, env, step{match: "has_users", results: rows([]any{int64(0), int64(0), int64(0)}), err: nil})
 
 			rec := h.do(request{method: http.MethodGet, path: pathFirstRun})
 

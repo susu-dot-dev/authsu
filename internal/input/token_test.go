@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 )
@@ -266,6 +267,45 @@ func TestParseTokens(t *testing.T) {
 		t.Run(spec.name, func(t *testing.T) {
 			t.Parallel()
 			runStringTable(t, tokenCases(spec.tag), spec.parse, spec.code)
+		})
+	}
+}
+
+// TestFirstRunSecret holds that the configured first-run secret is usable
+// exactly when it is an invitation token: it is offered for every value
+// ParseInvitationToken accepts, as that token, and for no other, whether it is
+// unset or any of the near misses of the shared table. Nothing is trimmed.
+func TestFirstRunSecret(t *testing.T) {
+	t.Parallel()
+
+	valid := secret.Prefix(secret.TagInvitation) + strings.Repeat("A", secret.BodyLen)
+
+	cases := tokenCases(secret.TagInvitation)
+	cases = append(cases,
+		parseCase{"unset", "", false},
+		parseCase{"leading whitespace", " " + valid, false},
+		parseCase{"trailing newline", valid + "\n", false},
+	)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := input.FirstRunSecret(func(name string) string {
+				if name != config.SecretFirstRun {
+					t.Errorf("read %q, want only %q", name, config.SecretFirstRun)
+				}
+
+				return tc.in
+			})
+
+			if tc.ok != (got != nil) {
+				t.Fatalf("FirstRunSecret(%q) = %v, want usable = %v", tc.in, got, tc.ok)
+			}
+
+			if got != nil && got.String() != tc.in {
+				t.Errorf("FirstRunSecret(%q) = %q, want the value exactly as configured", tc.in, got.String())
+			}
 		})
 	}
 }

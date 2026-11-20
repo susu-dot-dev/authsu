@@ -76,7 +76,7 @@ func NewHandler(platform Platform) http.Handler {
 
 	routes := slices.Concat(
 		[]auth.Route{healthRoute()},
-		firstrun.Routes(firstrun.Deps{Store: db, Now: time.Now, NewID: newID}),
+		firstrun.Routes(firstrun.Deps{Store: db}),
 		registration.Routes(registration.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID}),
 		login.Routes(login.Deps{
 			Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID, IssueSession: auth.IssueSession,

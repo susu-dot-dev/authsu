@@ -1,7 +1,6 @@
 package registration
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/challenge"
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/store"
 	"github.com/susu-dot-dev/authsu/internal/webauthn"
@@ -116,15 +116,14 @@ var (
 // anything written.
 func (h *handlers) finish(call *auth.Call) result.Result[httpapi.Response] {
 	now := h.now()
-	ctx := call.Request.Context
 
 	return httpapi.Decode[finishBody](call.Request).
 		Then(parseFinish).
 		Then(func(cmd finishCommand) (FinishResponse, error) {
 			return result.Of(call.Config()).
 				Then(func(cfg config.Config) (verified, error) { return verifyCeremony(cfg, cmd, now) }).
-				Then(func(ok verified) (authorized, error) { return h.authorize(ctx, cmd, ok, now) }).
-				Then(func(ok authorized) (FinishResponse, error) { return h.createAccount(ctx, cmd, ok, now) }).
+				Then(func(ok verified) (authorized, error) { return h.authorize(call, cmd, ok, now) }).
+				Then(func(ok authorized) (FinishResponse, error) { return h.createAccount(call, cmd, ok, now) }).
 				Get()
 		}).
 		Map(func(out FinishResponse) httpapi.Response { return httpapi.JSON(http.StatusCreated, out) })
@@ -188,8 +187,9 @@ func invalidCredential(cause error) error {
 // its type grants. The read is advisory: createAccount's write re-checks every
 // condition, so a request that went stale since this read gets a clean 403
 // here and the race this read cannot close gets a 409 there.
-func (h *handlers) authorize(ctx context.Context, cmd finishCommand, ok verified, now time.Time) (authorized, error) {
-	invitationType, redeemable, err := h.store.RedeemableInvitationType(ctx, cmd.token, now)
+func (h *handlers) authorize(call *auth.Call, cmd finishCommand, ok verified, now time.Time) (authorized, error) {
+	invitationType, redeemable, err := h.store.RedeemableInvitationType(
+		call.Request.Context, cmd.token, input.FirstRunSecret(call.Getenv), now)
 	if err != nil {
 		return authorized{}, err //nolint:wrapcheck // the store classifies its own failures
 	}
@@ -210,24 +210,31 @@ func (h *handlers) authorize(ctx context.Context, cmd finishCommand, ok verified
 // createAccount writes the account and its first passkey. A conflict means the
 // invitation was used up or this registration was already submitted.
 func (h *handlers) createAccount(
-	ctx context.Context, cmd finishCommand, ok authorized, now time.Time,
+	call *auth.Call, cmd finishCommand, ok authorized, now time.Time,
 ) (FinishResponse, error) {
 	userID := h.newID()
 
-	err := h.store.CreateAccount(ctx, store.NewAccount{
-		UserID:          userID,
-		UserHandle:      ok.handle,
-		Role:            ok.role,
-		Name:            cmd.name,
-		Token:           cmd.token,
-		InvitationType:  ok.invitationType,
-		CredentialRowID: h.newID(),
-		CredentialID:    ok.credential.ID,
-		PublicKey:       ok.credential.PublicKey,
-		Flags:           ok.credential.Flags.Stored(),
-		AAGUID:          formatAAGUID(ok.credential.AAGUID),
-		Transports:      ok.credential.Transports,
-		CreatedAt:       now,
+	err := h.store.CreateAccount(call.Request.Context, store.NewAccount{
+		UserID:         userID,
+		UserHandle:     ok.handle,
+		Role:           ok.role,
+		Name:           cmd.name,
+		Token:          cmd.token,
+		InvitationType: ok.invitationType,
+		// What the write needs to create the first-run invitation, if this
+		// registration is the one that redeems the configured first-run secret.
+		// Its id is taken after the account's own, so those do not depend on it.
+		FirstRun:          input.FirstRunSecret(call.Getenv),
+		CredentialRowID:   h.newID(),
+		FirstRunID:        h.newID(),
+		FirstRunLabel:     FirstRunLabel,
+		FirstRunExpiresAt: now.Add(input.ExpiryHorizon),
+		CredentialID:      ok.credential.ID,
+		PublicKey:         ok.credential.PublicKey,
+		Flags:             ok.credential.Flags.Stored(),
+		AAGUID:            formatAAGUID(ok.credential.AAGUID),
+		Transports:        ok.credential.Transports,
+		CreatedAt:         now,
 	})
 	if errors.Is(err, store.ErrConflict) {
 		return FinishResponse{}, apierr.Wrap(err, apierr.Conflict, CodeAcceptFailed, descConflict)

@@ -16,6 +16,10 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -133,16 +137,25 @@ func brokenEntropy() io.Reader {
 }
 
 // redeemCall is one RedeemableInvitationType call: the token as the store
-// received it, the hash the store would look it up by, and the time.
+// received it, the hash the store would look it up by, the configured first-run
+// token it was given ("" for none) and the time.
 type redeemCall struct {
-	token string
-	hash  [sha256.Size]byte
-	now   time.Time
+	token    string
+	hash     [sha256.Size]byte
+	firstRun string
+	now      time.Time
 }
 
-// wantRedeem is the call a store receives for token at now.
+// wantRedeem is the call a store receives for token at now when the deployment
+// has no first-run secret configured.
 func wantRedeem(token string, now time.Time) redeemCall {
-	return redeemCall{token: token, hash: secret.Hash(token), now: now}
+	return wantRedeemWith(token, "", now)
+}
+
+// wantRedeemWith is the call a store receives for token at now when firstRun is
+// the configured first-run secret.
+func wantRedeemWith(token, firstRun string, now time.Time) redeemCall {
+	return redeemCall{token: token, hash: secret.Hash(token), firstRun: firstRun, now: now}
 }
 
 // fakeStore is the database as registration sees it. It records every call and
@@ -161,9 +174,14 @@ type fakeStore struct {
 }
 
 func (f *fakeStore) RedeemableInvitationType(
-	_ context.Context, token input.InvitationToken, now time.Time,
+	_ context.Context, token input.InvitationToken, firstRunToken *input.InvitationToken, now time.Time,
 ) (string, bool, error) {
-	f.redeemed = append(f.redeemed, redeemCall{token: token.String(), hash: [sha256.Size]byte(token.Hash()), now: now})
+	call := redeemCall{token: token.String(), hash: [sha256.Size]byte(token.Hash()), now: now}
+	if firstRunToken != nil {
+		call.firstRun = firstRunToken.String()
+	}
+
+	f.redeemed = append(f.redeemed, call)
 
 	if f.redeemErr != nil {
 		return "", false, f.redeemErr
@@ -755,4 +773,47 @@ func wantQuietSuccess(t *testing.T, r *rig, rec *httptest.ResponseRecorder) {
 		t.Errorf("cookies %v, logged %v: registering issues no session and logs nothing",
 			rec.Result().Cookies(), r.logged)
 	}
+}
+
+// migrationLimits reads the numbers a CHECK of the migrations states, by a
+// pattern whose capture groups are the numbers, over the migrations' text with
+// whitespace collapsed. A pattern that matches nothing fails the test, so a
+// reworded migration is noticed.
+func migrationLimits(t *testing.T, pattern string) []int {
+	t.Helper()
+
+	paths, err := filepath.Glob("../../migrations/*.sql")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no migrations found: %v", err)
+	}
+
+	var text strings.Builder
+
+	for _, path := range paths {
+		raw, err := os.ReadFile(path) //nolint:gosec // the paths are a glob of the repository's own migrations
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+
+		text.Write(raw)
+		text.WriteString("\n")
+	}
+
+	match := regexp.MustCompile(pattern).FindStringSubmatch(strings.Join(strings.Fields(text.String()), " "))
+	if match == nil {
+		t.Fatalf("no CHECK matches %s; was the migration text changed?", pattern)
+	}
+
+	limits := make([]int, 0, len(match)-1)
+
+	for _, captured := range match[1:] {
+		number, err := strconv.Atoi(captured)
+		if err != nil {
+			t.Fatalf("limit %q: %v", captured, err)
+		}
+
+		limits = append(limits, number)
+	}
+
+	return limits
 }

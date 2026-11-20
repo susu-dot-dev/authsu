@@ -76,13 +76,17 @@ func regSeedInvitation(t *testing.T, id, code, kind string, numInvites int, extr
 	seed(t, "INSERT INTO invitations (id, type, label, num_invites) VALUES (?, ?, 'e2e', ?)", id, kind, numInvites)
 }
 
-// regSeedAdminAndFirstRun is the state of a registered first admin, as the
-// Worker leaves it, so later tests can add invitations of their own.
+// regOpenFirstRun is a fresh deployment, in which the first admin can register
+// with the configured first-run secret. The invitation is not stored: it is
+// created by the registration that redeems it, in the same write as the
+// account, so nothing is written here and the status is only read.
 func regOpenFirstRun(t *testing.T) {
 	t.Helper()
 
 	reset(t)
 	frExpectStatus(t, "open first run", frPending)
+	expectCount(t, "invitations", "0")
+	expectCount(t, "secrets", "0")
 }
 
 // regDecode parses a response body into v.
@@ -1009,8 +1013,12 @@ func regRun(t *testing.T, rows []regRefusal) {
 				t.Errorf("finish = %d %s, want %d %s", got.status, got.body, tt.wantStatus, tt.wantCode)
 			}
 
+			// A refused registration leaves nothing behind, the first-run
+			// invitation included: it is created only by the write that also
+			// creates the account.
 			regExpectNothingWritten(t, tt.name)
-			expectCount(t, "invitations", "1")
+			expectCount(t, "invitations", "0")
+			expectCount(t, "secrets", "0")
 		})
 	}
 }
@@ -2311,23 +2319,47 @@ func TestRegistrationSecondAccountViaFirstRun(t *testing.T) {
 // states next to the first-run one and proves none lets a registration through:
 // only the exact code of a redeemable, role-bearing invitation does.
 //
+// The first-run invitation is created by the first registration, and only on a
+// database with no invitation at all (docs/first_run_design.md, stage 1). So the
+// bystanders are added after the first admin registered, and the two checks that
+// follow are that they stay refused and that, had they existed first, first run
+// could not have started.
+//
 //nolint:paralleltest // shares one database
 func TestRegistrationOtherInvitationsAreInert(t *testing.T) {
-	regOpenFirstRun(t)
+	t.Run("after the first admin", func(t *testing.T) {
+		regOpenFirstRun(t)
+		registerWith(t, "Admin")
 
-	// An already revoked, expired and exhausted invitation of the first_run type
-	// cannot exist beside the live one (the type is unique by construction); use
-	// the role-less type for the bystanders.
-	regSeedInvitation(t, idInvitationA, regSpareCode, regNoRoleType, 5, "revoked")
-	regSeedInvitation(t, idInvitationB, regNoRoleCode, regNoRoleType, 5, "expired")
+		// An already revoked and an already expired invitation of the role-less
+		// type: the first_run type is unique by construction.
+		regSeedInvitation(t, idInvitationA, regSpareCode, regNoRoleType, 5, "revoked")
+		regSeedInvitation(t, idInvitationB, regNoRoleCode, regNoRoleType, 5, "expired")
 
-	for _, code := range []string{regSpareCode, regNoRoleCode} {
-		beginRegistration(t, code, "Alice").expect(t, "begin with "+code, http.StatusForbidden, regCodeInvalid)
-	}
+		for _, code := range []string{regSpareCode, regNoRoleCode} {
+			beginRegistration(t, code, "Alice").expect(t, "begin with "+code, http.StatusForbidden, regCodeInvalid)
+		}
 
-	// The live one still works.
-	registerWith(t, "Admin")
-	expectCount(t, "users", "1")
+		expectCount(t, "users", "1")
+	})
+
+	t.Run("before it: an invitation of another type blocks first run", func(t *testing.T) {
+		regOpenFirstRun(t)
+		regSeedInvitation(t, idInvitationA, regSpareCode, regNoRoleType, 5, "")
+
+		// The configured secret is no longer redeemable, because the first-run
+		// invitation can no longer be created.
+		beginRegistration(t, firstRunSecret, "Alice").
+			expect(t, "begin with the secret", http.StatusForbidden, regCodeInvalid)
+
+		// The bystander's type grants no role, and begin only reads, so it is
+		// accepted there as it is today; what the test holds is that it does not
+		// let the first admin in by any route, and that nothing was written.
+		expectCount(t, "users", "0")
+		expectCount(t, "credentials", "0")
+		expectCount(t, "invitations", "1")
+		expectCount(t, "secrets", "1")
+	})
 }
 
 // TestRegistrationFirstRunIgnoresTheCap seeds a first_run invitation that allows

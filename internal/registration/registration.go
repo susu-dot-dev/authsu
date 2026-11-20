@@ -11,6 +11,13 @@
 // the challenge, then creates the account and credential in one store
 // operation whose conditions enforce the invitation.
 //
+// The first admin registers like anyone else, with the first-run secret as the
+// invitation token (docs/first_run_design.md). That invitation is not stored
+// beforehand: finish's write creates it in the same batch as the account, when
+// the token is the configured FIRST_RUN_SECRET and the database has no
+// invitation and no account, and begin accepts the token in the same case. Both
+// are decided against the configuration read on that request.
+//
 // Both routes are open (auth.None): the caller has no session yet.
 package registration
 
@@ -39,6 +46,10 @@ const (
 	// minutes.
 	ChallengeTTL = 5 * time.Minute
 
+	// FirstRunLabel is the admin-facing label of the first-run invitation, so it
+	// is recognisable in an invitation list.
+	FirstRunLabel = "First run: initial administrator"
+
 	// MaxBeginBody caps the begin request, which is two short strings (a real
 	// one is about 100 bytes). A name is escaped in JSON, at worst six bytes
 	// per byte, so this leaves room for the longest valid one.
@@ -57,12 +68,18 @@ const (
 // Store is the part of the store registration uses. *store.Store satisfies it.
 type Store interface {
 	// RedeemableInvitationType returns the type of the invitation the token names
-	// when it is redeemable at now, and false when it is not. It is advisory:
-	// CreateAccount decides.
-	RedeemableInvitationType(ctx context.Context, token input.InvitationToken, now time.Time) (string, bool, error)
+	// when it is redeemable at now, and false when it is not. firstRun is the
+	// configured first-run token, or nil: a token equal to it is redeemable as
+	// the first-run invitation while there is no invitation and no account, even
+	// though none is stored yet. It is advisory: CreateAccount decides.
+	RedeemableInvitationType(
+		ctx context.Context, token input.InvitationToken, firstRun *input.InvitationToken, now time.Time,
+	) (string, bool, error)
 
-	// CreateAccount creates the account and its first passkey, and reports
-	// store.ErrConflict when the registration cannot stand.
+	// CreateAccount creates the account and its first passkey, creating the
+	// first-run invitation in the same batch when the token is the configured
+	// first-run secret and the database is empty. It reports store.ErrConflict
+	// when the registration cannot stand.
 	CreateAccount(ctx context.Context, account store.NewAccount) error
 }
 
@@ -77,8 +94,9 @@ type Deps struct {
 	// Entropy supplies random bytes (crypto/rand.Reader in production). It
 	// is where the challenge's nonce, which is the user handle, comes from.
 	Entropy io.Reader
-	// NewID returns a fresh UUIDv7 in canonical text form, for the user and
-	// the credential row.
+	// NewID returns a fresh UUIDv7 in canonical text form, for the user, the
+	// credential row and the first-run invitation, should this registration
+	// create it.
 	NewID func() string
 }
 

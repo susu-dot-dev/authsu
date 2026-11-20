@@ -146,7 +146,7 @@ func coreInventory() []inventoryRoute {
 		},
 		{
 			method: http.MethodGet, path: "/api/first-run",
-			script:     []step{{match: "has_users", results: rows([]any{int64(1), int64(1)}), err: nil}},
+			script:     []step{{match: "has_users", results: rows([]any{int64(1), int64(1), int64(1)}), err: nil}},
 			wantStatus: http.StatusOK, wantBody: `{"status":"invitation_accepted"}` + "\n", wantCalls: 1,
 		},
 		{
@@ -476,7 +476,7 @@ func TestBodyLimits(t *testing.T) {
 	tests := map[string]limitCase{
 		"health": {http.MethodGet, "/healthz", defaultCap, http.StatusOK, nil},
 		"first run": {http.MethodGet, "/api/first-run", defaultCap, http.StatusOK,
-			[]step{{match: "has_users", results: rows([]any{int64(1), int64(1)}), err: nil}}},
+			[]step{{match: "has_users", results: rows([]any{int64(1), int64(1), int64(1)}), err: nil}}},
 		"register begin":    {http.MethodPost, "/api/register/begin", 4 << 10, http.StatusBadRequest, nil},
 		"register finish":   {http.MethodPost, "/api/register/finish", 32 << 10, http.StatusBadRequest, nil},
 		"login begin":       {http.MethodPost, "/api/login/begin", 1 << 10, http.StatusOK, nil},
@@ -596,7 +596,9 @@ func TestNoneRoutes(t *testing.T) {
 
 	const firstRunQuery = "has_users"
 
-	state := func(users, invitation any) []store.Result { return rows([]any{users, invitation}) }
+	state := func(users, invitations, firstRun any) []store.Result {
+		return rows([]any{users, invitations, firstRun})
+	}
 
 	tests := map[string]struct {
 		env        map[string]string
@@ -610,17 +612,17 @@ func TestNoneRoutes(t *testing.T) {
 	}{
 		"first run: an account exists": {
 			env: fullEnv(), method: http.MethodGet, path: "/api/first-run",
-			script:     []step{{match: firstRunQuery, results: state(int64(1), int64(0)), err: nil}},
+			script:     []step{{match: firstRunQuery, results: state(int64(1), int64(0), int64(0)), err: nil}},
 			wantStatus: http.StatusOK, wantBody: `{"status":"invitation_accepted"}`,
 		},
 		"first run: invitation waiting": {
 			env: fullEnv(), method: http.MethodGet, path: "/api/first-run",
-			script:     []step{{match: firstRunQuery, results: state(int64(0), int64(1)), err: nil}},
+			script:     []step{{match: firstRunQuery, results: state(int64(0), int64(1), int64(1)), err: nil}},
 			wantStatus: http.StatusOK, wantBody: `{"status":"invitation_pending"}`,
 		},
 		"first run: nothing, no secret": {
 			env: fullEnv(), method: http.MethodGet, path: "/api/first-run",
-			script:     []step{{match: firstRunQuery, results: state(int64(0), int64(0)), err: nil}},
+			script:     []step{{match: firstRunQuery, results: state(int64(0), int64(0), int64(0)), err: nil}},
 			wantStatus: http.StatusOK, wantBody: `{"status":"missing_secret"}`,
 		},
 		"first run: database down": {
@@ -631,7 +633,7 @@ func TestNoneRoutes(t *testing.T) {
 		},
 		"first run: boolean as float": {
 			env: fullEnv(), method: http.MethodGet, path: "/api/first-run",
-			script:     []step{{match: firstRunQuery, results: state(float64(1), int64(0)), err: nil}},
+			script:     []step{{match: firstRunQuery, results: state(float64(1), int64(0), int64(0)), err: nil}},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal,
 			wantLogged: []string{store.CodeFirstRunCheckRejected},
 		},
