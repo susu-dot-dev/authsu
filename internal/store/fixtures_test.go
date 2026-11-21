@@ -177,6 +177,17 @@ func mustAPIKeyToken(tb testing.TB, seed byte) input.APIKeyToken {
 // seed: what a caller hands the store as secret.Hash(token)[:].
 func hashOf(seed byte) []byte { return bytes.Repeat([]byte{seed}, sha256.Size) }
 
+func mustEmail(tb testing.TB, raw string) input.Email {
+	tb.Helper()
+
+	email, err := input.ParseEmail(raw)
+	if err != nil {
+		tb.Fatalf("parse email %q: %v", raw, err)
+	}
+
+	return email
+}
+
 func mustName(tb testing.TB, raw string) input.AccountName {
 	tb.Helper()
 

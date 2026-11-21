@@ -517,7 +517,7 @@ func (p passkey) registrationBody(t *testing.T, challenge, code, name string) st
 	id := b64(p.credID)
 
 	body, err := json.Marshal(map[string]any{
-		"invitationCode": code, "name": name,
+		"invitationCode": code, "name": name, "email": registeredEmail,
 		"credential": map[string]any{
 			"id": id, "rawId": id, typeMember: "public-key",
 			"response": map[string]any{

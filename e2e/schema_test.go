@@ -260,6 +260,58 @@ func TestSchemaSecretsAreBounded(t *testing.T) {
 	})
 }
 
+// TestSchemaUserProfileIsBounded: the CHECK of users.profile, against the real
+// SQLite, is the backstop of the parsers' bounds on the name and the email. It
+// counts characters, not bytes, and accepts only JSON stored as text.
+//
+//nolint:paralleltest // shares one database
+func TestSchemaUserProfileIsBounded(t *testing.T) {
+	schemaWorld(t)
+
+	const insert = "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
+		"VALUES (?, randomblob(16), 'member', ?, ?, 1)"
+
+	// padded is a profile whose name member makes it n characters in all.
+	padded := func(filler string, n int) string {
+		const syntax = len(`{"name":""}`)
+
+		return `{"name":"` + strings.Repeat(filler, n-syntax) + `"}`
+	}
+
+	// The worst case the parsers allow: a 128-byte name of angle brackets, each
+	// escaped to six bytes, and a 200-byte email.
+	worst := `{"name":"` + strings.Repeat(`\u003c`, 128) + `","email":"` + strings.Repeat("e", 200) + `"}`
+
+	tests := []struct {
+		name    string
+		profile any
+		want    bool // refused
+	}{
+		{"the worst case the parsers allow", worst, false},
+		{"1024 characters", padded("a", 1024), false},
+		{"1025 characters", padded("a", 1025), true},
+		{"1024 two-byte characters (2048 bytes)", padded("\u00e9", 1024), false},
+		{"1025 two-byte characters", padded("\u00e9", 1025), true},
+		{"1024 four-byte characters (4096 bytes)", padded("\U0001f600", 1024), false},
+		{"1025 four-byte characters", padded("\U0001f600", 1025), true},
+		{"the default", "{}", false},
+		{"not JSON", `{"name":`, true},
+		{"empty", "", true},
+		{"a NUL then valid JSON", "\x00{}", true},
+		{"JSON stored as a BLOB", []byte(`{"name":"a"}`), true},
+		{"no profile at all", nil, true},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := refused(t, insert, idN("0f70", i+1), idInvitationA, tt.profile)
+			if got != tt.want {
+				t.Errorf("refused = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestSchemaDeletionGoesBothWays: a secret and its kind's row exist together
 // and are removed together, whichever side the delete starts from, and however
 // far above them it starts. A foreign key cascades from the secret down to its

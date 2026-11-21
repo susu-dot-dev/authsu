@@ -87,7 +87,7 @@ func bndRoutes() []bndRoute {
 
 // bndPublicRoutes are the routes that need no credential.
 func bndPublicRoutes() []bndRoute {
-	const regBegin = `{"invitationCode":"x","name":"n"}`
+	const regBegin = `{"invitationCode":"x","name":"n","email":"n@example.com"}`
 
 	return []bndRoute{
 		bndRouteOf("healthz", http.MethodGet, "/healthz", bndPublic, bndDefaultMB, "", ""),
@@ -2732,7 +2732,7 @@ func TestBndNoInternalsInErrorBodies(t *testing.T) {
 			req: request{
 				method: http.MethodPost,
 				path:   "/api/register/begin",
-				body:   []byte(`{"invitationCode":"` + strings.Repeat("A", 43) + `","name":"n"}`),
+				body:   []byte(`{"invitationCode":"` + strings.Repeat("A", 43) + `","name":"n","email":"n@example.com"}`),
 			},
 			status: -1,
 		},

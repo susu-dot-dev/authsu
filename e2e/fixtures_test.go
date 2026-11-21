@@ -83,6 +83,7 @@ const (
 	memberChallenge      = "challenge"
 	memberInvitationCode = "invitationCode"
 	memberName           = "name"
+	memberEmail          = "email"
 	memberClientData     = "clientDataJSON"
 	memberAttStmt        = "attStmt"
 	memberFmt            = "fmt"
@@ -418,8 +419,16 @@ func coseES256(t *testing.T, x, y []byte) []byte {
 	return mustCBOR(t, map[int64]any{1: 2, 3: -7, -1: 1, -2: x, -3: y})
 }
 
-// finishBody builds the POST /api/register/finish body answering options.
+// finishBody builds the POST /api/register/finish body answering options, for
+// the email address every registration uses unless a test says otherwise.
 func (a authenticator) finishBody(t *testing.T, options creationOptions, code, name string) []byte {
+	t.Helper()
+
+	return a.finishBodyFor(t, options, code, name, testEmail)
+}
+
+// finishBodyFor is finishBody for an email address of the test's choosing.
+func (a authenticator) finishBodyFor(t *testing.T, options creationOptions, code, name, email string) []byte {
 	t.Helper()
 
 	clientData := mustJSON(t, map[string]any{
@@ -435,6 +444,7 @@ func (a authenticator) finishBody(t *testing.T, options creationOptions, code, n
 	return mustJSON(t, map[string]any{
 		memberInvitationCode: code,
 		memberName:           name,
+		memberEmail:          email,
 		"credential": map[string]any{
 			"id": id, "rawId": id, memberType: "public-key",
 			"response": map[string]any{
@@ -484,18 +494,37 @@ func (a authenticator) attestationObject(t *testing.T) []byte {
 	})
 }
 
-// beginRegistration posts a register begin for code and name.
+// beginRegistration posts a register begin for code and name, with the email
+// address every registration uses unless a test says otherwise.
 func beginRegistration(t *testing.T, code, name string) reply {
 	t.Helper()
 
-	return post(t, pathRegisterBegin, mustJSON(t, map[string]string{memberInvitationCode: code, memberName: name}), "")
+	return beginRegistrationFor(t, code, name, testEmail)
+}
+
+// beginRegistrationFor is beginRegistration for an email address of the test's
+// choosing.
+func beginRegistrationFor(t *testing.T, code, name, email string) reply {
+	t.Helper()
+
+	return post(t, pathRegisterBegin, mustJSON(t, map[string]string{
+		memberInvitationCode: code, memberName: name, memberEmail: email,
+	}), "")
 }
 
 // mustBeginRegistration begins a registration and decodes the options.
 func mustBeginRegistration(t *testing.T, code, name string) creationOptions {
 	t.Helper()
 
-	got := beginRegistration(t, code, name)
+	return mustBeginRegistrationFor(t, code, name, testEmail)
+}
+
+// mustBeginRegistrationFor is mustBeginRegistration for an email address of the
+// test's choosing.
+func mustBeginRegistrationFor(t *testing.T, code, name, email string) creationOptions {
+	t.Helper()
+
+	got := beginRegistrationFor(t, code, name, email)
 	if got.status != http.StatusOK {
 		t.Fatalf("register begin = %d %s, want 200", got.status, got.body)
 	}

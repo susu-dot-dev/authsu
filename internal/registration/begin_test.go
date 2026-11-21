@@ -13,6 +13,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/challenge"
 	"github.com/susu-dot-dev/authsu/internal/config"
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -28,8 +29,8 @@ func TestBeginSucceeds(t *testing.T) {
 	rec := r.begin(testName)
 
 	// The same challenge, made independently from the same entropy.
-	made, handle, err := challenge.Create(
-		r.config().RegistrationKey, counterEntropy(), r.now.Add(5*time.Minute), registrationAD(testCode, testName)...)
+	made, handle, err := challenge.Create(r.config().RegistrationKey, counterEntropy(), r.now.Add(5*time.Minute),
+		registrationAD(testCode, testName, testEmail)...)
 	if err != nil {
 		t.Fatalf("challenge: %v", err)
 	}
@@ -53,6 +54,39 @@ func TestBeginSucceeds(t *testing.T) {
 	if len(r.store.created) != 0 || r.ids != 0 {
 		t.Errorf("begin created %d accounts and allocated %d ids: nothing may exist before finish",
 			len(r.store.created), r.ids)
+	}
+}
+
+// emailOfLength returns a well-formed address of exactly n bytes, with the
+// longest local part and domain labels the parser allows, so that only its total
+// length can make it acceptable or not. n must be between 194 and 256.
+func emailOfLength(n int) string {
+	const (
+		local     = 64
+		fullLabel = 63
+		// The local part, "@", two full labels and the two dots between labels.
+		fixed = local + 1 + 2*fullLabel + 2
+	)
+
+	return strings.Repeat("a", local) + "@" + strings.Repeat("b", fullLabel) + "." +
+		strings.Repeat("b", fullLabel) + "." + strings.Repeat("c", n-fixed)
+}
+
+// TestBeginAcceptsTheLongestEmail: an address of exactly MaxEmailBytes is
+// accepted at the route, so the bound the parser enforces is the one the
+// profile column was sized for, not a smaller one.
+func TestBeginAcceptsTheLongestEmail(t *testing.T) {
+	t.Parallel()
+
+	email := emailOfLength(input.MaxEmailBytes)
+	if len(email) != input.MaxEmailBytes {
+		t.Fatalf("test address is %d bytes, want %d", len(email), input.MaxEmailBytes)
+	}
+
+	r := newRig(t)
+
+	if rec := r.post(registration.PathBegin, beginJSONWithEmail(testCode, testName, email)); rec.Code != http.StatusOK {
+		t.Errorf("begin with an address of %d bytes = %d %q, want 200", len(email), rec.Code, rec.Body.String())
 	}
 }
 
@@ -155,7 +189,7 @@ func TestBeginChallengeIsBoundAndExpires(t *testing.T) {
 	handle := unb64(t, options.PublicKey.User.ID)
 	cfg := r.config()
 
-	this := registrationAD(testCode, testName)
+	this := registrationAD(testCode, testName, testEmail)
 	cases := []struct {
 		name string
 		key  []byte
@@ -166,9 +200,12 @@ func TestBeginChallengeIsBoundAndExpires(t *testing.T) {
 		{"this token and name", cfg.RegistrationKey, this, 0, true},
 		{"one second before the TTL", cfg.RegistrationKey, this, ttl - time.Second, true},
 		{"exactly the TTL", cfg.RegistrationKey, this, ttl, false},
-		{"another token", cfg.RegistrationKey, registrationAD(otherCode, testName), 0, false},
-		{"another name", cfg.RegistrationKey, registrationAD(testCode, "Bob"), 0, false},
-		{"token and name swapped", cfg.RegistrationKey, registrationAD(testName, testCode), 0, false},
+		{"another token", cfg.RegistrationKey, registrationAD(otherCode, testName, testEmail), 0, false},
+		{"another name", cfg.RegistrationKey, registrationAD(testCode, "Bob", testEmail), 0, false},
+		{"another email", cfg.RegistrationKey, registrationAD(testCode, testName, "bob@example.com"), 0, false},
+		{"token and name swapped", cfg.RegistrationKey, registrationAD(testName, testCode, testEmail), 0, false},
+		{"name and email swapped", cfg.RegistrationKey, registrationAD(testCode, testEmail, testName), 0, false},
+		{"no email", cfg.RegistrationKey, [][]byte{[]byte(testCode), []byte(testName)}, 0, false},
 		{"no associated data", cfg.RegistrationKey, nil, 0, false},
 		{"the login key", cfg.LoginKey, this, 0, false},
 	}
@@ -228,6 +265,10 @@ func refusedRequests() []beginFailure {
 		return malformed(name, body, codeInvalidName, msgInvalidName)
 	}
 
+	badEmail := func(name, body string) beginFailure {
+		return malformed(name, body, codeInvalidEmail, msgInvalidEmail)
+	}
+
 	cases := []beginFailure{
 		malformed("not JSON", "{", "invalid_json", "request body is not valid JSON"),
 		malformed("empty body", "", "empty_body", "request body is empty"),
@@ -240,6 +281,22 @@ func refusedRequests() []beginFailure {
 		badName("missing name", `{"invitationCode":"`+testCode+`"}`),
 		badName("name with a bidirectional override", beginJSON(testCode, "Al\u202eice")),
 		badName("name too long", beginJSON(testCode, strings.Repeat("n", 129))),
+		badEmail("missing email", `{"invitationCode":"`+testCode+`","name":"`+testName+`"}`),
+		badEmail("email as null", `{"invitationCode":"`+testCode+`","name":"`+testName+`","email":null}`),
+		badEmail("empty email", beginJSONWithEmail(testCode, testName, "")),
+		badEmail("email without an @", beginJSONWithEmail(testCode, testName, "alice.example.com")),
+		badEmail("email with a display name", beginJSONWithEmail(testCode, testName, "Alice <alice@example.com>")),
+		badEmail("email with surrounding space", beginJSONWithEmail(testCode, testName, " alice@example.com")),
+		badEmail("email with a control character", beginJSONWithEmail(testCode, testName, "alice@example.com\n")),
+		badEmail("email that is not ASCII", beginJSONWithEmail(testCode, testName, "alic\u00e9@example.com")),
+		// A valid shape in every respect but its length, so only the total bound
+		// can refuse it.
+		badEmail("email one byte over the limit", beginJSONWithEmail(testCode, testName,
+			emailOfLength(input.MaxEmailBytes+1))),
+		malformed("email is not UTF-8",
+			`{"invitationCode":"`+testCode+`","name":"`+testName+`","email":"a`+"\xff"+`@example.com"}`,
+			"invalid_text", "request body has text that is not valid UTF-8"),
+		badName("a bad name is reported before a bad email", beginJSONWithEmail(testCode, "", "")),
 		malformed("name is not UTF-8", `{"invitationCode":"`+testCode+`","name":"Ali`+"\xff"+`ce"}`,
 			"invalid_text", "request body has text that is not valid UTF-8"),
 		badCode("a bad token is reported before a bad name", beginJSON("", "")),
@@ -253,7 +310,32 @@ func refusedRequests() []beginFailure {
 		malformedTokens[i] = badCode("invalid token: "+bad.name, beginJSON(bad.value, testName))
 	}
 
-	return slices.Concat(cases, malformedTokens)
+	return slices.Concat(cases, malformedTokens, refusedEmailMembers())
+}
+
+// refusedEmailMembers are the begins whose email member is of the wrong JSON
+// type, repeated, or spelled in another case: refused while decoding.
+func refusedEmailMembers() []beginFailure {
+	const (
+		wrongType = "a field has the wrong type"
+		prefix    = `{"invitationCode":"` + testCode + `","name":"b",`
+	)
+
+	typed := func(name, member string) beginFailure {
+		return malformed(name, prefix+member+`}`, "invalid_field_type", wrongType)
+	}
+
+	return []beginFailure{
+		typed("email as a number", `"email":5`),
+		typed("email as a huge number", `"email":1e999`),
+		typed("email as an array", `"email":["a@example.com"]`),
+		typed("email as an object", `"email":{}`),
+		typed("email as a bool", `"email":true`),
+		malformed("repeated email member", prefix+`"email":"a@example.com","email":"c@example.com"}`,
+			"duplicate_field", "request body repeats a field"),
+		malformed("email member in another case", prefix+`"Email":"a@example.com"}`,
+			"unknown_field", "request body has an unknown field"),
+	}
 }
 
 // refusedByTheDatabase are the begins refused at or after the invitation lookup.

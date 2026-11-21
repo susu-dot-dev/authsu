@@ -360,7 +360,7 @@ func TestUserGet(t *testing.T) {
 	t.Run("active admin", func(t *testing.T) {
 		view := usrOne(t, token, admin.userID)
 		if view.Role != roleAdmin || view.Status != usrActive || view.RevokedAt != nil ||
-			string(view.Profile) != `{"name":"Admin"}` || view.InvitationID == "" {
+			string(view.Profile) != `{"name":"Admin","email":"`+testEmail+`"}` || view.InvitationID == "" {
 			t.Errorf("view = %+v profile %s", view, view.Profile)
 		}
 	})
@@ -443,7 +443,7 @@ func TestUserGet(t *testing.T) {
 }
 
 // TestUserProfileServedAsObject: a profile registered through the Worker is
-// served as a JSON object equal to {"name": ...}, for normal names and for the
+// served as a JSON object equal to {"name": ..., "email": ...}, for normal names and for the
 // worst case a name can reach: 128 bytes of '<', which JSON-escapes six-fold.
 //
 //nolint:paralleltest // shares one database
@@ -475,13 +475,14 @@ func TestUserProfileServedAsObject(t *testing.T) {
 
 			// The stored text, and what the Worker serves, both decode to the name.
 			var want, fromDB struct {
-				Name string `json:"name"`
+				Name  string `json:"name"`
+				Email string `json:"email"`
 			}
 
 			usrDecode(t, stored, &fromDB)
 
-			if fromDB.Name != value {
-				t.Fatalf("stored profile %s does not hold the name %q", stored, value)
+			if fromDB.Name != value || fromDB.Email != testEmail {
+				t.Fatalf("stored profile %s does not hold the name %q and the email %q", stored, value, testEmail)
 			}
 
 			for what, body := range map[string]string{
@@ -510,8 +511,8 @@ func TestUserProfileServedAsObject(t *testing.T) {
 
 				usrDecode(t, string(profile), &want)
 
-				if want.Name != value {
-					t.Errorf("%s: profile name = %q, want %q (profile %s)", what, want.Name, value, profile)
+				if want.Name != value || want.Email != testEmail {
+					t.Errorf("%s: profile = %q, %q, want %q, %q (profile %s)", what, want.Name, want.Email, value, testEmail, profile)
 				}
 			}
 		})

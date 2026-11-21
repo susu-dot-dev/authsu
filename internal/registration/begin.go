@@ -18,7 +18,7 @@ import (
 // Error codes the handlers produce. Each failing step has its own, so a log
 // line or an alert names the step. They are stable: clients and dashboards may
 // match on them. The codes of malformed input are input's (invalid_invitation,
-// invalid_name), those of a missing configuration are auth's (not_configured)
+// invalid_name, invalid_email), those of a missing configuration are auth's (not_configured)
 // and those of the database are the store's.
 const (
 	// CodeInvalidInvitation is also input.CodeInvalidInvitation: a token that
@@ -40,35 +40,45 @@ type beginBody struct {
 	// Name is the account name. It is also the display name: one value, so
 	// the user types it once.
 	Name string `json:"name"`
+	// Email is the account's email address. It is not part of the creation
+	// options: begin takes it so a malformed one is refused before the user's
+	// biometric prompt, and binds it so finish cannot be given another.
+	Email string `json:"email"`
 }
 
 // ceremony is what begin and finish both bind a challenge to: the invitation
-// being redeemed and the name the account is to have.
+// being redeemed and the name and email address the account is to have.
 type ceremony struct {
 	token input.InvitationToken
 	name  input.AccountName
+	email input.Email
 }
 
 // associatedData is what the challenge's tag commits to besides its own bytes.
 func (c ceremony) associatedData() [][]byte {
-	return [][]byte{[]byte(c.token.String()), []byte(c.name.String())}
+	return [][]byte{[]byte(c.token.String()), []byte(c.name.String()), []byte(c.email.String())}
 }
 
-// parseCeremony parses the two strings every request carries.
-func parseCeremony(rawToken, rawName string) (ceremony, error) {
+// parseCeremony parses the three strings every request carries.
+func parseCeremony(rawToken, rawName, rawEmail string) (ceremony, error) {
 	token, err := input.ParseInvitationToken(rawToken)
 	if err != nil {
 		return ceremony{}, err //nolint:wrapcheck // the parser's error is already the classified client error
 	}
 
 	name, err := input.ParseAccountName(rawName)
+	if err != nil {
+		return ceremony{}, err //nolint:wrapcheck // the parser's error is already the classified client error
+	}
+
+	email, err := input.ParseEmail(rawEmail)
 
 	//nolint:wrapcheck // the parser's error is already the classified client error
-	return ceremony{token: token, name: name}, err
+	return ceremony{token: token, name: name, email: email}, err
 }
 
 func parseBegin(body beginBody) (ceremony, error) {
-	return parseCeremony(body.InvitationToken, body.Name)
+	return parseCeremony(body.InvitationToken, body.Name, body.Email)
 }
 
 // creationOptions is PublicKeyCredentialCreationOptionsJSON, trimmed to what

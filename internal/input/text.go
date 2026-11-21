@@ -8,7 +8,7 @@ const (
 	// `length(profile) <= 1024` (migration 0001) limits to 1024 bytes. JSON
 	// escaping can expand a character up to six-fold ("<" becomes \u003c), so
 	// 128 bytes encode to at most 768 bytes plus the 10 bytes of the object
-	// syntax, which leaves room for further profile fields.
+	// syntax, which leaves room for the other profile fields (MaxEmailBytes).
 	MaxAccountNameBytes = 128
 
 	// MaxAgentNameRunes bounds AgentName, in Unicode code points. The schema

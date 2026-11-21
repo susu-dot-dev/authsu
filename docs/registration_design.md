@@ -60,13 +60,13 @@ The challenge is the only field we control, so anything `begin` wants back at `f
 
 ```
 state     = version || expires_at || nonce              -- the nonce is the user handle
-signature = HMAC(K, state || H(invitation_code) || H(name))
+signature = HMAC(K, state || H(invitation_code) || H(name) || H(email))
 challenge = state || signature
 ```
 
-The invitation code is **an input to the signature but not part of the blob.** Its hash is mixed into the HMAC and never transmitted. The account name is bound the same way, because `begin` returns it in the creation options and a client could otherwise begin with one name and finish with another. This is the "associated data" idea from authenticated encryption: the signature commits to it, and the verifier supplies it independently. At `finish` the client sends the code and the name again, and the server recomputes the signature from the state it got back and the hashes of what it just received. A mismatch means the challenge was forged, altered, or created for a different code or name.
+The invitation code is **an input to the signature but not part of the blob.** Its hash is mixed into the HMAC and never transmitted. The account name is bound the same way, because `begin` returns it in the creation options and a client could otherwise begin with one name and finish with another. The email address is bound too, so that what `begin` checked before the biometric prompt is exactly what `finish` stores in the profile. This is the "associated data" idea from authenticated encryption: the signature commits to it, and the verifier supplies it independently. At `finish` the client sends the code, the name and the email again, and the server recomputes the signature from the state it got back and the hashes of what it just received. A mismatch means the challenge was forged, altered, or created for a different code, name or email.
 
-Only after the signature verifies does the server read the expiry, so a client-chosen expiry is never acted on. It also refuses an expiry further ahead than the ceremony timeout, which is what limits a leaked key. Hashing the code and name to a fixed width first means two different pairs can never produce the same bytes.
+Only after the signature verifies does the server read the expiry, so a client-chosen expiry is never acted on. It also refuses an expiry further ahead than the ceremony timeout, which is what limits a leaked key. Hashing the code, name and email to a fixed width first means two different tuples can never produce the same bytes.
 
 Consequences of this shape:
 
@@ -129,7 +129,7 @@ What `finish` accepts is deliberately narrow, and everything outside it fails cl
 - **One spelling for everything.** CBOR, base64url and the client data are each accepted only in their single canonical form. Anything a lenient decoder would quietly accept (duplicates, case variants, padding, trailing bytes) is refused, so a document cannot mean one thing to the browser and another to us.
 - **Authenticator data** must match our relying party, have user presence and user verification, carry the new credential, and contain nothing we did not ask for.
 - **Transports are a hint.** They are stored as reported rather than verified, and an oversized list is the only thing refused.
-- **The account name and the invitation code are parsed once, and refused rather than corrected.** The name is strict printable text, because it is what an administrator recognises an account by. The code is an invitation token in its exact shape ([secrets_design.md](secrets_design.md)).
+- **The account name, the email address and the invitation code are parsed once, and refused rather than corrected.** The name is strict printable text, because it is what an administrator recognises an account by. The email is a deliberately narrow ASCII subset of an address, kept in the spelling it was sent in, and it is only stored: nothing verifies it or contacts it. The code is an invitation token in its exact shape ([secrets_design.md](secrets_design.md)).
 
 The signature counter is not stored: synced passkeys always report zero. The parsers are fuzzed, with the property that anything accepted is a bounded credential id and a key that round-trips byte for byte.
 
@@ -137,7 +137,7 @@ The signature counter is not stored: synced passkeys always report zero. The par
 
 - **`begin` writes nothing; `finish` is the single point of acceptance**, with every authorization check inside its write.
 - **The user handle is random and decoupled from the user id**, which exists only once the account does.
-- **State travels in a signed challenge**, with the invitation code and the name bound in as associated data.
+- **State travels in a signed challenge**, with the invitation code, the name and the email bound in as associated data.
 - **A code that is not well formed and a code that is not redeemable are different statuses**, but why a code is not redeemable (unknown, used up, revoked, expired) is never revealed.
 - **The role comes from the invitation**, never the client.
 - **`finish` issues no session.** Registering a passkey is the whole job; signing in is [login](login_design.md).

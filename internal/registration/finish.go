@@ -19,11 +19,12 @@ import (
 )
 
 // finishBody is the body of POST /api/register/finish, as the client sent it.
-// The invitation token (member invitationCode) and the name are sent again
-// because the challenge is bound to them.
+// The invitation token (member invitationCode), the name and the email address
+// are sent again because the challenge is bound to them.
 type finishBody struct {
 	InvitationToken string         `json:"invitationCode"`
 	Name            string         `json:"name"`
+	Email           string         `json:"email"`
 	Credential      credentialBody `json:"credential"`
 }
 
@@ -77,7 +78,7 @@ type finishCommand struct {
 }
 
 func parseFinish(body finishBody) (finishCommand, error) {
-	c, err := parseCeremony(body.InvitationToken, body.Name)
+	c, err := parseCeremony(body.InvitationToken, body.Name, body.Email)
 
 	return finishCommand{ceremony: c, credential: body.Credential}, err
 }
@@ -219,6 +220,7 @@ func (h *handlers) createAccount(
 		UserHandle:     ok.handle,
 		Role:           ok.role,
 		Name:           cmd.name,
+		Email:          cmd.email,
 		Token:          cmd.token,
 		InvitationType: ok.invitationType,
 		// What the write needs to create the first-run invitation, if this

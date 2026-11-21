@@ -59,6 +59,7 @@ const (
 	// unknownCode is well formed, and no invitation has it.
 	unknownCode = "susu_inv_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	testName    = "Alice"
+	testEmail   = "alice@example.com"
 
 	jsonType = "application/json"
 
@@ -76,6 +77,7 @@ const (
 const (
 	codeInvalidInvitation = "invalid_invitation"
 	codeInvalidName       = "invalid_name"
+	codeInvalidEmail      = "invalid_email"
 	codeInvalidCredential = "invalid_credential" //nolint:gosec // an error code, not a credential
 	codeInvalidChallenge  = "invalid_challenge"
 	codeInternal          = "internal"
@@ -87,6 +89,8 @@ const (
 const (
 	msgInvalidInvitation = "invitation token must be susu_inv_ followed by 43 base64url characters"
 	msgInvalidName       = "name must be 1 to 128 bytes of normalised text without control or formatting characters"
+	msgInvalidEmail      = "email must be an address of the form local@domain, 5 to 200 bytes, " +
+		"in ASCII, with a dotted domain name"
 	msgNotRedeemable     = "invitation token is not valid"
 	msgNotConfigured     = "the service is not configured"
 	msgUnavailable       = "registration is temporarily unavailable"
@@ -347,7 +351,12 @@ func (r *rig) post(path, body string) *httptest.ResponseRecorder {
 
 // beginJSON is the body of a begin request.
 func beginJSON(code, name string) string {
-	return mustJSON(jsonBody{"invitationCode": code, "name": name})
+	return beginJSONWithEmail(code, name, testEmail)
+}
+
+// beginJSONWithEmail is beginJSON with an email address of the test's choosing.
+func beginJSONWithEmail(code, name, email string) string {
+	return mustJSON(jsonBody{"invitationCode": code, "name": name, "email": email})
 }
 
 // begin runs a begin and returns the response.
@@ -583,6 +592,7 @@ func (a authenticator) respond(t *testing.T, options creationOptions) jsonBody {
 	return jsonBody{
 		"invitationCode": testCode,
 		"name":           testName,
+		"email":          testEmail,
 		"credential": jsonBody{
 			"id": id, "rawId": id, "type": "public-key",
 			"response": jsonBody{
@@ -623,8 +633,8 @@ func forgeChallenge(t *testing.T, key []byte, expires time.Time, ad ...[]byte) [
 }
 
 // registrationAD is the associated data a registration challenge is bound to.
-func registrationAD(code, name string) [][]byte {
-	return [][]byte{[]byte(code), []byte(name)}
+func registrationAD(code, name, email string) [][]byte {
+	return [][]byte{[]byte(code), []byte(name), []byte(email)}
 }
 
 // wantFailure checks the status and the exact body of a failure response, and
@@ -732,6 +742,18 @@ func mustName(t *testing.T, raw string) input.AccountName {
 	}
 
 	return name
+}
+
+// mustEmail parses an email address the test knows is valid.
+func mustEmail(t *testing.T, raw string) input.Email {
+	t.Helper()
+
+	email, err := input.ParseEmail(raw)
+	if err != nil {
+		t.Fatalf("email: %v", err)
+	}
+
+	return email
 }
 
 // mustToken parses an invitation token the test knows is valid.

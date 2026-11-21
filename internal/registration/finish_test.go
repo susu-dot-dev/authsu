@@ -59,11 +59,11 @@ func flipByte(i int) func(*testing.T, *rig, []byte) []byte {
 // madeFor is a challenge the registration key made for the test's own choice of
 // expiry (relative to the clock), token and name, as a leaked key would let an
 // attacker make.
-func madeFor(expires time.Duration, code, name string) func(*testing.T, *rig, []byte) []byte {
+func madeFor(expires time.Duration, code, name, email string) func(*testing.T, *rig, []byte) []byte {
 	return func(t *testing.T, r *rig, _ []byte) []byte {
 		t.Helper()
 
-		return forgeChallenge(t, r.config().RegistrationKey, r.now.Add(expires), registrationAD(code, name)...)
+		return forgeChallenge(t, r.config().RegistrationKey, r.now.Add(expires), registrationAD(code, name, email)...)
 	}
 }
 
@@ -175,6 +175,12 @@ func shapeFailures() []finishCase {
 			rewriting(func(text string) string { return strings.Replace(text, testName, "Ali\xffce", 1) }),
 		badRequest("invalid name", codeInvalidName, msgInvalidName).
 			editing(func(b jsonBody) { b.set("name", "") }),
+		badRequest("missing email", codeInvalidEmail, msgInvalidEmail).
+			editing(func(b jsonBody) { b.remove("email") }),
+		badRequest("invalid email", codeInvalidEmail, msgInvalidEmail).
+			editing(func(b jsonBody) { b.set("email", "not an address") }),
+		badRequest("an email that is not UTF-8", "invalid_text", "request body has text that is not valid UTF-8").
+			rewriting(func(text string) string { return strings.Replace(text, testEmail, "a\xff@example.com", 1) }),
 		refusal("no configuration", http.StatusServiceUnavailable, codeNotConfigured, msgNotConfigured).
 			afterBegin(func(r *rig) { r.with(map[string]string{config.SecretHMAC: ""}) }),
 	}
@@ -328,20 +334,29 @@ func challengeFailures() []finishCase {
 		badChallenge("made by the login key").echoing(func(t *testing.T, r *rig, _ []byte) []byte {
 			t.Helper()
 
-			return forgeChallenge(t, r.config().LoginKey, r.now.Add(ttl), registrationAD(testCode, testName)...)
+			return forgeChallenge(t, r.config().LoginKey, r.now.Add(ttl), registrationAD(testCode, testName, testEmail)...)
 		}),
-		badChallenge("made for another token").echoing(madeFor(ttl, otherCode, testName)),
-		badChallenge("made for another name").echoing(madeFor(ttl, testCode, "Bob")),
+		badChallenge("made for another token").echoing(madeFor(ttl, otherCode, testName, testEmail)),
+		badChallenge("made for another name").echoing(madeFor(ttl, testCode, "Bob", testEmail)),
+		badChallenge("made for another email").echoing(madeFor(ttl, testCode, testName, "bob@example.com")),
+		badChallenge("made without an email").echoing(
+			func(t *testing.T, r *rig, _ []byte) []byte {
+				t.Helper()
+
+				return forgeChallenge(t, r.config().RegistrationKey, r.now.Add(ttl), []byte(testCode), []byte(testName))
+			}),
 		badChallenge("finished with another token than it began with").
 			editing(func(b jsonBody) { b.set("invitationCode", otherCode) }),
 		badChallenge("finished with another name than it began with").
 			editing(func(b jsonBody) { b.set("name", "Bob") }),
+		badChallenge("finished with another email than it began with").
+			editing(func(b jsonBody) { b.set("email", "bob@example.com") }),
 		badChallenge("the secret changed since begin").
 			afterBegin(func(r *rig) { r.with(map[string]string{config.SecretHMAC: strings.Repeat("z", 40)}) }),
 		badChallenge("expired exactly at its expiry").afterBegin(func(r *rig) { r.now = r.now.Add(ttl) }),
 		badChallenge("expired long ago").afterBegin(func(r *rig) { r.now = r.now.Add(24 * time.Hour) }),
-		badChallenge("signed with a far-future expiry").echoing(madeFor(ttl+time.Second, testCode, testName)),
-		badChallenge("signed to last for years").echoing(madeFor(10*365*24*time.Hour, testCode, testName)),
+		badChallenge("signed with a far-future expiry").echoing(madeFor(ttl+time.Second, testCode, testName, testEmail)),
+		badChallenge("signed to last for years").echoing(madeFor(10*365*24*time.Hour, testCode, testName, testEmail)),
 		badChallenge("the clock stepped back, so the expiry is further away than a TTL").
 			afterBegin(func(r *rig) { r.now = r.now.Add(-time.Second) }),
 	}
@@ -593,6 +608,7 @@ func TestFinishSucceeds(t *testing.T) {
 				UserHandle:      unb64(t, options.PublicKey.User.ID),
 				Role:            "admin",
 				Name:            mustName(t, testName),
+				Email:           mustEmail(t, testEmail),
 				Token:           mustToken(t, testCode),
 				InvitationType:  firstRun,
 				CredentialRowID: rowID2,
@@ -707,7 +723,7 @@ func TestFinishForgedExpiryBoundaries(t *testing.T) {
 			r := newRig(t)
 			a := newAuthenticator(t)
 			a.challenge = forgeChallenge(t, r.config().RegistrationKey, r.now.Add(tc.expires),
-				registrationAD(testCode, testName)...)
+				registrationAD(testCode, testName, testEmail)...)
 
 			body := a.respond(t, creationOptions{})
 
@@ -805,7 +821,7 @@ func TestFinishBodyCapFitsEveryLegitimateRequest(t *testing.T) {
 		b64Len(webauthn.MaxClientDataJSON) +
 		b64Len(webauthn.MaxAttestationObject) +
 		b64Len(webauthn.MaxAttestationObject) + // the authenticatorData and publicKey copies
-		(input.MaxAccountNameBytes+maxInvitationTokenBytes)*6 +
+		(input.MaxAccountNameBytes+input.MaxEmailBytes+maxInvitationTokenBytes)*6 +
 		webauthn.MaxTransports*(32+3) +
 		1024 // member names, braces, quotes, commas
 
@@ -817,7 +833,7 @@ func TestFinishBodyCapFitsEveryLegitimateRequest(t *testing.T) {
 		t.Errorf("MaxFinishBody = %d is not far below the default cap %d", registration.MaxFinishBody, httpapi.DefaultMaxBody)
 	}
 
-	if registration.MaxBeginBody <= (input.MaxAccountNameBytes+maxInvitationTokenBytes)*6 {
+	if registration.MaxBeginBody <= (input.MaxAccountNameBytes+input.MaxEmailBytes+maxInvitationTokenBytes)*6 {
 		t.Errorf("MaxBeginBody = %d cannot hold a maximal begin request", registration.MaxBeginBody)
 	}
 }
