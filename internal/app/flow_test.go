@@ -94,6 +94,8 @@ const (
 	writeAccount   = "INSERT INTO secrets (id, kind, hash, expires_at, created_at)"
 	writeSession   = "UPDATE credentials SET flags"
 	registeredName = "Alice"
+	// registeredEmail is the address every registration in these tests gives.
+	registeredEmail = "alice@example.com"
 )
 
 // errD1Unique is what D1 says when a UNIQUE constraint refuses a write,
@@ -112,7 +114,8 @@ func registerBegin(t *testing.T, h *harness, pk *passkey, name string) string {
 
 	rec := h.do(request{
 		method: http.MethodPost, path: pathRegisterBegin,
-		body: `{"invitationCode":"` + someCode + `","name":` + jsonString(t, name) + `}`,
+		body: `{"invitationCode":"` + someCode + `","name":` + jsonString(t, name) +
+			`,"email":` + jsonString(t, registeredEmail) + `}`,
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register begin = %d %s", rec.Code, rec.Body)
@@ -451,7 +454,7 @@ func checkCeremonyValues(t *testing.T, pk passkey, user, credential []any) {
 
 	checkInvitationLookup(t, user)
 
-	if user[userArgProfile] != `{"name":"`+registeredName+`"}` {
+	if user[userArgProfile] != `{"name":"`+registeredName+`","email":"`+registeredEmail+`"}` {
 		t.Errorf("profile = %v", user[userArgProfile])
 	}
 
@@ -884,7 +887,7 @@ func TestLoginFinishOutcomes(t *testing.T) {
 // the users routes: the name goes into users.profile through the JSON encoder
 // (which escapes <, > and & and the line separators), and the users routes
 // send the stored text back inside their own JSON, which must still be the
-// name the registrant gave.
+// name the registrant gave, beside the email address.
 func TestRegisteredProfileIsServedAsJSON(t *testing.T) {
 	t.Parallel()
 
@@ -923,7 +926,8 @@ func TestRegisteredProfileIsServedAsJSON(t *testing.T) {
 			var listed struct {
 				Users []struct {
 					Profile struct {
-						Name string `json:"name"`
+						Name  string `json:"name"`
+						Email string `json:"email"`
 					} `json:"profile"`
 				} `json:"users"`
 			}
@@ -935,6 +939,10 @@ func TestRegisteredProfileIsServedAsJSON(t *testing.T) {
 
 			if got := listed.Users[0].Profile.Name; got != registered {
 				t.Errorf("profile name = %q, want %q", got, registered)
+			}
+
+			if got := listed.Users[0].Profile.Email; got != registeredEmail {
+				t.Errorf("profile email = %q, want %q", got, registeredEmail)
 			}
 		})
 	}

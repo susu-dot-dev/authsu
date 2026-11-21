@@ -225,9 +225,11 @@ const insertCredentialQuery = `
 INSERT INTO credentials (id, credential_id, user_id, public_key, flags, metadata, created_at)
 VALUES (?, ?, (SELECT id FROM users WHERE user_handle = ?), ?, ?, ?, ?)`
 
-// profile is users.profile.
+// profile is users.profile. Its worst-case size is checked against the
+// column's CHECK by schema_test.go.
 type profile struct {
-	Name string `json:"name"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
 }
 
 // credentialMetadata is credentials.metadata: what is written once at
@@ -254,6 +256,10 @@ type NewAccount struct {
 
 	// Name is the display name the registrant gave.
 	Name input.AccountName
+
+	// Email is the email address the registrant gave. It is stored in the
+	// profile beside the name.
+	Email input.Email
 
 	// Token is the invitation being redeemed, and InvitationType the type the
 	// caller read for it with RedeemableInvitationType: the write refuses an
@@ -314,7 +320,7 @@ func (s *Store) CreateAccount(ctx context.Context, account NewAccount) error {
 		transports = []string{}
 	}
 
-	profileJSON, err := s.marshal(profile{Name: account.Name.String()})
+	profileJSON, err := s.marshal(profile{Name: account.Name.String(), Email: account.Email.String()})
 	if err != nil {
 		return o.defect(fmt.Errorf("encode profile: %w", err))
 	}

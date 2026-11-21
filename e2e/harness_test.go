@@ -65,6 +65,10 @@ const (
 	// no test can vary it (see firstrun_test.go).
 	firstRunSecret = "susu_inv_wYCCgEx_IWkXKzIV3WMZoYb7BSpdE7IzkSfl8f3uuA8"
 
+	// testEmail is the email address registrations use unless a test is about
+	// the address.
+	testEmail = "alice@example.com"
+
 	// authHMACSecret is the AUTH_HMAC_SECRET the Worker under test is started
 	// with: fixed and throwaway, 43 characters like a generated one.
 	authHMACSecret = "e2e-auth-hmac-secret-0123456789ABCDEFGHIJKLMN"

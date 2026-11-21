@@ -82,6 +82,31 @@ func worstAccountName(t *testing.T) input.AccountName {
 	return mustName(t, strings.Repeat("<", input.MaxAccountNameBytes))
 }
 
+// worstEmail is the longest Email: the longest domain made of the longest
+// labels, which JSON leaves unescaped.
+func worstEmail(t *testing.T) input.Email {
+	t.Helper()
+
+	const local = "a@"
+
+	var domain strings.Builder
+
+	for domain.Len() < input.MaxEmailBytes-len(local) {
+		if domain.Len() > 0 {
+			domain.WriteByte('.')
+		}
+
+		size := min(input.MaxEmailLabelBytes, input.MaxEmailBytes-len(local)-domain.Len())
+		if rest := input.MaxEmailBytes - len(local) - domain.Len() - size; rest == 1 {
+			size--
+		}
+
+		domain.WriteString(strings.Repeat("a", size))
+	}
+
+	return mustEmail(t, local+domain.String())
+}
+
 // worstNewAccount returns the largest account registration can write, as the
 // strings the store sends for the JSON columns.
 func worstNewAccount(t *testing.T) (string, string) {
@@ -98,7 +123,7 @@ func worstNewAccount(t *testing.T) (string, string) {
 	fake := newFake(applied(5))
 
 	err := fake.store().CreateAccount(context.Background(), store.NewAccount{
-		UserID: "u", UserHandle: []byte{1}, Role: "admin", Name: worstAccountName(t),
+		UserID: "u", UserHandle: []byte{1}, Role: "admin", Name: worstAccountName(t), Email: worstEmail(t),
 		Token: mustInvitationToken(t, 1), InvitationType: "member", CredentialRowID: "c", CredentialID: []byte{1},
 		PublicKey: []byte{1}, Flags: 0, AAGUID: strings.Repeat("0", 36), Transports: transports, CreatedAt: now,
 		FirstRunID: "f", FirstRunLabel: "l", FirstRunExpiresAt: now,
@@ -142,8 +167,8 @@ func schemaBounds(t *testing.T) []bound {
 			pattern: `CHECK \(typeof\(label\) = 'text' AND instr\(label, char\(0\)\) = 0 ` +
 				`AND length\(cast\(label AS BLOB\)\) <= (\d+)\)`,
 			lowest: 0, highest: input.MaxInvitationLabelRunes * utf8.UTFMax, exact: false},
-		{name: "profile JSON of the longest escaped account name", pattern: `length\(profile\) <= (\d+)`,
-			lowest: 0, highest: len(profile), exact: false},
+		{name: "profile JSON of the longest escaped name and the longest email",
+			pattern: `length\(profile\) <= (\d+)`, lowest: 0, highest: len(profile), exact: false},
 
 		// Every secret is stored as the hash of its token, whatever its kind.
 		{name: "invitation token hash", pattern: secretHashCheck,
@@ -260,8 +285,10 @@ func TestSchemaBoundsAreMeaningful(t *testing.T) {
 
 	profile, metadata := worstNewAccount(t)
 
-	// 128 escaped bytes: the six-fold expansion plus {"name":""}.
-	if want := len(`{"name":""}`) + input.MaxAccountNameBytes*len(`\u003c`); len(profile) != want {
+	// 128 escaped bytes: the six-fold expansion plus {"name":"","email":""} and
+	// the longest email, which JSON leaves as it is.
+	if want := len(`{"name":"","email":""}`) + input.MaxAccountNameBytes*len(`\u003c`) +
+		input.MaxEmailBytes; len(profile) != want {
 		t.Errorf("worst-case profile is %d bytes, want %d", len(profile), want)
 	}
 

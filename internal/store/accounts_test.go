@@ -153,13 +153,17 @@ func TestRedeemableInvitationTypeFailures(t *testing.T) {
 		})
 }
 
+// annProfile is the profile of the account newAccount returns.
+const annProfile = `{"name":"Ann","email":"ann@example.com"}`
+
 // newAccount returns a complete account to create; a test overrides what it is
 // about.
 func newAccount(t *testing.T, edit func(*store.NewAccount)) store.NewAccount {
 	t.Helper()
 
 	account := store.NewAccount{
-		UserID: "user-1", UserHandle: []byte{1, 2, 3}, Role: "admin", Name: mustName(t, "Ann"),
+		UserID: "user-1", UserHandle: []byte{1, 2, 3}, Role: "admin",
+		Name: mustName(t, "Ann"), Email: mustEmail(t, "ann@example.com"),
 		Token: mustInvitationToken(t, 1), InvitationType: "member",
 		CredentialRowID: "cred-row-1", CredentialID: []byte{4, 5}, PublicKey: []byte{6, 7, 8}, Flags: 0x45,
 		AAGUID: aaguid, Transports: []string{"usb"}, CreatedAt: now,
@@ -234,28 +238,32 @@ func TestCreateAccountStatements(t *testing.T) {
 		// configuredHash is the argument for the configured first-run hash.
 		configuredHash any
 	}{
-		{name: "a member with one transport", profile: `{"name":"Ann"}`, metadata: metadataOf(`["usb"]`)},
+		{name: "a member with one transport", profile: annProfile, metadata: metadataOf(`["usb"]`)},
 		{name: "the presented token is the configured first-run secret",
 			edit:    func(a *store.NewAccount) { a.FirstRun = &configured },
-			profile: `{"name":"Ann"}`, metadata: metadataOf(`["usb"]`), configuredHash: configured.Hash()},
+			profile: annProfile, metadata: metadataOf(`["usb"]`), configuredHash: configured.Hash()},
 		{name: "no transports reported is an empty array",
 			edit:    func(a *store.NewAccount) { a.Transports = nil },
-			profile: `{"name":"Ann"}`, metadata: metadataOf(`[]`)},
+			profile: annProfile, metadata: metadataOf(`[]`)},
 		{name: "an empty transport list is an empty array",
 			edit:    func(a *store.NewAccount) { a.Transports = []string{} },
-			profile: `{"name":"Ann"}`, metadata: metadataOf(`[]`)},
+			profile: annProfile, metadata: metadataOf(`[]`)},
 		{name: "several transports keep their order",
 			edit:    func(a *store.NewAccount) { a.Transports = []string{"nfc", "ble", "usb"} },
-			profile: `{"name":"Ann"}`, metadata: metadataOf(`["nfc","ble","usb"]`)},
+			profile: annProfile, metadata: metadataOf(`["nfc","ble","usb"]`)},
 		{name: "the name is escaped as JSON",
-			edit:    func(a *store.NewAccount) { a.Name = mustName(t, `Ann "<&>" \ O'Neil`) },
-			profile: `{"name":"Ann \"\u003c\u0026\u003e\" \\ O'Neil"}`, metadata: metadataOf(`["usb"]`)},
+			edit:     func(a *store.NewAccount) { a.Name = mustName(t, `Ann "<&>" \ O'Neil`) },
+			profile:  `{"name":"Ann \"\u003c\u0026\u003e\" \\ O'Neil","email":"ann@example.com"}`,
+			metadata: metadataOf(`["usb"]`)},
 		{name: "a non-ASCII name is kept",
 			edit:    func(a *store.NewAccount) { a.Name = mustName(t, "Zoë Ångström") },
-			profile: `{"name":"Zoë Ångström"}`, metadata: metadataOf(`["usb"]`)},
+			profile: `{"name":"Zoë Ångström","email":"ann@example.com"}`, metadata: metadataOf(`["usb"]`)},
+		{name: "the email is kept as given, in its own case",
+			edit:    func(a *store.NewAccount) { a.Email = mustEmail(t, "Ann.O'Neil+Tag@Example.COM") },
+			profile: `{"name":"Ann","email":"Ann.O'Neil+Tag@Example.COM"}`, metadata: metadataOf(`["usb"]`)},
 		{name: "the first-run type is bound apart from the redeemed type",
 			edit:    func(a *store.NewAccount) { a.InvitationType = store.InvitationFirstRun },
-			profile: `{"name":"Ann"}`, metadata: metadataOf(`["usb"]`)},
+			profile: annProfile, metadata: metadataOf(`["usb"]`)},
 	}
 
 	for _, test := range tests {

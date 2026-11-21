@@ -59,18 +59,18 @@ const (
 	// is recognisable in an invitation list.
 	FirstRunLabel = "First run: initial administrator"
 
-	// MaxBeginBody caps the begin request, which is two short strings (a real
-	// one is about 100 bytes). A name is escaped in JSON, at worst six bytes
-	// per byte, so this leaves room for the longest valid one.
+	// MaxBeginBody caps the begin request, which is three short strings (a real
+	// one is about 150 bytes). Each is escaped in JSON, at worst six bytes per
+	// byte, so this leaves room for the longest valid one.
 	MaxBeginBody = 4 << 10
 
 	// MaxFinishBody caps the finish request, so the server never parses more
 	// than a legitimate one could hold (a real one is under 1 KiB). It is the
 	// sum of what the members may legally be, with room for JSON syntax and
 	// escaping: id and rawId (1023 bytes each, base64url), clientDataJSON
-	// (2048) and attestationObject (4096) as base64url, the name and invitation token, and
-	// the transports. Anything larger fails a member's own bound anyway, so
-	// refusing it here costs no honest client.
+	// (2048) and attestationObject (4096) as base64url, the name, email and
+	// invitation token, and the transports. Anything larger fails a member's
+	// own bound anyway, so refusing it here costs no honest client.
 	MaxFinishBody = 32 << 10
 )
 

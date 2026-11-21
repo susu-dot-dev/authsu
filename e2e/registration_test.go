@@ -41,6 +41,7 @@ import (
 const (
 	regCodeInvalid = "invalid_invitation"
 	regCodeName    = "invalid_name"
+	regCodeEmail   = "invalid_email"
 	regCodeCred    = "invalid_credential"
 	regCodeChal    = "invalid_challenge"
 	regCodeAccept  = "registration_accept_failed"
@@ -205,7 +206,7 @@ func TestRegistrationStoresEveryColumn(t *testing.T) {
 		"id":                  out.UserID,
 		"role":                "admin",
 		"typeof(role)":        "text",
-		"profile":             `{"name":"Alice"}`,
+		"profile":             `{"name":"Alice","email":"alice@example.com"}`,
 		"typeof(profile)":     "text",
 		"typeof(user_handle)": "blob",
 		"hex(user_handle)":    strings.ToUpper(hex.EncodeToString(handle)),
@@ -648,28 +649,28 @@ func TestRegistrationBeginParsesInputs(t *testing.T) {
 		wantCode   string
 	}{
 		// ---- codes: exactly "susu_inv_" and 43 canonical base64url characters ----
-		{"empty code", `{"invitationCode":"","name":"A"}`, 400, regCodeInvalid},
-		{"missing code", `{"name":"A"}`, 400, regCodeInvalid},
-		{"null code", `{"invitationCode":null,"name":"A"}`, 400, regCodeInvalid},
-		{"code with a space", `{"invitationCode":"abc def","name":"A"}`, 400, regCodeInvalid},
-		{"code with padding", `{"invitationCode":"abcd==","name":"A"}`, 400, regCodeInvalid},
-		{"code with +", `{"invitationCode":"ab+cd","name":"A"}`, 400, regCodeInvalid},
-		{"code with /", `{"invitationCode":"ab/cd","name":"A"}`, 400, regCodeInvalid},
-		{"code with a dot", `{"invitationCode":"ab.cd","name":"A"}`, 400, regCodeInvalid},
-		{"code with a newline", `{"invitationCode":"ab\ncd","name":"A"}`, 400, regCodeInvalid},
-		{"code with NUL", `{"invitationCode":"ab\u0000cd","name":"A"}`, 400, regCodeInvalid},
-		{"code with a non-ASCII letter", `{"invitationCode":"abcé","name":"A"}`, 400, regCodeInvalid},
-		{"code with a fullwidth letter", `{"invitationCode":"ａｂｃ","name":"A"}`, 400, regCodeInvalid},
-		{"a token of 43 characters is well-formed but unknown", `{"invitationCode":"` + regUnknownCode + `","name":"A"}`, 403, regCodeInvalid},
-		{"a token of 42 characters is malformed", `{"invitationCode":"` + regUnknownCode[:len(regUnknownCode)-1] + `","name":"A"}`, 400, regCodeInvalid},
-		{"a token of 44 characters is malformed", `{"invitationCode":"` + regUnknownCode + `A","name":"A"}`, 400, regCodeInvalid},
-		{"code of 257 bytes is malformed", `{"invitationCode":"` + strings.Repeat("A", 257) + `","name":"A"}`, 400, regCodeInvalid},
-		{"code of 3000 bytes is malformed", `{"invitationCode":"` + strings.Repeat("A", 3000) + `","name":"A"}`, 400, regCodeInvalid},
-		{"code of 1 byte is malformed", `{"invitationCode":"A","name":"A"}`, 400, regCodeInvalid},
-		{"code as a number", `{"invitationCode":123,"name":"A"}`, 400, "invalid_field_type"},
-		{"code as an array", `{"invitationCode":["a"],"name":"A"}`, 400, "invalid_field_type"},
-		{"code as an object", `{"invitationCode":{},"name":"A"}`, 400, "invalid_field_type"},
-		{"code as a bool", `{"invitationCode":true,"name":"A"}`, 400, "invalid_field_type"},
+		{"empty code", `{"invitationCode":"","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"missing code", `{"name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"null code", `{"invitationCode":null,"name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with a space", `{"invitationCode":"abc def","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with padding", `{"invitationCode":"abcd==","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with +", `{"invitationCode":"ab+cd","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with /", `{"invitationCode":"ab/cd","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with a dot", `{"invitationCode":"ab.cd","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with a newline", `{"invitationCode":"ab\ncd","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with NUL", `{"invitationCode":"ab\u0000cd","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with a non-ASCII letter", `{"invitationCode":"abcé","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code with a fullwidth letter", `{"invitationCode":"ａｂｃ","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"a token of 43 characters is well-formed but unknown", `{"invitationCode":"` + regUnknownCode + `","name":"A","email":"a@example.com"}`, 403, regCodeInvalid},
+		{"a token of 42 characters is malformed", `{"invitationCode":"` + regUnknownCode[:len(regUnknownCode)-1] + `","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"a token of 44 characters is malformed", `{"invitationCode":"` + regUnknownCode + `A","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code of 257 bytes is malformed", `{"invitationCode":"` + strings.Repeat("A", 257) + `","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code of 3000 bytes is malformed", `{"invitationCode":"` + strings.Repeat("A", 3000) + `","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code of 1 byte is malformed", `{"invitationCode":"A","name":"A","email":"a@example.com"}`, 400, regCodeInvalid},
+		{"code as a number", `{"invitationCode":123,"name":"A","email":"a@example.com"}`, 400, "invalid_field_type"},
+		{"code as an array", `{"invitationCode":["a"],"name":"A","email":"a@example.com"}`, 400, "invalid_field_type"},
+		{"code as an object", `{"invitationCode":{},"name":"A","email":"a@example.com"}`, 400, "invalid_field_type"},
+		{"code as a bool", `{"invitationCode":true,"name":"A","email":"a@example.com"}`, 400, "invalid_field_type"},
 
 		// ---- request envelope ----
 		{"empty body", ``, 400, "empty_body"},
@@ -677,11 +678,11 @@ func TestRegistrationBeginParsesInputs(t *testing.T) {
 		{"array body", `[]`, 400, "invalid_field_type"},
 		{"string body", `"x"`, 400, "invalid_field_type"},
 		{"number body", `1`, 400, "invalid_field_type"},
-		{"trailing garbage", `{"invitationCode":"` + firstRunSecret + `","name":"A"}x`, 400, "trailing_data"},
-		{"two documents", `{"invitationCode":"` + firstRunSecret + `","name":"A"}{}`, 400, "trailing_data"},
+		{"trailing garbage", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":"a@example.com"}x`, 400, "trailing_data"},
+		{"two documents", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":"a@example.com"}{}`, 400, "trailing_data"},
 		{"unknown member", `{"invitationCode":"` + firstRunSecret + `","name":"A","role":"admin"}`, 400, codeUnknownField},
 		{"member in another case", `{"invitationCode":"` + firstRunSecret + `","Name":"A"}`, 400, codeUnknownField},
-		{"duplicate code member", `{"invitationCode":"x","invitationCode":"` + firstRunSecret + `","name":"A"}`, 400, "duplicate_field"},
+		{"duplicate code member", `{"invitationCode":"x","invitationCode":"` + firstRunSecret + `","name":"A","email":"a@example.com"}`, 400, "duplicate_field"},
 		{"duplicate name member", `{"invitationCode":"` + firstRunSecret + `","name":"A","name":"B"}`, 400, "duplicate_field"},
 		{"truncated JSON", `{"invitationCode":"` + firstRunSecret, 400, "invalid_json"},
 		{"name as a number", `{"invitationCode":"` + firstRunSecret + `","name":5}`, 400, "invalid_field_type"},
@@ -691,6 +692,15 @@ func TestRegistrationBeginParsesInputs(t *testing.T) {
 		{"name as a bool", `{"invitationCode":"` + firstRunSecret + `","name":false}`, 400, "invalid_field_type"},
 		{"name as a huge number", `{"invitationCode":"` + firstRunSecret + `","name":1e999}`, 400, "invalid_field_type"},
 		{"missing name", `{"invitationCode":"` + firstRunSecret + `"}`, 400, regCodeName},
+		{"email as a number", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":5}`, 400, "invalid_field_type"},
+		{"email as null", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":null}`, 400, regCodeEmail},
+		{"email as an array", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":["a@example.com"]}`, 400, "invalid_field_type"},
+		{"email as an object", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":{}}`, 400, "invalid_field_type"},
+		{"email as a bool", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":false}`, 400, "invalid_field_type"},
+		{"email as a huge number", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":1e999}`, 400, "invalid_field_type"},
+		{"duplicate email member", `{"invitationCode":"` + firstRunSecret + `","name":"A","email":"a@example.com","email":"b@example.com"}`, 400, "duplicate_field"},
+		{"email member in another case", `{"invitationCode":"` + firstRunSecret + `","name":"A","Email":"a@example.com"}`, 400, codeUnknownField},
+		{"missing email", `{"invitationCode":"` + firstRunSecret + `","name":"A"}`, 400, regCodeEmail},
 		{"empty object", `{}`, 400, regCodeInvalid},
 	}
 
@@ -758,26 +768,26 @@ func regNameCases() []regNameCase {
 	decomposed := "e\u0301"     // e + combining acute: not NFC
 
 	return []regNameCase{
-		{"one ASCII byte", quote("A"), ok, "", `{"name":"A"}`},
-		{"128 ASCII bytes (the limit)", quote(strings.Repeat("a", 128)), ok, "", `{"name":"` + strings.Repeat("a", 128) + `"}`},
+		{"one ASCII byte", quote("A"), ok, "", `{"name":"A","email":"alice@example.com"}`},
+		{"128 ASCII bytes (the limit)", quote(strings.Repeat("a", 128)), ok, "", `{"name":"` + strings.Repeat("a", 128) + `","email":"alice@example.com"}`},
 		{"129 ASCII bytes (one over)", quote(strings.Repeat("a", 129)), bad, regCodeName, ""},
 		{"1000 ASCII bytes", quote(strings.Repeat("a", 1000)), bad, regCodeName, ""},
-		{"64 two-byte runes (128 bytes)", quote(strings.Repeat(two, 64)), ok, "", `{"name":"` + strings.Repeat(two, 64) + `"}`},
+		{"64 two-byte runes (128 bytes)", quote(strings.Repeat(two, 64)), ok, "", `{"name":"` + strings.Repeat(two, 64) + `","email":"alice@example.com"}`},
 		{"65 two-byte runes (130 bytes)", quote(strings.Repeat(two, 65)), bad, regCodeName, ""},
-		{"42 three-byte runes (126 bytes)", quote(strings.Repeat(three, 42)), ok, "", `{"name":"` + strings.Repeat(three, 42) + `"}`},
+		{"42 three-byte runes (126 bytes)", quote(strings.Repeat(three, 42)), ok, "", `{"name":"` + strings.Repeat(three, 42) + `","email":"alice@example.com"}`},
 		{"43 three-byte runes (129 bytes)", quote(strings.Repeat(three, 43)), bad, regCodeName, ""},
-		{"32 four-byte runes (128 bytes)", quote(strings.Repeat(four, 32)), ok, "", `{"name":"` + strings.Repeat(four, 32) + `"}`},
+		{"32 four-byte runes (128 bytes)", quote(strings.Repeat(four, 32)), ok, "", `{"name":"` + strings.Repeat(four, 32) + `","email":"alice@example.com"}`},
 		{"33 four-byte runes (132 bytes)", quote(strings.Repeat(four, 33)), bad, regCodeName, ""},
 		{"127 ASCII + one two-byte rune (129 bytes)", quote(strings.Repeat("a", 127) + two), bad, regCodeName, ""},
-		{"126 ASCII + one two-byte rune (128 bytes)", quote(strings.Repeat("a", 126) + two), ok, "", `{"name":"` + strings.Repeat("a", 126) + two + `"}`},
+		{"126 ASCII + one two-byte rune (128 bytes)", quote(strings.Repeat("a", 126) + two), ok, "", `{"name":"` + strings.Repeat("a", 126) + two + `","email":"alice@example.com"}`},
 		{"empty", `""`, bad, regCodeName, ""},
 		{"a single space", `" "`, bad, regCodeName, ""},
 		{"only whitespace", `"   "`, bad, regCodeName, ""},
 		{"only a tab escape", `"\t"`, bad, regCodeName, ""},
 		{"ideographic space only", quote("\u3000"), bad, regCodeName, ""},
 		{"no-break space only", quote("\u00a0"), bad, regCodeName, ""},
-		{"leading and trailing spaces are kept, never trimmed", `"  Alice  "`, ok, "", `{"name":"  Alice  "}`},
-		{"inner space", `"Alice Bob"`, ok, "", `{"name":"Alice Bob"}`},
+		{"leading and trailing spaces are kept, never trimmed", `"  Alice  "`, ok, "", `{"name":"  Alice  ","email":"alice@example.com"}`},
+		{"inner space", `"Alice Bob"`, ok, "", `{"name":"Alice Bob","email":"alice@example.com"}`},
 		{"NUL escape", `"a\u0000b"`, bad, regCodeName, ""},
 		{"NUL alone", `"\u0000"`, bad, regCodeName, ""},
 		{"newline escape", `"a\nb"`, bad, regCodeName, ""},
@@ -798,21 +808,21 @@ func regNameCases() []regNameCase {
 		{"soft hyphen", `"a\u00adb"`, bad, regCodeName, ""},
 		{"word joiner", `"a\u2060b"`, bad, regCodeName, ""},
 		{"non-NFC (e + combining acute)", quote("caf" + decomposed), bad, regCodeName, ""},
-		{"NFC precomposed", quote("café"), ok, "", `{"name":"café"}`},
+		{"NFC precomposed", quote("café"), ok, "", `{"name":"café","email":"alice@example.com"}`},
 		{"Hangul jamo sequence (not NFC)", quote("\u1100\u1161"), bad, regCodeName, ""},
-		{"Hangul syllable (NFC)", quote("\uac00"), ok, "", `{"name":"` + "\uac00" + `"}`},
+		{"Hangul syllable (NFC)", quote("\uac00"), ok, "", `{"name":"` + "\uac00" + `","email":"alice@example.com"}`},
 		{"U+FFFD replacement char (refused by the body decoder before the name parser)", quote("a\ufffdb"), bad, "invalid_text", ""},
 		{"lone high surrogate escape", `"a\ud800b"`, bad, "invalid_text", ""},
 		{"lone low surrogate escape", `"a\udc00b"`, bad, "invalid_text", ""},
-		{"valid surrogate pair escape", `"\ud83d\ude00"`, ok, "", `{"name":"😀"}`},
+		{"valid surrogate pair escape", `"\ud83d\ude00"`, ok, "", `{"name":"😀","email":"alice@example.com"}`},
 		{"reversed surrogate pair escape", `"\ude00\ud83d"`, bad, "invalid_text", ""},
-		{"private use character", quote("\ue000"), ok, "", `{"name":"` + "\ue000" + `"}`}, // Co is not Cc/Cf
-		{"CJK", quote("山田太郎"), ok, "", `{"name":"山田太郎"}`},
-		{"RTL Hebrew without controls", quote("שלום"), ok, "", `{"name":"שלום"}`},
-		{"quote and backslash survive", `"a\"b\\c"`, ok, "", `{"name":"a\"b\\c"}`},
-		{"slash escape is read as a slash", `"a\/b"`, ok, "", `{"name":"a/b"}`},
-		{"HTML-sensitive characters are escaped by Go in the stored JSON", `"<a&b>"`, ok, "", `{"name":"\u003ca\u0026b\u003e"}`},
-		{"line separator U+2028 (Zl is not Cc/Cf)", quote("a\u2028b"), ok, "", `{"name":"a\u2028b"}`},
+		{"private use character", quote("\ue000"), ok, "", `{"name":"` + "\ue000" + `","email":"alice@example.com"}`}, // Co is not Cc/Cf
+		{"CJK", quote("山田太郎"), ok, "", `{"name":"山田太郎","email":"alice@example.com"}`},
+		{"RTL Hebrew without controls", quote("שלום"), ok, "", `{"name":"שלום","email":"alice@example.com"}`},
+		{"quote and backslash survive", `"a\"b\\c"`, ok, "", `{"name":"a\"b\\c","email":"alice@example.com"}`},
+		{"slash escape is read as a slash", `"a\/b"`, ok, "", `{"name":"a/b","email":"alice@example.com"}`},
+		{"HTML-sensitive characters are escaped by Go in the stored JSON", `"<a&b>"`, ok, "", `{"name":"\u003ca\u0026b\u003e","email":"alice@example.com"}`},
+		{"line separator U+2028 (Zl is not Cc/Cf)", quote("a\u2028b"), ok, "", `{"name":"a\u2028b","email":"alice@example.com"}`},
 		{"invalid UTF-8 byte 0xff", "\"a\xffb\"", bad, "invalid_text", ""},
 		{"invalid UTF-8 lone continuation byte", "\"a\x80b\"", bad, "invalid_text", ""},
 		{"invalid UTF-8 overlong NUL (C0 80)", "\"a\xc0\x80b\"", bad, "invalid_text", ""},
@@ -835,7 +845,7 @@ func TestRegistrationNames(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			regOpenFirstRun(t)
 
-			begin := post(t, pathRegisterBegin, []byte(`{"invitationCode":"`+firstRunSecret+`","name":`+tt.raw+`}`), "")
+			begin := post(t, pathRegisterBegin, []byte(`{"invitationCode":"`+firstRunSecret+`","name":`+tt.raw+`,"email":"`+testEmail+`"}`), "")
 
 			if begin.status != tt.wantBegin || (tt.wantCode != "" && begin.errorCode() != tt.wantCode) {
 				t.Fatalf("begin = %d %s, want %d %s", begin.status, begin.body, tt.wantBegin, tt.wantCode)
@@ -982,6 +992,207 @@ func TestRegistrationWorstCaseNameFitsTheProfileCheck(t *testing.T) {
 				t.Errorf("profile length %s exceeds the CHECK", length)
 			}
 		})
+	}
+}
+
+// regEmailCase is one email address to try at begin and finish.
+type regEmailCase struct {
+	name  string
+	email string
+	// ok is whether the address is accepted. A refused one is 400 invalid_email
+	// at begin and at finish, and leaves nothing.
+	ok bool
+}
+
+func regEmailCases() []regEmailCase {
+	return []regEmailCase{
+		{"a plain address", "alice@example.com", true},
+		{"case is kept, never folded", "Alice.Smith@Example.COM", true},
+		{"a plus tag", "alice+tag@example.com", true},
+		{"an apostrophe", "o'brien@example.com", true},
+		{"every special character of the local part", "!#$%'*+-/=?^_`{|}~@example.com", true},
+		{"a subdomain", "alice@mail.eu.example.co.uk", true},
+		{"a local part of 64 bytes", strings.Repeat("a", 64) + "@example.com", true},
+		{"an address of exactly 200 bytes", strings.Repeat("a", 64) + "@" + strings.Repeat("b", 63) + "." +
+			strings.Repeat("c", 63) + "." + strings.Repeat("d", 3) + ".com", true},
+		{"the empty string", "", false},
+		{"no @", "alice.example.com", false},
+		{"two @", "a@b@example.com", false},
+		{"no domain", "alice@", false},
+		{"no local part", "@example.com", false},
+		{"a domain without a dot", "alice@localhost", false},
+		{"an address literal", "alice@[127.0.0.1]", false},
+		{"a display name", "Alice <alice@example.com>", false},
+		{"a quoted local part", `"alice"@example.com`, false},
+		{"a leading space", " alice@example.com", false},
+		{"a trailing newline", "alice@example.com\n", false},
+		{"a NUL", "alice@example.com\x00", false},
+		{"an ampersand, which JSON would expand six-fold", "r&d@example.com", false},
+		{"a non-ASCII local part", "alic\u00e9@example.com", false},
+		{"an internationalised domain", "alice@\u4f8b\u3048.jp", false},
+		{"a fullwidth @", "alice\uff20example.com", false},
+		{"two dots in a row", "al..ice@example.com", false},
+		{"a local part of 65 bytes", strings.Repeat("a", 65) + "@example.com", false},
+		{"201 bytes", strings.Repeat("a", 64) + "@" + strings.Repeat("b", 63) + "." +
+			strings.Repeat("c", 63) + "." + strings.Repeat("d", 4) + ".com", false},
+		{"3 KiB, under the body cap", strings.Repeat("a", 3<<10) + "@example.com", false},
+	}
+}
+
+// TestRegistrationEmails drives every email address through begin and, when
+// begin accepts it, through a complete registration, then reads users.profile
+// back: the address is stored exactly as sent, in its own spelling.
+//
+//nolint:paralleltest // shares one database
+func TestRegistrationEmails(t *testing.T) {
+	for _, tt := range regEmailCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			regOpenFirstRun(t)
+
+			begin := beginRegistrationFor(t, firstRunSecret, "Alice", tt.email)
+
+			if !tt.ok {
+				begin.expect(t, "begin", http.StatusBadRequest, regCodeEmail)
+
+				// finish takes the same address through the same parser first,
+				// so a refused one never reaches the verifier or the database.
+				options := creationOptions{}
+				options.PublicKey.Challenge = b64(randomBytes(73))
+
+				finish := post(t, pathRegisterEnd,
+					newAuthenticator().finishBodyFor(t, options, firstRunSecret, "Alice", tt.email), "")
+				finish.expect(t, "finish", http.StatusBadRequest, regCodeEmail)
+
+				regExpectNothingWritten(t, tt.name)
+
+				return
+			}
+
+			begin.expect(t, "begin", http.StatusOK, "")
+
+			var options creationOptions
+
+			regDecode(t, begin, &options)
+
+			finish := post(t, pathRegisterEnd,
+				newAuthenticator().finishBodyFor(t, options, firstRunSecret, "Alice", tt.email), "")
+			finish.expect(t, "finish", http.StatusCreated, "")
+
+			var profile struct {
+				Name  string `json:"name"`
+				Email string `json:"email"`
+			}
+
+			err := json.Unmarshal([]byte(scalar(t, "SELECT profile FROM users")), &profile)
+			if err != nil || profile.Email != tt.email || profile.Name != "Alice" {
+				t.Errorf("profile = %+v (%v), want the name Alice and the email %q", profile, err, tt.email)
+			}
+
+			if scalar(t, "SELECT length(profile) <= 1024 FROM users") != "1" {
+				t.Errorf("profile length %s exceeds the CHECK", scalar(t, "SELECT length(profile) FROM users"))
+			}
+
+			expectCount(t, "users", "1")
+			expectCount(t, "credentials", "1")
+		})
+	}
+}
+
+// TestRegistrationEmailIsBoundToTheChallenge: the address begin was given is the
+// only one finish accepts, so a client cannot begin with one address and finish
+// with another, and an email-less finish is refused as invalid.
+//
+//nolint:paralleltest // shares one database
+func TestRegistrationEmailIsBoundToTheChallenge(t *testing.T) {
+	rows := []struct {
+		name  string
+		build func(t *testing.T, options creationOptions) []byte
+		code  string
+	}{
+		{"another valid address", func(t *testing.T, options creationOptions) []byte {
+			t.Helper()
+
+			return newAuthenticator().finishBodyFor(t, options, firstRunSecret, "Alice", "mallory@example.com")
+		}, regCodeChal},
+		{"the same address in another case", func(t *testing.T, options creationOptions) []byte {
+			t.Helper()
+
+			return newAuthenticator().finishBodyFor(t, options, firstRunSecret, "Alice", "Alice@example.com")
+		}, regCodeChal},
+		{"no email member", func(t *testing.T, options creationOptions) []byte {
+			t.Helper()
+
+			return regMutate(t, newAuthenticator().finishBody(t, options, firstRunSecret, "Alice"),
+				func(doc map[string]any) { delete(doc, "email") })
+		}, regCodeEmail},
+		{"email as a number", func(t *testing.T, options creationOptions) []byte {
+			t.Helper()
+
+			return regMutate(t, newAuthenticator().finishBody(t, options, firstRunSecret, "Alice"),
+				func(doc map[string]any) { doc["email"] = 5 })
+		}, "invalid_field_type"},
+		{"a repeated email member", func(t *testing.T, options creationOptions) []byte {
+			t.Helper()
+
+			return bytes.Replace(newAuthenticator().finishBody(t, options, firstRunSecret, "Alice"),
+				[]byte(`"email":`), []byte(`"email":"x@example.com","email":`), 1)
+		}, "duplicate_field"},
+	}
+
+	for _, tt := range rows {
+		t.Run(tt.name, func(t *testing.T) {
+			regOpenFirstRun(t)
+
+			options := mustBeginRegistration(t, firstRunSecret, "Alice")
+
+			post(t, pathRegisterEnd, tt.build(t, options), "").expect(t, "finish", http.StatusBadRequest, tt.code)
+			regExpectNothingWritten(t, tt.name)
+
+			// The ceremony is still good for the address it was begun with.
+			post(t, pathRegisterEnd, newAuthenticator().finishBody(t, options, firstRunSecret, "Alice"), "").
+				expect(t, "honest finish", http.StatusCreated, "")
+		})
+	}
+}
+
+// TestRegistrationWorstCaseProfileFitsTheCheck is the bound-confusion test for
+// the profile as a whole: the longest name, all of it escaped (128 bytes of '<',
+// six each), beside the longest email address, must still be at most the 1024
+// bytes of the users.profile CHECK, and so must register (201) rather than trip
+// the CHECK or the body caps.
+//
+//nolint:paralleltest // shares one database
+func TestRegistrationWorstCaseProfileFitsTheCheck(t *testing.T) {
+	regOpenFirstRun(t)
+
+	name := strings.Repeat("<", 128)
+	email := strings.Repeat("a", 64) + "@" + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." +
+		strings.Repeat("d", 3) + ".com"
+
+	if len(email) != 200 {
+		t.Fatalf("test email is %d bytes, want 200", len(email))
+	}
+
+	options := mustBeginRegistrationFor(t, firstRunSecret, name, email)
+
+	post(t, pathRegisterEnd, newAuthenticator().finishBodyFor(t, options, firstRunSecret, name, email), "").
+		expect(t, "finish with the worst-case profile", http.StatusCreated, "")
+
+	length := scalar(t, "SELECT length(profile) FROM users")
+	t.Logf("profile length = %s bytes", length)
+
+	if scalar(t, "SELECT length(profile) <= 1024 FROM users") != "1" {
+		t.Errorf("profile length %s exceeds the CHECK", length)
+	}
+
+	var profile struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	}
+
+	err := json.Unmarshal([]byte(scalar(t, "SELECT profile FROM users")), &profile)
+	if err != nil || profile.Name != name || profile.Email != email {
+		t.Errorf("profile = %+v (%v), want the name and the email as sent", profile, err)
 	}
 }
 
@@ -1944,7 +2155,7 @@ func TestRegistrationMethodsAndMedia(t *testing.T) {
 	// A foreign Origin gets no CORS grant: only the UI origin does.
 	got := send(t, request{
 		method: http.MethodPost, path: pathRegisterBegin,
-		body:    mustJSON(t, map[string]string{"invitationCode": firstRunSecret, "name": "A"}),
+		body:    mustJSON(t, map[string]string{"invitationCode": firstRunSecret, "name": "A", "email": "a@example.com"}),
 		headers: map[string]string{"Origin": "https://evil.example"},
 	})
 	if allow := got.header.Get("Access-Control-Allow-Origin"); allow == "https://evil.example" || allow == "*" {
