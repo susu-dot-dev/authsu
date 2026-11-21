@@ -21,6 +21,8 @@ type principalWant struct {
 	kind      string
 	expiresAt time.Time
 	agentID   string
+	orgID     string
+	sandboxID string
 	// scope and agentScope are the lists as stored, never nil.
 	scope, agentScope []string
 	effective         []scope.Scope
@@ -32,7 +34,7 @@ func checkPrincipal(t *testing.T, got auth.Principal, want principalWant) {
 
 	if got.UserID != userID || got.Role != want.role || got.SecretID != want.secretID ||
 		got.Kind != want.kind || !got.ExpiresAt.Equal(want.expiresAt) ||
-		got.AgentID != want.agentID {
+		got.AgentID != want.agentID || got.OrgID != want.orgID || got.SandboxID != want.sandboxID {
 		t.Errorf("principal = %+v, want %+v", got, want)
 	}
 
@@ -74,6 +76,21 @@ func sessionPrincipalCase(name, role string) principalCase {
 		return carried{headers: nil, cookies: []*http.Cookie{sessionCookie(issued)}}, principalWant{
 			role: role, secretID: issued.ID, kind: auth.KindSession,
 			expiresAt: issued.ExpiresAt, agentID: "",
+			scope: []string{scope.DefaultSession}, agentScope: []string{}, effective: sorted(scope.DefaultSession),
+		}
+	}}
+}
+
+// orgSessionPrincipalCase is a stored session of a member of the organization
+// org: the principal carries it, and no sandbox.
+func orgSessionPrincipalCase(name, org string) principalCase {
+	return principalCase{name, func(r *rig) (carried, principalWant) {
+		issued := r.sessionFor(roleMember)
+		r.setSession(issued, func(row *store.ActiveSession) { row.OrgID = org })
+
+		return carried{headers: nil, cookies: []*http.Cookie{sessionCookie(issued)}}, principalWant{
+			role: roleMember, secretID: issued.ID, kind: auth.KindSession,
+			expiresAt: issued.ExpiresAt, orgID: org,
 			scope: []string{scope.DefaultSession}, agentScope: []string{}, effective: sorted(scope.DefaultSession),
 		}
 	}}
@@ -128,6 +145,12 @@ func userPrincipalCases() []principalCase {
 		keyPrincipalCase("a user's key with no scopes",
 			bearerSpec{scope: list(), role: roleMember},
 			principalWant{scope: []string{}, agentScope: []string{}, effective: sorted()}),
+		orgSessionPrincipalCase("a session of a member of an organization", orgOne),
+		keyPrincipalCase("a user's key reads the account's organization",
+			bearerSpec{scope: list(scope.DefaultUser), org: orgOne},
+			principalWant{
+				orgID: orgOne, scope: []string{scope.DefaultUser}, agentScope: []string{}, effective: sorted(scope.DefaultUser),
+			}),
 		keyPrincipalCase("an administrator's key",
 			bearerSpec{scope: list(scope.DefaultSession), role: auth.RoleAdmin},
 			principalWant{
@@ -162,6 +185,21 @@ func agentPrincipalCases() []principalCase {
 			principalWant{
 				agentID: agentOne, scope: []string{"agent:read"}, agentScope: []string{scope.DefaultSession},
 				effective: sorted("agent:read"),
+			}),
+		keyPrincipalCase("an agent's key reads the agent's sandbox and the account's organization",
+			bearerSpec{
+				scope: list(scope.DefaultUser), agent: agentOne, agentScopes: list(scope.DefaultAgent).JSON(),
+				org: orgOne, sandbox: sandboxOne,
+			},
+			principalWant{
+				agentID: agentOne, orgID: orgOne, sandboxID: sandboxOne, scope: []string{scope.DefaultUser},
+				agentScope: []string{scope.DefaultAgent}, effective: sorted(scope.DefaultAgent),
+			}),
+		keyPrincipalCase("an ordinary agent's key has no sandbox",
+			bearerSpec{scope: list(scope.DefaultUser), agent: agentOne, agentScopes: list(scope.DefaultAgent).JSON()},
+			principalWant{
+				agentID: agentOne, scope: []string{scope.DefaultUser}, agentScope: []string{scope.DefaultAgent},
+				effective: sorted(scope.DefaultAgent),
 			}),
 		keyPrincipalCase("an agent with no scopes leaves the key nothing",
 			bearerSpec{scope: list(scope.DefaultSession), agent: agentOne, agentScopes: list().JSON()},
@@ -242,7 +280,13 @@ func TestPrincipalIsTheStoredRow(t *testing.T) {
 			r := newRig(t)
 			presented, want := test.present(r)
 
-			rec := r.serveWith(r.standardRoutes(), pathMe, presented.headers, presented.cookies)
+			// A sandboxed agent reaches only a route that opted in.
+			path := pathMe
+			if want.sandboxID != "" {
+				path = pathMeInSandbox
+			}
+
+			rec := r.serveWith(r.standardRoutes(), path, presented.headers, presented.cookies)
 			if rec.Code != http.StatusOK || len(r.handled) != 1 {
 				t.Fatalf("status = %d, ran %d times: %s", rec.Code, len(r.handled), rec.Body)
 			}

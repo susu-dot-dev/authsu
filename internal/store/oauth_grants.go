@@ -55,9 +55,9 @@ var (
 	ErrAgentLimit = errors.New("the user has the most active agents they may have")
 
 	// ErrAgentUnavailable means the agent the grant was to attach to is not
-	// there, is not the user's, or is revoked. The write cannot tell which, and
-	// the three are answered alike so that a request cannot probe another
-	// user's agents.
+	// there, is not the user's, is revoked, or is in a sandbox. The write cannot
+	// tell which, and they are answered alike so that a request cannot probe
+	// another user's agents.
 	ErrAgentUnavailable = errors.New("the agent is not an active agent of the user")
 
 	// ErrUserInactive means the account was revoked after the request was
@@ -152,10 +152,13 @@ type NewGrant struct {
 // the secret with it, and which column failed says why (see CreateGrant):
 //
 //   - user_id is read from users and must be an active account;
-//   - agent_id is read from agents and must be the owner's own and active. For
-//     an agent created in this batch the subselect finds it; when the agent
-//     insert matched nothing (the account was revoked, or the user was at the
-//     limit) it is NULL;
+//   - agent_id is read from agents and must be the owner's own, active and in
+//     no sandbox. A grant is a credential an outside service holds, and an agent
+//     of a sandbox is confined to it and reaches nothing else, so consent
+//     cannot attach one (the agent reads as unavailable, as a revoked one
+//     does). For an agent created in this batch the subselect finds it; when
+//     the agent insert matched nothing (the account was revoked, or the user
+//     was at the limit) it is NULL;
 //   - auth_time is the created_at of the approving session's secret, which must
 //     be that user's session and active at ?14. It is never taken from the
 //     request.
@@ -178,7 +181,8 @@ INSERT INTO oauth_grants (id, kind, user_id, agent_id, client_id, client_name, r
                           code_challenge, nonce, auth_time, granted_from)
 VALUES (?1, ?2,
         (SELECT u.id FROM users u WHERE u.id = ?3 AND u.revoked_at IS NULL),
-        (SELECT a.id FROM agents a WHERE a.id = ?4 AND a.user_id = ?3 AND a.revoked_at IS NULL),
+        (SELECT a.id FROM agents a WHERE a.id = ?4 AND a.user_id = ?3 AND a.revoked_at IS NULL
+                                         AND a.sandbox_id IS NULL),
         ?5, ?6, ?7, ?8, ?9, ?10, ?11,
         (SELECT s.created_at FROM secrets s JOIN sessions x ON x.id = s.id AND x.kind = s.kind
          WHERE s.id = ?12 AND s.kind = ?13 AND x.user_id = ?3
@@ -195,7 +199,7 @@ VALUES (?1, ?2,
 //   - ErrUserInactive: the account was revoked;
 //   - ErrAgentLimit: a new agent was asked for and the user is at the limit;
 //   - ErrAgentUnavailable: an existing agent was asked for and it is not the
-//     user's or is revoked;
+//     user's, is revoked or is in a sandbox;
 //   - ErrSessionInactive: the approving session ended or is not the user's;
 //   - ErrGrantReplayed: this consent was already used.
 //
@@ -220,10 +224,9 @@ func (s *Store) CreateGrant(ctx context.Context, grant NewGrant) error {
 	statements := make([]Statement, 0, maxGrantStatements)
 
 	if grant.NewAgent != nil {
-		statements = append(statements, Statement{Query: insertAgentQuery, Args: []any{
+		statements = append(statements, agentInsert(
 			grant.AgentID, grant.NewAgent.Name.String(), GrantAgentScopes, created, grant.Owner,
-			int64(grant.NewAgent.MaxActive),
-		}})
+			grant.NewAgent.MaxActive, ""))
 	}
 
 	statements = append(statements,

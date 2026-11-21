@@ -157,9 +157,10 @@ func TestUserKeyIsAcceptedAsABearerWithTheScopesItWasGiven(t *testing.T) {
 	secretArgs, key := batch[0].Args, batch[1].Args
 
 	// The row the database would return for the lookup: the key's id and expiry,
-	// its owner, no agent, and its own scope.
+	// its owner, no agent, its own scope, and no organization and no sandbox.
 	row := []any{
 		secretArgs[secretArgID], memberID, roleMember, secretArgs[secretArgExpires], "", "", key[userKeyArgScope],
+		"", "",
 	}
 
 	h := newHarness(t, fullEnv(),

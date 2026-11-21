@@ -22,7 +22,7 @@ func userSchemaBounds() []bound {
 		// Every column the revoke statements set exists on its table, and is
 		// not NOT NULL: NULL is "not revoked", which the guard relies on.
 		{name: "users.revoked_at is a nullable integer",
-			pattern: `CREATE TABLE users \(.*?revoked_at INTEGER, created_at INTEGER NOT NULL \)`,
+			pattern: `CREATE TABLE users \(.*?revoked_at INTEGER, created_at INTEGER NOT NULL,`,
 			lowest:  0, highest: 0, exact: false},
 	}
 }

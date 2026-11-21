@@ -48,6 +48,13 @@ type Invitation struct {
 	CreatedBy *string `json:"createdBy,omitempty"`
 	// CreatedAt is in Unix seconds.
 	CreatedAt int64 `json:"createdAt"`
+	// OrgID and OrgRole are the offer to join an organization that the
+	// invitation carries, present together while the offer exists: whoever
+	// registers with the invitation joins that organization as that role. They
+	// are absent when it carries none, was withdrawn, or its organization was
+	// revoked.
+	OrgID   *string `json:"orgId,omitempty"`
+	OrgRole *string `json:"orgRole,omitempty"`
 }
 
 // statusAt returns the status of row at now. Revocation, expiry and the cap
@@ -77,7 +84,7 @@ func present(row store.Invitation, now time.Time) Invitation {
 		ID: row.ID, Type: row.Type, Label: row.Label,
 		NumInvites: row.NumInvites, Uses: row.Uses, Status: statusAt(row, now),
 		ExpiresAt: row.ExpiresAt, RevokedAt: row.RevokedAt, CreatedBy: row.CreatedBy,
-		CreatedAt: row.CreatedAt,
+		CreatedAt: row.CreatedAt, OrgID: row.OrgID, OrgRole: row.OrgRole,
 	}
 }
 

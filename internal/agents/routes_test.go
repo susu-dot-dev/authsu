@@ -16,7 +16,10 @@ import (
 // every route of the API, and for each the credential and the exact access it
 // declares. Every agent route is the caller's own business, so none is an admin
 // scope; renaming and revoking refuse agents (siblings are peers), and creating
-// is the one write an agent may do, with agent:create.
+// is the one write an agent may do, with agent:create. The list, the read and
+// the create are the only routes an agent of a sandbox may use (InSandbox), and
+// the store confines their queries to the sandbox; renaming and revoking are
+// refused to it by the boundary.
 func TestRouteDeclarations(t *testing.T) {
 	t.Parallel()
 
@@ -24,9 +27,9 @@ func TestRouteDeclarations(t *testing.T) {
 		method, path string
 		access       auth.Access
 	}{
-		{http.MethodGet, "/api/agent", auth.Needs(scope.AgentRead)},
-		{http.MethodPost, "/api/agent", auth.Needs(scope.AgentCreate)},
-		{http.MethodGet, itemPattern, auth.Needs(scope.AgentRead)},
+		{http.MethodGet, "/api/agent", auth.Needs(scope.AgentRead).InSandbox()},
+		{http.MethodPost, "/api/agent", auth.Needs(scope.AgentCreate).InSandbox()},
+		{http.MethodGet, itemPattern, auth.Needs(scope.AgentRead).InSandbox()},
 		{http.MethodPatch, itemPattern, auth.Needs(scope.AgentUpdate).WithoutAgents()},
 		{http.MethodDelete, itemPattern, auth.Needs(scope.AgentRevoke).WithoutAgents()},
 	}

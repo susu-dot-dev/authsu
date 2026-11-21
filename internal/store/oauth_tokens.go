@@ -167,12 +167,14 @@ const codeSecretConditions = `hash = ?1 AND kind = ?2
 
 // codeGrantConditions are the conditions on the grant of the exchange of a code,
 // over the alias g: the account and the agent that holds the grant are not
-// revoked, and it is the presented client's, approved for the presented redirect
-// URI and for the PKCE challenge of the presented verifier. Arguments: ?4
-// client_id, ?5 redirect_uri, ?6 code_challenge.
+// revoked and the agent is in no sandbox (as introspectQuery: consent never
+// attaches an agent of a sandbox to a grant, and one that somehow did is
+// refused here and not trusted), and it is the presented client's, approved for
+// the presented redirect URI and for the PKCE challenge of the presented
+// verifier. Arguments: ?4 client_id, ?5 redirect_uri, ?6 code_challenge.
 const codeGrantConditions = `FROM oauth_grants g
              JOIN users u ON u.id = g.user_id AND u.revoked_at IS NULL
-             JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL
+             JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL AND a.sandbox_id IS NULL
              WHERE g.client_id = ?4 AND g.redirect_uri = ?5 AND g.code_challenge = ?6`
 
 // rotateCodeQuery is the exchange of an authorization code: it rotates the
@@ -253,13 +255,14 @@ const refreshSecretConditions = `hash = ?1 AND kind = ?2
   AND (revoked_at IS NULL OR revoked_at > ?3) AND expires_at > ?3`
 
 // refreshGrantConditions are the conditions on the grant of a refresh, over the
-// alias g: the account and the agent are not revoked and the grant is the
-// presented client's (?4). The redirect URI and the PKCE challenge are not part
+// alias g: the account and the agent are not revoked, the agent is in no
+// sandbox (as for codeGrantConditions), and the grant is the presented
+// client's (?4). The redirect URI and the PKCE challenge are not part
 // of it: a refresh is made by whoever holds the token, and the client is the one
 // condition a public client can be held to.
 const refreshGrantConditions = `FROM oauth_grants g
              JOIN users u ON u.id = g.user_id AND u.revoked_at IS NULL
-             JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL
+             JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL AND a.sandbox_id IS NULL
              WHERE g.client_id = ?4`
 
 // rotateRefreshQuery is the refresh of a refresh token: rotateCodeQuery's rotation
@@ -623,7 +626,10 @@ func (d diagnosis) refusal(found bool) error {
 //     together;
 //   - the grant's secret is active too, so revoking the grant (or its agent, or
 //     its user, which revoke the same secret) ends the access token at once;
-//   - the account is not revoked, and the agent that holds the grant is not;
+//   - the account is not revoked, and the agent that holds the grant is not,
+//     and is in no sandbox: consent never attaches an agent of a sandbox to a
+//     grant (insertGrantQuery), so there is none, and a token that somehow
+//     reached one is refused here rather than trusted;
 //   - the grant is for exactly the resource asked about, by exact comparison, so
 //     a token for one resource is not live at another.
 //
@@ -651,6 +657,7 @@ WHERE s.hash = ?1
   AND (gs.revoked_at IS NULL OR gs.revoked_at > ?3) AND gs.expires_at > ?3
   AND u.revoked_at IS NULL
   AND a.revoked_at IS NULL
+  AND a.sandbox_id IS NULL
   AND g.resource = ?4`
 
 // ActiveAccessToken is an access token that may be used, with what it was

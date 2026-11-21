@@ -18,6 +18,15 @@
 // invitation and no account, and begin accepts the token in the same case. Both
 // are decided against the configuration read on that request.
 //
+// An invitation may carry an offer to join an organization
+// (docs/orgs_design.md, principle 2). Finish does nothing about it: the store's
+// write that creates the account also places it in the offered organization,
+// and makes it an administrator when the offer says so, only if that
+// organization is standard and unrevoked in that same write. The organization
+// is a side effect of registration and never a condition of it, so a revoked
+// one means an account with none, and the response is the same either way. The
+// offer stays for the next registrant of a multi-use invitation.
+//
 // Both routes are open (auth.None): the caller has no session yet.
 package registration
 

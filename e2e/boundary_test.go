@@ -77,11 +77,12 @@ const (
 
 // bndRoutes is the complete public surface, derived from the Routes()
 // declarations of internal/{firstrun,registration,login,session,agents,
-// invitations,users} and internal/app/app.go (/healthz). The caps are the
+// invitations,users,orgs} and internal/app/app.go (/healthz). The caps are the
 // production constants (MaxBeginBody, MaxFinishBody, invitations.MaxBody, the
-// users maxBody) and httpapi.DefaultMaxBody for a route that declares none.
+// users maxBody, the orgs maxBody and maxSmallBody) and httpapi.DefaultMaxBody
+// for a route that declares none.
 func bndRoutes() []bndRoute {
-	return slices.Concat(bndPublicRoutes(), bndSessionInventory(), bndAdminInventory())
+	return slices.Concat(bndPublicRoutes(), bndSessionInventory(), bndOrgInventory(), bndAdminInventory())
 }
 
 // bndPublicRoutes are the routes that need no credential.
@@ -117,6 +118,39 @@ func bndSessionInventory() []bndRoute {
 		bndRouteOf("agent get", http.MethodGet, item, session, 8*bndKiB, "", ""),
 		bndRouteOf("agent rename", http.MethodPatch, item, session, 8*bndKiB, `{"name":"renamed"}`, renamed),
 		bndRouteOf("agent revoke", http.MethodDelete, item, session, 8*bndKiB, "", archived),
+	}
+}
+
+// bndOrgInventory are the organization routes. Each needs a session and its own
+// scope and no role: whether the caller may act on an organization is decided
+// in the write, so at the boundary they are any-session routes. The ids in the
+// patterns are an organization's, a user's (a member is named by its user) or an
+// offer's; bndWorld.idFor says which a pattern takes.
+func bndOrgInventory() []bndRoute {
+	const (
+		org    = "/api/org/" + bndIDToken
+		member = "/api/member/" + bndIDToken
+		offer  = "/api/offer/" + bndIDToken
+	)
+
+	session := bndAnySession
+
+	return []bndRoute{
+		bndRouteOf("org create", http.MethodPost, "/api/org", session, 8*bndKiB, `{"kind":"standard","name":"bnd"}`, "orgs"),
+		bndRouteOf("org list", http.MethodGet, "/api/org", session, bndKiB, "", ""),
+		bndRouteOf("org get", http.MethodGet, org, session, bndKiB, "", ""),
+		bndRouteOf("org rename", http.MethodPatch, org, session, 8*bndKiB, `{"name":"renamed"}`,
+			"orgs WHERE name = 'renamed'"),
+		bndRouteOf("org revoke", http.MethodDelete, org, session, bndKiB, "", "orgs WHERE revoked_at IS NOT NULL"),
+		bndRouteOf("member list", http.MethodGet, org+"/member", session, bndKiB, "", ""),
+		bndRouteOf("member update", http.MethodPatch, member, session, bndKiB, `{"admin":true}`, "org_admins"),
+		bndRouteOf("member revoke", http.MethodDelete, member, session, bndKiB, "", "users WHERE org_id IS NOT NULL"),
+		bndRouteOf("offer create", http.MethodPost, org+"/offer", session, bndKiB,
+			`{"userId":"`+idMissing+`","role":"member"}`, "org_offers"),
+		bndRouteOf("org offer list", http.MethodGet, org+"/offer", session, bndKiB, "", ""),
+		bndRouteOf("offer list", http.MethodGet, "/api/offer", session, bndKiB, "", ""),
+		bndRouteOf("offer accept", http.MethodPost, offer+"/accept", session, bndKiB, "", "users WHERE org_id IS NOT NULL"),
+		bndRouteOf("offer revoke", http.MethodDelete, offer, session, bndKiB, "", "org_offers"),
 	}
 }
 
@@ -240,6 +274,49 @@ type bndWorld struct {
 	agentID         string
 	invitationID    string
 	invitationToken string
+	// orgID is a standard organization the admin created and administers, and
+	// offerID an offer from it to the member. The admin has not joined it: the
+	// schema does not ask that, and a world where the member and the admin are
+	// both outside it lets the matrix create, accept and join without a state
+	// to undo beyond bndRestore's.
+	orgID   string
+	offerID string
+}
+
+// bndOrgID and bndOfferID are the ids of the organization and the offer a
+// bndWorld holds.
+func bndOrgID() string { return idN("0b10", 1) }
+
+func bndOfferID() string { return idN("0b11", 1) }
+
+// idFor is the id a pattern's {id} takes in this world: the organization for
+// the organization routes, the member for a member (a user's id), the offer for
+// an offer, and the agent, the invitation or the user the older routes address.
+func (w bndWorld) idFor(pattern string) string {
+	switch {
+	case strings.HasPrefix(pattern, "/api/invitation"):
+		return w.invitationID
+	case strings.HasPrefix(pattern, "/api/user"), strings.HasPrefix(pattern, "/api/member"):
+		return w.member.userID
+	case strings.HasPrefix(pattern, "/api/org"):
+		return w.orgID
+	case strings.HasPrefix(pattern, "/api/offer"):
+		return w.offerID
+	default:
+		return w.agentID
+	}
+}
+
+// bndSeedOrg seeds the world's organization, administered by the admin, with an
+// offer to the member. It is written only while the Worker is idle.
+func bndSeedOrg(t *testing.T, admin, member string) {
+	t.Helper()
+
+	seed(t, "INSERT INTO orgs (id, kind, name, created_by, created_at) "+
+		"VALUES (?, 'standard', 'bnd', ?, strftime('%s','now'))", bndOrgID(), admin)
+	seed(t, "INSERT INTO org_admins (org_id, user_id, created_at) VALUES (?, ?, strftime('%s','now'))", bndOrgID(), admin)
+	seed(t, "INSERT INTO org_offers (id, org_id, user_id, role, created_by, created_at) "+
+		"VALUES (?, ?, ?, 'member', ?, strftime('%s','now'))", bndOfferID(), bndOrgID(), member, admin)
 }
 
 // bndNewWorld resets the deployment and creates an admin (through the real
@@ -264,9 +341,12 @@ func bndNewWorld(t *testing.T) bndWorld {
 
 	seedAgent(t, idAgentA, admin.userID, "seeded")
 
+	bndSeedOrg(t, admin.userID, member.userID)
+
 	return bndWorld{
 		admin: admin, adminToken: adminToken, member: member, memberToken: memberToken,
 		agentID: idAgentA, invitationID: idInvitationA, invitationToken: invitationToken,
+		orgID: bndOrgID(), offerID: bndOfferID(),
 	}
 }
 
@@ -350,7 +430,7 @@ func bndNoCookies(t *testing.T, what string, r reply) {
 func bndSnapshot(t *testing.T) string {
 	t.Helper()
 
-	parts := make([]string, 0, len(tables())+6)
+	parts := make([]string, 0, len(tables())+9)
 
 	for _, table := range tables() {
 		parts = append(parts, table+"="+count(t, table))
@@ -365,6 +445,12 @@ func bndSnapshot(t *testing.T) string {
 		"agent_names="+scalar(t, "SELECT group_concat(name) FROM (SELECT name FROM agents ORDER BY id)"),
 		"agent_labels="+scalar(t, "SELECT group_concat(agent_id||':'||label) "+
 			"FROM (SELECT agent_id, label FROM agent_labels ORDER BY agent_id, label)"),
+		"org_members="+scalar(t, "SELECT group_concat(id||':'||org_id) "+
+			"FROM (SELECT id, org_id FROM users WHERE org_id IS NOT NULL ORDER BY id)"),
+		"org_cells="+scalar(t, "SELECT group_concat(id||':'||name||':'||ifnull(revoked_at, '')) "+
+			"FROM (SELECT id, name, revoked_at FROM orgs ORDER BY id)"),
+		"org_admin_roles="+scalar(t, "SELECT group_concat(org_id||':'||user_id) "+
+			"FROM (SELECT org_id, user_id FROM org_admins ORDER BY org_id, user_id)"),
 		"invite_caps="+scalar(t, "SELECT group_concat(num_invites) FROM (SELECT num_invites FROM invitations ORDER BY id)"),
 	)
 
@@ -468,8 +554,8 @@ func TestBndInventoryIsTheWholeSurface(t *testing.T) {
 			seen[key] = true
 		}
 
-		if len(seen) != 20 {
-			t.Errorf("inventory has %d routes, want the 20 the product declares", len(seen))
+		if len(seen) != 33 {
+			t.Errorf("inventory has %d routes, want the 33 the product declares", len(seen))
 		}
 	})
 }
@@ -1223,12 +1309,19 @@ func TestBndMalformedPathIDs(t *testing.T) {
 			for _, credential := range credentials {
 				t.Run(route.name+"/"+bad.name+"/"+credential.name, func(t *testing.T) {
 					path := strings.ReplaceAll(route.pattern, bndIDToken, bad.segment)
-					got := send(t, request{method: route.method, path: path, token: credential.token, body: bndBodyOf(route)})
+					// A redirect is kept, not followed: a followed one lands on
+					// another route (an id in the middle of a path becomes the
+					// route of the cleaned path), which is that route's answer.
+					got := send(t, request{
+						method: route.method, path: path, token: credential.token, body: bndBodyOf(route), keepRedirect: true,
+					})
 
 					// An encoded slash or a dot-only segment changes the path
 					// the mux routes (see TestBndUnknownPathsAreNotFound and
-					// TestBndPathCleaningBehaviour), so those are 404 or the
-					// cleaned route; everything else is an id the boundary refuses.
+					// TestBndPathCleaningBehaviour), so those are 404, the
+					// redirect to the cleaned path (an in-API one, never
+					// protocol-relative) or the answer the credential would
+					// get; everything else is an id the boundary refuses.
 					status, code := want(route, credential.token)
 
 					if bndChangesRouting(bad.segment) {
@@ -1236,8 +1329,12 @@ func TestBndMalformedPathIDs(t *testing.T) {
 							return
 						}
 
-						if got.status != http.StatusNotFound {
-							t.Errorf("%s = %d %s, want %d %s or 404", path, got.status, got.body, status, code)
+						location := got.header.Get("Location")
+						redirected := got.status == http.StatusMovedPermanently &&
+							strings.HasPrefix(location, "/api/") && !strings.HasPrefix(location, "//")
+
+						if got.status != http.StatusNotFound && !redirected {
+							t.Errorf("%s = %d %s, want %d %s, 404 or a redirect inside the API", path, got.status, got.body, status, code)
 						}
 
 						return
@@ -1254,9 +1351,25 @@ func TestBndMalformedPathIDs(t *testing.T) {
 
 		t.Run(route.name+"/empty segment is not an id", func(t *testing.T) {
 			// "/api/agent/" is the trailing-slash path: a 404, never an id error.
+			// An id in the middle ("/api/org//member") leaves an empty segment,
+			// which the mux redirects to the cleaned path, again never an id
+			// error and never a handler.
 			path := strings.ReplaceAll(route.pattern, bndIDToken, "")
-			got := send(t, request{method: route.method, path: path, token: world.adminToken, body: bndBodyOf(route)})
-			got.expect(t, route.method+" "+path, http.StatusNotFound, codeNotFound)
+			got := send(t, request{
+				method: route.method, path: path, token: world.adminToken, body: bndBodyOf(route), keepRedirect: true,
+			})
+
+			if strings.HasSuffix(route.pattern, bndIDToken) {
+				got.expect(t, route.method+" "+path, http.StatusNotFound, codeNotFound)
+
+				return
+			}
+
+			cleaned := strings.ReplaceAll(route.pattern, "/"+bndIDToken, "")
+			if got.status != http.StatusMovedPermanently || got.header.Get("Location") != cleaned {
+				t.Errorf("%s %s = %d %q (Location %q), want a 301 to %s",
+					route.method, path, got.status, got.body, got.header.Get("Location"), cleaned)
+			}
 		})
 	}
 
@@ -1294,9 +1407,19 @@ func TestBndValidButMissingIDIsNoOracle(t *testing.T) {
 		"/api/user/" + bndIDToken:       world.admin.userID,
 	}
 
+	// idOf is the existing id of a route: the organization, member and offer
+	// routes take the world's own, and the older ones their map entry.
+	idOf := func(route bndRoute) string {
+		if id, ok := existing[route.pattern]; ok {
+			return id
+		}
+
+		return world.idFor(route.pattern)
+	}
+
 	for _, route := range bndIDRoutes() {
 		t.Run(route.name+"/anonymous", func(t *testing.T) {
-			live := send(t, request{method: route.method, path: route.path(existing[route.pattern]), body: bndBodyOf(route)})
+			live := send(t, request{method: route.method, path: route.path(idOf(route)), body: bndBodyOf(route)})
 			missing := send(t, request{method: route.method, path: route.path(idMissing), body: bndBodyOf(route)})
 
 			live.expect(t, route.name+" existing id", http.StatusUnauthorized, codeUnauthenticated)
@@ -1313,7 +1436,7 @@ func TestBndValidButMissingIDIsNoOracle(t *testing.T) {
 					t,
 					request{
 						method: route.method,
-						path:   route.path(existing[route.pattern]),
+						path:   route.path(idOf(route)),
 						token:  world.memberToken,
 						body:   bndBodyOf(route),
 					},
@@ -1818,7 +1941,15 @@ func bndStateBreaks() []struct {
 			"UPDATE users SET revoked_at = strftime('%s','now') - 1 " +
 				"WHERE id = (SELECT user_id FROM sessions WHERE id = '{ID}')",
 		},
-		{"user deleted", "DELETE FROM users WHERE id = (SELECT user_id FROM sessions WHERE id = '{ID}')"},
+		{
+			// An account that created an organization cannot be deleted while it
+			// stands (the creator is kept for the limits), so the organizations and
+			// the offers that name them go first.
+			"user deleted",
+			"DELETE FROM org_offers; " +
+				"DELETE FROM orgs WHERE created_by = (SELECT user_id FROM sessions WHERE id = '{ID}'); " +
+				"DELETE FROM users WHERE id = (SELECT user_id FROM sessions WHERE id = '{ID}')",
+		},
 	}
 }
 
@@ -1957,14 +2088,7 @@ func TestBndPermissionMatrix(t *testing.T) {
 				want := bndExpected(route.access, credential.who)
 
 				before := bndSnapshot(t)
-				id := world.agentID
-
-				switch {
-				case strings.HasPrefix(route.pattern, "/api/invitation"):
-					id = world.invitationID
-				case strings.HasPrefix(route.pattern, "/api/user"):
-					id = world.member.userID
-				}
+				id := world.idFor(route.pattern)
 
 				got := send(t, request{method: route.method, path: route.path(id), token: credential.token, body: bndBodyOf(route)})
 
@@ -2032,8 +2156,8 @@ func bndExpected(access bndAccess, who string) bndOutcome {
 
 // bndRestore puts back what a let-through request may have changed, so the
 // next case in the matrix starts from the same world: the admin's and the
-// member's sessions (a logout revokes one), the agent, the invitation, and the
-// member.
+// member's sessions (a logout revokes one), the agent, the invitation, the
+// member, and the organization with its offer.
 func bndRestore(t *testing.T, world bndWorld) {
 	t.Helper()
 
@@ -2049,6 +2173,14 @@ func bndRestore(t *testing.T, world bndWorld) {
 	seed(t, "UPDATE invitations SET num_invites = 3 WHERE id = ?", world.invitationID)
 	seed(t, "DELETE FROM invitations WHERE id <> ? AND type <> 'first_run'", world.invitationID)
 	seed(t, "UPDATE users SET revoked_at = NULL WHERE id IN (?, ?)", world.admin.userID, world.member.userID)
+
+	// The organizations: whoever joined or created one leaves it, and the
+	// world's own organization and offer are put back as they were.
+	seed(t, "UPDATE users SET org_id = NULL")
+	seed(t, "DELETE FROM org_offers")
+	seed(t, "DELETE FROM org_admins")
+	seed(t, "DELETE FROM orgs")
+	bndSeedOrg(t, world.admin.userID, world.member.userID)
 }
 
 // bndSeedExtraAccount seeds another account with the role and a passkey.
@@ -2180,7 +2312,13 @@ func TestBndCredentialConfusion(t *testing.T) {
 
 	routes := bndSessionRoutes()
 
-	for _, route := range routes {
+	// An account may have 25 active agents, and every route gets its own key, so
+	// the keys are spread over the two accounts, turn and turn about.
+	owners := []string{world.adminToken, world.memberToken}
+
+	for i, route := range routes {
+		owner := owners[i%len(owners)]
+
 		t.Run(route.name+"/api key as cookie", func(t *testing.T) {
 			got := send(t, request{method: route.method, path: route.path(idMissing), token: apiKey, body: bndBodyOf(route)})
 			if got.status != http.StatusUnauthorized || got.body != bndErrUnauth {
@@ -2194,7 +2332,7 @@ func TestBndCredentialConfusion(t *testing.T) {
 		// the admin routes need the role AND an admin scope the bundle lacks.
 		// Each route gets its own key: logout ends the key it presents.
 		t.Run(route.name+"/api key as bearer", func(t *testing.T) {
-			own := bndAgentKey(t, world.adminToken)
+			own := bndAgentKey(t, owner)
 
 			got := send(t, request{
 				method: route.method, path: route.path(idMissing), body: bndBodyOf(route),

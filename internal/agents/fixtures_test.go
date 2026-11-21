@@ -141,8 +141,22 @@ type storeCall struct {
 	agent store.NewAgent
 	// patch is the AgentPatch of a patch.
 	patch store.AgentPatch
-	// label is the label filter of a list, "" for none.
-	label string
+	// label is the label filter of a list, "" for none; and sandbox the sandbox
+	// filter, "" for none.
+	label   string
+	sandbox string
+	// confined and confinedTo are the reach a list or a get was made with: an
+	// agent's (confined, to its sandbox or to none) and not the user's.
+	confined   bool
+	confinedTo string
+}
+
+// fakeSandbox is a sandbox as the fake database holds it: who administers it,
+// and whether it is usable. A sandbox that is expired, or is not a sandbox at
+// all (a standard organization), is not one an agent can be created in.
+type fakeSandbox struct {
+	admin   string
+	expired bool
 }
 
 // ownedAgent is an agent as the fake database holds it: with its owner.
@@ -155,16 +169,19 @@ type ownedAgent struct {
 // real one is, with a programmable failure per method. It records every call.
 type fakeStore struct {
 	rows []ownedAgent
+	// sandboxes are the sandboxes that exist, by id.
+	sandboxes map[string]fakeSandbox
 	// failures are returned by the named method instead of its normal outcome.
 	failures map[string]error
 	calls    []storeCall
 }
 
-// ListAgents is the contract of store.ListAgents: the owner's agents with an id
-// below the cursor, newest first, at most limit, only those with the filter's
-// label when it is set, and Next set when more remain.
+// ListAgents is the contract of store.ListAgents: the agents the reach allows
+// with an id below the cursor, newest first, at most limit, only those with the
+// filter's label and in the filter's sandbox when they are set, and Next set when
+// more remain.
 func (f *fakeStore) ListAgents(
-	_ context.Context, owner string, cursor input.Cursor, limit input.PageLimit, filter input.LabelFilter,
+	_ context.Context, reach store.AgentReach, cursor input.Cursor, limit input.PageLimit, filter store.AgentFilter,
 ) (store.AgentPage, error) {
 	before := ""
 	if id, ok := cursor.ID(); ok {
@@ -172,19 +189,26 @@ func (f *fakeStore) ListAgents(
 	}
 
 	want := ""
-	if label, ok := filter.Label(); ok {
+	if label, ok := filter.Label.Label(); ok {
 		want = label.String()
 	}
 
-	f.calls = append(f.calls,
-		storeCall{method: methodList, owner: owner, cursor: before, limit: limit.Int(), label: want})
+	inSandbox := ""
+	if sandbox, ok := filter.Sandbox.Sandbox(); ok {
+		inSandbox = sandbox.String()
+	}
+
+	f.calls = append(f.calls, storeCall{
+		method: methodList, owner: reach.Owner(), cursor: before, limit: limit.Int(), label: want, sandbox: inSandbox,
+		confined: reach.Confined(), confinedTo: reach.Sandbox(),
+	})
 
 	err := f.fail(methodList)
 	if err != nil {
 		return store.AgentPage{}, err
 	}
 
-	mine := f.matching(owner, before, want)
+	mine := f.matching(reach, before, want, inSandbox)
 
 	slices.SortFunc(mine, func(a, b store.Agent) int { return cmp.Compare(b.ID, a.ID) })
 
@@ -198,20 +222,37 @@ func (f *fakeStore) ListAgents(
 }
 
 // GetAgent is the contract of store.GetAgent.
-func (f *fakeStore) GetAgent(_ context.Context, owner string, id input.ID) (store.Agent, error) {
-	f.calls = append(f.calls, storeCall{method: methodGet, owner: owner, id: id.String()})
+func (f *fakeStore) GetAgent(_ context.Context, reach store.AgentReach, id input.ID) (store.Agent, error) {
+	f.calls = append(f.calls, storeCall{
+		method: methodGet, owner: reach.Owner(), id: id.String(), confined: reach.Confined(), confinedTo: reach.Sandbox(),
+	})
 
 	err := f.fail(methodGet)
 	if err != nil {
 		return store.Agent{}, err
 	}
 
-	at, ok := f.find(owner, id.String())
-	if !ok {
+	at, ok := f.find(reach.Owner(), id.String())
+	if !ok || !reaches(reach, f.rows[at].agent) {
 		return store.Agent{}, store.ErrNotFound
 	}
 
 	return normalised(f.rows[at].agent), nil
+}
+
+// reaches is the reach's rule: a confined reach allows only agents whose
+// sandbox is exactly its own (none equals none), and an unconfined one allows
+// every agent of the owner.
+func reaches(reach store.AgentReach, agent store.Agent) bool {
+	if !reach.Confined() {
+		return true
+	}
+
+	if agent.SandboxID == nil {
+		return reach.Sandbox() == ""
+	}
+
+	return *agent.SandboxID == reach.Sandbox()
 }
 
 // normalised returns agent with a non-nil, sorted label list, as the store
@@ -227,27 +268,17 @@ func normalised(agent store.Agent) store.Agent {
 
 // CreateAgent is the contract of store.CreateAgent. A programmed failure is
 // returned before anything is written.
-func (f *fakeStore) CreateAgent(_ context.Context, agent store.NewAgent) (string, error) {
+func (f *fakeStore) CreateAgent(_ context.Context, agent store.NewAgent) (store.CreatedAgent, error) {
 	f.calls = append(f.calls, storeCall{method: methodCreate, owner: agent.Owner, agent: agent})
 
 	err := f.fail(methodCreate)
 	if err != nil {
-		return "", err
+		return store.CreatedAgent{}, err
 	}
 
-	scopes := agent.Scopes
-
-	// The contract of store.CreateAgent for an agent's create: the new agent's
-	// scopes are the creating agent's, read from its row, and the list the
-	// caller offered is not used. A creating agent that is not the owner's, or
-	// is revoked, makes the write fail as a conflict.
-	if agent.CreatedBy != "" {
-		at, ok := f.find(agent.Owner, agent.CreatedBy)
-		if !ok || f.rows[at].agent.RevokedAt != nil {
-			return "", store.ErrConflict
-		}
-
-		scopes = f.rows[at].agent.Scopes
+	scopes, sandbox, err := f.inherited(agent)
+	if err != nil {
+		return store.CreatedAgent{}, err
 	}
 
 	// The contract: the labels are written with the agent, in the same batch.
@@ -258,11 +289,16 @@ func (f *fakeStore) CreateAgent(_ context.Context, agent store.NewAgent) (string
 
 	f.rows = append(f.rows, ownedAgent{owner: agent.Owner, agent: store.Agent{
 		ID: agent.ID, Name: agent.Name.String(), Scopes: scopes, RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(),
-		Labels: labels,
+		Labels: labels, SandboxID: sandbox,
 	}})
 
 	// The contract: what the row holds is what is returned.
-	return scopes, nil
+	created := store.CreatedAgent{Scopes: scopes, SandboxID: ""}
+	if sandbox != nil {
+		created.SandboxID = *sandbox
+	}
+
+	return created, nil
 }
 
 // PatchAgent is the contract of store.PatchAgent: the whole patch takes effect
@@ -339,21 +375,69 @@ func (f *fakeStore) RevokeAgent(_ context.Context, owner string, id input.ID, no
 	return normalised(f.rows[at].agent), nil
 }
 
-// matching is the owner's agents with an id below before (any, when it is ""),
-// and with the label (any, when it is "").
-func (f *fakeStore) matching(owner, before, label string) []store.Agent {
+// inherited is the scopes and the sandbox a create writes. For an agent's create
+// they are the creating agent's, read from its row, and the list and sandbox
+// the caller offered are not used; a creating agent that is not the owner's, or
+// is revoked, or whose sandbox has expired, makes the write fail as a conflict.
+// For a user's create they are the ones offered, and a sandbox must be one the
+// user administers that has not expired: otherwise the refusal, which as in the
+// store also carries the conflict.
+func (f *fakeStore) inherited(agent store.NewAgent) (string, *string, error) {
+	if agent.CreatedBy == "" {
+		return f.offered(agent)
+	}
+
+	at, ok := f.find(agent.Owner, agent.CreatedBy)
+	if !ok || f.rows[at].agent.RevokedAt != nil {
+		return "", nil, store.ErrConflict
+	}
+
+	creator := f.rows[at].agent
+	if creator.SandboxID != nil && f.sandboxes[*creator.SandboxID].expired {
+		return "", nil, store.ErrConflict
+	}
+
+	return creator.Scopes, creator.SandboxID, nil
+}
+
+// offered is the sandbox a user's create names, or the refusal of it.
+func (f *fakeStore) offered(agent store.NewAgent) (string, *string, error) {
+	named := agent.Sandbox.String()
+	if named == "" {
+		return agent.Scopes, nil, nil
+	}
+
+	have, ok := f.sandboxes[named]
+	if !ok || have.admin != agent.Owner || have.expired {
+		return "", nil, errors.Join(store.ErrSandboxUnavailable, store.ErrConflict)
+	}
+
+	return agent.Scopes, &named, nil
+}
+
+// matching is the agents the reach allows with an id below before (any, when it
+// is ""), with the label (any, when it is "") and in the sandbox (any, when it is
+// "").
+func (f *fakeStore) matching(reach store.AgentReach, before, label, sandbox string) []store.Agent {
 	var mine []store.Agent
 
 	for _, row := range f.rows {
-		below := before == "" || row.agent.ID < before
-		labelled := label == "" || slices.Contains(row.agent.Labels, label)
-
-		if row.owner == owner && below && labelled {
+		if row.owner == reach.Owner() && reaches(reach, row.agent) && listed(row.agent, before, label, sandbox) {
 			mine = append(mine, normalised(row.agent))
 		}
 	}
 
 	return mine
+}
+
+// listed is the part of a list's match that is a filter: the id below the
+// cursor, the label and the sandbox, each of them any when it is "".
+func listed(agent store.Agent, before, label, sandbox string) bool {
+	below := before == "" || agent.ID < before
+	labelled := label == "" || slices.Contains(agent.Labels, label)
+	inSandbox := sandbox == "" || (agent.SandboxID != nil && *agent.SandboxID == sandbox)
+
+	return below && labelled && inSandbox
 }
 
 // fail is the failure programmed for method, if any.
@@ -483,7 +567,7 @@ func newRig(t *testing.T) *rig {
 
 	rg := &rig{
 		t:     t,
-		store: &fakeStore{rows: nil, failures: map[string]error{}, calls: nil},
+		store: &fakeStore{rows: nil, sandboxes: map[string]fakeSandbox{}, failures: map[string]error{}, calls: nil},
 		creds: &fakeCredentials{sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}},
 		// A fixed instant, in whole seconds: the response carries Unix seconds.
 		now:     time.Date(2030, time.March, 4, 5, 6, 7, 0, time.UTC),
@@ -781,6 +865,8 @@ type keySpec struct {
 	// agent is the agent the key acts for, or "" for the user's own key; and
 	// agentScopes is that agent's stored list (JSON), read now.
 	agent, agentScopes string
+	// sandbox is the sandbox that agent is confined to, or "" for none.
+	sandbox string
 }
 
 // signInKey issues an API key as spec describes, stores its row as active, and
@@ -795,7 +881,7 @@ func (r *rig) signInKey(spec keySpec) string {
 
 	r.creds.keys[string(issued.Hash)] = store.ActiveAPIKey{
 		ID: issued.ID, UserID: spec.owner, Role: spec.role, ExpiresAt: issued.ExpiresAt,
-		AgentID: spec.agent, AgentScopes: spec.agentScopes, Scope: spec.scope.JSON(),
+		AgentID: spec.agent, AgentScopes: spec.agentScopes, Scope: spec.scope.JSON(), SandboxID: spec.sandbox,
 	}
 
 	return "Bearer " + issued.Token
@@ -815,6 +901,7 @@ func storeKeyRow(written store.NewAgent, rg *rig) store.ActiveAPIKey {
 	return store.ActiveAPIKey{
 		ID: written.KeyID, UserID: written.Owner, Role: roleMember, ExpiresAt: written.KeyExpiresAt,
 		AgentID: written.ID, AgentScopes: rg.store.agent2(written.ID).Scopes, Scope: written.KeyScope,
+		SandboxID: rg.store.sandboxOf(written.ID),
 	}
 }
 
@@ -826,5 +913,14 @@ func (f *fakeStore) agent2(id string) store.Agent {
 		}
 	}
 
-	return store.Agent{ID: "", Name: "", Scopes: "", RevokedAt: nil, CreatedAt: 0}
+	return store.Agent{ID: "", Name: "", Scopes: "", RevokedAt: nil, CreatedAt: 0, Labels: nil, SandboxID: nil}
+}
+
+// sandboxOf is the sandbox of the stored agent with id, or "".
+func (f *fakeStore) sandboxOf(id string) string {
+	if in := f.agent2(id).SandboxID; in != nil {
+		return *in
+	}
+
+	return ""
 }

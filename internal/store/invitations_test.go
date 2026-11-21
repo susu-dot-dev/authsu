@@ -21,7 +21,7 @@ const invitationID = "0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b"
 
 // invitationColumns is the number of columns every invitation statement
 // returns (not counting the verdict of an update).
-const invitationColumns = 9
+const invitationColumns = 11
 
 // Parsers for the input types the invitation operations take, which only their
 // parsers can build. They are prefixed because the package's test files share
@@ -72,10 +72,22 @@ func invExpiry(tb testing.TB, unix int64, at time.Time) input.Expiry {
 }
 
 // invitationRow is the row every invitation statement returns: id, type,
-// label, num_invites, uses, expires_at, revoked_at, created_by, created_at.
+// label, num_invites, uses, expires_at, revoked_at, created_by, created_at,
+// org_id, org_role. It carries no offer.
 func invitationRow() []any {
 	return row(invitationID, "member", "workshop", int64(5), int64(2), int64(1_800_000_000),
-		nil, "admin-1", int64(1_700_000_000))
+		nil, "admin-1", int64(1_700_000_000), nil, nil)
+}
+
+// offeredOrgID is the organization the offers of these tests are for.
+const offeredOrgID = "0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a99"
+
+// offerID is the id of the offer a create writes.
+const offerID = "0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a98"
+
+// offered is an invitation row that carries an offer of offeredOrgID as role.
+func offered(role string) []any {
+	return with(with(invitationRow(), 9, offeredOrgID), 10, role)
 }
 
 // wantInvitation is what invitationRow decodes to.
@@ -179,6 +191,8 @@ func invHash() []byte { return []byte("0123456789abcdef0123456789abcdef") }
 
 // TestInvitationDecoding holds how a returned row becomes an Invitation, for
 // every operation that returns one.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestInvitationDecoding(t *testing.T) {
 	t.Parallel()
 
@@ -192,6 +206,12 @@ func TestInvitationDecoding(t *testing.T) {
 	extreme.NumInvites, extreme.Uses, extreme.CreatedAt = 1<<53-1, 1<<53-1, 1<<53-1
 	extreme.ExpiresAt = 1<<53 - 1
 	extreme.CreatedBy = new("admin-1")
+
+	offeredMember := wantInvitation()
+	offeredMember.OrgID, offeredMember.OrgRole = new(offeredOrgID), new("member")
+
+	offeredAdmin := wantInvitation()
+	offeredAdmin.OrgID, offeredAdmin.OrgRole = new(offeredOrgID), new("admin")
 
 	empty := wantInvitation()
 	empty.Label, empty.Uses = "", 0
@@ -211,8 +231,18 @@ func TestInvitationDecoding(t *testing.T) {
 		{name: "a multibyte label", row: with(invitationRow(), 2, "naïve ☕ Ωμέγα"), want: multibyte},
 		{name: "integers at the largest value JavaScript holds exactly",
 			row: row(invitationID, "member", "workshop", int64(1<<53-1), int64(1<<53-1), int64(1<<53-1),
-				nil, "admin-1", int64(1<<53-1)),
+				nil, "admin-1", int64(1<<53-1), nil, nil),
 			want: extreme},
+		{name: "an offer to join as a member", row: offered("member"), want: offeredMember},
+		{name: "an offer to join as an administrator", row: offered("admin"), want: offeredAdmin},
+		{name: "an offer is shown whatever the invitation's state",
+			row: with(offered("admin"), 6, int64(1_700_000_050)),
+			want: func() store.Invitation {
+				v := offeredAdmin
+				v.RevokedAt = new(int64(1_700_000_050))
+
+				return v
+			}()},
 	}
 
 	for _, operation := range invitationOps(t) {
@@ -264,6 +294,12 @@ func TestInvitationDefects(t *testing.T) {
 		{name: "created_by is a blob", row: with(invitationRow(), 7, []byte("admin-1"))},
 		{name: "created_at is a float", row: with(invitationRow(), 8, 1.7e9)},
 		{name: "created_at is NULL", row: with(invitationRow(), 8, nil)},
+		{name: "org_id is an integer", row: with(offered("member"), 9, int64(1))},
+		{name: "org_id is a blob", row: with(offered("member"), 9, []byte(offeredOrgID))},
+		{name: "org_role is an integer", row: with(offered("member"), 10, int64(1))},
+		{name: "org_role is a blob", row: with(offered("member"), 10, []byte("member"))},
+		{name: "an organization with no role", row: with(offered("member"), 10, nil)},
+		{name: "a role with no organization", row: with(offered("member"), 9, nil)},
 		{name: "a column too few", row: invitationRow()[:invitationColumns-1]},
 		{name: "a column too many", row: append(invitationRow(), "extra")},
 		{name: "an empty row", row: row()},
@@ -515,13 +551,16 @@ func TestUpdateNumInvitesVerdictDefects(t *testing.T) {
 }
 
 // invitationSelect is the columns of the statement that reads an invitation
-// with its secret: the invitation's own, the use count (counted in the statement)
-// and the secret's expiry, revocation and creation time.
+// with its secret and its offer: the invitation's own, the use count (counted in
+// the statement), the secret's expiry, revocation and creation time, and the
+// offer's organization and role, a LEFT JOIN so that an invitation without one
+// is still read.
 const invitationSelect = "SELECT i.id AS id, i.type AS type, i.label AS label, i.num_invites AS num_invites, " +
 	"(SELECT count(*) FROM users u WHERE u.invitation_id = i.id) AS uses, " +
 	"s.expires_at AS expires_at, s.revoked_at AS revoked_at, i.created_by AS created_by, " +
-	"s.created_at AS created_at " +
-	"FROM invitations i JOIN secrets s ON s.id = i.id AND s.kind = i.kind"
+	"s.created_at AS created_at, o.org_id AS org_id, o.role AS org_role " +
+	"FROM invitations i JOIN secrets s ON s.id = i.id AND s.kind = i.kind " +
+	"LEFT JOIN org_offers o ON o.invitation_id = i.id"
 
 // TestListInvitationsStatement pins the list: every invitation (no filter, so
 // revoked ones are included), joined to its secret on the id and the kind,
@@ -630,10 +669,11 @@ func TestCreateInvitationStatements(t *testing.T) {
 func TestCreateInvitationReturnsTheStoredRow(t *testing.T) {
 	t.Parallel()
 
-	stored := row("stored-id", "stored-type", "stored label", int64(77), int64(0), int64(99), nil, nil, int64(42))
+	stored := row("stored-id", "stored-type", "stored label", int64(77), int64(0), int64(99), nil, nil, int64(42),
+		"stored-org", "admin")
 	want := store.Invitation{
 		ID: "stored-id", Type: "stored-type", Label: "stored label", NumInvites: 77, Uses: 0,
-		ExpiresAt: 99, RevokedAt: nil, CreatedBy: nil, CreatedAt: 42,
+		ExpiresAt: 99, RevokedAt: nil, CreatedBy: nil, CreatedAt: 42, OrgID: new("stored-org"), OrgRole: new("admin"),
 	}
 
 	fake := newFake(readLast(2)(stored))
@@ -644,6 +684,228 @@ func TestCreateInvitationReturnsTheStoredRow(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("invitation = %+v, want %+v", got, want)
 	}
+}
+
+// newOffer is an offer of offeredOrgID as role, to ride on newInvitation.
+func newOffer(t *testing.T, role string) *store.NewInvitationOffer {
+	t.Helper()
+
+	orgID, err := input.ParseID(offeredOrgID)
+	if err != nil {
+		t.Fatalf("parse org id: %v", err)
+	}
+
+	parsed, err := input.ParseOrgRole(role)
+	if err != nil {
+		t.Fatalf("parse org role %q: %v", role, err)
+	}
+
+	return &store.NewInvitationOffer{ID: offerID, OrgID: orgID, Role: parsed}
+}
+
+// TestCreateInvitationWithAnOfferStatements pins the batch of an invitation that
+// carries an offer: the secret, the invitation, then the offer, then the read of
+// all of it. What makes the offer safe is in the statement: the organization is
+// a subselect that must find a standard, unrevoked organization at the write
+// (NULL otherwise, which NOT NULL turns into a failure of the whole batch), the
+// kind is an argument and never a literal, the offer is addressed to the
+// invitation and not to a user, and the creator and time are the invitation's.
+func TestCreateInvitationWithAnOfferStatements(t *testing.T) {
+	t.Parallel()
+
+	for _, role := range input.OrgRoles() {
+		t.Run(role, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(readLast(3)(offered(role)))
+
+			invitation := newInvitation(t)
+			invitation.Offer = newOffer(t, role)
+
+			got, err := fake.store().CreateInvitation(context.Background(), invitation)
+			checkErr(t, err, nil)
+
+			if got.OrgID == nil || *got.OrgID != offeredOrgID || got.OrgRole == nil || *got.OrgRole != role {
+				t.Errorf("created %+v, want the offer of %s as %s", got, offeredOrgID, role)
+			}
+
+			checkBatch(t, fake,
+				wantStatement{
+					fragments: []string{"INSERT INTO secrets (id, kind, hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"},
+					args:      []any{invitationID, store.KindInvitation, invHash(), now.Unix() + 3600, now.Unix()},
+				},
+				wantStatement{
+					fragments: []string{"INSERT INTO invitations (id, kind, type, label, num_invites, created_by) " +
+						"VALUES (?, ?, ?, ?, ?, ?)"},
+					args: []any{invitationID, store.KindInvitation, "member", "workshop", int64(5), "admin-1"},
+				},
+				wantStatement{
+					fragments: []string{
+						"INSERT INTO org_offers (id, org_id, invitation_id, role, created_by, created_at) VALUES (?, " +
+							"(SELECT g.id FROM orgs g WHERE g.id = ? AND g.kind = ? AND g.revoked_at IS NULL), ?, ?, ?, ?)",
+					},
+					args: []any{
+						offerID, offeredOrgID, store.OrgKindStandard, invitationID, role, "admin-1", now.Unix(),
+					},
+				},
+				wantStatement{
+					fragments: []string{invitationSelect + " WHERE i.id = ?"},
+					args:      []any{invitationID},
+				},
+			)
+		})
+	}
+}
+
+// TestCreateInvitationWithoutAnOfferWritesNoOffer holds that an invitation that
+// carries none sends no statement about one.
+func TestCreateInvitationWithoutAnOfferWritesNoOffer(t *testing.T) {
+	t.Parallel()
+
+	fake := newFake(readLast(2)(invitationRow()))
+
+	_, err := fake.store().CreateInvitation(context.Background(), newInvitation(t))
+	checkErr(t, err, nil)
+
+	if len(fake.calls[0]) != 3 {
+		t.Fatalf("batch has %d statements, want 3", len(fake.calls[0]))
+	}
+
+	for _, statement := range fake.calls[0] {
+		if strings.Contains(statement.Query, "INSERT INTO org_offers") {
+			t.Errorf("an offer was written without one: %s", statement.Query)
+		}
+	}
+}
+
+// TestCreateInvitationWithAnOfferOutcomes holds how the database's refusal of the
+// batch is read. Only the NOT NULL failure of the offer's organization is the
+// organization being unavailable (revoked, a sandbox, or no such organization):
+// it carries ErrOfferOrgUnavailable and the database's text for the log, and not
+// ErrConflict. Every other constraint failure is a defect, as it is for a create
+// without an offer: the id, the hashes and the invitation are generated, so
+// nothing else in the batch can be the client's doing.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
+func TestCreateInvitationWithAnOfferOutcomes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		err         string
+		unavailable bool
+	}{
+		{name: "the organization is NULL", unavailable: true,
+			err: "D1_ERROR: NOT NULL constraint failed: org_offers.org_id: SQLITE_CONSTRAINT_NOTNULL"},
+		{name: "the organization is NULL, as the host driver words it", unavailable: true,
+			err: "constraint failed: NOT NULL constraint failed: org_offers.org_id (1299)  SQLITE_CONSTRAINT_NOTNULL"},
+		{name: "another NOT NULL column of the offer",
+			err: "D1_ERROR: NOT NULL constraint failed: org_offers.role: SQLITE_CONSTRAINT_NOTNULL"},
+		{name: "a NOT NULL column of the invitation",
+			err: "D1_ERROR: NOT NULL constraint failed: invitations.created_by: SQLITE_CONSTRAINT_NOTNULL"},
+		{name: "a NOT NULL failure that names nothing",
+			err: "D1_ERROR: NOT NULL constraint failed: SQLITE_CONSTRAINT_NOTNULL"},
+		{name: "the offer's unique key on the organization and the user",
+			err: "D1_ERROR: UNIQUE constraint failed: org_offers.org_id, org_offers.user_id: SQLITE_CONSTRAINT_UNIQUE"},
+		{name: "the offer's unique key on the invitation",
+			err: "D1_ERROR: UNIQUE constraint failed: org_offers.invitation_id: SQLITE_CONSTRAINT_UNIQUE"},
+		{name: "the offer's primary key",
+			err: "D1_ERROR: UNIQUE constraint failed: org_offers.id: SQLITE_CONSTRAINT_PRIMARYKEY"},
+		{name: "the invitation's id",
+			err: "D1_ERROR: UNIQUE constraint failed: invitations.id: SQLITE_CONSTRAINT_PRIMARYKEY"},
+		{name: "the secret's hash", err: "D1_ERROR: UNIQUE constraint failed: secrets.hash: SQLITE_CONSTRAINT_UNIQUE"},
+		{name: "a foreign key of the offer",
+			err: "D1_ERROR: FOREIGN KEY constraint failed: SQLITE_CONSTRAINT_FOREIGNKEY"},
+		{name: "a check of the offer", err: "D1_ERROR: CHECK constraint failed: role: SQLITE_CONSTRAINT_CHECK"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(failing(store.Classify(dbError(test.err))))
+
+			invitation := newInvitation(t)
+			invitation.Offer = newOffer(t, "admin")
+
+			got, err := fake.store().CreateInvitation(context.Background(), invitation)
+
+			if !reflect.DeepEqual(got, store.Invitation{}) {
+				t.Errorf("a refused create returned %+v", got)
+			}
+
+			if errors.Is(err, store.ErrConflict) {
+				t.Errorf("error %v is a conflict; the feature must not see one", err)
+			}
+
+			if test.unavailable {
+				if !errors.Is(err, store.ErrOfferOrgUnavailable) {
+					t.Fatalf("error = %v, want ErrOfferOrgUnavailable", err)
+				}
+
+				if _, isAPI := errors.AsType[*apierr.Error](err); isAPI {
+					t.Errorf("%v is classified; the feature must decide that", err)
+				}
+
+				if !strings.Contains(err.Error(), "org_offers.org_id") {
+					t.Errorf("error %v lost the database's text", err)
+				}
+
+				return
+			}
+
+			if errors.Is(err, store.ErrOfferOrgUnavailable) {
+				t.Errorf("error %v is reported as the organization being unavailable", err)
+			}
+
+			checkErr(t, err, defectOf(store.CodeInvitationCreateRejected))
+		})
+	}
+}
+
+// TestCreateInvitationWithAnOfferFailures holds the platform failures of the
+// four-statement batch, which are those of any create.
+func TestCreateInvitationWithAnOfferFailures(t *testing.T) {
+	t.Parallel()
+
+	for _, f := range infraFailures(4, store.CodeInvitationCreateFailed, store.CodeInvitationCreateRejected,
+		invitationsDescription) {
+		t.Run(f.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(f.outcome)
+
+			invitation := newInvitation(t)
+			invitation.Offer = newOffer(t, "member")
+
+			_, err := fake.store().CreateInvitation(context.Background(), invitation)
+
+			if f.conflict {
+				checkErr(t, err, defectOf(store.CodeInvitationCreateRejected))
+
+				return
+			}
+
+			checkFailure(t, err, f)
+		})
+	}
+}
+
+// TestCreateInvitationWithAnOfferNeedsTheRowBack holds that a create with an offer
+// whose last statement reads no row is a defect, as for a create without one: the
+// row was written by the batch, so it is always read back.
+func TestCreateInvitationWithAnOfferNeedsTheRowBack(t *testing.T) {
+	t.Parallel()
+
+	// The offer's own statement returns no rows, and the read after it does.
+	fake := newFake(readLast(3)())
+
+	invitation := newInvitation(t)
+	invitation.Offer = newOffer(t, "member")
+
+	_, err := fake.store().CreateInvitation(context.Background(), invitation)
+
+	checkErr(t, err, defectOf(store.CodeInvitationCreateRejected))
 }
 
 // TestUpdateNumInvitesStatement pins what makes the update safe: the row is
@@ -685,7 +947,9 @@ func TestUpdateNumInvitesStatement(t *testing.T) {
 						"(SELECT s.revoked_at FROM secrets s WHERE s.id = invitations.id AND s.kind = invitations.kind) " +
 						"AS revoked_at, created_by, " +
 						"(SELECT s.created_at FROM secrets s WHERE s.id = invitations.id AND s.kind = invitations.kind) " +
-						"AS created_at",
+						"AS created_at, " +
+						"(SELECT o.org_id FROM org_offers o WHERE o.invitation_id = invitations.id) AS org_id, " +
+						"(SELECT o.role FROM org_offers o WHERE o.invitation_id = invitations.id) AS org_role",
 				},
 				args: []any{n, n, invitationID, now.Unix()},
 			})

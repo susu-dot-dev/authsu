@@ -61,6 +61,8 @@ That keeps the admin-creates-admin and bootstrap cases from needing special code
 
 The kinds of invitation, and the role each grants, are fixed in code together, not in configuration, so a deployment cannot be wired with a kind of invitation that grants no role. First run is creatable only by the bootstrap itself.
 
+An invitation can also carry an offer to join an organization, which is a side effect of registration and never a condition of it ([orgs_design.md](orgs_design.md), principle 2).
+
 ## Managing invitations
 
 Admins list, create, change the cap of and revoke invitations. Every action requires an admin, the role is read on each request so demoting an admin takes effect at once ([users_design.md](users_design.md)), and the code is in the response that created it and nowhere else.

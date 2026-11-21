@@ -95,7 +95,7 @@ func worstNewAccount(t *testing.T) (string, string) {
 		transports[i] = strings.Repeat(`"`, 32)
 	}
 
-	fake := newFake(applied(4))
+	fake := newFake(applied(5))
 
 	err := fake.store().CreateAccount(context.Background(), store.NewAccount{
 		UserID: "u", UserHandle: []byte{1}, Role: "admin", Name: worstAccountName(t),
@@ -109,9 +109,10 @@ func worstNewAccount(t *testing.T) (string, string) {
 
 	statements := fake.calls[0]
 
-	// The batch is the first-run secret and invitation, the user, the passkey.
+	// The batch is the first-run secret and invitation, the user, the
+	// organization's administrator, the passkey.
 	profile, _ := statements[2].Args[3].(string)
-	metadata, _ := statements[3].Args[5].(string)
+	metadata, _ := statements[4].Args[5].(string)
 
 	return profile, metadata
 }

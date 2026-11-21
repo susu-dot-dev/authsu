@@ -76,6 +76,7 @@ import (
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
+	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
 // Statement is one SQL statement with its bound arguments.
@@ -395,6 +396,88 @@ func findRow[T any](rows [][]any, o op, read func(*row) T) (T, bool, error) {
 	}
 
 	return value, err == nil, err
+}
+
+// outcome hands the end of a result chain back as a plain value and error, for
+// an operation that returns them. Every error in a chain here was classified when
+// it arose, by run, one, all, a lookup or the step that refused, so nothing is
+// left to wrap.
+func outcome[T any](r result.Result[T]) (T, error) {
+	return r.Get() //nolint:wrapcheck // every error in the chain is already classified, as the comment says
+}
+
+// found is a looked-up row and whether it was there: a lookup whose absence is
+// an answer and not an error, so that it can be a step of a result chain.
+type found[T any] struct {
+	value T
+	ok    bool
+}
+
+// orNotFound is the row, or ErrNotFound when it was not there.
+func (f found[T]) orNotFound() (T, error) {
+	if !f.ok {
+		var zero T
+
+		return zero, ErrNotFound
+	}
+
+	return f.value, nil
+}
+
+// lookup is findRow as a step of a result chain.
+func lookup[T any](rows [][]any, o op, read func(*row) T) result.Result[found[T]] {
+	value, ok, err := findRow(rows, o, read)
+
+	return result.Of(found[T]{value: value, ok: ok}, err)
+}
+
+// wroteOr is the outcome of a conditional write that returns its row: the row it
+// returned, or what refusal makes of the write having matched nothing. A row
+// that does not decode is a defect and is returned as it is.
+func wroteOr[T any](o op, rows [][]any, read func(*row) T, refusal func() (T, error)) (T, error) {
+	return outcome(lookup(rows, o, read).
+		Then(func(wrote found[T]) (T, error) {
+			if wrote.ok {
+				return wrote.value, nil
+			}
+
+			return refusal()
+		}),
+	)
+}
+
+// refusedBy is the error a write that matched nothing is refused with, read off
+// the standing statement that followed it in the same batch: why decides it from
+// the row, or from its absence. The outcome has no value, which is T's zero. A
+// standing row that does not decode is a defect and is returned as it is.
+func refusedBy[S, T any](o op, rows [][]any, read func(*row) S, why func(found[S]) error) (T, error) {
+	var zero T
+
+	return outcome(lookup(rows, o, read).
+		Then(func(standing found[S]) (T, error) { return zero, why(standing) }),
+	)
+}
+
+// pageOf cuts the decoded rows of a keyset page that asked for one row more than
+// it returns (see paged) and builds the page from the rows it keeps and the
+// cursor of the next one.
+func pageOf[T, P any](
+	o op, decoded result.Result[[]T], size int, id func(T) string, build func([]T, string) P,
+) (P, error) {
+	return outcome(decoded.
+		Then(func(rows []T) (P, error) {
+			page, next, err := paged(o, rows, size, id)
+
+			return build(page, next), err
+		}),
+	)
+}
+
+// runChecked is run for an operation whose writes cannot collide with data that
+// exists, so a conflict is a defect (see defectOnConflict), as the first step of
+// a result chain.
+func (s *Store) runChecked(ctx context.Context, o op, statements ...Statement) result.Result[[]Result] {
+	return result.Of(s.run(ctx, o, statements...)).MapErr(conflictIsDefect(o))
 }
 
 // row reads typed values from one returned row, left to right. The first value

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/result"
 )
 
 // Error codes of the invitation operations. They are stable: clients and
@@ -57,19 +58,36 @@ type Invitation struct {
 
 	// CreatedAt is in Unix seconds.
 	CreatedAt int64
+
+	// OrgID and OrgRole are the offer to join an organization that the
+	// invitation carries (docs/orgs_design.md, principle 2): whoever registers
+	// with it joins that organization, as that role. Both are nil when it
+	// carries none, which includes an offer that was withdrawn and one whose
+	// organization was revoked, since both are deleted. They are set together
+	// or not at all.
+	OrgID   *string
+	OrgRole *string
 }
 
-// readInvitation reads the nine columns every invitation statement returns, in
-// this order: id, type, label, num_invites, uses, expires_at, revoked_at,
-// created_by, created_at.
+// readInvitation reads the eleven columns every invitation statement returns,
+// in this order: id, type, label, num_invites, uses, expires_at, revoked_at,
+// created_by, created_at, org_id, org_role.
 func readInvitation(r *row) Invitation {
 	// Struct fields are evaluated in order, which is the column order.
-	return Invitation{
+	invitation := Invitation{
 		ID: r.text(), Type: r.text(), Label: r.text(),
 		NumInvites: r.integer(), Uses: r.integer(),
 		ExpiresAt: r.integer(), RevokedAt: r.optInteger(), CreatedBy: r.optText(),
-		CreatedAt: r.integer(),
+		CreatedAt: r.integer(), OrgID: r.optText(), OrgRole: r.optText(),
 	}
+
+	// The offer's two columns come from one row, whose organization and role are
+	// both NOT NULL, so one without the other is not a row the query can return.
+	if (invitation.OrgID == nil) != (invitation.OrgRole == nil) {
+		r.failf("the offer has an organization or a role but not both")
+	}
+
+	return invitation
 }
 
 // listInvitationsQuery reads every invitation, revoked ones included, newest
@@ -82,14 +100,21 @@ func readInvitation(r *row) Invitation {
 // and its hash are not selected: nothing here can return them. The count has an
 // alias of its own, because a batch returns rows keyed by column name.
 //
+// The offer to join an organization that the invitation carries is a LEFT JOIN,
+// so an invitation with none is still listed, with NULL in both of its columns.
+// invitation_id is UNIQUE on org_offers, so the join never repeats an
+// invitation. The offer's columns are aliased like every other column of the
+// statement, and the role is org_role to say whose role it is.
+//
 // Arguments: none.
 const listInvitationsQuery = `
 SELECT i.id AS id, i.type AS type, i.label AS label, i.num_invites AS num_invites,
        (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) AS uses,
        s.expires_at AS expires_at, s.revoked_at AS revoked_at, i.created_by AS created_by,
-       s.created_at AS created_at
+       s.created_at AS created_at, o.org_id AS org_id, o.role AS org_role
 FROM invitations i
 JOIN secrets s ON s.id = i.id AND s.kind = i.kind
+LEFT JOIN org_offers o ON o.invitation_id = i.id
 ORDER BY s.created_at DESC, i.id DESC`
 
 // ListInvitations returns every invitation, revoked ones included, newest
@@ -108,19 +133,45 @@ func (s *Store) ListInvitations(ctx context.Context) ([]Invitation, error) {
 // before it and nothing another request did in between, which is what makes the
 // response the database's view and not the caller's copy of what it sent.
 //
-// It is a SELECT of its own because an invitation's row and its secret are two
-// tables, and no single write can return both. No row means no such
-// invitation.
+// It is a SELECT of its own because an invitation's row, its secret and its
+// offer are three tables, and no single write can return them. No row means no
+// such invitation. The offer is a LEFT JOIN, as in listInvitationsQuery, so a
+// create reports the offer the batch just wrote.
 //
 // Arguments: id.
 const readInvitationQuery = `
 SELECT i.id AS id, i.type AS type, i.label AS label, i.num_invites AS num_invites,
        (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) AS uses,
        s.expires_at AS expires_at, s.revoked_at AS revoked_at, i.created_by AS created_by,
-       s.created_at AS created_at
+       s.created_at AS created_at, o.org_id AS org_id, o.role AS org_role
 FROM invitations i
 JOIN secrets s ON s.id = i.id AND s.kind = i.kind
+LEFT JOIN org_offers o ON o.invitation_id = i.id
 WHERE i.id = ?`
+
+// insertInvitationOfferQuery writes the offer to join an organization that an
+// invitation carries, after the invitation's own row, in the same batch. The
+// organization must be standard and unrevoked AT THIS WRITE, because D1 has no
+// interactive transaction and a read before it would race with a revocation:
+// the organization's id is a subselect that is NULL unless the organization
+// exists, is of the standard kind and is not revoked. org_id is NOT NULL, so
+// when it is NULL the insert fails as a constraint failure, which rolls back
+// the secret and the invitation with it, and the column the database names
+// (see CreateInvitation) says why. A sandbox is refused the same way: it is not
+// of the standard kind (and the schema's key on the organization and its kind
+// together would refuse it anyway).
+//
+// The offer is addressed to the invitation and to no user (user_id is NULL, as
+// the schema's CHECK requires of exactly one of the two). The role is what the
+// registrant becomes (input.OrgRole), bound as given.
+//
+// Arguments, in order: id, org id, organization kind, invitation id, role,
+// created_by, created_at.
+const insertInvitationOfferQuery = `
+INSERT INTO org_offers (id, org_id, invitation_id, role, created_by, created_at)
+VALUES (?,
+        (SELECT g.id FROM orgs g WHERE g.id = ? AND g.kind = ? AND g.revoked_at IS NULL),
+        ?, ?, ?, ?)`
 
 // insertInvitationQuery writes the invitation's own row, after its secret, in
 // the same batch. The creator is an admin, who is a user, so created_by is
@@ -166,48 +217,105 @@ type NewInvitation struct {
 
 	// CreatedAt is when it was created.
 	CreatedAt time.Time
+
+	// Offer is the offer to join an organization that the invitation carries,
+	// or nil when it carries none.
+	Offer *NewInvitationOffer
 }
 
-// CreateInvitation writes an invitation's secret and its own row as one batch,
-// then reads the invitation back in the same batch, and returns the row as the
-// database stored it.
+// NewInvitationOffer is an offer to join an organization, written with the
+// invitation it rides on. It is made by the invitation's creator at the
+// invitation's creation time.
+type NewInvitationOffer struct {
+	// ID is the new offer's id (a UUIDv7 in canonical text form).
+	ID string
+
+	// OrgID is the organization offered. It must be standard and unrevoked when
+	// the batch is written, or the whole create is refused (ErrOfferOrgUnavailable).
+	OrgID input.ID
+
+	// Role is what whoever registers with the invitation becomes there.
+	Role input.OrgRole
+}
+
+// ErrOfferOrgUnavailable means a create asked for an offer of an organization
+// that does not exist, is a sandbox, or is revoked, as of the write. Nothing was
+// created. It wraps the database's text for the log, but not ErrConflict, so
+// that a feature that matches on ErrConflict cannot mistake it for another.
+var ErrOfferOrgUnavailable = errors.New("the organization offered is not a standard, unrevoked organization")
+
+// offerOrgFailure is the database's text for the NOT NULL failure of an offer's
+// organization, which is how a refused organization is told from every other
+// failure of the batch (see failedOn).
+const offerOrgFailure = "NOT NULL constraint failed: org_offers.org_id"
+
+// CreateInvitation writes an invitation's secret and its own row, and its offer
+// when it carries one, as one batch, then reads the invitation back in the same
+// batch, and returns the row as the database stored it.
 //
-// There is no conflict outcome. The id and the token hash are both generated by
-// the server (a UUIDv7 and the hash of 256 random bits), so a UNIQUE collision
-// is not something the client did or can resolve by changing its request: it
-// is a defect (or an entropy failure), reported under
+// It returns ErrOfferOrgUnavailable, and creates nothing, when the offered
+// organization does not exist, is a sandbox or is revoked as of the write (see
+// insertInvitationOfferQuery).
+//
+// There is no other conflict outcome. The id and the token hash are both
+// generated by the server (a UUIDv7 and the hash of 256 random bits), so a
+// UNIQUE collision is not something the client did or can resolve by changing
+// its request: it is a defect (or an entropy failure), reported under
 // CodeInvitationCreateRejected like a CHECK or FOREIGN KEY refusal. The client
 // may simply try again, which generates a new token.
 func (s *Store) CreateInvitation(ctx context.Context, invitation NewInvitation) (Invitation, error) {
 	o := op{failed: CodeInvitationCreateFailed, rejected: CodeInvitationCreateRejected,
 		description: invitationsDescription}
 
-	results, err := s.run(ctx, o,
+	statements := []Statement{
 		insertSecret(invitation.ID, KindInvitation, invitation.TokenHash,
 			invitation.ExpiresAt.Unix(), invitation.CreatedAt.Unix()),
-		Statement{Query: insertInvitationQuery, Args: []any{
+		{Query: insertInvitationQuery, Args: []any{
 			invitation.ID, KindInvitation, invitation.Type, invitation.Label.String(),
 			invitation.NumInvites.Int64(), invitation.CreatedBy,
 		}},
-		Statement{Query: readInvitationQuery, Args: []any{invitation.ID}},
+	}
+
+	if offer := invitation.Offer; offer != nil {
+		statements = append(statements, Statement{Query: insertInvitationOfferQuery, Args: []any{
+			offer.ID, offer.OrgID.String(), OrgKindStandard, invitation.ID, offer.Role.String(),
+			invitation.CreatedBy, invitation.CreatedAt.Unix(),
+		}})
+	}
+
+	statements = append(statements, Statement{Query: readInvitationQuery, Args: []any{invitation.ID}})
+
+	return outcome(result.Of(s.run(ctx, o, statements...)).
+		MapErr(func(err error) error { return invitationCreateRefused(o, err) }).
+		Then(func(results []Result) (Invitation, error) {
+			return one(results[len(results)-1].Rows, o, readInvitation)
+		}).
+		MapErr(func(err error) error {
+			if errors.Is(err, ErrNotFound) {
+				// The row was written by this batch, so the read always returns it.
+				return o.defect(fmt.Errorf("%w: the invitation just written was not found", errRowCount))
+			}
+
+			return err
+		}),
 	)
-	if errors.Is(err, ErrConflict) {
+}
+
+// invitationCreateRefused classifies a failure of the batch of CreateInvitation:
+// a conflict that names the offer's organization is ErrOfferOrgUnavailable, and
+// any other conflict is a defect, since every value the batch writes is
+// generated. Any other error is returned as it is.
+func invitationCreateRefused(o op, err error) error {
+	switch {
+	case !errors.Is(err, ErrConflict):
+		return err
+	case failedOn(err, offerOrgFailure):
+		return fmt.Errorf("%w: %s", ErrOfferOrgUnavailable, err.Error())
+	default:
 		// The text is kept for the log, but the sentinel is not: a feature that
 		// looks for ErrConflict in the chain must not see this as the client's.
-		return Invitation{}, o.defect(fmt.Errorf("%w: %s", errGeneratedValueTaken, err.Error()))
+		return o.defect(fmt.Errorf("%w: %s", errGeneratedValueTaken, err.Error()))
 	}
-
-	if err != nil {
-		return Invitation{}, err
-	}
-
-	created, err := one(results[2].Rows, o, readInvitation)
-	if errors.Is(err, ErrNotFound) {
-		// The row was written by this batch, so the read always returns it.
-		return Invitation{}, o.defect(fmt.Errorf("%w: the invitation just written was not found", errRowCount))
-	}
-
-	return created, err
 }
 
 // updateNumInvitesQuery changes how many accounts an invitation may create. It
@@ -239,8 +347,8 @@ func (s *Store) CreateInvitation(ctx context.Context, invitation NewInvitation) 
 // in the SET.
 //
 // RETURNING is "applied" (1 or 0) followed by the columns of
-// listInvitationsQuery in the same order, the secret's read by subselect: a
-// write to one table cannot join another. Each column has a distinct name,
+// listInvitationsQuery in the same order, the secret's and the offer's read by
+// subselect: a write to one table cannot join another. Each column has a distinct name,
 // which D1's batch results need: columns that share one collapse into one.
 //
 // Arguments, by number: ?1 the new num_invites, ?2 the same value (compared
@@ -266,7 +374,9 @@ RETURNING
   (SELECT s.expires_at FROM secrets s WHERE s.id = invitations.id AND s.kind = invitations.kind) AS expires_at,
   (SELECT s.revoked_at FROM secrets s WHERE s.id = invitations.id AND s.kind = invitations.kind) AS revoked_at,
   created_by,
-  (SELECT s.created_at FROM secrets s WHERE s.id = invitations.id AND s.kind = invitations.kind) AS created_at`
+  (SELECT s.created_at FROM secrets s WHERE s.id = invitations.id AND s.kind = invitations.kind) AS created_at,
+  (SELECT o.org_id FROM org_offers o WHERE o.invitation_id = invitations.id) AS org_id,
+  (SELECT o.role FROM org_offers o WHERE o.invitation_id = invitations.id) AS org_role`
 
 // UpdateNumInvites sets how many accounts an invitation may create. It returns
 // the invitation as the write left it and whether the change applied.

@@ -181,8 +181,9 @@ func metadataOf(transports string) string {
 // TestCreateAccountStatements pins the batch registration writes: the two
 // inserts that create the first-run invitation when the configured secret is
 // presented on an empty database, the user insert carrying the invitation's
-// conditions, then the credential insert that fails the batch when the user
-// insert matched nothing; the JSON columns the store builds; and every argument
+// conditions, then the insert of an organization administrator, then the
+// credential insert that fails the batch when the user insert matched nothing;
+// the JSON columns the store builds; and every argument
 // in placeholder order.
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
@@ -190,8 +191,10 @@ func TestCreateAccountStatements(t *testing.T) {
 	t.Parallel()
 
 	userFragments := []string{
-		"INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at)",
-		"SELECT ?, ?, ?, i.id, ?, ? FROM secrets s",
+		"INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id)",
+		"SELECT ?, ?, ?, i.id, ?, ?, (SELECT o.org_id FROM org_offers o " +
+			"JOIN orgs g ON g.id = o.org_id AND g.kind = o.kind " +
+			"WHERE o.invitation_id = i.id AND g.kind = ? AND g.revoked_at IS NULL) FROM secrets s",
 		"JOIN invitations i ON i.id = s.id AND i.kind = s.kind",
 		"WHERE s.hash = ?",
 		"AND s.kind = ?",
@@ -199,6 +202,12 @@ func TestCreateAccountStatements(t *testing.T) {
 		"AND " + activeFragment,
 		"AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites",
 		"AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))",
+	}
+	adminFragments := []string{
+		"INSERT INTO org_admins (org_id, user_id, created_at) SELECT u.org_id, u.id, ? FROM users u",
+		"JOIN org_offers o ON o.invitation_id = u.invitation_id AND o.org_id = u.org_id",
+		"JOIN orgs g ON g.id = o.org_id AND g.kind = o.kind",
+		"WHERE u.id = ? AND g.kind = ? AND g.revoked_at IS NULL AND o.role = ?",
 	}
 	credentialFragments := []string{
 		"INSERT INTO credentials (id, credential_id, user_id, public_key, flags, metadata, created_at)",
@@ -254,7 +263,7 @@ func TestCreateAccountStatements(t *testing.T) {
 			t.Parallel()
 
 			account := newAccount(t, test.edit)
-			fake := newFake(applied(4))
+			fake := newFake(applied(5))
 
 			checkErr(t, fake.store().CreateAccount(context.Background(), account), nil)
 
@@ -278,10 +287,14 @@ func TestCreateAccountStatements(t *testing.T) {
 				wantStatement{
 					fragments: userFragments,
 					args: []any{
-						"user-1", []byte{1, 2, 3}, "admin", test.profile, created,
+						"user-1", []byte{1, 2, 3}, "admin", test.profile, created, store.OrgKindStandard,
 						account.Token.Hash(), store.KindInvitation, account.InvitationType, created, created,
 						store.InvitationFirstRun,
 					},
+				},
+				wantStatement{
+					fragments: adminFragments,
+					args:      []any{created, "user-1", store.OrgKindStandard, store.OfferRoleAdmin},
 				},
 				wantStatement{
 					fragments: credentialFragments,
@@ -315,7 +328,7 @@ func TestCreateAccountEncodingFailure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := newFake(applied(4))
+			fake := newFake(applied(5))
 			calls := 0
 
 			s := store.NewWithMarshal(fake.exec, func(_ any) ([]byte, error) {
@@ -348,7 +361,7 @@ func TestCreateAccountEncodingFailure(t *testing.T) {
 func TestCreateAccountFailures(t *testing.T) {
 	t.Parallel()
 
-	runFailures(t, 4, store.CodeRegistrationAcceptFailed, store.CodeRegistrationAcceptRejected, registrationDescription,
+	runFailures(t, 5, store.CodeRegistrationAcceptFailed, store.CodeRegistrationAcceptRejected, registrationDescription,
 		func(s *store.Store) error { return passErr(s.CreateAccount(context.Background(), newAccount(t, nil))) })
 }
 

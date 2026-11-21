@@ -28,6 +28,12 @@ const (
 	// bytes each is exactly 1024. The CHECK also refuses NUL, which a label
 	// never contains.
 	MaxInvitationLabelRunes = 256
+
+	// MaxOrgNameRunes bounds OrgName, in Unicode code points. The schema CHECK
+	// `length(cast(name AS BLOB)) BETWEEN 1 AND 1024` on orgs.name
+	// (migration 0001) counts bytes; 256 runes of at most 4 bytes each is
+	// exactly 1024.
+	MaxOrgNameRunes = 256
 )
 
 // Error codes of the display-text types.
@@ -35,6 +41,7 @@ const (
 	CodeInvalidName      = "invalid_name"
 	CodeInvalidAgentName = "invalid_agent_name"
 	CodeInvalidKeyName   = "invalid_key_name"
+	CodeInvalidOrgName   = "invalid_org_name"
 	CodeInvalidLabel     = "invalid_label"
 )
 
@@ -44,6 +51,7 @@ const (
 	descInvalidName      = "name must be 1 to 128 bytes" + textRules
 	descInvalidAgentName = "agent name must be 1 to 256 characters" + displayRules
 	descInvalidKeyName   = "key name must be 1 to 256 characters" + displayRules
+	descInvalidOrgName   = "organization name must be 1 to 256 characters" + displayRules
 	descInvalidLabel     = "label must be at most 256 characters" + displayRules
 )
 
@@ -100,6 +108,24 @@ func ParseKeyName(raw string) (KeyName, error) {
 
 // String returns the name exactly as it was parsed.
 func (n KeyName) String() string { return n.v }
+
+// OrgName is the name of an organization or a sandbox, which a person tells
+// theirs apart by. Like AgentName it is not what anyone is identified by, so it
+// may hold the joiners that some scripts need, and still refuses controls and
+// hidden formatting.
+type OrgName struct{ v string }
+
+// ParseOrgName accepts display text of 1 to MaxOrgNameRunes runes.
+func ParseOrgName(raw string) (OrgName, error) {
+	if !displayText(raw, textRule{unit: unitRunes, max: MaxOrgNameRunes, allowEmpty: false, identifying: false}) {
+		return OrgName{}, refuse(CodeInvalidOrgName, descInvalidOrgName)
+	}
+
+	return OrgName{v: raw}, nil
+}
+
+// String returns the name exactly as it was parsed.
+func (n OrgName) String() string { return n.v }
 
 // InvitationLabel is the note an administrator attaches to an invitation. It
 // may be empty.

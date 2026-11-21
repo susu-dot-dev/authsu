@@ -13,7 +13,11 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/scope"
 )
 
-const agentOne = "00000000-0000-7000-8000-0000000000a1"
+const (
+	agentOne   = "00000000-0000-7000-8000-0000000000a1"
+	orgOne     = "00000000-0000-7000-8000-0000000000b1"
+	sandboxOne = "00000000-0000-7000-8000-0000000000c1"
+)
 
 // scopedRoutes is a route table where each route declares one access rule, so a
 // request's outcome shows exactly which rule it met. Every route records its
@@ -33,6 +37,11 @@ func (r *rig) scopedRoutes() []auth.Route {
 		declare("/invitation-create", auth.Needs(scope.InvitationCreate)),
 		declare("/open-no-agents", auth.Open().WithoutAgents()),
 		declare("/open-sessions", auth.Open().Sessions()),
+		declare("/sandbox-open", auth.Open().InSandbox()),
+		declare("/sandbox-read", auth.Needs(scope.AgentRead).InSandbox()),
+		declare("/sandbox-admin", auth.Needs(scope.UserRead).InSandbox()),
+		declare("/sandbox-no-agents", auth.Needs(scope.AgentUpdate).InSandbox().WithoutAgents()),
+		declare("/sandbox-sessions", auth.Open().Sessions().InSandbox()),
 	}
 }
 
@@ -44,6 +53,7 @@ const (
 	allowed scopedOutcome = iota
 	noScope
 	forbiddenAccess
+	confined
 )
 
 // status is the HTTP status of the outcome.
@@ -64,6 +74,8 @@ func (o scopedOutcome) code() string {
 		return auth.CodeInsufficientScope
 	case forbiddenAccess:
 		return auth.CodeForbidden
+	case confined:
+		return auth.CodeSandboxConfined
 	}
 
 	return ""
@@ -170,13 +182,63 @@ func agentKeyCases() []accessCase {
 	}
 }
 
+// sandboxCases: an agent of a sandbox is refused on every route that does not
+// opt in with InSandbox, whatever else the route requires or the agent holds
+// (the sandbox check is the first), and on a route that does it is judged by the
+// remaining checks as any caller is. An ordinary agent and a user are never
+// refused for it.
+func sandboxCases() []accessCase {
+	every := func(l ...string) credentialFn { return sandboxKey(list(l...), list(l...), roleMember) }
+	everyAdmin := func(l ...string) credentialFn { return sandboxKey(list(l...), list(l...), auth.RoleAdmin) }
+
+	return []accessCase{
+		// Not opted in: refused, however the rest of the access reads.
+		{"sandbox agent: an open route is refused", every(bundleSession), "/open", confined},
+		{"sandbox agent: an open route with no scopes is refused", every(), "/open", confined},
+		{"sandbox agent: a scoped route is refused", every(bundleSession), "/agent-read", confined},
+		{"sandbox agent: a route it lacks the scope for is the sandbox's 403", every(), "/agent-read", confined},
+		{"sandbox agent: a route that refuses agents is the sandbox's 403", every(bundleSession), "/agent-update", confined},
+		{"sandbox agent: a session route is the sandbox's 403", every(bundleSession), "/open-sessions", confined},
+		{"sandbox agent: an open route that refuses agents", every(), "/open-no-agents", confined},
+		{"sandbox agent: an admin route of a member is the sandbox's 403", every(bundleSession), "/user-read", confined},
+		{"sandbox agent of an admin: an admin route is the sandbox's 403", everyAdmin(bundleSession), "/user-read", confined},
+		{"sandbox agent of an admin: an admin create", everyAdmin(bundleSession), "/invitation-create", confined},
+		// Opted in: the other checks decide.
+		{"sandbox agent: an opted-in open route", every(), "/sandbox-open", allowed},
+		{"sandbox agent: an opted-in scoped route", every(scopeRead), "/sandbox-read", allowed},
+		{"sandbox agent: an opted-in route it lacks the scope for", every(), "/sandbox-read", noScope},
+		{
+			"sandbox agent: the key alone has the scope",
+			sandboxKey(list(scopeRead), list(), roleMember), "/sandbox-read", noScope,
+		},
+		{
+			"sandbox agent: the agent alone has the scope",
+			sandboxKey(list(), list(scopeRead), roleMember), "/sandbox-read", noScope,
+		},
+		{"sandbox agent of a member: an opted-in admin scope is the role's 403",
+			every(bundleSession), "/sandbox-admin", forbiddenAccess},
+		{"sandbox agent of an admin: an opted-in admin scope", everyAdmin(bundleSession), "/sandbox-admin", allowed},
+		{"sandbox agent: an opted-in route that refuses agents", every(bundleSession), "/sandbox-no-agents", forbiddenAccess},
+		{"sandbox agent: an opted-in session route", every(bundleSession), "/sandbox-sessions", forbiddenAccess},
+		// Neither a user nor an ordinary agent is a sandbox's.
+		{"a user's key: an opted-in route", userKey(scopeRead), "/sandbox-read", allowed},
+		{"a session: an opted-in route", member(session), "/sandbox-open", allowed},
+		{"an ordinary agent: an opted-in route", agentKey(list(scopeRead), list(scopeRead)), "/sandbox-read", allowed},
+		{
+			"an ordinary agent: a route that is not opted in",
+			agentKey(list(scopeRead), list(scopeRead)), "/agent-read", allowed,
+		},
+		{"a member of an organization: a route that is not opted in", orgKey(scopeRead), "/agent-read", allowed},
+	}
+}
+
 // TestAccessMatrix is the permission table, one row per credential, route and
 // answer. It drives the real boundary, so the declaration, the key's stored
 // scopes, the agent's row and the role are all the real ones.
 func TestAccessMatrix(t *testing.T) {
 	t.Parallel()
 
-	for _, group := range [][]accessCase{sessionCases(), userKeyCases(), agentKeyCases()} {
+	for _, group := range [][]accessCase{sessionCases(), userKeyCases(), agentKeyCases(), sandboxCases()} {
 		for _, test := range group {
 			t.Run(test.name, func(t *testing.T) {
 				t.Parallel()
@@ -294,6 +356,23 @@ func agentOf(role string, key scope.List, agentStored string) credentialFn {
 	}
 }
 
+// sandboxKey is a stored API key of an agent of a member (or an admin) that is
+// confined to a sandbox.
+func sandboxKey(key, agent scope.List, role string) credentialFn {
+	return func(r *rig) (string, *http.Cookie) {
+		return bearer(r.apiKey(bearerSpec{
+			scope: key, role: role, agent: agentOne, agentScopes: agent.JSON(), sandbox: sandboxOne,
+		})), nil
+	}
+}
+
+// orgKey is a stored API key of a member of an organization.
+func orgKey(names ...string) credentialFn {
+	return func(r *rig) (string, *http.Cookie) {
+		return bearer(r.apiKey(bearerSpec{scope: list(names...), role: roleMember, org: orgOne})), nil
+	}
+}
+
 // TestCredentialIsJudgedBeforeAccess: a bad credential is 401 on every route, a
 // good one that lacks what the route needs is 403, and neither learns anything
 // about the route's rule from the other. 401 means signed out and 403 means not
@@ -333,9 +412,36 @@ func TestCredentialIsJudgedBeforeAccess(t *testing.T) {
 	}
 }
 
+// TestSandboxIsRefusedBeforeThePathIDIsRead: a sandboxed agent on a route that
+// has not opted in is refused whatever the id in the path is, so it learns
+// nothing about the route's ids, and the handler never runs.
+func TestSandboxIsRefusedBeforeThePathIDIsRead(t *testing.T) {
+	t.Parallel()
+
+	for name, target := range map[string]string{
+		"a malformed id": pathItems + "not-an-id", "a well-formed id": pathItems + agentOne,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRig(t)
+			header, _ := sandboxKey(list(), list(), roleMember)(r)
+
+			rec := r.serveWith(r.standardRoutes(), target, []string{header}, nil)
+
+			if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), auth.CodeSandboxConfined) ||
+				len(r.handled) != 0 {
+				t.Errorf("response = %d %s, handled %d times", rec.Code, rec.Body, len(r.handled))
+			}
+		})
+	}
+}
+
 // TestAccessOrder pins the order of the checks, which decides what a caller who
-// fails several of them is told: the role for an admin scope, then the scope,
-// then the session requirement, then agents.
+// fails several of them is told: the sandbox, then the role for an admin scope,
+// then the scope, then the session requirement, then agents.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestAccessOrder(t *testing.T) {
 	t.Parallel()
 
@@ -348,6 +454,41 @@ func TestAccessOrder(t *testing.T) {
 		wantCode string
 		wantText string
 	}{
+		{
+			name:     "a sandboxed agent that fails everything else is told about the sandbox first",
+			who:      auth.Principal{Role: roleMember, Kind: auth.KindAPIKey, AgentID: agentOne, SandboxID: sandboxOne},
+			access:   everything,
+			wantCode: auth.CodeSandboxConfined, wantText: "an agent of a sandbox may not do this",
+		},
+		{
+			name:     "an opted-in route then tells a member about the role",
+			who:      auth.Principal{Role: roleMember, Kind: auth.KindAPIKey, AgentID: agentOne, SandboxID: sandboxOne},
+			access:   everything.InSandbox(),
+			wantCode: auth.CodeForbidden, wantText: "administrator access is required",
+		},
+		{
+			name: "an opted-in route then tells an admin without the scope about the scope",
+			who: auth.Principal{
+				Role: auth.RoleAdmin, Kind: auth.KindAPIKey, AgentID: agentOne, SandboxID: sandboxOne,
+			},
+			access:   everything.InSandbox(),
+			wantCode: auth.CodeInsufficientScope, wantText: "this credential lacks the scope user:read",
+		},
+		{
+			name: "an opted-in route then tells an admin with the scope about the session",
+			who: auth.Principal{
+				Role: auth.RoleAdmin, Kind: auth.KindAPIKey, AgentID: agentOne, SandboxID: sandboxOne,
+				Effective: list(scope.DefaultSession).Expand(),
+			},
+			access:   everything.InSandbox(),
+			wantCode: auth.CodeForbidden, wantText: "a signed-in session is required",
+		},
+		{
+			name:     "an open route refuses a sandboxed agent too",
+			who:      auth.Principal{Role: roleMember, Kind: auth.KindAPIKey, AgentID: agentOne, SandboxID: sandboxOne},
+			access:   auth.Open(),
+			wantCode: auth.CodeSandboxConfined, wantText: "an agent of a sandbox may not do this",
+		},
 		{
 			name:     "a member without the scope on an admin route is told about the role",
 			who:      auth.Principal{Role: roleMember, Kind: auth.KindAPIKey, AgentID: agentOne},
@@ -406,6 +547,8 @@ func TestAccessPasses(t *testing.T) {
 
 	for name, access := range map[string]auth.Access{
 		"open":                          auth.Open(),
+		"open in a sandbox":             auth.Open().InSandbox(),
+		"everything in a sandbox":       auth.Needs(scope.UserRead).Sessions().WithoutAgents().InSandbox(),
 		"a scope":                       auth.Needs(scope.UserRead),
 		"a scope and a session":         auth.Needs(scope.UserRead).Sessions(),
 		"a scope and no agents":         auth.Needs(scope.UserRead).WithoutAgents(),
@@ -426,9 +569,18 @@ func TestAccessBuildersDoNotShareState(t *testing.T) {
 	base := auth.Needs(scope.AgentRead)
 	_ = base.Sessions()
 	_ = base.WithoutAgents()
+	_ = base.InSandbox()
 
 	if base != auth.Needs(scope.AgentRead) {
 		t.Errorf("deriving from an Access changed it: %+v", base)
+	}
+
+	if auth.Open().InSandbox() == auth.Open() || !auth.Open().InSandbox().SandboxOK || auth.Open().SandboxOK {
+		t.Error("InSandbox must set only SandboxOK, on a copy")
+	}
+
+	if auth.Needs(scope.AgentRead).InSandbox().Sessions() != auth.Needs(scope.AgentRead).Sessions().InSandbox() {
+		t.Error("the order of the builders changed what they declare")
 	}
 
 	if auth.Open() == (auth.Access{}) {
