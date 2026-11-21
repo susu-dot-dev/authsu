@@ -61,32 +61,32 @@ func TestSessionRowSeam(t *testing.T) {
 			row: func(s session) step {
 				expires := float64(s.issued.ExpiresAt.Unix())
 
-				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, expires})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, expires, ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"expires_at as text": {
 			row: func(s session) step {
-				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, "1900000000"})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, "1900000000", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"expires_at NULL": {
 			row: func(s session) step {
-				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, nil})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, roleMember, nil, ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"role NULL": {
 			row: func(s session) step {
-				return s.activeSessionRow([]any{s.issued.ID, s.userID, nil, s.issued.ExpiresAt.Unix()})
+				return s.activeSessionRow([]any{s.issued.ID, s.userID, nil, s.issued.ExpiresAt.Unix(), ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"role as a blob": {
 			row: func(s session) step {
 				return s.activeSessionRow([]any{
-					s.issued.ID, s.userID, []byte(roleAdmin), s.issued.ExpiresAt.Unix(),
+					s.issued.ID, s.userID, []byte(roleAdmin), s.issued.ExpiresAt.Unix(), "",
 				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
@@ -94,14 +94,14 @@ func TestSessionRowSeam(t *testing.T) {
 		"id as a blob": {
 			row: func(s session) step {
 				return s.activeSessionRow([]any{
-					[]byte(s.issued.ID), s.userID, roleMember, s.issued.ExpiresAt.Unix(),
+					[]byte(s.issued.ID), s.userID, roleMember, s.issued.ExpiresAt.Unix(), "",
 				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"user_id as an integer": {
 			row: func(s session) step {
-				return s.activeSessionRow([]any{s.issued.ID, int64(7), roleMember, s.issued.ExpiresAt.Unix()})
+				return s.activeSessionRow([]any{s.issued.ID, int64(7), roleMember, s.issued.ExpiresAt.Unix(), ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
@@ -114,7 +114,7 @@ func TestSessionRowSeam(t *testing.T) {
 		"a column too many": {
 			row: func(s session) step {
 				return s.activeSessionRow([]any{
-					s.issued.ID, s.userID, roleMember, s.issued.ExpiresAt.Unix(), "extra",
+					s.issued.ID, s.userID, roleMember, s.issued.ExpiresAt.Unix(), "", "extra",
 				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
@@ -223,43 +223,55 @@ func TestAPIKeyRowSeam(t *testing.T) {
 		},
 		"expires_at as float64": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{k.issued.ID, memberID, roleMember, float64(k.issued.ExpiresAt.Unix()), "", "", keyScope})
+				return k.keyRow([]any{
+					k.issued.ID, memberID, roleMember, float64(k.issued.ExpiresAt.Unix()), "", "", keyScope, "", "",
+				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"role NULL": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{k.issued.ID, memberID, nil, k.issued.ExpiresAt.Unix(), "", "", keyScope})
+				return k.keyRow([]any{k.issued.ID, memberID, nil, k.issued.ExpiresAt.Unix(), "", "", keyScope, "", ""})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"id as a blob": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{[]byte(k.issued.ID), memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope})
+				return k.keyRow([]any{
+					[]byte(k.issued.ID), memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope, "", "",
+				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"agent id NULL": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), nil, "", keyScope})
+				return k.keyRow([]any{
+					k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), nil, "", keyScope, "", "",
+				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"agent scopes NULL": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", nil, keyScope})
+				return k.keyRow([]any{
+					k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", nil, keyScope, "", "",
+				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"agent scopes as a blob": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", []byte("[]"), keyScope})
+				return k.keyRow([]any{
+					k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", []byte("[]"), keyScope, "", "",
+				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
 		"scope NULL": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", nil})
+				return k.keyRow([]any{
+					k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", nil, "", "",
+				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
@@ -271,7 +283,9 @@ func TestAPIKeyRowSeam(t *testing.T) {
 		},
 		"a column too many": {
 			row: func(k apiKey) step {
-				return k.keyRow([]any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope, "extra"})
+				return k.keyRow([]any{
+					k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope, "", "", "extra",
+				})
 			},
 			wantStatus: http.StatusInternalServerError, wantBody: bodyInternal, wantLogged: rejected,
 		},
@@ -282,7 +296,7 @@ func TestAPIKeyRowSeam(t *testing.T) {
 		},
 		"two rows": {
 			row: func(k apiKey) step {
-				good := []any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope}
+				good := []any{k.issued.ID, memberID, roleMember, k.issued.ExpiresAt.Unix(), "", "", keyScope, "", ""}
 
 				return step{match: readAPIKey, results: rows(good, good), err: nil}
 			},
@@ -495,7 +509,8 @@ func TestRolesAtTheRoutes(t *testing.T) {
 
 // TestAgentsBelongToTheCaller: the agent routes act for the signed-in user. The
 // owner in the query is the token's account, never anything in the request, and
-// the label filter, when there is one, is the fourth argument (NULL for none).
+// the label filter, when there is one, is the fourth argument (NULL for none). A
+// user's own reach is not confined, and there is no sandbox filter.
 func TestAgentsBelongToTheCaller(t *testing.T) {
 	t.Parallel()
 
@@ -525,8 +540,11 @@ func TestAgentsBelongToTheCaller(t *testing.T) {
 			}
 
 			args := h.exec.calls[1][0].Args
-			if len(args) != 4 || args[0] != memberID || args[2] != int64(6) || args[3] != tt.label {
-				t.Errorf("agent list args = %v, want the caller's id, a page of 5 plus one and the label %v", args, tt.label)
+			want := []any{memberID, nil, int64(6), tt.label, int64(0), nil, nil}
+			if len(args) != len(want) || args[0] != want[0] || args[2] != want[2] || args[3] != want[3] ||
+				args[4] != want[4] || args[5] != want[5] || args[6] != want[6] {
+				t.Errorf("agent list args = %v, want the caller's id, a page of 5 plus one, the label %v and no confinement",
+					args, tt.label)
 			}
 		})
 	}

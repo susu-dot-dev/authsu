@@ -126,6 +126,8 @@ func oauthInventory() []inventoryRoute {
 }
 
 // coreInventory is every other route of the inventory.
+//
+//nolint:funlen // the inventory is the table; splitting it would only scatter the routes
 func coreInventory() []inventoryRoute {
 	const (
 		emptyObject  = `{}`
@@ -184,17 +186,26 @@ func coreInventory() []inventoryRoute {
 		sessionRoute(http.MethodGet, "/api/user"),
 		sessionRoute(http.MethodGet, "/api/user/"+someID),
 		sessionRoute(http.MethodDelete, "/api/user/"+someID),
+		sessionRoute(http.MethodPost, "/api/org"),
+		sessionRoute(http.MethodGet, "/api/org"),
+		sessionRoute(http.MethodGet, "/api/org/"+someID),
+		sessionRoute(http.MethodPatch, "/api/org/"+someID),
+		sessionRoute(http.MethodDelete, "/api/org/"+someID),
+		sessionRoute(http.MethodGet, "/api/org/"+someID+"/member"),
+		sessionRoute(http.MethodPatch, "/api/member/"+someID),
+		sessionRoute(http.MethodDelete, "/api/member/"+someID),
+		sessionRoute(http.MethodPost, "/api/org/"+someID+"/offer"),
+		sessionRoute(http.MethodGet, "/api/org/"+someID+"/offer"),
+		sessionRoute(http.MethodGet, "/api/offer"),
+		sessionRoute(http.MethodPost, "/api/offer/"+someID+"/accept"),
+		sessionRoute(http.MethodDelete, "/api/offer/"+someID),
 	}
 }
 
 // pathPattern is a route path with its id wildcard, which is how routes are
 // grouped by path.
 func pathPattern(path string) string {
-	if before, ok := strings.CutSuffix(path, someID); ok {
-		return before + "{id}"
-	}
-
-	return path
+	return strings.Replace(path, someID, "{id}", 1)
 }
 
 // TestEveryRouteIsRouted: every route of the inventory answers, as the feature
@@ -371,7 +382,7 @@ func TestCredentialIsJudgedBeforeAPathID(t *testing.T) {
 	}
 
 	for _, route := range inventory() {
-		if !strings.HasSuffix(route.path, someID) {
+		if !strings.Contains(route.path, someID) {
 			continue
 		}
 
@@ -379,7 +390,7 @@ func TestCredentialIsJudgedBeforeAPathID(t *testing.T) {
 			t.Run(route.method+" "+pathPattern(route.path)+" "+name, func(t *testing.T) {
 				t.Parallel()
 
-				path := strings.TrimSuffix(route.path, someID) + bad
+				path := strings.Replace(route.path, someID, bad, 1)
 
 				h := newHarness(t, fullEnv())
 				rec := h.do(request{method: route.method, path: path})
@@ -500,6 +511,19 @@ func TestBodyLimits(t *testing.T) {
 		"user list":         {http.MethodGet, "/api/user", 1024, unauth, nil},
 		"user get":          {http.MethodGet, "/api/user/" + someID, 1024, unauth, nil},
 		"user revoke":       {http.MethodDelete, "/api/user/" + someID, 1024, unauth, nil},
+		"org create":        {http.MethodPost, "/api/org", 8 << 10, unauth, nil},
+		"org list":          {http.MethodGet, "/api/org", 1024, unauth, nil},
+		"org get":           {http.MethodGet, "/api/org/" + someID, 1024, unauth, nil},
+		"org rename":        {http.MethodPatch, "/api/org/" + someID, 8 << 10, unauth, nil},
+		"org revoke":        {http.MethodDelete, "/api/org/" + someID, 1024, unauth, nil},
+		"member list":       {http.MethodGet, "/api/org/" + someID + "/member", 1024, unauth, nil},
+		"member update":     {http.MethodPatch, "/api/member/" + someID, 1024, unauth, nil},
+		"member remove":     {http.MethodDelete, "/api/member/" + someID, 1024, unauth, nil},
+		"offer create":      {http.MethodPost, "/api/org/" + someID + "/offer", 1024, unauth, nil},
+		"offer list org":    {http.MethodGet, "/api/org/" + someID + "/offer", 1024, unauth, nil},
+		"offer list mine":   {http.MethodGet, "/api/offer", 1024, unauth, nil},
+		"offer accept":      {http.MethodPost, "/api/offer/" + someID + "/accept", 1024, unauth, nil},
+		"offer revoke":      {http.MethodDelete, "/api/offer/" + someID, 1024, unauth, nil},
 
 		"oauth metadata":       {http.MethodGet, "/.well-known/oauth-authorization-server", 1024, http.StatusOK, nil},
 		"openid configuration": {http.MethodGet, "/.well-known/openid-configuration", 1024, http.StatusOK, nil},

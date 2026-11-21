@@ -571,15 +571,17 @@ func createGrantWant(grant store.NewGrant, newAgent bool) []wantStatement {
 	if newAgent {
 		want = append(want, wantStatement{
 			fragments: []string{
-				"INSERT INTO agents (id, user_id, name, scopes, created_at)",
+				"INSERT INTO agents (id, user_id, name, scopes, created_at, sandbox_id)",
 				// The owner is read from users and must be active, and the limit
 				// counts the owner's active agents in the write.
 				"WHERE u.id = ?5 AND u.revoked_at IS NULL",
-				"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6",
+				"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL",
+				"AND (a.sandbox_id IS NULL OR EXISTS (SELECT 1 FROM orgs g WHERE g.id = a.sandbox_id AND g.expires_at > ?4))) < ?6",
 			},
+			// A consent never puts the agent it creates in a sandbox: ?7 is NULL.
 			args: []any{
 				grant.AgentID, grant.NewAgent.Name.String(), "[]", grant.CreatedAt.Unix(), grant.Owner,
-				int64(grant.NewAgent.MaxActive),
+				int64(grant.NewAgent.MaxActive), nil, store.OrgKindSandbox,
 			},
 		})
 	}
@@ -597,9 +599,11 @@ func createGrantWant(grant store.NewGrant, newAgent bool) []wantStatement {
 					"resource, scope, code_challenge, nonce, auth_time, granted_from)",
 				// The account must be active.
 				"(SELECT u.id FROM users u WHERE u.id = ?3 AND u.revoked_at IS NULL)",
-				// The agent must be the owner's and active: one created in this
-				// batch is found, and none is NULL.
-				"(SELECT a.id FROM agents a WHERE a.id = ?4 AND a.user_id = ?3 AND a.revoked_at IS NULL)",
+				// The agent must be the owner's, active and in no sandbox: one
+				// created in this batch is found, and none is NULL. An agent of a
+				// sandbox reads as unavailable, so consent cannot attach one.
+				"(SELECT a.id FROM agents a WHERE a.id = ?4 AND a.user_id = ?3 AND a.revoked_at IS NULL " +
+					"AND a.sandbox_id IS NULL)",
 				// auth_time is the approving session's secret's creation, and the
 				// session must be the owner's and active now.
 				"(SELECT s.created_at FROM secrets s JOIN sessions x ON x.id = s.id AND x.kind = s.kind " +

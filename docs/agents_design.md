@@ -35,7 +35,7 @@ Authority moves in one direction only:
 
 - **Admins invite users.** This is unchanged: invitations are the only way to create an account.
 - **Users create agents, and only for themselves.** Creating an agent is a user delegating their own authority, so the agent's owner is whoever made the request. Nobody, including an admin, creates an agent for someone else.
-- **An agent may create agents only if it has been explicitly allowed to**, and that permission is elevated and never a default. An agent made this way is an ordinary agent of the same user, not a child of the agent that created it. It can be no more capable than its creator, and it counts against a per-user limit on how many agents there are.
+- **An agent may create agents only if it has been explicitly allowed to**, and that permission is elevated and never a default. An agent made this way is an agent of the same user (in the same sandbox as its creator, if it has one: [orgs_design.md](orgs_design.md), principle 4), not a child of the agent that created it. It can be no more capable than its creator, and it counts against a per-user limit on how many agents there are.
 
 Agents form a flat set under their user, not a tree. Each agent answers to its user and nothing else, so its standing depends only on itself and its user, never on a chain of other agents.
 

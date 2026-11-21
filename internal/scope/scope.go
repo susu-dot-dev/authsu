@@ -38,6 +38,13 @@
 // route boundary requires the caller's role to be administrator as well as the
 // scope (internal/auth), so an admin scope on a member's credential grants
 // nothing. Scopes only ever narrow what the user may already do.
+//
+// The organization scopes (org, member and offer) are not admin scopes. Who may
+// look after a given organization is a fact about that organization, so the
+// store decides it in the write that depends on it, with the platform
+// administrator's override beside it; the scope only says whether the
+// credential may ask. They are in the session and user bundles and not the
+// agent's.
 package scope
 
 import (
@@ -79,6 +86,32 @@ const (
 	// GrantRevoke revokes one of the caller's OAuth grants.
 	GrantRevoke Scope = "grant:revoke"
 
+	// OrgRead lists and reads organizations and sandboxes the caller belongs to
+	// or administers.
+	OrgRead Scope = "org:read"
+	// OrgCreate creates an organization or a sandbox.
+	OrgCreate Scope = "org:create"
+	// OrgUpdate renames an organization or a sandbox.
+	OrgUpdate Scope = "org:update"
+	// OrgRevoke revokes an organization, or deletes a sandbox.
+	OrgRevoke Scope = "org:revoke"
+
+	// MemberRead lists the members of an organization.
+	MemberRead Scope = "member:read"
+	// MemberUpdate promotes or demotes a member as an administrator.
+	MemberUpdate Scope = "member:update"
+	// MemberRevoke removes a member from an organization, or leaves it.
+	MemberRevoke Scope = "member:revoke"
+
+	// OfferRead lists offers to join an organization.
+	OfferRead Scope = "offer:read"
+	// OfferCreate offers a user a place in an organization.
+	OfferCreate Scope = "offer:create"
+	// OfferUpdate accepts an offer addressed to the caller.
+	OfferUpdate Scope = "offer:update"
+	// OfferRevoke withdraws or declines an offer.
+	OfferRevoke Scope = "offer:revoke"
+
 	// InvitationRead lists invitations. Admin only.
 	InvitationRead Scope = "invitation:read"
 	// InvitationCreate creates an invitation. Admin only.
@@ -118,6 +151,9 @@ func definitions() []definition {
 		{AgentRead, false}, {AgentCreate, false}, {AgentUpdate, false}, {AgentRevoke, false},
 		{KeyRead, false}, {KeyCreate, false}, {KeyUpdate, false}, {KeyRevoke, false},
 		{GrantRead, false}, {GrantRevoke, false},
+		{OrgRead, false}, {OrgCreate, false}, {OrgUpdate, false}, {OrgRevoke, false},
+		{MemberRead, false}, {MemberUpdate, false}, {MemberRevoke, false},
+		{OfferRead, false}, {OfferCreate, false}, {OfferUpdate, false}, {OfferRevoke, false},
 		{InvitationRead, true}, {InvitationCreate, true}, {InvitationUpdate, true}, {InvitationRevoke, true},
 		{UserRead, true}, {UserRevoke, true},
 	}
@@ -131,11 +167,15 @@ func bundles() map[string][]Scope {
 		DefaultSession: {
 			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke,
 			GrantRead, GrantRevoke,
+			OrgRead, OrgCreate, OrgUpdate, OrgRevoke, MemberRead, MemberUpdate, MemberRevoke,
+			OfferRead, OfferCreate, OfferUpdate, OfferRevoke,
 			InvitationRead, InvitationCreate, InvitationUpdate, InvitationRevoke, UserRead, UserRevoke,
 		},
 		DefaultUser: {
 			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke,
 			GrantRead, GrantRevoke,
+			OrgRead, OrgCreate, OrgUpdate, OrgRevoke, MemberRead, MemberUpdate, MemberRevoke,
+			OfferRead, OfferCreate, OfferUpdate, OfferRevoke,
 		},
 		DefaultAgent: {AgentRead},
 	}

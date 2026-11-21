@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,6 +30,10 @@ const (
 	agentsUnavailable = "agents are temporarily unavailable"
 	agentOwner        = "user-1"
 	agentTarget       = "01900000-0000-7000-8000-000000000042"
+
+	// agentSandbox and agentOtherSandbox are two sandboxes.
+	agentSandbox      = "01900000-0000-7000-8000-0000000005a1"
+	agentOtherSandbox = "01900000-0000-7000-8000-0000000005a2"
 	agentCursorID     = "01900000-0000-7000-8000-000000000050"
 
 	// agentLargestID is the greatest id an agent can have, in the order the
@@ -41,14 +46,15 @@ const (
 func agentIDAt(n int) string { return fmt.Sprintf("01900000-0000-7000-8000-%012d", n) }
 
 // agentRowAt is a returned agent row: id, name, scopes, revoked_at, created_at,
-// labels (the JSON text of an array, as json_group_array returns it).
+// labels (the JSON text of an array, as json_group_array returns it) and
+// sandbox_id (NULL for an ordinary agent).
 func agentRowAt(n int) []any {
-	return row(agentIDAt(n), "agent "+strconv.Itoa(n), `["default:agent"]`, nil, int64(1_700_000_000+n), "[]")
+	return row(agentIDAt(n), "agent "+strconv.Itoa(n), `["default:agent"]`, nil, int64(1_700_000_000+n), "[]", nil)
 }
 
 // agentRow is the row of the agent agentTarget.
 func agentRow() []any {
-	return row(agentTarget, "build bot", `["default:agent"]`, nil, int64(1_700_000_000), "[]")
+	return row(agentTarget, "build bot", `["default:agent"]`, nil, int64(1_700_000_000), "[]", nil)
 }
 
 // agentRevokedRow is agentRow once it is revoked.
@@ -63,6 +69,17 @@ func mustAgentName(tb testing.TB, raw string) input.AgentName {
 	}
 
 	return name
+}
+
+func mustAgentSandboxID(tb testing.TB, raw string) input.SandboxID {
+	tb.Helper()
+
+	id, err := input.ParseSandboxID(raw)
+	if err != nil {
+		tb.Fatalf("parse sandbox id %q: %v", raw, err)
+	}
+
+	return id
 }
 
 func mustAgentID(tb testing.TB) input.ID {
@@ -87,7 +104,8 @@ func mustAgentCursor(tb testing.TB, values ...string) input.Cursor {
 	return cursor
 }
 
-func mustAgentFilter(tb testing.TB, values ...string) input.LabelFilter {
+// mustAgentFilter is the list filter that names the label in values, or none.
+func mustAgentFilter(tb testing.TB, values ...string) store.AgentFilter {
 	tb.Helper()
 
 	filter, err := input.ParseLabelFilter(values)
@@ -95,7 +113,19 @@ func mustAgentFilter(tb testing.TB, values ...string) input.LabelFilter {
 		tb.Fatalf("parse label filter %q: %v", values, err)
 	}
 
-	return filter
+	return store.AgentFilter{Label: filter, Sandbox: input.SandboxFilter{}}
+}
+
+// mustAgentSandboxFilter is the list filter that names the sandbox in values.
+func mustAgentSandboxFilter(tb testing.TB, values ...string) store.AgentFilter {
+	tb.Helper()
+
+	filter, err := input.ParseSandboxFilter(values)
+	if err != nil {
+		tb.Fatalf("parse sandbox filter %q: %v", values, err)
+	}
+
+	return store.AgentFilter{Label: input.LabelFilter{}, Sandbox: filter}
 }
 
 func mustAgentLabelPatch(tb testing.TB, add, remove []string) input.LabelPatch {
@@ -186,14 +216,16 @@ func agentReadOps(t *testing.T) []agentOp {
 		{
 			name: "list", rejected: store.CodeAgentListRejected, one: false, outcome: returning,
 			call: func(s *store.Store) ([]store.Agent, error) {
-				page, err := s.ListAgents(ctx, agentOwner, cursor, limit, mustAgentFilter(t))
+				page, err := s.ListAgents(ctx, store.OwnAgents(agentOwner), cursor, limit, mustAgentFilter(t))
 
 				return page.Agents, passErr(err)
 			},
 		},
 		{
 			name: "get", rejected: store.CodeAgentLookupRejected, one: true, outcome: returning,
-			call: func(s *store.Store) ([]store.Agent, error) { return single(s.GetAgent(ctx, agentOwner, id)) },
+			call: func(s *store.Store) ([]store.Agent, error) {
+				return single(s.GetAgent(ctx, store.OwnAgents(agentOwner), id))
+			},
 		},
 		{
 			name: "patch", rejected: store.CodeAgentUpdateRejected, one: true,
@@ -217,19 +249,18 @@ func agentReadOps(t *testing.T) []agentOp {
 	}
 }
 
-// TestAgentDecoding holds how a returned row becomes an Agent, for every
-// operation that reads one: they share a reader, and a column it reads wrongly
-// would be wrong everywhere.
-func TestAgentDecoding(t *testing.T) {
-	t.Parallel()
+// agentDecodingCase is a returned row and the agent it decodes to.
+type agentDecodingCase struct {
+	name string
+	row  []any
+	want store.Agent
+}
 
+// agentDecodingCases are the rows TestAgentDecoding reads.
+func agentDecodingCases() []agentDecodingCase {
 	revokedAt := int64(1_700_000_100)
 
-	tests := []struct {
-		name string
-		row  []any
-		want store.Agent
-	}{
+	return []agentDecodingCase{
 		{name: "an active agent", row: agentRow(), want: store.Agent{
 			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
 			Labels: []string{},
@@ -255,10 +286,26 @@ func TestAgentDecoding(t *testing.T) {
 			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
 			Labels: []string{"a", "b"},
 		}},
+		{name: "an agent in a sandbox", row: with(agentRow(), 6, agentSandbox), want: store.Agent{
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{}, SandboxID: new(agentSandbox),
+		}},
+		{name: "a revoked agent in a sandbox, with labels",
+			row: with(with(agentRevokedRow(), 6, agentSandbox), 5, `["a"]`), want: store.Agent{
+				ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
+				Labels: []string{"a"}, SandboxID: new(agentSandbox),
+			}},
 	}
+}
+
+// TestAgentDecoding holds how a returned row becomes an Agent, for every
+// operation that reads one: they share a reader, and a column it reads wrongly
+// would be wrong everywhere.
+func TestAgentDecoding(t *testing.T) {
+	t.Parallel()
 
 	for _, op := range agentReadOps(t) {
-		for _, test := range tests {
+		for _, test := range agentDecodingCases() {
 			t.Run(op.name+"/"+test.name, func(t *testing.T) {
 				t.Parallel()
 
@@ -309,7 +356,11 @@ func TestAgentDefects(t *testing.T) {
 		{name: "labels holds null after a label", row: with(agentRow(), 5, `["a",null]`)},
 		{name: "labels holds a nested array", row: with(agentRow(), 5, `[["a"]]`)},
 		{name: "labels is truncated", row: with(agentRow(), 5, `["a"`)},
-		{name: "a column too few", row: agentRow()[:5]},
+		{name: "sandbox_id is an integer", row: with(agentRow(), 6, int64(1))},
+		{name: "sandbox_id is a blob", row: with(agentRow(), 6, []byte(agentSandbox))},
+		{name: "sandbox_id is a float", row: with(agentRow(), 6, 1.5)},
+		{name: "a column too few", row: agentRow()[:6]},
+		{name: "the sandbox column is missing", row: agentRow()[:6]},
 		{name: "the labels column is missing", row: agentRow()[:5]},
 		{name: "a column too many", row: append(agentRow(), "extra")},
 		{name: "an empty row", row: row()},
@@ -402,7 +453,7 @@ func checkAgentPage(t *testing.T, page store.AgentPage, fake *fakeExec, test age
 		ids[i] = agent.ID
 	}
 
-	checkPage(t, pageResult{ids: ids, next: page.Next, args: fake.calls[0][0].Args, argc: 4, idAt: agentIDAt},
+	checkPage(t, pageResult{ids: ids, next: page.Next, args: fake.calls[0][0].Args, argc: 7, idAt: agentIDAt},
 		pageWant{size: test.size, ids: test.agents, next: test.next})
 }
 
@@ -440,7 +491,7 @@ func TestListAgentsPaging(t *testing.T) {
 			fake := newFake(returning(rows...))
 
 			page, err := fake.store().ListAgents(
-				context.Background(), agentOwner, mustAgentCursor(t), test.limit, mustAgentFilter(t))
+				context.Background(), store.OwnAgents(agentOwner), mustAgentCursor(t), test.limit, mustAgentFilter(t))
 			checkErr(t, err, nil)
 
 			checkAgentPage(t, page, fake, test)
@@ -457,7 +508,7 @@ func TestListAgentsMoreRowsThanAsked(t *testing.T) {
 	fake := newFake(returning(agentRowAt(5), agentRowAt(4), agentRowAt(3)))
 
 	page, err := fake.store().ListAgents(
-		context.Background(), agentOwner, mustAgentCursor(t), mustAgentLimit(t, "1"), mustAgentFilter(t))
+		context.Background(), store.OwnAgents(agentOwner), mustAgentCursor(t), mustAgentLimit(t, "1"), mustAgentFilter(t))
 
 	checkErr(t, err, defectOf(store.CodeAgentListRejected))
 
@@ -466,43 +517,80 @@ func TestListAgentsMoreRowsThanAsked(t *testing.T) {
 	}
 }
 
+// listStatementCase is one list and the arguments it must bind.
+type listStatementCase struct {
+	name   string
+	reach  store.AgentReach
+	cursor input.Cursor
+	limit  input.PageLimit
+
+	filter store.AgentFilter
+
+	// before is the cursor argument, or "" for the first page's bound.
+	before string
+	rows   int64
+
+	// label, confined, confinedTo and sandbox are the arguments the filters
+	// and the reach become: NULL (nil) for none.
+	label      any
+	confined   int64
+	confinedTo any
+	sandbox    any
+}
+
+// listStatementCases are the lists TestListAgentsStatement pins.
+func listStatementCases(t *testing.T) []listStatementCase {
+	t.Helper()
+
+	return []listStatementCase{
+		{name: "first page", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t), limit: mustAgentLimit(t),
+			filter: mustAgentFilter(t), before: "", rows: 26, label: nil, confined: 0, confinedTo: nil, sandbox: nil},
+		{name: "after a cursor", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t, agentCursorID),
+			limit: mustAgentLimit(t, "7"), filter: mustAgentFilter(t), before: agentCursorID, rows: 8,
+			label: nil, confined: 0, confinedTo: nil, sandbox: nil},
+		{name: "filtered by a label", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t),
+			limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t, "prod"), before: "", rows: 4,
+			label: "prod", confined: 0, confinedTo: nil, sandbox: nil},
+		{name: "filtered, after a cursor", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t, agentCursorID),
+			limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t, "a.b_c-1"), before: agentCursorID, rows: 4,
+			label: "a.b_c-1", confined: 0, confinedTo: nil, sandbox: nil},
+		{name: "filtered by a sandbox", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t),
+			limit: mustAgentLimit(t, "3"), filter: mustAgentSandboxFilter(t, agentSandbox), before: "", rows: 4,
+			label: nil, confined: 0, confinedTo: nil, sandbox: agentSandbox},
+		{name: "an agent of a sandbox is confined to it", reach: store.SandboxAgents(agentOwner, agentSandbox),
+			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t), before: "", rows: 4,
+			label: nil, confined: 1, confinedTo: agentSandbox, sandbox: nil},
+		{name: "an ordinary agent is confined to none", reach: store.SandboxAgents(agentOwner, ""),
+			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t), before: "", rows: 4,
+			label: nil, confined: 1, confinedTo: nil, sandbox: nil},
+		{name: "a confined agent filtering by another sandbox", reach: store.SandboxAgents(agentOwner, agentSandbox),
+			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentSandboxFilter(t, agentOtherSandbox),
+			before: "", rows: 4, label: nil, confined: 1, confinedTo: agentSandbox, sandbox: agentOtherSandbox},
+		{name: "everything at once", reach: store.SandboxAgents(agentOwner, agentSandbox),
+			cursor: mustAgentCursor(t, agentCursorID), limit: mustAgentLimit(t, "2"),
+			filter: store.AgentFilter{
+				Label:   mustAgentFilter(t, "prod").Label,
+				Sandbox: mustAgentSandboxFilter(t, agentSandbox).Sandbox,
+			},
+			before: agentCursorID, rows: 3, label: "prod", confined: 1, confinedTo: agentSandbox, sandbox: agentSandbox},
+	}
+}
+
 // TestListAgentsStatement pins the query's guards and its arguments in
 // placeholder order: the owner scopes the page, the cursor is an exclusive
-// upper bound on the id, and the first page has a bound above every id.
+// upper bound on the id, the first page has a bound above every id, the reach
+// (confined or not, and to which sandbox) is two arguments of its own and the
+// sandbox filter is the last.
 func TestListAgentsStatement(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name   string
-		cursor input.Cursor
-		limit  input.PageLimit
-
-		filter input.LabelFilter
-
-		// before is the cursor argument, or "" for the first page's bound.
-		before string
-		rows   int64
-
-		// label is the filter argument: nil for none.
-		label any
-	}{
-		{name: "first page", cursor: mustAgentCursor(t), limit: mustAgentLimit(t), filter: mustAgentFilter(t),
-			before: "", rows: 26, label: nil},
-		{name: "after a cursor", cursor: mustAgentCursor(t, agentCursorID), limit: mustAgentLimit(t, "7"),
-			filter: mustAgentFilter(t), before: agentCursorID, rows: 8, label: nil},
-		{name: "filtered by a label", cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"),
-			filter: mustAgentFilter(t, "prod"), before: "", rows: 4, label: "prod"},
-		{name: "filtered, after a cursor", cursor: mustAgentCursor(t, agentCursorID), limit: mustAgentLimit(t, "3"),
-			filter: mustAgentFilter(t, "a.b_c-1"), before: agentCursorID, rows: 4, label: "a.b_c-1"},
-	}
-
-	for _, test := range tests {
+	for _, test := range listStatementCases(t) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
 			fake := newFake(returning())
 
-			_, err := fake.store().ListAgents(context.Background(), agentOwner, test.cursor, test.limit, test.filter)
+			_, err := fake.store().ListAgents(context.Background(), test.reach, test.cursor, test.limit, test.filter)
 			checkErr(t, err, nil)
 
 			before := test.before
@@ -522,10 +610,17 @@ func TestListAgentsStatement(t *testing.T) {
 					// The filter is a semi-join on the labels' primary key: one row
 					// per agent however many labels it has, and NULL is no filter.
 					"AND (?4 IS NULL OR EXISTS (SELECT 1 FROM agent_labels f WHERE f.agent_id = agents.id AND f.label = ?4))",
+					// The reach: a confined caller matches its own sandbox by IS,
+					// so NULL is the ordinary agents and nothing else.
+					"AND (?5 = 0 OR sandbox_id IS ?6)",
+					// The sandbox filter only narrows.
+					"AND (?7 IS NULL OR sandbox_id = ?7)",
 					"ORDER BY id DESC",
 					"LIMIT ?3",
 				},
-				args: []any{agentOwner, before, test.rows, test.label},
+				args: []any{
+					agentOwner, before, test.rows, test.label, test.confined, test.confinedTo, test.sandbox,
+				},
 			})
 		})
 	}
@@ -538,28 +633,77 @@ func TestListAgentsFailures(t *testing.T) {
 	runFailures(t, 1, store.CodeAgentListFailed, store.CodeAgentListRejected, agentsUnavailable,
 		func(s *store.Store) error {
 			return lastErr(s.ListAgents(
-				context.Background(), agentOwner, mustAgentCursor(t), mustAgentLimit(t), mustAgentFilter(t)))
+				context.Background(), store.OwnAgents(agentOwner), mustAgentCursor(t), mustAgentLimit(t), mustAgentFilter(t)))
 		})
 }
 
-// TestGetAgentStatement pins that the owner is part of the match, so another
-// user's agent is not found, and the arguments in order.
+// TestGetAgentStatement pins that the owner and the reach are part of the match,
+// so another user's agent and one outside a sandbox the caller is confined to
+// are not found, and the arguments in order.
 func TestGetAgentStatement(t *testing.T) {
 	t.Parallel()
 
-	fake := newFake(returning(agentRow()))
+	tests := []struct {
+		name       string
+		reach      store.AgentReach
+		confined   int64
+		confinedTo any
+	}{
+		{"the user", store.OwnAgents(agentOwner), 0, nil},
+		{"an agent of a sandbox", store.SandboxAgents(agentOwner, agentSandbox), 1, agentSandbox},
+		{"an ordinary agent", store.SandboxAgents(agentOwner, ""), 1, nil},
+	}
 
-	_, err := fake.store().GetAgent(context.Background(), agentOwner, mustAgentID(t))
-	checkErr(t, err, nil)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 
-	checkBatch(t, fake, wantStatement{
-		fragments: []string{
-			"SELECT id, name, scopes, revoked_at, created_at,",
-			"FROM agents",
-			"WHERE id = ? AND user_id = ?",
-		},
-		args: []any{agentTarget, agentOwner},
-	})
+			fake := newFake(returning(agentRow()))
+
+			_, err := fake.store().GetAgent(context.Background(), test.reach, mustAgentID(t))
+			checkErr(t, err, nil)
+
+			checkBatch(t, fake, wantStatement{
+				fragments: []string{
+					"SELECT id, name, scopes, revoked_at, created_at,",
+					"sandbox_id FROM agents",
+					"WHERE id = ?1 AND user_id = ?2 AND (?3 = 0 OR sandbox_id IS ?4)",
+				},
+				args: []any{agentTarget, agentOwner, test.confined, test.confinedTo},
+			})
+		})
+	}
+}
+
+// TestAgentReach holds what the reach reports, and that its zero value is no
+// one's: no owner, and not confined, so it can match nothing by accident.
+func TestAgentReach(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		reach    store.AgentReach
+		owner    string
+		confined bool
+		sandbox  string
+	}{
+		{"the zero reach", store.AgentReach{}, "", false, ""},
+		{"the user", store.OwnAgents(agentOwner), agentOwner, false, ""},
+		{"an agent of a sandbox", store.SandboxAgents(agentOwner, agentSandbox), agentOwner, true, agentSandbox},
+		{"an ordinary agent", store.SandboxAgents(agentOwner, ""), agentOwner, true, ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if test.reach.Owner() != test.owner || test.reach.Confined() != test.confined ||
+				test.reach.Sandbox() != test.sandbox {
+				t.Errorf("reach = %q, %v, %q; want %q, %v, %q", test.reach.Owner(), test.reach.Confined(),
+					test.reach.Sandbox(), test.owner, test.confined, test.sandbox)
+			}
+		})
+	}
 }
 
 // TestGetAgentFailures holds how a failed or malformed batch is reported.
@@ -568,7 +712,7 @@ func TestGetAgentFailures(t *testing.T) {
 
 	runFailures(t, 1, store.CodeAgentLookupFailed, store.CodeAgentLookupRejected, agentsUnavailable,
 		func(s *store.Store) error {
-			return lastErr(s.GetAgent(context.Background(), agentOwner, mustAgentID(t)))
+			return lastErr(s.GetAgent(context.Background(), store.OwnAgents(agentOwner), mustAgentID(t)))
 		})
 }
 
@@ -609,6 +753,17 @@ func createAgentCases(t *testing.T) []createAgentCase {
 				KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1),
 				KeyExpiresAt: expires, CreatedAt: now, Labels: mustAgentLabelSet(t, "zeta", "alpha", "mid"),
 			}},
+		{name: "in a sandbox", agent: store.NewAgent{
+			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
+			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1),
+			KeyExpiresAt: expires, CreatedAt: now, Sandbox: mustAgentSandboxID(t, agentSandbox),
+		}},
+		{name: "in a sandbox, with labels", labels: []string{"b", "a"}, agent: store.NewAgent{
+			ID: agentCursorID, Owner: "user-2", Name: mustAgentName(t, "ボット 🤖"), Scopes: `[]`,
+			KeyScope: `[]`, MaxActive: 1, KeyID: "key-2", KeyHash: hashOf(2), KeyExpiresAt: expires.Add(time.Hour),
+			CreatedAt: now.Add(time.Minute), Labels: mustAgentLabelSet(t, "b", "a"),
+			Sandbox: mustAgentSandboxID(t, agentOtherSandbox),
+		}},
 		{name: "the most labels, each the longest", labels: longestLabelSet(), agent: store.NewAgent{
 			ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "build bot"), Scopes: `["default:agent"]`,
 			KeyScope: `["agent:read"]`, MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1),
@@ -652,9 +807,88 @@ func createLabelStatement(agent, label string) wantStatement {
 	}
 }
 
+// agentInsertFragments are the guards of the insert of a user's agent, which is
+// the same text for an ordinary create, a create in a sandbox and the consent
+// that creates an agent.
+func agentInsertFragments() []string {
+	return []string{
+		"INSERT INTO agents (id, user_id, name, scopes, created_at, sandbox_id)",
+		"SELECT ?1, u.id, ?2, ?3, ?4, ?7 FROM users u",
+		// The owner must be active, read from users, and under the limit:
+		// the count is part of the write.
+		"WHERE u.id = ?5 AND u.revoked_at IS NULL",
+		// Agents of a sandbox that has expired as of the write do not count.
+		"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL",
+		"AND (a.sandbox_id IS NULL OR EXISTS (SELECT 1 FROM orgs g WHERE g.id = a.sandbox_id AND g.expires_at > ?4))) < ?6",
+		// A sandbox must be a sandbox, unexpired as of the create, and the
+		// owner's to administer: all in the write.
+		"AND (?7 IS NULL OR EXISTS (SELECT 1 FROM orgs g JOIN org_admins m ON m.org_id = g.id",
+		"WHERE g.id = ?7 AND g.kind = ?8 AND g.expires_at > ?4 AND m.user_id = u.id))",
+		// The stored list and sandbox come back from the write itself.
+		"RETURNING scopes, sandbox_id",
+	}
+}
+
+// createAgentWant is the batch a create must write: the sandbox guard when there
+// is a sandbox, the agent, its key's secret, its key, then each label in order.
+// The agent is before the key and the labels because they read its row, and the
+// key follows its secret.
+func createAgentWant(test createAgentCase) []wantStatement {
+	agent := test.agent
+
+	var guard []wantStatement
+
+	var sandbox any
+
+	if agent.Sandbox.String() != "" {
+		sandbox = agent.Sandbox.String()
+		guard = []wantStatement{{
+			fragments: []string{
+				"INSERT INTO org_admins (org_id, user_id, created_at)",
+				// A NULL org_id is the NOT NULL failure that names the sandbox,
+				// and only when the sandbox is not the owner's.
+				"SELECT NULL, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM orgs g JOIN org_admins m ON m.org_id = g.id",
+				"WHERE g.id = ?1 AND g.kind = ?4 AND g.expires_at > ?3 AND m.user_id = ?2)",
+			},
+			args: []any{agent.Sandbox.String(), agent.Owner, agent.CreatedAt.Unix(), store.OrgKindSandbox},
+		}}
+	}
+
+	fixed := []wantStatement{
+		{
+			fragments: agentInsertFragments(),
+			args: []any{
+				agent.ID, agent.Name.String(), agent.Scopes, agent.CreatedAt.Unix(),
+				agent.Owner, int64(agent.MaxActive), sandbox, store.OrgKindSandbox,
+			},
+		},
+		{
+			fragments: []string{"INSERT INTO secrets (id, kind, hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"},
+			args: []any{
+				agent.KeyID, store.KindAPIKey, agent.KeyHash, agent.KeyExpiresAt.Unix(), agent.CreatedAt.Unix(),
+			},
+		},
+		{
+			fragments: []string{
+				"INSERT INTO api_keys (id, kind, user_id, agent_id, name, scope)",
+				// The key's owner, agent and name are the agent row's, not
+				// arguments: no agent, no owner, and the batch fails, secret
+				// included.
+				"(SELECT user_id FROM agents WHERE id = ?3)",
+				"(SELECT id FROM agents WHERE id = ?3)",
+				"(SELECT name FROM agents WHERE id = ?3)",
+			},
+			args: []any{agent.KeyID, store.KindAPIKey, agent.ID, agent.KeyScope},
+		},
+	}
+
+	return slices.Concat(guard, fixed, labelStatements(agent.ID, test.labels))
+}
+
 // TestCreateAgentStatements pins the batch a create writes: the guards that make
 // the agent conditional on its owner, and the key whose owner is read from the
-// agent's row so that no agent means a failed batch.
+// agent's row so that no agent means a failed batch. A create in a sandbox is
+// preceded by the guard that says the sandbox is why it failed.
 func TestCreateAgentStatements(t *testing.T) {
 	t.Parallel()
 
@@ -662,68 +896,135 @@ func TestCreateAgentStatements(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			// The agent insert returns the scopes it stored, which is what the
-			// caller reports. Here the row holds what was offered.
-			fake := newFake(createdAgent(test.agent.Scopes, test.labels...))
+			agent := test.agent
+			inSandbox := agent.Sandbox.String() != ""
 
-			stored, err := fake.store().CreateAgent(context.Background(), test.agent)
+			// The agent insert returns the scopes and sandbox it stored, which is
+			// what the caller reports. Here the row holds what was offered.
+			var sandbox any
+			if inSandbox {
+				sandbox = agent.Sandbox.String()
+			}
+
+			fake := newFake(createdAgent(inSandbox, row(agent.Scopes, sandbox), test.labels...))
+
+			stored, err := fake.store().CreateAgent(context.Background(), agent)
 			checkErr(t, err, nil)
 
-			if stored != test.agent.Scopes {
-				t.Errorf("stored scopes = %q, want %q", stored, test.agent.Scopes)
+			if stored.Scopes != agent.Scopes || stored.SandboxID != agent.Sandbox.String() {
+				t.Errorf("stored = %+v, want scopes %q in sandbox %q", stored, agent.Scopes, agent.Sandbox.String())
 			}
 
-			agent := test.agent
+			want := createAgentWant(test)
+			checkBatch(t, fake, want...)
 
-			// The agent, its key's secret, its key, then each label in order:
-			// the agent is first because the key and the labels read its row,
-			// and the key follows its secret.
-			fixed := []wantStatement{
-				{
-					fragments: []string{
-						"INSERT INTO agents (id, user_id, name, scopes, created_at)",
-						"SELECT ?1, u.id, ?2, ?3, ?4 FROM users u",
-						// The owner must be active, read from users, and under the limit:
-						// the count is part of the write.
-						"WHERE u.id = ?5 AND u.revoked_at IS NULL",
-						"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6",
-						// The stored list comes back from the write itself.
-						"RETURNING scopes",
-					},
-					args: []any{
-						agent.ID, agent.Name.String(), agent.Scopes, agent.CreatedAt.Unix(),
-						agent.Owner, int64(agent.MaxActive),
-					},
-				},
-				{
-					fragments: []string{"INSERT INTO secrets (id, kind, hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"},
-					args: []any{
-						agent.KeyID, store.KindAPIKey, agent.KeyHash, agent.KeyExpiresAt.Unix(), agent.CreatedAt.Unix(),
-					},
-				},
-				{
-					fragments: []string{
-						"INSERT INTO api_keys (id, kind, user_id, agent_id, name, scope)",
-						// The key's owner, agent and name are the agent row's, not
-						// arguments: no agent, no owner, and the batch fails,
-						// secret included.
-						"(SELECT user_id FROM agents WHERE id = ?3)",
-						"(SELECT id FROM agents WHERE id = ?3)",
-						"(SELECT name FROM agents WHERE id = ?3)",
-					},
-					args: []any{agent.KeyID, store.KindAPIKey, agent.ID, agent.KeyScope},
-				},
-			}
-
-			checkBatch(t, fake, slices.Concat(fixed, labelStatements(agent.ID, test.labels))...)
-
-			for i := 1; i <= 2; i++ {
-				if strings.Contains(squash(fake.calls[0][i].Query), "'api_key'") {
-					t.Errorf("statement %d writes the kind as a literal; bind store.KindAPIKey", i)
+			// Literals of the kinds are never written: the kind of the agent's
+			// key and of a sandbox are bound.
+			for i, statement := range fake.calls[0] {
+				text := squash(statement.Query)
+				if strings.Contains(text, "'api_key'") || strings.Contains(text, "'sandbox'") {
+					t.Errorf("statement %d writes a kind as a literal; bind it", i)
 				}
 			}
 		})
 	}
+}
+
+// TestSandboxExpiryIsExclusiveAtTheRequestSecond holds that a sandbox is judged
+// by one instant, the second of the request, and that a sandbox whose expiry is
+// that very second has expired: every comparison with expires_at in the create's
+// batch is a strict "expires_at > ?N" against an argument that is the create's
+// time as whole seconds. The sub-second part of the clock is dropped, and so
+// cannot make a sandbox that expires this second stand a moment longer. The
+// real comparison runs only in the end-to-end tests; this pins its operator
+// and the instant it is given.
+func TestSandboxExpiryIsExclusiveAtTheRequestSecond(t *testing.T) {
+	t.Parallel()
+
+	second := time.Unix(1_700_000_200, 0)
+	expiry := regexp.MustCompile(`expires_at (\S+) \?(\d+)`)
+
+	tests := []struct {
+		name string
+		// at is the request's clock reading.
+		at      time.Time
+		sandbox string
+		by      string // the creating agent, "" for the user's own create
+		// judged is how many comparisons with an expiry the batch holds: the
+		// agent count and the sandbox clause of the insert (every create; the
+		// clause reads the creating agent's sandbox for a create by an agent),
+		// and, for a user's create in a sandbox, the guard before it.
+		judged int
+	}{
+		{name: "an ordinary create", at: second, judged: 2},
+		{name: "an ordinary create a moment into the second", at: second.Add(999 * time.Millisecond), judged: 2},
+		{name: "a create in a sandbox", at: second, sandbox: agentSandbox, judged: 3},
+		{name: "a create in a sandbox a moment into the second", at: second.Add(999 * time.Millisecond),
+			sandbox: agentSandbox, judged: 3},
+		{name: "a create by an agent", at: second, by: "agent-1", judged: 2},
+		{name: "a create by an agent a moment into the second", at: second.Add(999 * time.Millisecond),
+			by: "agent-1", judged: 2},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
+				MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1), KeyExpiresAt: test.at, CreatedAt: test.at,
+				CreatedBy: test.by,
+			}
+			if test.sandbox != "" {
+				agent.Sandbox = mustAgentSandboxID(t, test.sandbox)
+			}
+
+			var sandbox any
+			if test.sandbox != "" {
+				sandbox = test.sandbox
+			}
+
+			fake := newFake(createdAgent(test.sandbox != "", row("[]", sandbox)))
+
+			_, err := fake.store().CreateAgent(context.Background(), agent)
+			checkErr(t, err, nil)
+
+			judged := 0
+			for _, statement := range fake.calls[0] {
+				judged += checkExpiryComparisons(t, statement, expiry, test.at)
+			}
+
+			if judged != test.judged {
+				t.Errorf("the batch compares an expiry %d times, want %d", judged, test.judged)
+			}
+		})
+	}
+}
+
+// checkExpiryComparisons checks each comparison with expires_at in a statement:
+// it is a strict ">" against an argument that is at as whole seconds. It returns
+// how many there are.
+func checkExpiryComparisons(t *testing.T, statement store.Statement, expiry *regexp.Regexp, at time.Time) int {
+	t.Helper()
+
+	matches := expiry.FindAllStringSubmatch(squash(statement.Query), -1)
+
+	for _, match := range matches {
+		if match[1] != ">" {
+			t.Errorf("an expiry is compared with %q, want a strict >:\n%s", match[1], statement.Query)
+		}
+
+		position, err := strconv.Atoi(match[2])
+		if err != nil || position < 1 || position > len(statement.Args) {
+			t.Fatalf("expires_at is compared with ?%s, not an argument of %v", match[2], statement.Args)
+		}
+
+		if got := statement.Args[position-1]; got != at.Unix() {
+			t.Errorf("expires_at is compared with %v, want the request's whole second %d", got, at.Unix())
+		}
+	}
+
+	return len(matches)
 }
 
 // TestCreateAgentFailures holds that a limit or a revoked owner (conflicts) and
@@ -758,6 +1059,27 @@ func TestCreateAgentWithLabelsFailures(t *testing.T) {
 		})
 }
 
+// agentByAgentInsertFragments are the guards of the insert of an agent that
+// another agent creates.
+func agentByAgentInsertFragments() []string {
+	return []string{
+		"INSERT INTO agents (id, user_id, name, scopes, created_at, sandbox_id)",
+		// Scopes and sandbox come from the creating agent's row.
+		"SELECT ?1, u.id, ?2, c.scopes, ?4, c.sandbox_id FROM users u",
+		// It must be the owner's and not revoked.
+		"JOIN agents c ON c.user_id = u.id AND c.id = ?3 AND c.revoked_at IS NULL",
+		"WHERE u.id = ?5 AND u.revoked_at IS NULL",
+		// Agents of a sandbox that has expired as of the write do not count.
+		"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL",
+		"AND (a.sandbox_id IS NULL OR EXISTS (SELECT 1 FROM orgs g WHERE g.id = a.sandbox_id AND g.expires_at > ?4))) < ?6",
+		// Its sandbox must still stand, when it has one.
+		"AND (c.sandbox_id IS NULL OR EXISTS (SELECT 1 FROM orgs g",
+		"WHERE g.id = c.sandbox_id AND g.kind = c.sandbox_kind AND g.expires_at > ?4))",
+		// The creating agent's list and sandbox, as the write read them, come back.
+		"RETURNING scopes, sandbox_id",
+	}
+}
+
 // TestCreateAgentByAgentStatements pins the batch an agent's create writes. The
 // new agent's scopes are read from the creating agent's row in the write and are
 // not an argument at all, the creating agent must be the owner's and active, and
@@ -769,8 +1091,10 @@ func TestCreateAgentByAgentStatements(t *testing.T) {
 	expires := time.Unix(1_707_776_123, 0)
 	agent := store.NewAgent{
 		ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "child"),
-		// A request's idea of the scopes must never reach the write.
+		// A request's idea of the scopes and of the sandbox must never reach the
+		// write.
 		Scopes: `["user:read"]`, KeyScope: `["default:agent"]`, CreatedBy: agentCursorID,
+		Sandbox:   mustAgentSandboxID(t, agentOtherSandbox),
 		MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(1), KeyExpiresAt: expires, CreatedAt: now,
 	}
 
@@ -778,28 +1102,18 @@ func TestCreateAgentByAgentStatements(t *testing.T) {
 	// the write returns the row's: that is what the caller must report.
 	const creatorScopes = `["default:agent","agent:create"]`
 
-	fake := newFake(createdAgent(creatorScopes))
+	fake := newFake(createdAgent(false, row(creatorScopes, agentSandbox)))
 
 	stored, err := fake.store().CreateAgent(context.Background(), agent)
 	checkErr(t, err, nil)
 
-	if stored != creatorScopes {
-		t.Errorf("stored scopes = %q, want the creating agent's %q", stored, creatorScopes)
+	if stored.Scopes != creatorScopes || stored.SandboxID != agentSandbox {
+		t.Errorf("stored = %+v, want the creating agent's scopes %q and sandbox %q", stored, creatorScopes, agentSandbox)
 	}
 
 	checkBatch(t, fake,
 		wantStatement{
-			fragments: []string{
-				"INSERT INTO agents (id, user_id, name, scopes, created_at)",
-				// Scopes come from the creating agent's row.
-				"SELECT ?1, u.id, ?2, c.scopes, ?4 FROM users u",
-				// It must be the owner's and not revoked.
-				"JOIN agents c ON c.user_id = u.id AND c.id = ?3 AND c.revoked_at IS NULL",
-				"WHERE u.id = ?5 AND u.revoked_at IS NULL",
-				"AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6",
-				// The creating agent's list, as the write read it, comes back.
-				"RETURNING scopes",
-			},
+			fragments: agentByAgentInsertFragments(),
 			args: []any{
 				agent.ID, agent.Name.String(), agent.CreatedBy, agent.CreatedAt.Unix(), agent.Owner, int64(agent.MaxActive),
 			},
@@ -820,6 +1134,14 @@ func TestCreateAgentByAgentStatements(t *testing.T) {
 		if arg == agent.Scopes {
 			t.Error("the request's scopes were bound in an agent's create; they must come from the creating agent's row")
 		}
+
+		if arg == agent.Sandbox.String() {
+			t.Error("the request's sandbox was bound in an agent's create; it must come from the creating agent's row")
+		}
+	}
+
+	if len(fake.calls[0]) != 3 {
+		t.Errorf("an agent's create ran %d statements, want 3: it needs no sandbox guard", len(fake.calls[0]))
 	}
 }
 
@@ -838,16 +1160,23 @@ func TestCreateAgentByAgentFailures(t *testing.T) {
 }
 
 // createdAgent is the outcome of a create batch whose agent insert returned the
-// scopes it stored and whose key insert returned nothing, followed by one result
-// for each label the batch wrote.
-func createdAgent(scopes string, labels ...string) outcome {
+// row it stored (first: its scopes and its sandbox) and whose key insert
+// returned nothing, followed by one result for each label the batch wrote. A
+// create in a sandbox starts with the result of the sandbox guard, which
+// changes nothing when the sandbox is usable.
+func createdAgent(guarded bool, first []any, labels ...string) outcome {
 	// The agent insert returns its row; every later statement (the key's
 	// secret, the key, then each label) changes one row and returns none.
-	results := make([]store.Result, 1+2+len(labels))
-	results[0] = store.Result{Changes: 1, Rows: [][]any{row(scopes)}}
+	results := make([]store.Result, 0, 1+1+2+len(labels))
 
-	for i := 1; i < len(results); i++ {
-		results[i] = store.Result{Changes: 1, Rows: nil}
+	if guarded {
+		results = append(results, store.Result{Changes: 0, Rows: nil})
+	}
+
+	results = append(results, store.Result{Changes: 1, Rows: [][]any{first}})
+
+	for range 2 + len(labels) {
+		results = append(results, store.Result{Changes: 1, Rows: nil})
 	}
 
 	return outcome{results: results, err: nil}
@@ -871,10 +1200,13 @@ func TestCreateAgentResultShape(t *testing.T) {
 		out  outcome
 	}{
 		{name: "no row returned", out: two(nil)},
-		{name: "two rows returned", out: two([][]any{row("[]"), row("[]")})},
-		{name: "scopes not text", out: two([][]any{row(int64(1))})},
-		{name: "scopes is NULL", out: two([][]any{row(nil)})},
-		{name: "an extra column", out: two([][]any{row("[]", "[]")})},
+		{name: "two rows returned", out: two([][]any{row("[]", nil), row("[]", nil)})},
+		{name: "scopes not text", out: two([][]any{row(int64(1), nil)})},
+		{name: "scopes is NULL", out: two([][]any{row(nil, nil)})},
+		{name: "the sandbox is an integer", out: two([][]any{row("[]", int64(1))})},
+		{name: "the sandbox is a blob", out: two([][]any{row("[]", []byte("x"))})},
+		{name: "the sandbox column is missing", out: two([][]any{row("[]")})},
+		{name: "an extra column", out: two([][]any{row("[]", nil, "[]")})},
 		{name: "no column", out: two([][]any{row()})},
 	}
 
@@ -891,8 +1223,84 @@ func TestCreateAgentResultShape(t *testing.T) {
 
 			checkErr(t, err, defectOf(store.CodeAgentCreateRejected))
 
-			if stored != "" {
-				t.Errorf("stored scopes = %q on a defect, want none", stored)
+			if stored != (store.CreatedAgent{}) {
+				t.Errorf("stored = %+v on a defect, want none", stored)
+			}
+		})
+	}
+}
+
+// TestCreateAgentInASandboxFailures: the same failures for a create that names a
+// sandbox, which has the guard as a fourth statement and so the results to match.
+func TestCreateAgentInASandboxFailures(t *testing.T) {
+	t.Parallel()
+
+	runFailures(t, 4, store.CodeAgentCreateFailed, store.CodeAgentCreateRejected, agentsUnavailable,
+		func(s *store.Store) error {
+			return lastErr(s.CreateAgent(context.Background(), store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
+				MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(3), KeyExpiresAt: now, CreatedAt: now,
+				Sandbox: mustAgentSandboxID(t, agentSandbox),
+			}))
+		})
+}
+
+// TestCreateAgentTellsTheSandboxFromTheLimit: a create fails as a conflict when
+// the owner is at the limit, revoked, or the creating agent is gone, and as
+// ErrSandboxUnavailable (which keeps the conflict in its chain) only when the
+// column the database names is the sandbox guard's. A conflict that names
+// another column, or none, is never the sandbox's, in a create that names one
+// too.
+func TestCreateAgentTellsTheSandboxFromTheLimit(t *testing.T) {
+	t.Parallel()
+
+	notNull := func(column string) error {
+		return store.Classify(dbError("D1_ERROR: NOT NULL constraint failed: " + column + ": SQLITE_CONSTRAINT_NOTNULL"))
+	}
+
+	tests := []struct {
+		name           string
+		sandbox        string
+		cause          error
+		sandboxRefused bool
+	}{
+		{"the guard's column", agentSandbox, notNull("org_admins.org_id"), true},
+		{"the guard's column, for a create in no sandbox", "", notNull("org_admins.org_id"), true},
+		{"the key's owner: the limit or a revoked owner", agentSandbox, notNull("api_keys.user_id"), false},
+		{"the key's owner, in no sandbox", "", notNull("api_keys.user_id"), false},
+		{"a label's agent", agentSandbox, notNull("agent_labels.agent_id"), false},
+		{"no column named", agentSandbox, notNull(""), false},
+		{"the guard's table but another column", agentSandbox, notNull("org_admins.user_id"), false},
+		{"a unique value", agentSandbox, store.Classify(dbError(
+			"D1_ERROR: UNIQUE constraint failed: secrets.hash: SQLITE_CONSTRAINT_UNIQUE")), false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var sandbox input.SandboxID
+			if test.sandbox != "" {
+				sandbox = mustAgentSandboxID(t, test.sandbox)
+			}
+
+			fake := newFake(failing(test.cause))
+
+			_, err := fake.store().CreateAgent(context.Background(), store.NewAgent{
+				ID: agentTarget, Owner: agentOwner, Name: mustAgentName(t, "bot"), Scopes: "[]", KeyScope: "[]",
+				MaxActive: 25, KeyID: "key-1", KeyHash: hashOf(3), KeyExpiresAt: now, CreatedAt: now, Sandbox: sandbox,
+			})
+
+			if !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("error = %v, want ErrConflict in the chain", err)
+			}
+
+			if got := errors.Is(err, store.ErrSandboxUnavailable); got != test.sandboxRefused {
+				t.Errorf("ErrSandboxUnavailable = %v, want %v for %v", got, test.sandboxRefused, err)
+			}
+
+			if _, isAPI := errors.AsType[*apierr.Error](err); isAPI {
+				t.Errorf("conflict %v is classified; the feature must decide that", err)
 			}
 		})
 	}

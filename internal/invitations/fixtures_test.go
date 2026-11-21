@@ -57,6 +57,7 @@ const (
 
 	codeInvalidFieldType = "invalid_field_type"
 	codeUnknownField     = "unknown_field"
+	codeDuplicateField   = "duplicate_field"
 	codeInternal         = "internal"
 
 	// garbage is a body that is not JSON.
@@ -64,6 +65,10 @@ const (
 
 	// typeOther is a type a store row may have that is not the creatable one.
 	typeOther = "other"
+
+	// newOfferID is the id NewID hands out for the offer of a create, after the
+	// invitation's own.
+	newOfferID = "00000000-0000-7000-8000-0000000000ee"
 
 	// The operations of the fake store, as recorded in its calls.
 	opList   = "list"
@@ -187,10 +192,18 @@ func (f *fakeStore) CreateInvitation(_ context.Context, in store.NewInvitation) 
 		return *f.created, nil
 	}
 
-	return store.Invitation{
+	out := store.Invitation{
 		ID: in.ID, Type: in.Type, Label: in.Label.String(), NumInvites: in.NumInvites.Int64(), Uses: 0,
 		ExpiresAt: in.ExpiresAt.Unix(), RevokedAt: nil, CreatedBy: &in.CreatedBy, CreatedAt: in.CreatedAt.Unix(),
-	}, nil
+		OrgID: nil, OrgRole: nil,
+	}
+
+	// As the database stored them: the offer is the one the batch wrote.
+	if in.Offer != nil {
+		out.OrgID, out.OrgRole = new(in.Offer.OrgID.String()), new(in.Offer.Role.String())
+	}
+
+	return out, nil
 }
 
 func (f *fakeStore) UpdateNumInvites(
@@ -262,6 +275,10 @@ func newHarness(t *testing.T) *harness {
 		Store: harn.store, Now: harn.clock.read, Entropy: harn.entropy,
 		NewID: func() string {
 			harn.idCalls++
+
+			if harn.idCalls > 1 {
+				return newOfferID
+			}
 
 			return newInvID
 		},
@@ -381,6 +398,8 @@ type wireInvitation struct {
 	RevokedAt  *int64  `json:"revokedAt"`
 	CreatedBy  *string `json:"createdBy"`
 	CreatedAt  int64   `json:"createdAt"`
+	OrgID      *string `json:"orgId"`
+	OrgRole    *string `json:"orgRole"`
 }
 
 // wireCreated is the body of a created invitation.

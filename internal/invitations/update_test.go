@@ -40,7 +40,7 @@ func TestUpdateRefusesInvalidInput(t *testing.T) {
 		{"a boolean", updateBody("true"), codeInvalidFieldType},
 		{"unknown field", `{"numInvites":2,"type":"first_run"}`, codeUnknownField},
 		{"only an unknown field", `{"revoked":true}`, codeUnknownField},
-		{"repeated field", `{"numInvites":2,"numInvites":3}`, "duplicate_field"},
+		{"repeated field", `{"numInvites":2,"numInvites":3}`, codeDuplicateField},
 		{"empty body", "", "empty_body"},
 		{"not JSON", garbage, "invalid_json"},
 		{"trailing data", updateBody("2") + `{}`, "trailing_data"},

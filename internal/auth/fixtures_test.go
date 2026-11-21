@@ -61,11 +61,13 @@ const (
 
 // The routes of the standard table (see standardRoutes).
 const (
-	pathPublic  = "/public"
-	pathMe      = "/me"
-	pathAdmin   = "/admin"
-	pathItems   = "/items/"
-	patternItem = "/items/{id}"
+	pathPublic = "/public"
+	pathMe     = "/me"
+	// pathMeInSandbox is pathMe for a route that has opted in to sandboxed agents.
+	pathMeInSandbox = "/me-in-sandbox"
+	pathAdmin       = "/admin"
+	pathItems       = "/items/"
+	patternItem     = "/items/{id}"
 )
 
 // The answers a client is given: the status text is part of the contract. A
@@ -272,6 +274,7 @@ func (r *rig) standardRoutes() []auth.Route {
 		r.getRoute(pathPublic, auth.None, auth.Access{}),
 		r.getRoute(pathPublic+"/{id}", auth.None, auth.Access{}),
 		r.getRoute(pathMe, auth.Authenticated, auth.Open()),
+		r.getRoute(pathMeInSandbox, auth.Authenticated, auth.Open().InSandbox()),
 		r.getRoute(pathAdmin, auth.Authenticated, auth.Needs(scope.UserRead)),
 		r.getRoute(patternItem, auth.Authenticated, auth.Open()),
 	}
@@ -436,6 +439,10 @@ type bearerSpec struct {
 	agent string
 	// agentScopes is the agent's stored scope list (JSON), read now.
 	agentScopes string
+	// org is the owner's organization in the stored row, "" for none.
+	org string
+	// sandbox is the sandbox of the key's agent in the stored row, "" for none.
+	sandbox string
 }
 
 // withStoredScope returns a copy of s whose stored scope text is text.
@@ -465,6 +472,7 @@ func (r *rig) apiKey(spec bearerSpec) auth.Issued {
 	r.creds.keys[issued.Token] = store.ActiveAPIKey{
 		ID: issued.ID, UserID: userID, Role: role, ExpiresAt: issued.ExpiresAt,
 		AgentID: spec.agent, AgentScopes: spec.agentScopes, Scope: stored,
+		OrgID: spec.org, SandboxID: spec.sandbox,
 	}
 
 	return issued

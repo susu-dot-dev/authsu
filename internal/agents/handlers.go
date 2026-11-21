@@ -39,6 +39,14 @@ const (
 	// CodeKeyScopesExceeded is an agent that asked for a key holding a scope its
 	// own key does not list.
 	CodeKeyScopesExceeded = "key_scopes_exceeded"
+	// CodeSandboxNotFound is a create that names a sandbox the user does not
+	// administer or that has expired: one that does not exist, one that belongs
+	// to someone else, a standard organization and one that has run out are
+	// answered alike.
+	CodeSandboxNotFound = "sandbox_not_found"
+	// CodeSandboxInherited is an agent that tried to choose the sandbox of the
+	// agent it creates: it is always its own.
+	CodeSandboxInherited = "agent_sandbox_inherited"
 	// CodeLabelLimit is a PATCH that would leave an agent with more than
 	// input.MaxLabelsPerAgent labels. Nothing in the request took effect.
 	CodeLabelLimit = "agent_label_limit_reached"
@@ -68,6 +76,12 @@ const MaxBody = 8 << 10
 // Creating is the one route an agent may use, when it is given agent:create, and
 // it is bounded by the rules in create.
 //
+// The list, the read and the create opt in to agents of a sandbox (InSandbox),
+// the only routes that do: each therefore owes the boundary that every query it
+// makes is confined to Principal.SandboxID, so that such an agent reaches only
+// the agents of its own sandbox. Every other route here, and in every other
+// feature, refuses it at the boundary.
+//
 // It panics when a dependency is nil.
 func Routes(deps Deps) []auth.Route {
 	for name, missing := range map[string]bool{
@@ -80,9 +94,9 @@ func Routes(deps Deps) []auth.Route {
 	}
 
 	return []auth.Route{
-		declare(http.MethodGet, collectionPath, auth.Needs(scope.AgentRead), deps.list),
-		declare(http.MethodPost, collectionPath, auth.Needs(scope.AgentCreate), deps.create),
-		declare(http.MethodGet, itemPath, auth.Needs(scope.AgentRead), deps.get),
+		declare(http.MethodGet, collectionPath, auth.Needs(scope.AgentRead).InSandbox(), deps.list),
+		declare(http.MethodPost, collectionPath, auth.Needs(scope.AgentCreate).InSandbox(), deps.create),
+		declare(http.MethodGet, itemPath, auth.Needs(scope.AgentRead).InSandbox(), deps.get),
 		declare(http.MethodPatch, itemPath, auth.Needs(scope.AgentUpdate).WithoutAgents(), deps.patch),
 		declare(http.MethodDelete, itemPath, auth.Needs(scope.AgentRevoke).WithoutAgents(), deps.revoke),
 	}
@@ -110,10 +124,10 @@ type ListResponse struct {
 type page struct {
 	cursor input.Cursor
 	limit  input.PageLimit
-	filter input.LabelFilter
+	filter store.AgentFilter
 }
 
-// parsePage reads the limit, cursor and label from the query. Each may appear
+// parsePage reads the limit, cursor, label and sandbox from the query. Each may appear
 // at most once: a repeated parameter is ambiguous, and which value wins differs
 // between layers, so it is refused rather than guessed.
 func parsePage(query map[string][]string) result.Result[page] {
@@ -126,15 +140,33 @@ func parsePage(query map[string][]string) result.Result[page] {
 		}).
 		Then(func(p page) (page, error) {
 			return result.Of(input.ParseLabelFilter(query["label"])).
-				Map(func(filter input.LabelFilter) page { p.filter = filter; return p }).
+				Map(func(filter input.LabelFilter) page { p.filter.Label = filter; return p }).
+				Get()
+		}).
+		Then(func(p page) (page, error) {
+			return result.Of(input.ParseSandboxFilter(query["sandbox"])).
+				Map(func(filter input.SandboxFilter) page { p.filter.Sandbox = filter; return p }).
 				Get()
 		})
+}
+
+// reach is which agents the caller may reach. A user, with a session or one of
+// their own keys, reaches every agent they own. An agent reaches only those in
+// its own sandbox, or only the ordinary ones when it is in none, so a sandbox's
+// agents are neither seen from outside it nor able to see out. Which one it is
+// comes from the credential, never from the request.
+func reach(who auth.Principal) store.AgentReach {
+	if who.AgentID == "" {
+		return store.OwnAgents(who.UserID)
+	}
+
+	return store.SandboxAgents(who.UserID, who.SandboxID)
 }
 
 func (d Deps) list(call *auth.Call) result.Result[httpapi.Response] {
 	return parsePage(call.Request.Query).
 		Then(func(p page) (store.AgentPage, error) {
-			return d.Store.ListAgents(call.Request.Context, call.Principal.UserID, p.cursor, p.limit, p.filter)
+			return d.Store.ListAgents(call.Request.Context, reach(call.Principal), p.cursor, p.limit, p.filter)
 		}).
 		Map(func(stored store.AgentPage) ListResponse {
 			out := ListResponse{Agents: make([]Agent, 0, len(stored.Agents)), Next: stored.Next}
@@ -149,7 +181,7 @@ func (d Deps) list(call *auth.Call) result.Result[httpapi.Response] {
 }
 
 func (d Deps) get(call *auth.Call) result.Result[httpapi.Response] {
-	return result.Of(d.Store.GetAgent(call.Request.Context, call.Principal.UserID, call.ID())).
+	return result.Of(d.Store.GetAgent(call.Request.Context, reach(call.Principal), call.ID())).
 		MapErr(notFound).
 		Map(present).
 		Map(func(out Agent) httpapi.Response { return httpapi.JSON(http.StatusOK, out) })
@@ -191,6 +223,12 @@ type createBody struct {
 	// KeyScopes only to entries of its own key's list.
 	Scopes    *[]string `json:"scopes"`
 	KeyScopes *[]string `json:"keyScopes"`
+
+	// SandboxID is the sandbox to create the agent in. Absent and null mean an
+	// ordinary agent for a user. A user must administer the sandbox, and it must
+	// not have expired. An agent may not choose: its new agent is in its own
+	// sandbox, so it may only omit this or repeat its own.
+	SandboxID *string `json:"sandboxId"`
 }
 
 // CreateResponse is the body of a created agent. Key is the only time the
@@ -216,13 +254,15 @@ type Key struct {
 	ExpiresAt int64 `json:"expiresAt"`
 }
 
-// request is a create request that has been parsed: the name, the labels and
-// the scope lists the new agent and its key are to have.
+// request is a create request that has been parsed: the name, the labels, the
+// scope lists and the sandbox the new agent and its key are to have. sandbox is
+// the zero value when the request names none.
 type request struct {
 	name      input.AgentName
 	labels    input.LabelSet
 	scopes    scope.List
 	keyScopes scope.List
+	sandbox   input.SandboxID
 }
 
 // parseCreate parses the new agent's name, labels and scope lists. A scope list
@@ -249,7 +289,23 @@ func parseCreate(body createBody) result.Result[request] {
 			return parseOptionalScopes(body.KeyScopes).
 				Map(func(scopes scope.List) request { req.keyScopes = scopes; return req }).
 				Get()
+		}).
+		Then(func(req request) (request, error) {
+			return parseOptionalSandbox(body.SandboxID).
+				Map(func(sandbox input.SandboxID) request { req.sandbox = sandbox; return req }).
+				Get()
 		})
+}
+
+// parseOptionalSandbox parses the sandbox a create names, which may be absent
+// (the zero SandboxID). A present one is parsed strictly, the empty string
+// included.
+func parseOptionalSandbox(raw *string) result.Result[input.SandboxID] {
+	if raw == nil {
+		return result.Ok(input.SandboxID{})
+	}
+
+	return result.Of(input.ParseSandboxID(*raw))
 }
 
 // parseOptionalScopes parses a scope list that may be absent. Absent is nil and
@@ -277,25 +333,30 @@ type creation struct {
 	// write's own result, never from the plan, because an agent's create copies
 	// the creating agent's scopes from its row in the write.
 	scopes scope.List
+	// sandbox is the sandbox the agent is in, "" for none, set from the write
+	// too: an agent's create copies it from the creating agent's row.
+	sandbox string
 }
 
 func (d Deps) create(call *auth.Call) result.Result[httpapi.Response] {
 	return httpapi.Decode[createBody](call.Request).
 		Then(func(body createBody) (request, error) { return parseCreate(body).Get() }).
 		Then(func(req request) (request, error) { return resolveScopes(call.Principal, req).Get() }).
+		Then(func(req request) (request, error) { return resolveSandbox(call.Principal, req).Get() }).
 		Then(func(req request) (creation, error) { return d.plan(call, req).Get() }).
 		Then(func(plan creation) (creation, error) { return d.write(call, plan).Get() }).
-		MapErr(limitReached).
+		MapErr(createRefused).
 		Map(respondCreated).
 		Map(func(out CreateResponse) httpapi.Response { return httpapi.JSON(http.StatusCreated, out) })
 }
 
-// write stores the plan and records the scopes the write returned on it, which
-// are what the response reports for the agent.
+// write stores the plan and records the scopes and the sandbox the write
+// returned on it, which are what the response reports for the agent.
 func (d Deps) write(call *auth.Call, plan creation) result.Result[creation] {
 	return result.Of(d.Store.CreateAgent(call.Request.Context, plan.agent)).
-		Map(func(stored string) creation {
-			plan.scopes = scope.Read(stored)
+		Map(func(stored store.CreatedAgent) creation {
+			plan.scopes = scope.Read(stored.Scopes)
+			plan.sandbox = stored.SandboxID
 
 			return plan
 		})
@@ -353,6 +414,34 @@ func keyScopesExceeded() *apierr.Error {
 		"the new key may only hold scopes the creating key holds")
 }
 
+// resolveSandbox decides the sandbox of the new agent, from who is asking.
+//
+// A user names the sandbox, or none, and the write checks that they administer
+// it and that it has not expired, so there is nothing to compare here. An agent
+// does not choose: its new agent is in its own sandbox, or in none when it is
+// in none, and the write reads that from the agent's row. A request that names
+// any other sandbox is refused, so a client that expects one is told it did not
+// get it, rather than silently given another. Naming its own is allowed, and
+// the same as naming none.
+func resolveSandbox(who auth.Principal, req request) result.Result[request] {
+	if who.AgentID == "" {
+		return result.Ok(req)
+	}
+
+	if named := req.sandbox.String(); named != "" && named != who.SandboxID {
+		return result.Fail[request](sandboxInherited())
+	}
+
+	return result.Ok(req)
+}
+
+// sandboxInherited is the client's 403 for an agent that tried to choose the
+// sandbox of the agent it creates.
+func sandboxInherited() *apierr.Error {
+	return apierr.New(apierr.Forbidden, CodeSandboxInherited,
+		"an agent creates agents in its own sandbox and may not choose another")
+}
+
 // userScopes applies the default to a user's request: an absent list is
 // DefaultScopes.
 func userScopes(req request) request {
@@ -367,18 +456,30 @@ func userScopes(req request) request {
 	return req
 }
 
-// limitReached is the client's answer to a create the store refused as a
-// conflict: the user already has MaxAgentsPerUser active agents, their account
-// was revoked after the request was authenticated, or the creating agent was
-// revoked (the write cannot tell which, and a revoked account has no session
-// to be told on). The id and the key id are fresh UUIDv7s, so no other constraint
-// can conflict. Any other failure is returned as it is.
-func limitReached(err error) error {
-	if errors.Is(err, store.ErrConflict) {
+// createRefused is the client's answer to a create the store refused. A sandbox
+// the user does not administer, or that has expired, is a 404. Otherwise a
+// conflict is the user already having MaxAgentsPerUser active agents, their
+// account having been revoked after the request was authenticated, or the
+// creating agent having been revoked or its sandbox having expired (the write
+// cannot tell which, and a revoked account has no session to be told on). The
+// id and the key id are fresh UUIDv7s, so no other constraint can conflict. The
+// sandbox is judged first because the store's refusal for it also carries the
+// conflict. Any other failure is returned as it is.
+func createRefused(err error) error {
+	switch {
+	case errors.Is(err, store.ErrSandboxUnavailable):
+		return noSuchSandbox(err)
+	case errors.Is(err, store.ErrConflict):
 		return atLimit(err)
+	default:
+		return err
 	}
+}
 
-	return err
+// noSuchSandbox is the client's 404 for a sandbox the user cannot create an
+// agent in.
+func noSuchSandbox(cause error) *apierr.Error {
+	return apierr.New(apierr.NotFound, CodeSandboxNotFound, "no such sandbox").WithCause(cause)
 }
 
 // atLimit is the client's 409 for an owner who may have no more active agents.
@@ -411,7 +512,7 @@ func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
 	return result.Ok(creation{
 		agent: store.NewAgent{
 			ID: id, Owner: owner, Name: req.name, Scopes: req.scopes.JSON(), KeyScope: req.keyScopes.JSON(),
-			Labels: req.labels, CreatedBy: call.Principal.AgentID, MaxActive: MaxAgentsPerUser,
+			Labels: req.labels, CreatedBy: call.Principal.AgentID, Sandbox: req.sandbox, MaxActive: MaxAgentsPerUser,
 			KeyID: issued.ID, KeyHash: issued.Hash, KeyExpiresAt: issued.ExpiresAt, CreatedAt: now,
 		},
 		token:     issued.Token,
@@ -420,16 +521,21 @@ func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
 }
 
 // respondCreated is the response to a create, built from what was written: the
-// agent's scopes are the ones the write returned, and the row is not read back.
+// agent's scopes and sandbox are the ones the write returned, and the row is not read back.
 // The labels are the ones the batch wrote, in ascending order as every read of
 // an agent lists them, and an empty list when there are none.
 func respondCreated(plan creation) CreateResponse {
 	agent := plan.agent
 
+	var sandbox *string
+	if plan.sandbox != "" {
+		sandbox = &plan.sandbox
+	}
+
 	return CreateResponse{
 		Agent: Agent{
 			ID: agent.ID, Name: agent.Name.String(), Scopes: plan.scopes.Claim(), Status: StatusActive,
-			RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(), Labels: sortedLabels(agent.Labels),
+			RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(), Labels: sortedLabels(agent.Labels), SandboxID: sandbox,
 		},
 		Key: Key{ID: agent.KeyID, Token: plan.token, Scopes: plan.keyScopes.Claim(), ExpiresAt: agent.KeyExpiresAt.Unix()},
 	}

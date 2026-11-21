@@ -232,8 +232,10 @@ func (d Deps) newGrant(call *auth.Call, pending opened, chosen answer, code auth
 
 // refused maps the refusals of store.CreateGrant to the client's answers; any
 // other failure is returned as it is. The agent is not found alike whether it
-// does not exist, is another user's or is revoked, because the write cannot tell
-// them apart and a request must not probe another user's agents. An account or a
+// does not exist, is another user's, is revoked or is an agent of a sandbox (a
+// grant is held by an outside service, and such an agent is confined to its
+// sandbox), because the write cannot tell them apart and a request must not
+// probe another user's agents. An account or a
 // session that ended after the request was authenticated is what any request
 // without a session is told, a 401.
 func refused(err error) error {

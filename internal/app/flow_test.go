@@ -29,16 +29,17 @@ import (
 
 // Where the values are in the statements the account batch binds (see
 // store.CreateAccount): the first-run invitation's secret and row, then the user
-// insert, then the credential insert. The statements after the first two are
-// what accountOf returns.
+// insert, then the insert of an organization's administrator, then the
+// credential insert. The user and the credential are what accountOf returns.
 const (
 	userArgID      = 0
 	userArgHandle  = 1
 	userArgRole    = 2
 	userArgProfile = 3
-	userArgHash    = 5
-	userArgKind    = 6
-	userArgType    = 7
+	userArgOrgKind = 5
+	userArgHash    = 6
+	userArgKind    = 7
+	userArgType    = 8
 
 	credArgRowID    = 0
 	credArgID       = 1
@@ -155,8 +156,9 @@ func register(t *testing.T, h *harness, pk *passkey, name string, write step) (i
 }
 
 // accountBatchLen is the number of statements of the account write: the
-// first-run invitation's secret and row, the user and the passkey.
-const accountBatchLen = 4
+// first-run invitation's secret and row, the user, the administrator row of the
+// organization the invitation offers, and the passkey.
+const accountBatchLen = 5
 
 // accepted is the answer of the account write when it took effect.
 func accepted() step {
@@ -165,14 +167,15 @@ func accepted() step {
 
 // accountOf is the user and passkey statements of an account batch, which every
 // check of what registration wrote reads, without the first-run invitation's
-// two inserts that precede them. A batch of any other length is returned
-// unchanged, so a test fails on its length and not on an index.
+// two inserts that precede them and the administrator row between them. A batch
+// of any other length is returned unchanged, so a test fails on its length and
+// not on an index.
 func accountOf(batch []store.Statement) []store.Statement {
 	if len(batch) != accountBatchLen {
 		return batch
 	}
 
-	return batch[accountBatchLen-2:]
+	return []store.Statement{batch[accountBatchLen-3], batch[accountBatchLen-1]}
 }
 
 // credentialRowOf is the row the credential lookup answers for what a
@@ -254,6 +257,12 @@ func TestRegistrationWritesWhatTheSchemaAndLoginExpect(t *testing.T) {
 		}
 	})
 
+	t.Run("the organization the invitation may offer", func(t *testing.T) {
+		t.Parallel()
+
+		checkOrgBinds(t, h.lastCall(), user)
+	})
+
 	t.Run("generated ids are UUIDv7 that the routes accept back", func(t *testing.T) {
 		t.Parallel()
 
@@ -278,6 +287,25 @@ func TestRegistrationWritesWhatTheSchemaAndLoginExpect(t *testing.T) {
 			{"invitation type", `length\(type\) BETWEEN 1 AND (\d+)`, user[userArgType], false},
 		})
 	})
+}
+
+// checkOrgBinds checks that the user insert and the administrator insert after
+// it bind the kind and the role the store owns, and that the administrator row
+// is for the account just inserted.
+func checkOrgBinds(t *testing.T, batch []store.Statement, user []any) {
+	t.Helper()
+
+	admin := batch[accountBatchLen-2].Args
+
+	if user[userArgOrgKind] != store.OrgKindStandard {
+		t.Errorf("the user insert binds the organization kind %v, want %s", user[userArgOrgKind], store.OrgKindStandard)
+	}
+
+	if len(admin) != 4 || admin[1] != user[userArgID] || admin[2] != store.OrgKindStandard ||
+		admin[3] != store.OfferRoleAdmin {
+		t.Errorf("the administrator insert binds %v, want the account, %s and %s",
+			admin, store.OrgKindStandard, store.OfferRoleAdmin)
+	}
 }
 
 // checkFirstRunInserts checks the two statements that open an account batch,
@@ -618,7 +646,7 @@ func TestLoginAndSessionFollowRegistration(t *testing.T) {
 
 	// The boundary accepts the session from exactly what login wrote, typed as
 	// D1 returns it, and names the same account.
-	sessionRow := []any{login.secret[secretArgID], login.UserID, "admin", login.secret[secretArgExpires]}
+	sessionRow := []any{login.secret[secretArgID], login.UserID, "admin", login.secret[secretArgExpires], ""}
 	stored := step{match: readSession, results: rows(sessionRow), err: nil}
 
 	h.expect(stored)
@@ -1057,13 +1085,14 @@ func createAgentForBearer(t *testing.T) (*harness, bearerCreated, []store.Statem
 
 // agentKeyRow is what D1 returns for the lookup of the key a create wrote: the
 // key's secret id and expiry, its owner, the agent's id and its stored scopes,
-// and the key's own scope, all as the batch bound them.
+// the key's own scope, and no organization and no sandbox, all as the batch
+// bound them.
 func agentKeyRow(batch []store.Statement) []any {
 	agent, secretArgs, key := batch[0].Args, batch[1].Args, batch[2].Args
 
 	return []any{
 		secretArgs[secretArgID], memberID, roleMember, secretArgs[secretArgExpires],
-		agent[agentArgID], agent[agentArgScopes], key[keyArgScopes],
+		agent[agentArgID], agent[agentArgScopes], key[keyArgScopes], "", "",
 	}
 }
 

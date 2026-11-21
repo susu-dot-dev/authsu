@@ -52,10 +52,67 @@ type Agent struct {
 
 	// Labels are the agent's labels, in ascending order. It is never nil.
 	Labels []string
+
+	// SandboxID is the sandbox the agent is confined to, or nil for an ordinary
+	// agent.
+	SandboxID *string
+}
+
+// AgentReach is which of a user's agents a request may reach. Every agent read
+// is scoped to one owner, and to one more thing: whether the caller is confined
+// to a sandbox. It is built only by OwnAgents and SandboxAgents, so a caller
+// states which it is; the zero value has no owner and reaches nothing.
+type AgentReach struct {
+	owner    string
+	confined bool
+	sandbox  string
+}
+
+// OwnAgents is the reach of the user themselves, a session or one of their own
+// keys: every agent they own, ordinary or in a sandbox.
+func OwnAgents(owner string) AgentReach {
+	return AgentReach{owner: owner, confined: false, sandbox: ""}
+}
+
+// SandboxAgents is the reach of an agent: the owner's agents that are in the
+// same sandbox as it, and nothing else. sandbox is the acting agent's own
+// sandbox, and "" for an ordinary agent, which therefore reaches only ordinary
+// agents. The match is on equality with the NULL of an ordinary agent included
+// (IS, not =), so an ordinary agent cannot see a sandbox's agents any more than
+// a sandbox's agent can see ordinary ones.
+func SandboxAgents(owner, sandbox string) AgentReach {
+	return AgentReach{owner: owner, confined: true, sandbox: sandbox}
+}
+
+// Owner is the user whose agents are reached.
+func (r AgentReach) Owner() string { return r.owner }
+
+// Confined reports whether the reach is that of an agent (SandboxAgents), which
+// is limited to one sandbox, and not that of the user (OwnAgents).
+func (r AgentReach) Confined() bool { return r.confined }
+
+// Sandbox is the sandbox a confined reach is limited to, and "" when it is
+// limited to the agents of none, or is not confined at all.
+func (r AgentReach) Sandbox() string { return r.sandbox }
+
+// args are the reach's arguments, in the order agentReachPredicate numbers
+// them: the owner, the confinement flag and the sandbox (NULL for none).
+func (r AgentReach) args() (string, int64, any) {
+	var sandbox any
+	if r.sandbox != "" {
+		sandbox = r.sandbox
+	}
+
+	if r.confined {
+		return r.owner, 1, sandbox
+	}
+
+	return r.owner, 0, sandbox
 }
 
 // readAgent reads one agent row, in the column order every agent statement
-// selects or returns: id, name, scopes, revoked_at, created_at, labels.
+// selects or returns: id, name, scopes, revoked_at, created_at, labels,
+// sandbox_id.
 //
 // labels is the agent's labels as the text of a JSON array, sorted, and "[]" for
 // none. Every statement computes it with a subselect over agent_labels, and not
@@ -68,10 +125,11 @@ func readAgent(r *row) Agent {
 	// Struct fields are evaluated in order, which is the column order.
 	agent := Agent{
 		ID: r.text(), Name: r.text(), Scopes: r.text(),
-		RevokedAt: r.optInteger(), CreatedAt: r.integer(), Labels: nil,
+		RevokedAt: r.optInteger(), CreatedAt: r.integer(), Labels: nil, SandboxID: nil,
 	}
 
 	agent.Labels = r.labels()
+	agent.SandboxID = r.optText()
 
 	return agent
 }
@@ -92,17 +150,37 @@ func readAgent(r *row) Agent {
 // an agent with the label is one row however many labels it has. The labels
 // column still lists ALL of the agent's labels, not only the one filtered by.
 //
+// The reach is part of the match too. ?5 says whether the caller is confined to
+// a sandbox (an agent is) and ?6 is that sandbox, NULL for none: a confined
+// caller matches only agents whose sandbox_id IS ?6, which for NULL is the
+// ordinary agents, so an agent reaches nothing outside the sandbox it is in.
+// An unconfined caller (the user themselves) matches all of their agents. ?7 is
+// the sandbox to filter by, or NULL for no filter; it narrows further and
+// cannot widen what the reach allows.
+//
 // Arguments, by number: ?1 user id, ?2 cursor (the id to start below;
-// agentsFirstPage for the first page), ?3 rows wanted, ?4 the label or NULL.
+// agentsFirstPage for the first page), ?3 rows wanted, ?4 the label or NULL, ?5
+// confined (1 or 0), ?6 the confining sandbox or NULL, ?7 the sandbox filter or
+// NULL.
 const agentListQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
-   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
+  sandbox_id
 FROM agents
 WHERE user_id = ?1 AND id < ?2
   AND (?4 IS NULL OR EXISTS (SELECT 1 FROM agent_labels f WHERE f.agent_id = agents.id AND f.label = ?4))
+  AND (?5 = 0 OR sandbox_id IS ?6)
+  AND (?7 IS NULL OR sandbox_id = ?7)
 ORDER BY id DESC
 LIMIT ?3`
+
+// AgentFilter narrows a list: to agents with a label, to agents in a sandbox,
+// or both. The zero value is no filter.
+type AgentFilter struct {
+	Label   input.LabelFilter
+	Sandbox input.SandboxFilter
+}
 
 // AgentPage is one page of a user's agents, newest first.
 type AgentPage struct {
@@ -114,15 +192,15 @@ type AgentPage struct {
 	Next string
 }
 
-// ListAgents returns up to limit of the user's agents with an id below the
-// cursor, revoked ones included, newest first. An empty cursor starts at the
-// newest agent. owner is the authenticated user's id. A label filter limits the
-// page to agents that have that label.
+// ListAgents returns up to limit of the agents the reach allows with an id below
+// the cursor, revoked ones included, newest first. An empty cursor starts at the
+// newest agent. A label filter limits the page to agents that have that label,
+// and a sandbox filter to agents in that sandbox.
 //
 // It reads one row more than the page holds. If that row is there, there is a
 // next page, and it starts below the last agent that is returned.
 func (s *Store) ListAgents(
-	ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit, filter input.LabelFilter,
+	ctx context.Context, reach AgentReach, cursor input.Cursor, limit input.PageLimit, filter AgentFilter,
 ) (AgentPage, error) {
 	o := op{failed: CodeAgentListFailed, rejected: CodeAgentListRejected, description: agentsDescription}
 
@@ -136,14 +214,21 @@ func (s *Store) ListAgents(
 	size := max(limit.Int(), 1)
 	wanted := size + 1
 
-	// No filter is a NULL, which the query reads as "any label".
-	var label any
-	if filtered, ok := filter.Label(); ok {
+	// No filter is a NULL, which the query reads as "any".
+	var label, sandbox any
+	if filtered, ok := filter.Label.Label(); ok {
 		label = filtered.String()
 	}
 
+	if filtered, ok := filter.Sandbox.Sandbox(); ok {
+		sandbox = filtered.String()
+	}
+
+	owner, confined, confinedTo := reach.args()
+
 	agents, err := queryAll(ctx, s, o,
-		Statement{Query: agentListQuery, Args: []any{owner, before, int64(wanted), label}}, readAgent)
+		Statement{Query: agentListQuery, Args: []any{owner, before, int64(wanted), label, confined, confinedTo, sandbox}},
+		readAgent)
 	if err != nil {
 		return AgentPage{}, err
 	}
@@ -162,25 +247,42 @@ func (s *Store) ListAgents(
 	return AgentPage{Agents: agents, Next: agents[len(agents)-1].ID}, nil
 }
 
-// agentGetQuery reads one agent of a user. The owner is part of the match, so
-// another user's agent is not found, which is what the caller is told for an id
+// agentGetQuery reads one agent of a user, within a reach. The owner is part of
+// the match, so another user's agent is not found, and so is an agent outside
+// the reach (see agentListQuery): which is what the caller is told for an id
 // that does not exist at all.
 //
-// Arguments: id, user id.
+// Arguments: ?1 id, ?2 user id, ?3 confined (1 or 0), ?4 the confining sandbox
+// or NULL.
 const agentGetQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
-   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
+  sandbox_id
 FROM agents
-WHERE id = ? AND user_id = ?`
+WHERE id = ?1 AND user_id = ?2 AND (?3 = 0 OR sandbox_id IS ?4)`
 
-// GetAgent returns one of the user's agents. It returns ErrNotFound when the
-// user has none with this id, which includes an id that belongs to someone else.
-func (s *Store) GetAgent(ctx context.Context, owner string, id input.ID) (Agent, error) {
+// GetAgent returns one of the agents the reach allows. It returns ErrNotFound
+// when the user has none with this id, which includes an id that belongs to
+// someone else and one outside a sandbox the caller is confined to.
+func (s *Store) GetAgent(ctx context.Context, reach AgentReach, id input.ID) (Agent, error) {
 	o := op{failed: CodeAgentLookupFailed, rejected: CodeAgentLookupRejected, description: agentsDescription}
 
-	return queryOne(ctx, s, o, Statement{Query: agentGetQuery, Args: []any{id.String(), owner}}, readAgent)
+	owner, confined, confinedTo := reach.args()
+
+	return queryOne(ctx, s, o,
+		Statement{Query: agentGetQuery, Args: []any{id.String(), owner, confined, confinedTo}}, readAgent)
 }
+
+// ownerHasRoomForAgent holds when the owner u of a new agent has fewer than ?6
+// active agents, as of ?4. It is part of the write that creates the agent, and
+// both ways of creating one include it, so what counts toward the limit is
+// the same for each. An agent of a sandbox that has expired is not counted: the
+// sandbox is inert and may not have been deleted yet, so its agents must not
+// hold the user at the limit.
+const ownerHasRoomForAgent = `(SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL
+         AND (a.sandbox_id IS NULL
+              OR EXISTS (SELECT 1 FROM orgs g WHERE g.id = a.sandbox_id AND g.expires_at > ?4))) < ?6`
 
 // insertAgentQuery creates an agent for a user, if the user may have another.
 // The conditions are part of the write, because D1 has no interactive
@@ -190,51 +292,95 @@ func (s *Store) GetAgent(ctx context.Context, owner string, id input.ID) (Agent,
 //     not trusted from the request, so an account revoked after the request was
 //     authenticated gets no agent;
 //   - the owner must have fewer than ?6 active agents. The count is taken in
-//     the write, so two creates at the limit cannot both succeed.
+//     the write, so two creates at the limit cannot both succeed. An agent of a
+//     sandbox that has expired as of ?4 is not counted: the sandbox is inert
+//     and may not have been deleted yet, so its agents must not hold the
+//     user at the limit;
+//   - when a sandbox is asked for (?7 is not NULL) it must be a sandbox
+//     (?8 is its kind), not expired as of ?4, and the owner must be its
+//     administrator, an org_admins row read here. A user's sandbox is the one
+//     they created, so this is also what stops an agent being put in someone
+//     else's sandbox, or in a standard organization, or one that has run out.
 //
 // A conditional INSERT ... SELECT that matches nothing is not an error, so the
 // key insert that follows in the same batch depends on this row existing (see
 // insertAgentKeyQuery), which turns "no agent was created" into a failed batch.
+// A refused sandbox is told apart from the other refusals by the statement
+// before this one (agentSandboxGuardQuery).
 //
-// RETURNING gives the scopes the row was written with, so a caller reports what
-// is stored and not what it offered.
+// RETURNING gives the scopes and the sandbox the row was written with, so a
+// caller reports what is stored and not what it offered.
 //
 // Arguments, by number: ?1 id, ?2 name, ?3 scopes, ?4 created_at, ?5 user id,
-// ?6 the maximum active agents a user may have.
+// ?6 the maximum active agents a user may have, ?7 the sandbox or NULL for an
+// ordinary agent, ?8 the kind of a sandbox.
 const insertAgentQuery = `
-INSERT INTO agents (id, user_id, name, scopes, created_at)
-SELECT ?1, u.id, ?2, ?3, ?4
+INSERT INTO agents (id, user_id, name, scopes, created_at, sandbox_id)
+SELECT ?1, u.id, ?2, ?3, ?4, ?7
 FROM users u
 WHERE u.id = ?5
   AND u.revoked_at IS NULL
-  AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6
-RETURNING scopes`
+  AND ` + ownerHasRoomForAgent + `
+  AND (?7 IS NULL OR EXISTS (SELECT 1 FROM orgs g JOIN org_admins m ON m.org_id = g.id
+                             WHERE g.id = ?7 AND g.kind = ?8 AND g.expires_at > ?4 AND m.user_id = u.id))
+RETURNING scopes, sandbox_id`
+
+// agentSandboxGuardQuery is the first statement of a create that names a
+// sandbox. It writes nothing when the sandbox is usable: it selects a row only
+// when the sandbox is NOT one the user administers that is a sandbox and has
+// not expired, and that row has a NULL org_id, which the NOT NULL of
+// org_admins.org_id refuses. The batch then fails as a conflict, which rolls
+// everything back, and which column failed says why: the name is org_admins'
+// and no other statement of the batch writes that table, so it cannot be taken
+// for the limit or a revoked account, which the key insert reports as
+// api_keys.user_id. It repeats the condition of insertAgentQuery, and is
+// evaluated in the same batch and the same instant, so the two cannot disagree.
+//
+// Arguments, by number: ?1 the sandbox, ?2 user id, ?3 now (unix seconds), ?4
+// the kind of a sandbox.
+const agentSandboxGuardQuery = `
+INSERT INTO org_admins (org_id, user_id, created_at)
+SELECT NULL, ?2, ?3
+WHERE NOT EXISTS (SELECT 1 FROM orgs g JOIN org_admins m ON m.org_id = g.id
+                  WHERE g.id = ?1 AND g.kind = ?4 AND g.expires_at > ?3 AND m.user_id = ?2)`
+
+// agentSandboxGuardColumn is the column agentSandboxGuardQuery fails on, as
+// SQLite names it in "NOT NULL constraint failed: org_admins.org_id".
+const agentSandboxGuardColumn = "org_admins.org_id"
 
 // insertAgentByAgentQuery creates an agent on behalf of another agent of the
-// same user. It is insertAgentQuery with two differences, both part of the
+// same user. It is insertAgentQuery with three differences, all part of the
 // write for the same reason as its other conditions:
 //
 //   - the new agent's scopes are the creating agent's, read from that agent's
 //     row here and never taken from the request. An agent cannot give a new
 //     agent more than it has, and a request cannot misstate what it has;
+//   - the new agent's sandbox is the creating agent's, read from its row too
+//     (c.sandbox_id, NULL for an ordinary agent), and never from the request.
+//     An agent in a sandbox therefore creates agents only in that sandbox, and
+//     an ordinary one only ordinary agents. The sandbox must still stand, as it
+//     is judged when a key is used (resolveAPIKeyQuery), so an agent whose
+//     sandbox expired after the request was authenticated creates nothing;
 //   - the creating agent must belong to the owner and still be active, so an
 //     agent revoked after the request was authenticated creates nothing.
 //
-// RETURNING gives the scopes the row was written with, which here are the
-// creating agent's as the write read them: the only place they are known, since
-// they are not an argument.
+// RETURNING gives the scopes and sandbox the row was written with, which here
+// are the creating agent's as the write read them: the only place they are
+// known, since they are not arguments.
 //
 // Arguments, by number: ?1 id, ?2 name, ?3 the creating agent's id, ?4
 // created_at, ?5 user id, ?6 the maximum active agents a user may have.
 const insertAgentByAgentQuery = `
-INSERT INTO agents (id, user_id, name, scopes, created_at)
-SELECT ?1, u.id, ?2, c.scopes, ?4
+INSERT INTO agents (id, user_id, name, scopes, created_at, sandbox_id)
+SELECT ?1, u.id, ?2, c.scopes, ?4, c.sandbox_id
 FROM users u
 JOIN agents c ON c.user_id = u.id AND c.id = ?3 AND c.revoked_at IS NULL
 WHERE u.id = ?5
   AND u.revoked_at IS NULL
-  AND (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL) < ?6
-RETURNING scopes`
+  AND ` + ownerHasRoomForAgent + `
+  AND (c.sandbox_id IS NULL OR EXISTS (SELECT 1 FROM orgs g
+                                       WHERE g.id = c.sandbox_id AND g.kind = c.sandbox_kind AND g.expires_at > ?4))
+RETURNING scopes, sandbox_id`
 
 // insertAgentKeyQuery writes an agent's API key's own row, after its secret
 // (insertSecretQuery, in the same batch). The key's owner and the agent it
@@ -303,10 +449,17 @@ type NewAgent struct {
 	KeyScope string
 
 	// CreatedBy is the id of the agent that is creating this one, or "" when its
-	// user is. The new agent is an ordinary agent of the same owner either way,
-	// and nothing records who created it: the id only chooses where the scopes
-	// come from and what must still be active (see insertAgentByAgentQuery).
+	// user is. The new agent is an agent of the same owner either way, and
+	// nothing records who created it: the id only chooses where the scopes and
+	// the sandbox come from and what must still be active (see
+	// insertAgentByAgentQuery).
 	CreatedBy string
+
+	// Sandbox is the sandbox the new agent is to be created in, or "" for an
+	// ordinary agent. It is used only when CreatedBy is empty: an agent's
+	// create always puts the new agent in the creating agent's own sandbox,
+	// read in the write, and ignores this.
+	Sandbox input.SandboxID
 
 	// Labels are the labels the new agent starts with, possibly none. They are
 	// written in the same batch as the agent, so an agent is never seen
@@ -328,37 +481,59 @@ type NewAgent struct {
 	CreatedAt time.Time
 }
 
+// CreatedAgent is what a create wrote to the agent's row, as the write left
+// it, and not what the request offered.
+type CreatedAgent struct {
+	// Scopes is the agent's scope list as JSON.
+	Scopes string
+
+	// SandboxID is the sandbox the agent is in, or "" for an ordinary agent.
+	SandboxID string
+}
+
 // CreateAgent writes an agent, its first key (the key's secret, then its own
 // row) and its labels as one batch: either all of them exist or none does. See
 // insertAgentQuery,
 // insertAgentKeyQuery and insertAgentLabelQuery for how the owner being revoked
 // or at the limit fails the batch and not just the first statement.
 //
-// It returns the scope list the agent's row was written with, as the write
-// left it. For an agent created by another agent that is the creating agent's
-// list as the write read it, so the caller reports what is stored even if the
-// creating agent's scopes changed after the request was verified.
+// It returns the scope list and the sandbox the agent's row was written with,
+// as the write left them. For an agent created by another agent those are the
+// creating agent's as the write read them, so the caller reports what is stored
+// even if the creating agent's scopes changed after the request was verified.
 //
-// It returns ErrConflict in that case: the owner already has MaxActive active
-// agents, the account was revoked after the request was authenticated, or the
-// creating agent was revoked. The write cannot tell which, and a revoked
-// account has no session to be told on.
+// It returns ErrSandboxUnavailable when a user asked for a sandbox that is not
+// an unexpired sandbox they administer: it does not exist, is someone else's,
+// is a standard organization, or has expired. It returns ErrConflict in that
+// case: the owner already has MaxActive active agents, the account was revoked
+// after the request was authenticated, or the creating agent was revoked or its
+// sandbox expired. The write cannot tell which, and a revoked account has no
+// session to be told on.
 // The id and the key's id are fresh UUIDv7s and the key's hash that of 256
 // random bits, so no other constraint can conflict.
-func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (string, error) {
+func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (CreatedAgent, error) {
 	o := op{failed: CodeAgentCreateFailed, rejected: CodeAgentCreateRejected, description: agentsDescription}
 
-	insert := Statement{Query: insertAgentQuery, Args: []any{
-		agent.ID, agent.Name.String(), agent.Scopes, agent.CreatedAt.Unix(), agent.Owner, int64(agent.MaxActive),
-	}}
+	created := agent.CreatedAt.Unix()
 
-	if agent.CreatedBy != "" {
+	var guard []Statement
+
+	insert := agentInsert(agent.ID, agent.Name.String(), agent.Scopes, created, agent.Owner, agent.MaxActive, "")
+
+	switch {
+	case agent.CreatedBy != "":
 		insert = Statement{Query: insertAgentByAgentQuery, Args: []any{
-			agent.ID, agent.Name.String(), agent.CreatedBy, agent.CreatedAt.Unix(), agent.Owner, int64(agent.MaxActive),
+			agent.ID, agent.Name.String(), agent.CreatedBy, created, agent.Owner, int64(agent.MaxActive),
 		}}
+	case agent.Sandbox.String() != "":
+		insert = agentInsert(
+			agent.ID, agent.Name.String(), agent.Scopes, created, agent.Owner, agent.MaxActive, agent.Sandbox.String())
+		guard = []Statement{{Query: agentSandboxGuardQuery, Args: []any{
+			agent.Sandbox.String(), agent.Owner, created, OrgKindSandbox,
+		}}}
 	}
 
-	secret := insertSecret(agent.KeyID, KindAPIKey, agent.KeyHash, agent.KeyExpiresAt.Unix(), agent.CreatedAt.Unix())
+	secret := insertSecret(agent.KeyID, KindAPIKey, agent.KeyHash, agent.KeyExpiresAt.Unix(), created)
 
 	key := Statement{Query: insertAgentKeyQuery, Args: []any{agent.KeyID, KindAPIKey, agent.ID, agent.KeyScope}}
 
@@ -369,33 +544,67 @@ func (s *Store) CreateAgent(ctx context.Context, agent NewAgent) (string, error)
 		labelInserts[i] = Statement{Query: insertAgentLabelQuery, Args: []any{agent.ID, label.String()}}
 	}
 
-	// The agent, its key's secret, its key, then each label: the key and every
-	// label read the agent's row, so none of them can be written for an agent
-	// that was not, and the key's failure rolls back the secret before it.
-	statements := slices.Concat([]Statement{insert, secret, key}, labelInserts)
+	// The sandbox guard when there is one, the agent, its key's secret, its key,
+	// then each label: the key and every label read the agent's row, so none of
+	// them can be written for an agent that was not, and the key's failure rolls
+	// back the secret before it.
+	statements := slices.Concat(guard, []Statement{insert, secret, key}, labelInserts)
 
 	stored, err := result.Of(s.run(ctx, o, statements...)).
-		Then(func(results []Result) (string, error) { return one(results[0].Rows, o, readScopes) }).
+		Then(func(results []Result) (CreatedAgent, error) { return one(results[len(guard)].Rows, o, readCreated) }).
 		MapErr(func(err error) error { return agentInsertShape(o, err) }).
 		Get()
 
 	return stored, err //nolint:wrapcheck // every error in the chain is already classified by run, one or agentInsertShape
 }
 
-// agentInsertShape classifies a failure to read the row an agent insert
-// returns. The key insert names the agent's row, so a batch that succeeded
-// without it is not a conflict or a missing agent: the database did not do what
-// the statements say, which is a defect. Any other error is returned as it is.
-func agentInsertShape(o op, err error) error {
-	if errors.Is(err, ErrNotFound) {
-		return o.defect(fmt.Errorf("%w: the insert returned no row", errRowCount))
+// ErrSandboxUnavailable means the sandbox a create asked for is not an
+// unexpired sandbox the user administers. The write cannot tell which, and the
+// reasons are answered alike so that a request cannot probe other users'
+// sandboxes.
+var ErrSandboxUnavailable = errors.New("the sandbox is not an unexpired sandbox of the user")
+
+// agentInsert is the insert of an agent a user creates, with the sandbox it is to
+// be in, or "" for none. Creating it in a consent (oauth_grants.go) is the same
+// statement and never names a sandbox.
+func agentInsert(id, name, scopes string, created int64, owner string, maxActive int, sandbox string) Statement {
+	var inSandbox any
+	if sandbox != "" {
+		inSandbox = sandbox
 	}
 
-	return err
+	return Statement{Query: insertAgentQuery, Args: []any{
+		id, name, scopes, created, owner, int64(maxActive), inSandbox, OrgKindSandbox,
+	}}
 }
 
-// readScopes reads the one column an agent insert returns.
-func readScopes(r *row) string { return r.text() }
+// agentInsertShape classifies a failure of an agent create. The key insert
+// names the agent's row, so a batch that succeeded without it is not a conflict
+// or a missing agent: the database did not do what the statements say, which is
+// a defect. A conflict that names org_admins.org_id is the sandbox guard's, and
+// is ErrSandboxUnavailable. Any other error is returned as it is.
+func agentInsertShape(o op, err error) error {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return o.defect(fmt.Errorf("%w: the insert returned no row", errRowCount))
+	case errors.Is(err, ErrConflict) && failedOn(err, agentSandboxGuardColumn):
+		return fmt.Errorf("%w: %w", ErrSandboxUnavailable, err)
+	default:
+		return err
+	}
+}
+
+// readCreated reads the two columns an agent insert returns: scopes and
+// sandbox_id.
+func readCreated(r *row) CreatedAgent {
+	created := CreatedAgent{Scopes: r.text(), SandboxID: ""}
+
+	if sandbox := r.optText(); sandbox != nil {
+		created.SandboxID = *sandbox
+	}
+
+	return created
+}
 
 // agentPatchReadQuery is the last statement of PatchAgent: it reads the agent as
 // the batch left it. The batch is one transaction, so this reads the writes
@@ -413,7 +622,8 @@ func readScopes(r *row) string { return r.text() }
 const agentPatchReadQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
-   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
+  sandbox_id
 FROM agents
 WHERE id = ?1 AND user_id = ?2`
 
@@ -554,7 +764,8 @@ SET revoked_at = COALESCE(revoked_at, ?1)
 WHERE id = ?2 AND user_id = ?3
 RETURNING id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
-   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels`
+   FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
+  sandbox_id`
 
 // agentRevokeKeysQuery revokes the secret of every key of an agent, and of every
 // OAuth grant it holds with the grant's access token, in the same batch as

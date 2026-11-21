@@ -16,9 +16,10 @@ const (
 	loginDescription    = "login is temporarily unavailable"
 )
 
-// sessionRow is the row ResolveSession reads: id, user_id, role, expires_at.
+// sessionRow is the row ResolveSession reads: id, user_id, role, expires_at,
+// org_id.
 func sessionRow() []any {
-	return row("session-1", "user-1", "admin", int64(1_700_000_600))
+	return row("session-1", "user-1", "admin", int64(1_700_000_600), "")
 }
 
 // TestResolveSessionDecoding holds how the row becomes an ActiveSession, and
@@ -32,6 +33,8 @@ func TestResolveSessionDecoding(t *testing.T) {
 	}
 	member := active
 	member.Role = "member"
+	inOrg := active
+	inOrg.OrgID = "org-1"
 
 	tests := []struct {
 		name  string
@@ -42,6 +45,8 @@ func TestResolveSessionDecoding(t *testing.T) {
 		{name: "an active session", rows: [][]any{sessionRow()}, want: active, found: true},
 		{name: "the role is the account's current one", rows: [][]any{with(sessionRow(), 2, "member")},
 			want: member, found: true},
+		{name: "the organization is the account's current one", rows: [][]any{with(sessionRow(), 4, "org-1")},
+			want: inOrg, found: true},
 		{name: "unknown, wrong kind, expired, revoked or its account revoked", rows: nil},
 		{name: "an empty result", rows: [][]any{}},
 	}
@@ -73,7 +78,7 @@ func TestResolveSessionDecoding(t *testing.T) {
 func TestResolveSessionDefects(t *testing.T) {
 	t.Parallel()
 
-	for name, rows := range defectResults(sessionRow(), "text", "text", "text", "integer") {
+	for name, rows := range defectResults(sessionRow(), "text", "text", "text", "integer", "text") {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -114,6 +119,7 @@ func TestResolveSessionStatement(t *testing.T) {
 			"AND " + activeFragment,
 			"AND u.revoked_at IS NULL",
 			"u.role AS role",
+			"COALESCE(u.org_id, '') AS org_id",
 		},
 		args: []any{token.Hash(), store.KindSession, now.Unix(), now.Unix()},
 	})
@@ -130,9 +136,9 @@ func TestResolveSessionFailures(t *testing.T) {
 }
 
 // apiKeyRow is the row ResolveAPIKey reads: id, user_id, role, expires_at,
-// agent_id, agent_scopes, scope.
+// agent_id, agent_scopes, scope, org_id, sandbox_id.
 func apiKeyRow() []any {
-	return row("key-1", "user-1", "member", int64(1_700_000_600), "", "", `["agent:read"]`)
+	return row("key-1", "user-1", "member", int64(1_700_000_600), "", "", `["agent:read"]`, "", "")
 }
 
 // TestResolveAPIKeyDecoding holds how the row becomes an ActiveAPIKey: a user's
@@ -147,6 +153,10 @@ func TestResolveAPIKeyDecoding(t *testing.T) {
 	}
 	agent := own
 	agent.AgentID, agent.AgentScopes = "agent-1", `["default:agent"]`
+	member := own
+	member.OrgID = "org-1"
+	sandboxed := agent
+	sandboxed.SandboxID = "sandbox-1"
 
 	tests := []struct {
 		name  string
@@ -157,6 +167,11 @@ func TestResolveAPIKeyDecoding(t *testing.T) {
 		{name: "a user's own key", rows: [][]any{apiKeyRow()}, want: own, found: true},
 		{name: "an agent's key reads the agent's id and current scopes",
 			rows: [][]any{with(with(apiKeyRow(), 4, "agent-1"), 5, `["default:agent"]`)}, want: agent, found: true},
+		{name: "the organization is the account's current one", rows: [][]any{with(apiKeyRow(), 7, "org-1")},
+			want: member, found: true},
+		{name: "an agent in a sandbox reads the sandbox",
+			rows: [][]any{with(with(with(apiKeyRow(), 4, "agent-1"), 5, `["default:agent"]`), 8, "sandbox-1")},
+			want: sandboxed, found: true},
 		{name: "unknown, wrong kind, expired, revoked, or its account or agent revoked", rows: nil},
 		{name: "an empty result", rows: [][]any{}},
 	}
@@ -186,7 +201,9 @@ func TestResolveAPIKeyDecoding(t *testing.T) {
 func TestResolveAPIKeyDefects(t *testing.T) {
 	t.Parallel()
 
-	for name, rows := range defectResults(apiKeyRow(), "text", "text", "text", "integer", "text", "text", "text") {
+	columns := []string{"text", "text", "text", "integer", "text", "text", "text", "text", "text"}
+
+	for name, rows := range defectResults(apiKeyRow(), columns...) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -230,8 +247,14 @@ func TestResolveAPIKeyStatement(t *testing.T) {
 			"COALESCE(a.scopes, '') AS agent_scopes",
 			"COALESCE(k.agent_id, '') AS agent_id",
 			"AND (k.agent_id IS NULL OR (a.id IS NOT NULL AND a.revoked_at IS NULL))",
+			"COALESCE(u.org_id, '') AS org_id",
+			"COALESCE(a.sandbox_id, '') AS sandbox_id",
+			// A key of an agent in a sandbox needs the sandbox to stand, unexpired as of now,
+			// of the kind the agent's own foreign key names.
+			"AND (a.sandbox_id IS NULL OR EXISTS (SELECT 1 FROM orgs g " +
+				"WHERE g.id = a.sandbox_id AND g.kind = a.sandbox_kind AND g.expires_at > ?))",
 		},
-		args: []any{token.Hash(), store.KindAPIKey, now.Unix(), now.Unix()},
+		args: []any{token.Hash(), store.KindAPIKey, now.Unix(), now.Unix(), now.Unix()},
 	})
 }
 

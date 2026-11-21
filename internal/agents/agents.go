@@ -3,8 +3,10 @@
 // labels), change one (rename it, add and remove its labels), and revoke one.
 //
 //	GET    /api/agent        one page of the caller's agents, revoked ones included;
-//	                         ?label=x keeps only those that have the label x
-//	POST   /api/agent        create an agent, its first API key and its labels, if any
+//	                         ?label=x keeps only those that have the label x,
+//	                         ?sandbox=id only those in that sandbox
+//	POST   /api/agent        create an agent, its first API key and its labels, if any,
+//	                         optionally in a sandbox (sandboxId)
 //	GET    /api/agent/{id}   one of the caller's agents
 //	PATCH  /api/agent/{id}   rename it, and add and remove labels, atomically
 //	DELETE /api/agent/{id}   revoke it and its keys
@@ -30,6 +32,17 @@
 // the agent's first key, once: only the key's hash is stored, so a lost key
 // cannot be shown again. Agents are short-lived, and there is no rotation:
 // replace an agent by revoking it and creating another.
+//
+// An agent may be confined to a sandbox (docs/orgs_design.md). A user creates
+// one by naming a sandbox they administer that has not expired, and the write
+// checks that, so anything else is a 404 as for an agent that does not exist. An
+// agent creating an agent always puts it in its own sandbox (or in none, for an
+// ordinary agent): the new agent's sandbox is read from the creating agent's row
+// in the write, and a request that names a different one is refused. An agent
+// that is confined reaches only the agents of its own sandbox, here and in every
+// route it may call (an ordinary agent likewise reaches only ordinary agents),
+// while a user reaches all of their own, whichever sandbox they are in. These
+// are the only routes a sandboxed agent may use at all (auth.Access.InSandbox).
 //
 // A create may give the new agent labels, whoever is creating. They are written
 // in the same batch as the agent and its key, so a create gives the agent all of
@@ -65,18 +78,21 @@ func DefaultScopes() scope.List { return scope.List{scope.DefaultAgent} }
 // found. *store.Store satisfies it. A failure must come back classified (the
 // store does), because it is sent as is.
 type Store interface {
-	// ListAgents returns a page of the owner's agents, newest first, only those
-	// with the filter's label when it is set.
+	// ListAgents returns a page of the agents the reach allows, newest first,
+	// only those with the filter's label and in the filter's sandbox when they
+	// are set.
 	ListAgents(
-		ctx context.Context, owner string, cursor input.Cursor, limit input.PageLimit, filter input.LabelFilter,
+		ctx context.Context, reach store.AgentReach, cursor input.Cursor, limit input.PageLimit, filter store.AgentFilter,
 	) (store.AgentPage, error)
-	// GetAgent returns one of the owner's agents, or store.ErrNotFound.
-	GetAgent(ctx context.Context, owner string, id input.ID) (store.Agent, error)
+	// GetAgent returns one of the agents the reach allows, or store.ErrNotFound.
+	GetAgent(ctx context.Context, reach store.AgentReach, id input.ID) (store.Agent, error)
 	// CreateAgent writes an agent, its first key and its labels as one batch and
-	// returns the agent's scope list as the write stored it (JSON), or returns
-	// store.ErrConflict when the owner is at the limit or was revoked, in which
-	// case nothing was written, labels included.
-	CreateAgent(ctx context.Context, agent store.NewAgent) (string, error)
+	// returns the agent's scope list and sandbox as the write stored them, or
+	// returns store.ErrSandboxUnavailable when a user named a sandbox that is
+	// not an unexpired sandbox they administer, or store.ErrConflict when the
+	// owner is at the limit or was revoked, in which case nothing was written,
+	// labels included.
+	CreateAgent(ctx context.Context, agent store.NewAgent) (store.CreatedAgent, error)
 	// PatchAgent renames one of the owner's agents and adds and removes its
 	// labels as one batch, and returns it as the batch left it (a revoked agent
 	// is left as it is). It returns store.ErrNotFound when the owner has no such
@@ -140,6 +156,10 @@ type Agent struct {
 	// Labels are the agent's labels, in ascending order. It is always present,
 	// and an empty list for an agent with none.
 	Labels []string `json:"labels"`
+
+	// SandboxID is the sandbox the agent is confined to. It is absent for an
+	// ordinary agent.
+	SandboxID *string `json:"sandboxId,omitempty"`
 }
 
 // present is the client's view of a stored agent. Any revoked_at at all
@@ -152,6 +172,6 @@ func present(stored store.Agent) Agent {
 
 	return Agent{
 		ID: stored.ID, Name: stored.Name, Scopes: scope.Read(stored.Scopes).Claim(), Status: status,
-		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt, Labels: stored.Labels,
+		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt, Labels: stored.Labels, SandboxID: stored.SandboxID,
 	}
 }

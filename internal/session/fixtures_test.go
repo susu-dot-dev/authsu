@@ -187,6 +187,10 @@ type rig struct {
 
 	// logged records every error the boundary turned into a response.
 	logged []*apierr.Error
+
+	// org is the organization of the account of every secret the rig stores
+	// from now on, or "" for none.
+	org string
 }
 
 func newRig(t *testing.T) *rig {
@@ -311,7 +315,7 @@ func (r *rig) activeSession(owner, role string, expiresAt time.Time) (*http.Cook
 	r.creds.rows[string(issued.Hash)] = held{
 		kind: auth.KindSession,
 		session: store.ActiveSession{
-			ID: issued.ID, UserID: owner, Role: role, ExpiresAt: expiresAt,
+			ID: issued.ID, UserID: owner, Role: role, ExpiresAt: expiresAt, OrgID: r.org,
 		},
 		key: store.ActiveAPIKey{},
 	}
@@ -336,7 +340,7 @@ func (r *rig) liveKey(owner, role, agentID string, expiresAt time.Time) (string,
 		session: store.ActiveSession{},
 		key: store.ActiveAPIKey{
 			ID: issued.ID, UserID: owner, Role: role, ExpiresAt: expiresAt,
-			AgentID: agentID, AgentScopes: "", Scope: `["default:session"]`,
+			AgentID: agentID, AgentScopes: "", Scope: `["default:session"]`, OrgID: r.org,
 		},
 	}
 

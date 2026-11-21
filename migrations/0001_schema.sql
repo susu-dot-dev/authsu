@@ -1,9 +1,10 @@
--- The schema: secrets, invitations, users, passkey credentials, sessions,
--- agents, API keys and OAuth grants.
+-- The schema: secrets, invitations, users, passkey credentials, organizations
+-- and sandboxes, sessions, agents, API keys and OAuth grants.
 --
 -- Rationale: docs/secrets_design.md, docs/invitations_design.md,
 -- docs/registration_design.md, docs/login_design.md, docs/users_design.md,
--- docs/agents_design.md, docs/permissions_design.md and docs/oauth_design.md.
+-- docs/orgs_design.md, docs/agents_design.md, docs/permissions_design.md and
+-- docs/oauth_design.md.
 --
 -- Timestamps are Unix seconds. Identifiers we create are UUIDv7 in canonical
 -- text form; hashes and WebAuthn bytes are BLOB.
@@ -27,10 +28,13 @@
 --     is 4x the character limit and only ever fires on a Go bug.
 --
 -- No CHECK constrains a value that grows with the code (a role, an invitation
--- type, a scope list, the kind of a secret): Go validates those, because
--- changing a CHECK means rebuilding the table (docs/DATABASE.md). The kind
--- column of each kind's own table is the exception: it is fixed to one literal
--- and never changes, so it is an invariant and not an open-ended set.
+-- type, a scope list, the kind of a secret, the kind of an organization, the
+-- role of an offer): Go validates those, because changing a CHECK means
+-- rebuilding the table (docs/DATABASE.md). The kind column of each kind's own
+-- table is the exception: it is fixed to one literal and never changes, so it
+-- is an invariant and not an open-ended set. So are the few rules about the two
+-- kinds of organization below, which restate facts that define them (a sandbox
+-- has an expiry and is never revoked) and are not a list of values.
 --
 -- Foreign keys are enforced: D1 runs with foreign_keys on and does not allow
 -- turning it off. The ON DELETE actions and the triggers below rely on that,
@@ -176,11 +180,43 @@ CREATE TABLE users (
     -- this column.
     revoked_at    INTEGER,
 
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+
+    -- The standard organization the user belongs to, or NULL (docs/orgs_design.md,
+    -- principle 3). A user belongs to at most one, so membership is one fact
+    -- about the user and a request never has to say which organization it acts
+    -- in. It is a column read with the account, like role and revoked_at, so a
+    -- credential's resolve reads it in the same statement.
+    --
+    -- org_kind is fixed to 'standard' and the foreign key is on (org_id,
+    -- org_kind), so a user can belong only to a standard organization and
+    -- never to a sandbox, the same device the kind tables use for secrets. It
+    -- is NOT NULL with a default, so a NULL org_id leaves it 'standard' and the
+    -- key, which SQLite does not check when any column of it is NULL, is
+    -- unchecked: that is "no organization".
+    --
+    -- There is no ON DELETE action. A standard organization is revoked and
+    -- never deleted, so a delete that would leave a member behind is refused,
+    -- which is the guard that a user is never left in an organization that is
+    -- gone. Revoking an organization releases its members by setting org_id to
+    -- NULL in the same batch, never by a cascade, so that joining can require
+    -- the organization to be active in the write that sets it.
+    org_id        TEXT,
+    org_kind      TEXT    NOT NULL DEFAULT 'standard'
+                          CHECK (org_kind = 'standard'),
+
+    FOREIGN KEY (org_id, org_kind) REFERENCES orgs (id, kind)
 );
 
 -- Cap check and "who came from this invitation".
 CREATE INDEX users_invitation_id ON users (invitation_id);
+
+-- The members of an organization, to list them and to release them when it is
+-- revoked. Ending in id, the sort key and the pagination cursor of the member
+-- list, lets a page read just its rows in order, with no sort of the whole
+-- organization. Partial: most users belong to none, and no query asks who has
+-- none.
+CREATE INDEX users_org_id ON users (org_id, id) WHERE org_id IS NOT NULL;
 
 CREATE TABLE credentials (
     id            TEXT    PRIMARY KEY
@@ -231,6 +267,177 @@ CREATE INDEX credentials_user_id ON credentials (user_id);
 -- A format that allowed several would have to be canonicalised before this
 -- index means "one key".
 CREATE UNIQUE INDEX credentials_public_key ON credentials (public_key);
+
+-- ---------------------------------------------------------------------------
+-- Organizations and sandboxes (docs/orgs_design.md)
+-- ---------------------------------------------------------------------------
+
+-- An organization is a group of users with administrators; a sandbox is a
+-- temporary organization that holds agents and confines them. They are one
+-- table with a kind, because both are a named thing with administrators that
+-- other things belong to, and one table is one thing to reason about. Go owns
+-- the set of kinds ('standard' and 'sandbox'), so kind has only a size CHECK;
+-- the rules below that name them are what define each kind.
+--
+--   * A sandbox has an expiry, and is never revoked: it is deleted, by hand,
+--     and an expired one is inert when read (nothing here deletes on time).
+--     Deleting it reaches its agents through agents.sandbox_id, and from them
+--     their keys, labels and OAuth grants and the secrets behind them
+--     (docs/orgs_design.md, principle 5). That is one level of cascade deeper
+--     than any other delete, and there is deliberately NO new trigger for it:
+--     the four delete triggers at the end of this file are all D1 allows (see
+--     "Why only four triggers"), and the existing ones already remove the
+--     secrets of the keys and grants the cascade reaches. Whether the depth
+--     fits can be shown only on the real database; the end-to-end test of
+--     deleting a sandbox that holds agents with keys, labels and grants is
+--     required, and if it fails the design is wrong, not the test.
+--   * A standard organization has no expiry, and is never deleted, only
+--     revoked, so that whatever is later attributed to it stays answerable. A
+--     revoked one stops working and stays as a record.
+--
+-- created_by is who made it. It has no ON DELETE action: users are revoked and
+-- never deleted, and an organization's creator must stay answerable. It is
+-- also the one fact the creation limits count (docs/orgs_design.md, principle
+-- 6): sandboxes that have not expired and standard organizations ever
+-- created, revoked ones included, per user. The organizations are their own
+-- record, so there is no counter to keep in step.
+--
+-- name is typed by a person and bounded in BYTES and refuses NUL, as
+-- agents.name is. Go counts characters (at most 4 bytes each), so the byte
+-- ceiling is 4x the 256-character limit.
+CREATE TABLE orgs (
+    id         TEXT    PRIMARY KEY
+                       CHECK (length(id) = 36 AND id NOT GLOB '*[^0-9a-f-]*'),
+
+    kind       TEXT    NOT NULL
+                       CHECK (typeof(kind) = 'text' AND length(kind) BETWEEN 1 AND 64),
+
+    name       TEXT    NOT NULL
+                       CHECK (typeof(name) = 'text'
+                              AND instr(name, char(0)) = 0
+                              AND length(cast(name AS BLOB)) BETWEEN 1 AND 1024),
+
+    created_by TEXT    NOT NULL REFERENCES users (id),
+
+    -- When a sandbox stops working, in Unix seconds. Required for a sandbox,
+    -- NULL for a standard organization, which does not expire. A time and not
+    -- a flag, as secrets.expires_at is, so "is it still standing" is read
+    -- against now whenever a credential is used.
+    expires_at INTEGER,
+
+    -- When a standard organization was revoked, or NULL. Any value at all
+    -- revokes, as with users.revoked_at. A sandbox is never revoked, so its is
+    -- always NULL.
+    revoked_at INTEGER,
+
+    created_at INTEGER NOT NULL,
+
+    CHECK (kind <> 'sandbox'  OR (expires_at IS NOT NULL AND revoked_at IS NULL)),
+    CHECK (kind <> 'standard' OR expires_at IS NULL),
+
+    -- Makes (id, kind) a foreign key target, so a user can be bound to a
+    -- standard organization and an agent to a sandbox, and no other. id is
+    -- already unique; this adds nothing to what may be stored.
+    UNIQUE (id, kind)
+);
+
+-- The creation limits: how many sandboxes a user holds that have not expired,
+-- and how many standard organizations they have ever created. Both are counts
+-- over one creator, split by kind, and the first also by expiry.
+CREATE INDEX orgs_created_by ON orgs (created_by, kind, expires_at);
+
+-- Who looks after an organization. It is a row and not a role on the user: a
+-- role is one value, so a user could never administer two organizations, nor be
+-- both a platform administrator and an organization administrator
+-- (docs/orgs_design.md, principle 3). It is not a scope either, which can only
+-- narrow what a user may already do: who may look after a given organization
+-- is a condition of the write that depends on it.
+--
+-- A sandbox has exactly one administrator, the user who made it, who keeps
+-- their own organization. Both foreign keys cascade: deleting a sandbox
+-- releases its administrator, who stays, and deleting an account (which only
+-- ever happens in tests) takes its rows with it.
+--
+-- A standard organization is never left without an unrevoked administrator by
+-- the two writes that remove one: demoting an administrator and removing a
+-- member (which is also leaving) both refuse to take the last unrevoked
+-- administrator, a count in the write itself, since no CHECK can state it.
+-- Revoking the ACCOUNT of the last administrator is not refused: refusing it
+-- would let an organization administrator shield themselves from platform
+-- revocation. The organization is then left with no unrevoked administrator,
+-- and a platform administrator's override (who may do anything an organization
+-- administrator may, on any organization) is how it is managed.
+CREATE TABLE org_admins (
+    org_id     TEXT    NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
+    user_id    TEXT    NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+
+    PRIMARY KEY (org_id, user_id)
+) WITHOUT ROWID;
+
+-- The organizations a user administers, and the rows to remove with them. The
+-- table is WITHOUT ROWID, so SQLite ends this index with the primary key: it is
+-- (user_id, org_id), and a page of the organizations a user administers is read
+-- from it in org_id order, which is the sort key of the organization list.
+CREATE INDEX org_admins_user_id ON org_admins (user_id);
+
+-- An offer to join a standard organization (docs/orgs_design.md, principle 2).
+-- It is a record of its own, apart from the platform invitation it may ride on:
+-- the invitation is the record of who was admitted and is never touched, while
+-- an offer means nothing once its organization is gone or revoked, so offers
+-- are deleted, and the invitation stays.
+--
+-- An offer is addressed to exactly one of two things, which the CHECK states:
+--   * an existing user (user_id), who accepts or declines it, and then it is
+--     deleted; or
+--   * an invitation (invitation_id), so that whoever registers with it joins
+--     the organization in the same step. It outlives each registration, because
+--     an invitation may admit several people, and is deleted only when it is
+--     withdrawn, when its organization is revoked, or when its invitation row
+--     is (the key cascades). invitation_id is UNIQUE: an invitation carries at
+--     most one offer.
+--
+-- Only a standard organization is offered: org_kind is fixed to 'standard' and
+-- the foreign key is on (org_id, kind), so a sandbox, which has no members, can
+-- never be offered. There is no ON DELETE action on it, so a delete of an
+-- organization that still has offers is refused, as it is with members.
+--
+-- role is what the person becomes on joining: Go owns the set ('member' and
+-- 'admin'), so there is only a size CHECK. UNIQUE (org_id, user_id) is the
+-- guard that a user is offered a place in an organization once; it does not
+-- constrain invitation offers, whose user_id is NULL and which SQLite treats as
+-- distinct there.
+CREATE TABLE org_offers (
+    id            TEXT    PRIMARY KEY
+                          CHECK (length(id) = 36 AND id NOT GLOB '*[^0-9a-f-]*'),
+
+    org_id        TEXT    NOT NULL,
+    kind          TEXT    NOT NULL DEFAULT 'standard'
+                          CHECK (kind = 'standard'),
+
+    -- The existing user the offer is addressed to. The offer dies with them.
+    user_id       TEXT    REFERENCES users (id) ON DELETE CASCADE,
+
+    -- The invitation the offer rides on. The offer dies with the invitation row;
+    -- the invitation is never touched by the offer's removal.
+    invitation_id TEXT    UNIQUE REFERENCES invitations (id) ON DELETE CASCADE,
+
+    role          TEXT    NOT NULL
+                          CHECK (typeof(role) = 'text' AND length(role) BETWEEN 1 AND 64),
+
+    -- Who made the offer: an administrator of the organization, or a platform
+    -- administrator. No ON DELETE action, as for orgs.created_by.
+    created_by    TEXT    NOT NULL REFERENCES users (id),
+
+    created_at    INTEGER NOT NULL,
+
+    CHECK ((user_id IS NULL) <> (invitation_id IS NULL)),
+    UNIQUE (org_id, user_id),
+    FOREIGN KEY (org_id, kind) REFERENCES orgs (id, kind)
+);
+
+-- A user's offers, and the rows to remove with them.
+CREATE INDEX org_offers_user_id ON org_offers (user_id) WHERE user_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- Sessions
@@ -298,6 +505,15 @@ CREATE INDEX sessions_credential_id ON sessions (credential_id);
 -- as with users.revoked_at and secrets.revoked_at. The row is never deleted,
 -- so "which agent did this?" stays answerable. Revoking an agent revokes its
 -- keys; revoking its user revokes it.
+--
+-- sandbox_id is the sandbox the agent is confined to, or NULL for an ordinary
+-- agent (docs/orgs_design.md, principle 4). It is how a restriction is
+-- recorded, so it must never fall back to "unrestricted" when what it points
+-- at disappears: an agent whose sandbox vanished would otherwise read as an
+-- ordinary agent with all of its user's reach. So the key cascades, and the
+-- agent is deleted with its sandbox and is not released from it. This is the
+-- one agent that is removed and not revoked, and only because nothing outside a
+-- sandbox can have recorded it.
 CREATE TABLE agents (
     id         TEXT    PRIMARY KEY
                        CHECK (length(id) = 36 AND id NOT GLOB '*[^0-9a-f-]*'),
@@ -320,13 +536,27 @@ CREATE TABLE agents (
 
     revoked_at INTEGER,
 
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+
+    -- sandbox_kind is fixed to 'sandbox' and the foreign key is on (sandbox_id,
+    -- sandbox_kind), so an agent can be confined only to a sandbox and never to
+    -- a standard organization, which is not a boundary. A NULL sandbox_id
+    -- leaves the key unchecked: an ordinary agent.
+    sandbox_id   TEXT,
+    sandbox_kind TEXT NOT NULL DEFAULT 'sandbox'
+                      CHECK (sandbox_kind = 'sandbox'),
+
+    FOREIGN KEY (sandbox_id, sandbox_kind) REFERENCES orgs (id, kind) ON DELETE CASCADE
 );
 
 -- A user's agents, newest first, and the per-user limit on how many exist. The
 -- id is a UUIDv7, so it is in creation order: it is the sort key and the
 -- pagination cursor, and created_at is only a value to show.
 CREATE INDEX agents_user_id ON agents (user_id, id);
+
+-- A sandbox's agents, to list them and to delete them with it. Partial: most
+-- agents are ordinary.
+CREATE INDEX agents_sandbox_id ON agents (sandbox_id) WHERE sandbox_id IS NOT NULL;
 
 -- agent_labels: short tags a user attaches to their own agents, to group and
 -- find them (GET /api/agent?label=...). Rationale: docs/agents_design.md.

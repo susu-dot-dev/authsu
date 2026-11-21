@@ -28,6 +28,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/keys"
 	"github.com/susu-dot-dev/authsu/internal/login"
 	"github.com/susu-dot-dev/authsu/internal/oauth"
+	"github.com/susu-dot-dev/authsu/internal/orgs"
 	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/result"
@@ -90,6 +91,7 @@ func NewHandler(platform Platform) http.Handler {
 		}),
 		invitations.Routes(invitations.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID}),
 		users.Routes(users.Deps{Store: db, Now: time.Now, Log: platform.Log}),
+		orgs.Routes(orgs.Deps{Store: db, Now: time.Now, NewID: newID}),
 		oauth.Routes(oauth.Deps{
 			Store: db, Resources: resource.Select, Fetch: platform.Fetch, Now: time.Now, Entropy: rand.Reader,
 			NewID: newID, MaxAgents: agents.MaxAgentsPerUser, Log: platform.Log,

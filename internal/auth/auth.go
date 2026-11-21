@@ -18,15 +18,19 @@
 //     is refused here, before the store is read. A token that parses is resolved
 //     in the store (store.ResolveSession, store.ResolveAPIKey), which reads
 //     the secret, its account and, for an agent's key, the agent in one
-//     statement and finds it only while every part is active. Every verdict on
+//     statement and finds it only while every part is active (an agent's
+//     sandbox, when it has one, included: a key of an expired or deleted
+//     sandbox is not active). Every verdict on
 //     the credential is one answer, 401 unauthenticated (see Unauthenticated); a
 //     failure of the store is 503 session_verify_failed. Verifying a credential
 //     needs no configuration: a token carries nothing to check.
 //  3. Works out the effective scopes: the credential's scope list (a session's
 //     is SessionScope, a key's is the one stored with it), narrowed by the
 //     agent's scopes when an agent is acting (docs/permissions_design.md).
-//  4. Applies the route's Access (403): the administrator role for an admin
-//     scope, then the scope, then session-only, then no-agents.
+//  4. Applies the route's Access (403): a sandboxed agent on a route that has
+//     not opted in with InSandbox (sandbox_confined), then the administrator
+//     role for an admin scope, then the scope, then session-only, then
+//     no-agents.
 //  5. Parses the route's {id} wildcard, if it has one, as an input.ID (400
 //     invalid_id). This is after the credential, so a caller who may not use
 //     the route learns nothing about what a valid id looks like or whether the
@@ -121,8 +125,17 @@ type Principal struct {
 	// ExpiresAt is when the credential stops being active.
 	ExpiresAt time.Time
 
+	// OrgID is the standard organization the account belongs to now, read with
+	// the account, or "" when it belongs to none.
+	OrgID string
 	// AgentID is the agent acting, or "" when the user is.
 	AgentID string
+	// SandboxID is the sandbox the acting agent is confined to, read with the
+	// agent, or "" for a user, a session and an ordinary agent. A request with
+	// one is refused by every route that does not opt in with
+	// Access.InSandbox, and a route that does must confine what it reads and
+	// writes to this sandbox.
+	SandboxID string
 	// Scope is the credential's own scope list exactly as stored: SessionScope
 	// for a session, the key row's list for an API key. A list that is damaged
 	// reads as empty.

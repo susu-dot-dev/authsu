@@ -150,7 +150,7 @@ func invalidShapes() []invalidCase {
 	return []invalidCase{
 		{"unknown field", `{"type":"member","numInvites":1,"role":"admin"}`, codeUnknownField},
 		{"a field of a stored invitation", `{"type":"member","numInvites":1,"id":"` + invID + `"}`, codeUnknownField},
-		{"repeated field", `{"type":"member","numInvites":1,"numInvites":2}`, "duplicate_field"},
+		{"repeated field", `{"type":"member","numInvites":1,"numInvites":2}`, codeDuplicateField},
 		{"field name in another case", `{"Type":"workshop","numInvites":1}`, codeUnknownField},
 		{"empty body", "", "empty_body"},
 		{"not JSON", garbage, "invalid_json"},
@@ -405,8 +405,13 @@ func TestCreateResponseIsTheStoredRow(t *testing.T) {
 // sameInvitation compares two wire invitations by value, following pointers.
 func sameInvitation(a, b wireInvitation) bool {
 	return a.ID == b.ID && a.Type == b.Type && a.Label == b.Label && a.NumInvites == b.NumInvites &&
-		a.Uses == b.Uses && a.Status == b.Status && a.CreatedAt == b.CreatedAt &&
-		equalPtr(a.ExpiresAt, b.ExpiresAt) && equalPtr(a.RevokedAt, b.RevokedAt) && equalPtr(a.CreatedBy, b.CreatedBy)
+		a.Uses == b.Uses && a.Status == b.Status && a.CreatedAt == b.CreatedAt && samePointers(a, b)
+}
+
+// samePointers compares the optional members two wire invitations show.
+func samePointers(a, b wireInvitation) bool {
+	return equalPtr(a.ExpiresAt, b.ExpiresAt) && equalPtr(a.RevokedAt, b.RevokedAt) &&
+		equalPtr(a.CreatedBy, b.CreatedBy) && equalPtr(a.OrgID, b.OrgID) && equalPtr(a.OrgRole, b.OrgRole)
 }
 
 func equalPtr[T comparable](a, b *T) bool {

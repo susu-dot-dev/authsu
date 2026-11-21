@@ -297,7 +297,7 @@ const agentRowID = "00000000-0000-7000-8000-0000000000a1"
 // activeSessionStep is the answer to the session lookup of the auth boundary,
 // with the row exactly as D1 returns it: text as string, integers as int64.
 func (s session) activeSessionStep(role string) step {
-	return s.activeSessionRow([]any{s.issued.ID, s.userID, role, s.issued.ExpiresAt.Unix()})
+	return s.activeSessionRow([]any{s.issued.ID, s.userID, role, s.issued.ExpiresAt.Unix(), ""})
 }
 
 // activeSessionRow is activeSessionStep with a row of the test's own making, to
@@ -336,9 +336,10 @@ func bearer(token string) map[string]string { return authorization("Bearer " + t
 
 // keyStep is the answer to the API key lookup of the auth boundary: the key's
 // own user, role and expiry, the agent it belongs to (or "" for none) with
-// that agent's stored scopes, and the key's own scope.
+// that agent's stored scopes, the key's own scope, and no organization and no
+// sandbox.
 func (k apiKey) keyStep(userID, role, agentID, agentScopes, keyScope string) step {
-	return k.keyRow([]any{k.issued.ID, userID, role, k.issued.ExpiresAt.Unix(), agentID, agentScopes, keyScope})
+	return k.keyRow([]any{k.issued.ID, userID, role, k.issued.ExpiresAt.Unix(), agentID, agentScopes, keyScope, "", ""})
 }
 
 // keyRow is keyStep with a row of the test's own making.
@@ -383,10 +384,11 @@ func (h *harness) lastCall() []store.Statement {
 func batchOf(n int) []store.Result { return make([]store.Result, n) }
 
 // createdAgentBatch is the answer of an agent create's batch: the agent insert
-// returns the scope list it stored (RETURNING scopes, as D1 sends text), and the
-// key's secret and the key's own row return nothing.
+// returns the scope list it stored and its sandbox (RETURNING scopes, sandbox_id,
+// as D1 sends text and NULL), and the key's secret and the key's own row return
+// nothing.
 func createdAgentBatch(scopes string) []store.Result {
-	return []store.Result{{Changes: 1, Rows: [][]any{{scopes}}}, {Changes: 1, Rows: nil}, {Changes: 1, Rows: nil}}
+	return []store.Result{{Changes: 1, Rows: [][]any{{scopes, nil}}}, {Changes: 1, Rows: nil}, {Changes: 1, Rows: nil}}
 }
 
 // passkey is a software authenticator: a fresh ES256 key and the credential id

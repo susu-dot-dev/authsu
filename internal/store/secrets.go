@@ -89,9 +89,13 @@ func insertSecret(id, kind string, hash []byte, expiresAt, createdAt int64) Stat
 // sessions is on the id and the kind together, as the schema's foreign key is.
 // A hash that belongs to another kind of secret therefore resolves to nothing.
 //
+// The account's organization is read from the account in the same statement, as
+// its role is: "" when it belongs to none.
+//
 // Arguments, in order: hash, kind, now, now (unix seconds).
 const resolveSessionQuery = `
-SELECT s.id AS id, x.user_id AS user_id, u.role AS role, s.expires_at AS expires_at
+SELECT s.id AS id, x.user_id AS user_id, u.role AS role, s.expires_at AS expires_at,
+       COALESCE(u.org_id, '') AS org_id
 FROM secrets s
 JOIN sessions x ON x.id = s.id AND x.kind = s.kind
 JOIN users u ON u.id = x.user_id
@@ -114,6 +118,9 @@ type ActiveSession struct {
 
 	// ExpiresAt is when the session stops being active.
 	ExpiresAt time.Time
+
+	// OrgID is the standard organization the account belongs to now, or "".
+	OrgID string
 }
 
 // ResolveSession reads the session the token names if it is active at now: not
@@ -133,7 +140,7 @@ func (s *Store) ResolveSession(
 		func(r *row) ActiveSession {
 			// Struct fields are evaluated in order, which is the column order.
 			return ActiveSession{
-				ID: r.text(), UserID: r.text(), Role: r.text(), ExpiresAt: r.timestamp(),
+				ID: r.text(), UserID: r.text(), Role: r.text(), ExpiresAt: r.timestamp(), OrgID: r.text(),
 			}
 		})
 }
@@ -152,10 +159,21 @@ func (s *Store) ResolveSession(
 // The key's own scope is read as stored. It is authoritative and nothing
 // updates it (docs/permissions_design.md).
 //
-// Arguments, in order: hash, kind, now, now (unix seconds).
+// The account's organization is read as for a session, and the agent's sandbox
+// is read with the agent, "" for an ordinary agent and for a key with none. A
+// key of an agent in a sandbox is active only while that sandbox is standing:
+// it must exist and not have expired as of now, which is read here, in the
+// statement that resolves the credential, because nothing deletes an expired
+// sandbox on time and the boundary must hold without it (docs/orgs_design.md,
+// principle 4). A sandbox that is gone cannot be told apart from one that has
+// expired, and neither can from an unknown key, and the sandbox's kind is
+// bound by the agent's own sandbox_kind, as the schema's foreign key is.
+//
+// Arguments, in order: hash, kind, then now three times (unix seconds).
 const resolveAPIKeyQuery = `
 SELECT s.id AS id, k.user_id AS user_id, u.role AS role, s.expires_at AS expires_at,
-       COALESCE(k.agent_id, '') AS agent_id, COALESCE(a.scopes, '') AS agent_scopes, k.scope AS scope
+       COALESCE(k.agent_id, '') AS agent_id, COALESCE(a.scopes, '') AS agent_scopes, k.scope AS scope,
+       COALESCE(u.org_id, '') AS org_id, COALESCE(a.sandbox_id, '') AS sandbox_id
 FROM secrets s
 JOIN api_keys k ON k.id = s.id AND k.kind = s.kind
 JOIN users u ON u.id = k.user_id
@@ -164,7 +182,10 @@ WHERE s.hash = ?
   AND s.kind = ?
   AND ` + activeSecretPredicate + `
   AND u.revoked_at IS NULL
-  AND (k.agent_id IS NULL OR (a.id IS NOT NULL AND a.revoked_at IS NULL))`
+  AND (k.agent_id IS NULL OR (a.id IS NOT NULL AND a.revoked_at IS NULL))
+  AND (a.sandbox_id IS NULL
+       OR EXISTS (SELECT 1 FROM orgs g
+                  WHERE g.id = a.sandbox_id AND g.kind = a.sandbox_kind AND g.expires_at > ?))`
 
 // ActiveAPIKey is an API key that may be used, with the account it acts for.
 type ActiveAPIKey struct {
@@ -190,12 +211,21 @@ type ActiveAPIKey struct {
 
 	// Scope is the key's own scope list as stored.
 	Scope string
+
+	// OrgID is the standard organization the account belongs to now, or "".
+	OrgID string
+
+	// SandboxID is the sandbox the key's agent is confined to, or "" for a
+	// user's own key and for an ordinary agent. A key whose sandbox has
+	// expired or is gone is not active and is not returned.
+	SandboxID string
 }
 
 // ResolveAPIKey reads the API key the token names if it is active at now: not
 // revoked, not expired, its account not revoked and, when it belongs to an
-// agent, that agent not revoked. It reports false otherwise, so an unknown,
-// wrong-kind, expired and revoked key are indistinguishable.
+// agent, that agent not revoked and its sandbox, if it has one, standing and
+// unexpired. It reports false otherwise, so an unknown, wrong-kind, expired and
+// revoked key are indistinguishable.
 func (s *Store) ResolveAPIKey(
 	ctx context.Context, token input.APIKeyToken, now time.Time,
 ) (ActiveAPIKey, bool, error) {
@@ -205,12 +235,12 @@ func (s *Store) ResolveAPIKey(
 	unix := now.Unix()
 
 	return find(ctx, s, o,
-		Statement{Query: resolveAPIKeyQuery, Args: []any{token.Hash(), KindAPIKey, unix, unix}},
+		Statement{Query: resolveAPIKeyQuery, Args: []any{token.Hash(), KindAPIKey, unix, unix, unix}},
 		func(r *row) ActiveAPIKey {
 			// Struct fields are evaluated in order, which is the column order.
 			return ActiveAPIKey{
 				ID: r.text(), UserID: r.text(), Role: r.text(), ExpiresAt: r.timestamp(),
-				AgentID: r.text(), AgentScopes: r.text(), Scope: r.text(),
+				AgentID: r.text(), AgentScopes: r.text(), Scope: r.text(), OrgID: r.text(), SandboxID: r.text(),
 			}
 		})
 }

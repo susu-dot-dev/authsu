@@ -250,7 +250,7 @@ func TestQueriesAreFound(t *testing.T) {
 		"invitationQuery", "insertUserQuery", "insertCredentialQuery", "credentialQuery",
 		"firstRunStateQuery", "insertFirstRunSecretQuery", "insertFirstRunInvitationQuery",
 		"listInvitationsQuery", "readInvitationQuery", "insertInvitationQuery", "updateNumInvitesQuery",
-		"revokeInvitationSecretQuery",
+		"revokeInvitationSecretQuery", "insertInvitationOfferQuery", "insertOrgAdminQuery",
 		"listUsersQuery", "getUserQuery", "revokeUserQuery", "revokeUserSecretsQuery", "revokeUserAgentsQuery",
 		"agentRevokeKeysQuery",
 		"keyListQuery", "keyGetQuery", "insertUserKeyQuery", "keyRenameQuery", "keyRevokeQuery",
@@ -258,6 +258,13 @@ func TestQueriesAreFound(t *testing.T) {
 		"rotateCodeQuery", "rotateRefreshQuery", "replaceAccessQuery", "insertAccessSecretQuery",
 		"insertAccessRowQuery", "introspectQuery", "revokeRefreshTokenQuery", "revokeRefreshAccessQuery",
 		"revokeAccessTokenQuery",
+		"insertOrgQuery", "joinCreatedOrgQuery", "insertCreatorAdminQuery", "createOrgStandingQuery", "getOrgQuery",
+		"listOrgsQuery", "renameOrgQuery", "orgStandingQuery", "revokeOrgQuery", "releaseMembersQuery",
+		"deleteRevokedOrgOffersQuery", "deleteRevokedOrgAdminsQuery", "deleteSandboxQuery",
+		"listMembersQuery", "memberStandingQuery", "promoteMemberQuery", "demoteMemberQuery",
+		"removeMemberAdminQuery", "removeMemberQuery",
+		"insertOfferQuery", "offerStandingQuery", "listOrgOffersQuery", "listMyOffersQuery", "acceptStandingQuery",
+		"acceptOfferAdminQuery", "acceptOfferQuery", "acceptOfferDeleteQuery", "revokeOfferQuery",
 	} {
 		if _, ok := queries[name]; !ok {
 			t.Errorf("query %s was not found", name)
@@ -273,7 +280,22 @@ func TestQueriesAreFound(t *testing.T) {
 // edits, with no authority to record, and removing one deletes its row.
 //
 //nolint:gochecknoglobals // a fixed table shared by the tests below
-var mayDelete = map[string]string{"agentLabelRemoveQuery": "agent_labels"}
+var mayDelete = map[string]string{
+	"agentLabelRemoveQuery": "agent_labels",
+
+	// Organizations: a sandbox is deleted by hand and is always deleted; a
+	// standard organization is revoked and stays, and its offers and
+	// administrator rows are deleted with it. An offer is deleted when it is
+	// accepted, declined or withdrawn, and an administrator row when its member is
+	// demoted or leaves. None of them is a record that must outlive its subject.
+	"deleteSandboxQuery":          "orgs",
+	"deleteRevokedOrgOffersQuery": "org_offers",
+	"deleteRevokedOrgAdminsQuery": "org_admins",
+	"demoteMemberQuery":           "org_admins",
+	"removeMemberAdminQuery":      "org_admins",
+	"acceptOfferDeleteQuery":      "org_offers",
+	"revokeOfferQuery":            "org_offers",
+}
 
 // TestNoQueryDeletes holds that nothing is ever deleted, except the labels of an
 // agent: and those only by the query named in mayDelete, only from the table it
@@ -315,9 +337,10 @@ func TestNoQueryDeletes(t *testing.T) {
 
 // TestQueriesBindValuesTheCodeOwns holds that the values Go gives meaning to
 // are bound as arguments from their one definition and not repeated as
-// literals in SQL: the invitation type that is redeemable only once, and the
-// kind of every secret. The schema fixes each kind in a CHECK, which is a
-// different place and is held to the constants by TestKindsMatchTheMigration.
+// literals in SQL: the invitation type that is redeemable only once, the
+// kind of every secret, the kinds of organization and the roles of an offer.
+// The schema fixes each kind in a CHECK, which is a different place and is held
+// to the constants by TestKindsMatchTheMigration and TestOrgKindsMatchTheMigration.
 func TestQueriesBindValuesTheCodeOwns(t *testing.T) {
 	t.Parallel()
 
@@ -326,6 +349,8 @@ func TestQueriesBindValuesTheCodeOwns(t *testing.T) {
 			"'" + store.InvitationFirstRun + "'", "'" + store.KindInvitation + "'",
 			"'" + store.KindSession + "'", "'" + store.KindAPIKey + "'",
 			"'" + store.KindOAuthGrant + "'", "'" + store.KindOAuthAccess + "'",
+			"'" + store.OrgKindStandard + "'", "'" + store.OrgKindSandbox + "'",
+			"'" + store.OfferRoleMember + "'", "'" + store.OfferRoleAdmin + "'",
 		} {
 			if strings.Contains(query, literal) {
 				t.Errorf("%s contains the literal %s; bind the constant instead", name, literal)
@@ -754,6 +779,8 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 	agentID := mustAgentID(t)
 	invitation := newInvitation(t)
 	invitation.ExpiresAt = invExpiry(t, now.Add(input.ExpiryHorizon).Unix(), now)
+	invitation.CreatedAt = farthest
+	invitation.Offer = newOffer(t, "admin")
 
 	return map[string]func(*store.Store){
 		"ResolveSession": func(s *store.Store) {
@@ -793,15 +820,20 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 			_, _ = s.RevokeUser(ctx, mustUserID(t, userID1), userAdminRole, farthest)
 		},
 		"ListAgents": func(s *store.Store) {
-			_, _ = s.ListAgents(ctx, "owner", mustAgentCursor(t, agentIDAt(1)), mustAgentLimit(t, "100"),
-				mustAgentFilter(t, strings.Repeat("z", input.MaxLabelBytes)))
+			filter := mustAgentFilter(t, strings.Repeat("z", input.MaxLabelBytes))
+			filter.Sandbox = mustAgentSandboxFilter(t, agentSandbox).Sandbox
+
+			_, _ = s.ListAgents(ctx, store.SandboxAgents("owner", agentSandbox),
+				mustAgentCursor(t, agentIDAt(1)), mustAgentLimit(t, "100"), filter)
 		},
-		"GetAgent": func(s *store.Store) { _, _ = s.GetAgent(ctx, "owner", agentID) },
+		"GetAgent": func(s *store.Store) {
+			_, _ = s.GetAgent(ctx, store.SandboxAgents("owner", agentSandbox), agentID)
+		},
 		"CreateAgent": func(s *store.Store) {
 			_, _ = s.CreateAgent(ctx, store.NewAgent{
 				ID: "id", Owner: "owner", Name: mustAgentName(t, "agent"), Scopes: "[]", KeyScope: "[]", MaxActive: 1 << 30,
 				KeyID: "key-id", KeyHash: hashOf(1), KeyExpiresAt: farthest, CreatedAt: farthest,
-				Labels: mustAgentLabelSet(t, longestLabelSet()...),
+				Labels: mustAgentLabelSet(t, longestLabelSet()...), Sandbox: mustAgentSandboxID(t, agentSandbox),
 			})
 		},
 		"PatchAgent":  func(s *store.Store) { _, _ = s.PatchAgent(ctx, "owner", agentID, largestPatch(t)) },
@@ -851,6 +883,37 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		"RevokeAccessToken": func(s *store.Store) {
 			_ = s.RevokeAccessToken(ctx, mustAccessToken(t, 3), oauthWorstClientID(t), farthest)
 		},
+		"CreateOrg": func(s *store.Store) {
+			_, _ = s.CreateOrg(ctx, store.NewOrg{
+				ID: "id", Kind: orgKindOf(t, store.OrgKindSandbox), Name: orgWorstName(t), Creator: "owner",
+				ExpiresAt: farthest, Limit: 1 << 30, CreatedAt: farthest,
+			})
+		},
+		"GetOrg": func(s *store.Store) { _, _ = s.GetOrg(ctx, agentID, "owner", "role") },
+		"ListOrgs": func(s *store.Store) {
+			_, _ = s.ListOrgs(ctx, "owner", "role", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
+		},
+		"RenameOrg": func(s *store.Store) { _, _ = s.RenameOrg(ctx, agentID, orgWorstName(t), "owner", "role", farthest) },
+		"RevokeOrg": func(s *store.Store) { _, _ = s.RevokeOrg(ctx, agentID, "owner", "role", farthest) },
+		"ListMembers": func(s *store.Store) {
+			_, _ = s.ListMembers(ctx, agentID, "owner", "role", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
+		},
+		"SetMemberAdmin": func(s *store.Store) { _, _ = s.SetMemberAdmin(ctx, agentID, true, "owner", "role", farthest) },
+		"RemoveMember":   func(s *store.Store) { _, _ = s.RemoveMember(ctx, agentID, "owner", "role") },
+		"CreateOffer": func(s *store.Store) {
+			_, _ = s.CreateOffer(ctx, store.NewOffer{
+				ID: "id", OrgID: agentID, UserID: agentID, Role: orgRoleOf(t, store.OfferRoleAdmin), Caller: "owner",
+				AdminRole: "role", CreatedAt: farthest,
+			})
+		},
+		"ListOrgOffers": func(s *store.Store) {
+			_, _ = s.ListOrgOffers(ctx, agentID, "owner", "role", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
+		},
+		"ListMyOffers": func(s *store.Store) {
+			_, _ = s.ListMyOffers(ctx, "owner", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
+		},
+		"AcceptOffer": func(s *store.Store) { _, _ = s.AcceptOffer(ctx, agentID, "owner", farthest) },
+		"RevokeOffer": func(s *store.Store) { _, _ = s.RevokeOffer(ctx, agentID, "owner", "role") },
 	}
 }
 

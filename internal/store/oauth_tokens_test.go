@@ -170,7 +170,7 @@ func exchangeStatements(ex store.CodeExchange) []wantStatement {
 		"AND (revoked_at IS NULL OR revoked_at > ?3) AND expires_at > ?3 AND created_at + ?7 > ?3"
 	grantConditions := "FROM oauth_grants g " +
 		"JOIN users u ON u.id = g.user_id AND u.revoked_at IS NULL " +
-		"JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL " +
+		"JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL AND a.sandbox_id IS NULL " +
 		"WHERE g.client_id = ?4 AND g.redirect_uri = ?5 AND g.code_challenge = ?6"
 
 	return append([]wantStatement{
@@ -486,7 +486,7 @@ func TestRefreshStatements(t *testing.T) {
 			// agent live.
 			grantConditions := "FROM oauth_grants g " +
 				"JOIN users u ON u.id = g.user_id AND u.revoked_at IS NULL " +
-				"JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL " +
+				"JOIN agents a ON a.id = g.agent_id AND a.revoked_at IS NULL AND a.sandbox_id IS NULL " +
 				"WHERE g.client_id = ?4"
 			// Every name asked for is a whole name of the grant's scope, between
 			// delimiters, so mcp:read is not found in mcp:readwrite.
@@ -614,9 +614,10 @@ func TestIntrospectAccessToken(t *testing.T) {
 			"AND (s.revoked_at IS NULL OR s.revoked_at > ?3) AND s.expires_at > ?3",
 			// The grant's secret is active too, so revoking a grant ends its token.
 			"AND gs.kind = ?5 AND (gs.revoked_at IS NULL OR gs.revoked_at > ?3) AND gs.expires_at > ?3",
-			// The account and the agent are not revoked, and the grant is for exactly
-			// this resource.
-			"AND u.revoked_at IS NULL AND a.revoked_at IS NULL AND g.resource = ?4",
+			// The account and the agent are not revoked, the agent is in no sandbox
+			// (consent never attaches one), and the grant is for exactly this
+			// resource.
+			"AND u.revoked_at IS NULL AND a.revoked_at IS NULL AND a.sandbox_id IS NULL AND g.resource = ?4",
 		},
 		args: []any{token.Hash(), store.KindOAuthAccess, now.Unix(), resource.ProductionURL, store.KindOAuthGrant},
 	})

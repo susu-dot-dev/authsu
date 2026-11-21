@@ -34,7 +34,8 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_id": "6ae7ad67-1698-45d5-8fc7-df6cff311140",
+			"database_name": "authsu-prod",
+			"database_id": "93eec6a2-6bd4-4c11-950f-7601edf5977c",
 			"migrations_dir": "migrations"
 		}
 	]

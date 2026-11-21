@@ -165,6 +165,55 @@ func TestGrantScopesAreForPeopleNotAgents(t *testing.T) {
 	}
 }
 
+// TestOrganizationScopes: each organization scope exists, is not an admin scope
+// (who may look after an organization is decided in the store's write, with the
+// platform administrator's override), and is held by a login session and a
+// user's own keys but never by default:agent, whatever it grows to hold.
+func TestOrganizationScopes(t *testing.T) {
+	t.Parallel()
+
+	resources := map[string][]string{
+		"org":    {"read", "create", "update", "revoke"},
+		"member": {"read", "update", "revoke"},
+		"offer":  {"read", "create", "update", "revoke"},
+	}
+
+	count := 0
+
+	for resource, verbs := range resources {
+		for _, verb := range verbs {
+			count++
+			name := resource + ":" + verb
+
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				if !scope.Known(name) || !slices.Contains(scope.Scopes(), scope.Scope(name)) {
+					t.Fatalf("%s is not a scope", name)
+				}
+
+				if scope.IsAdmin(scope.Scope(name)) {
+					t.Errorf("%s is an admin scope", name)
+				}
+
+				for bundle, want := range map[string]bool{
+					scope.DefaultSession: true, scope.DefaultUser: true, scope.DefaultAgent: false,
+				} {
+					members, _ := scope.Bundle(bundle)
+
+					if got := slices.Contains(members, scope.Scope(name)); got != want {
+						t.Errorf("%s holds %s = %v, want %v", bundle, name, got, want)
+					}
+				}
+			})
+		}
+	}
+
+	if count != 11 {
+		t.Errorf("%d organization scopes are tested, want 11", count)
+	}
+}
+
 func TestBundlesDoNotContainBundles(t *testing.T) {
 	t.Parallel()
 
@@ -194,6 +243,17 @@ func TestIsAdmin(t *testing.T) {
 		{"key revoke", scope.KeyRevoke, false},
 		{"grant read", scope.GrantRead, false},
 		{"grant revoke", scope.GrantRevoke, false},
+		{"org read", scope.OrgRead, false},
+		{"org create", scope.OrgCreate, false},
+		{"org update", scope.OrgUpdate, false},
+		{"org revoke", scope.OrgRevoke, false},
+		{"member read", scope.MemberRead, false},
+		{"member update", scope.MemberUpdate, false},
+		{"member revoke", scope.MemberRevoke, false},
+		{"offer read", scope.OfferRead, false},
+		{"offer create", scope.OfferCreate, false},
+		{"offer update", scope.OfferUpdate, false},
+		{"offer revoke", scope.OfferRevoke, false},
 		{"unknown scope", "nope:read", false},
 		{"a bundle is not an admin scope", scope.DefaultSession, false},
 		{"empty", "", false},
@@ -221,6 +281,20 @@ func TestKnown(t *testing.T) {
 		{"user:revoke", true},
 		{"grant:read", true},
 		{"grant:revoke", true},
+		{"org:read", true},
+		{"org:create", true},
+		{"org:update", true},
+		{"org:revoke", true},
+		{"member:read", true},
+		{"member:update", true},
+		{"member:revoke", true},
+		{"offer:read", true},
+		{"offer:create", true},
+		{"offer:update", true},
+		{"offer:revoke", true},
+		{"org:delete", false},
+		{"member:create", false},
+		{"orgs:read", false},
 		{"default:user", true},
 		{"default:session", true},
 		{"default:agent", true},

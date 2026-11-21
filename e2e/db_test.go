@@ -166,6 +166,10 @@ const (
 
 	tableOAuthGrants = "oauth_grants"
 	tableOAuthAccess = "oauth_access_tokens"
+
+	tableOrgs      = "orgs"
+	tableOrgAdmins = "org_admins"
+	tableOrgOffers = "org_offers"
 )
 
 // tables are every table a test may leave rows in, in the order that empties
@@ -175,10 +179,16 @@ const (
 // any more. users go before invitations because users.invitation_id has no
 // ON DELETE action. Deleting a session or a key also deletes its secret (a
 // trigger), so by the time secrets is emptied it only removes strays.
+//
+// The organizations sit between the two: offers first (they point at users,
+// invitations and organizations with no ON DELETE action that would clear
+// them), then administrators, then the organizations, which agents (already
+// gone) and users point at. users and orgs point at each other (users.org_id,
+// orgs.created_by), so reset releases every member before it deletes either.
 func tables() []string {
 	return []string{
 		tableOAuthAccess, tableOAuthGrants, tableKeys, tableLabels, tableAgents, tableSessions, tableCredentials,
-		tableUsers, tableInvitations, tableSecrets,
+		tableOrgOffers, tableOrgAdmins, tableOrgs, tableUsers, tableInvitations, tableSecrets,
 	}
 }
 
@@ -186,6 +196,11 @@ func tables() []string {
 // ran before it. This is what makes tests independent of source order.
 func reset(t *testing.T) {
 	t.Helper()
+
+	// A member holds its organization with no ON DELETE action, and the
+	// organization holds its creator the same way: release the members first,
+	// or neither table can be emptied before the other.
+	seed(t, "UPDATE users SET org_id = NULL")
 
 	for _, table := range tables() {
 		seed(t, "DELETE FROM "+table)
