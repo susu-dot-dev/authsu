@@ -567,3 +567,15 @@ func partial[A, B, T any](parse func(A, B) (T, error), first A) func(B) (T, erro
 func withTable[T any](parse func(string, resource.Table) (T, error), table resource.Table) func(string) (T, error) {
 	return func(raw string) (T, error) { return parse(raw, table) }
 }
+
+// loginEntry is the first-party login resource of the production table.
+func loginEntry(t *testing.T) resource.Entry {
+	t.Helper()
+
+	entry, ok := productionTable().Lookup(resource.ProductionLoginURL)
+	if !ok {
+		t.Fatal("the production table has no first-party login resource")
+	}
+
+	return entry
+}

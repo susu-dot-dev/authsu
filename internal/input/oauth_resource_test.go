@@ -1,4 +1,4 @@
-//nolint:goconst // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
+//nolint:goconst,lll,dupword // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
 package input_test
 
 import (
@@ -503,4 +503,174 @@ func requireKnownDistinctNames(t *testing.T, raw string, got input.OAuthScopes, 
 	if got.OpenID() != seen["openid"] {
 		t.Fatalf("OpenID() = %v for %q", got.OpenID(), raw)
 	}
+}
+
+// firstPartyScopeCases is the table of ParseFirstPartyScopes, against the login
+// resource, whose one scope is profile. want is what is stored, and openid
+// whether it asks for an ID token. email is the profile and offline_access is
+// dropped, so neither is ever stored; anything else is as strict as for any
+// resource.
+func firstPartyScopeCases() []scopeCase {
+	return []scopeCase{
+		// Absent: the defaults, written out.
+		{"absent", "", false, true, "profile", false},
+		{"absent, with a value that is ignored", "anything", false, true, "profile", false},
+
+		// Accepted, with the two names read.
+		{"profile", "profile", true, true, "profile", false},
+		{"openid profile", "openid profile", true, true, "openid profile", true},
+		{"the whole OpenID Connect request", "openid email profile offline_access", true, true, "openid profile", true},
+		{"email is the profile", "email", true, true, "profile", false},
+		{"email, kept where it stood", "openid email", true, true, "openid profile", true},
+		{"email then profile is one", "email profile", true, true, "profile", false},
+		{"profile then email is one", "profile email", true, true, "profile", false},
+		{"offline_access is dropped", "profile offline_access", true, true, "profile", false},
+		{"offline_access first", "offline_access openid profile", true, true, "openid profile", true},
+		{"openid alone", "openid", true, true, "openid", true},
+		{"openid and offline_access", "openid offline_access", true, true, "openid", true},
+		{"offline_access alone", "offline_access", true, true, "", false},
+
+		// Refused as for any resource.
+		{"present and empty", "", true, false, "", false},
+		{"a leading space", " profile", true, false, "", false},
+		{"a trailing space", "profile ", true, false, "", false},
+		{"a doubled space", "openid  profile", true, false, "", false},
+		{"a tab", "openid\tprofile", true, false, "", false},
+		{"a comma", "openid,profile", true, false, "", false},
+		{"NUL", "profile\x00", true, false, "", false},
+		{"upper-case profile", "PROFILE", true, false, "", false},
+		{"upper-case email", "Email", true, false, "", false},
+		{"upper-case offline_access", "OFFLINE_ACCESS", true, false, "", false},
+		{"offline-access", "offline-access", true, false, "", false},
+		{"an unknown scope", "openid profile admin", true, false, "", false},
+		{"an MCP scope", "openid profile mcp:read", true, false, "", false},
+		{"an MCP scope with email", "email mcp:write", true, false, "", false},
+		{"an authsu scope", string(scope.UserRead), true, false, "", false},
+		{"address, which is not offered", "openid address", true, false, "", false},
+		{"phone, which is not offered", "phone", true, false, "", false},
+		{"a repeated profile", "profile profile", true, false, "", false},
+		{"a repeated email", "email email", true, false, "", false},
+		{"a repeated offline_access", "offline_access profile offline_access", true, false, "", false},
+		{"a repeated openid", "openid profile openid", true, false, "", false},
+		{"a megabyte", strings.Repeat("profile ", 1<<17), true, false, "", false},
+		{"more names than a request may have", strings.Repeat("a ", input.MaxOAuthScopeEntries) + "profile", true, false, "", false},
+	}
+}
+
+// TestParseFirstPartyScopes: the login resource's scope is read as any
+// resource's, with email read as profile and offline_access dropped. Nothing the
+// resource does not define is stored.
+func TestParseFirstPartyScopes(t *testing.T) {
+	t.Parallel()
+
+	entry := loginEntry(t)
+
+	_, probe := input.ParseFirstPartyScopes("\x00", true, entry)
+	description := descriptionOf(t, probe, input.CodeInvalidOAuthScope)
+
+	for _, tc := range firstPartyScopeCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := input.ParseFirstPartyScopes(tc.in, tc.present, entry)
+			if !tc.ok {
+				requireFixedRefusal(t, err, input.CodeInvalidOAuthScope, description)
+
+				if got.String() != "" || got.OpenID() {
+					t.Errorf("a refused value returned %q", got.String())
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+
+			requireFirstPartyStored(t, tc, got, entry)
+		})
+	}
+}
+
+// requireFirstPartyStored holds what an accepted login scope is stored as: the
+// expected text, neither tolerated name, and a form the strict parser reads back
+// as it is.
+func requireFirstPartyStored(t *testing.T, tc scopeCase, got input.OAuthScopes, entry resource.Entry) {
+	t.Helper()
+
+	if got.String() != tc.want || got.OpenID() != tc.openid ||
+		slices.Contains(got.Names(), input.EmailScope) || slices.Contains(got.Names(), input.OfflineAccessScope) {
+		t.Errorf("String() = %q, OpenID() = %v, want %q, %v and neither email nor offline_access",
+			got.String(), got.OpenID(), tc.want, tc.openid)
+	}
+
+	if got.String() == "" {
+		return
+	}
+
+	again, err := input.ParseOAuthScopes(got.String(), true, entry)
+	if err != nil || again.String() != got.String() {
+		t.Errorf("the stored %q is not read back as it is: %q, %v", got.String(), again.String(), err)
+	}
+}
+
+// TestFirstPartyNamesAreRefusedElsewhere: email and offline_access are the login
+// resource's tolerance alone. The strict parser refuses each, for the login
+// resource and for the MCP resource, and the tolerant one refuses email for an
+// entry with no scope for it to stand for.
+func TestFirstPartyNamesAreRefusedElsewhere(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{"email", "offline_access", "openid email profile offline_access", "profile email"} {
+		for name, entry := range map[string]resource.Entry{"login": loginEntry(t), "mcp": resourceEntry(t)} {
+			t.Run(name+" "+raw, func(t *testing.T) {
+				t.Parallel()
+
+				_, err := input.ParseOAuthScopes(raw, true, entry)
+				requireRefusal(t, err, input.CodeInvalidOAuthScope)
+			})
+		}
+	}
+
+	_, err := input.ParseFirstPartyScopes("email", true, resource.Entry{})
+	requireRefusal(t, err, input.CodeInvalidOAuthScope)
+}
+
+func FuzzParseFirstPartyScopes(f *testing.F) {
+	for _, tc := range firstPartyScopeCases() {
+		f.Add(tc.in)
+	}
+
+	entry, _ := productionTable().Lookup(resource.ProductionLoginURL)
+
+	_, probe := input.ParseFirstPartyScopes("\x00", true, entry)
+	description := probeDescription(probe)
+
+	f.Fuzz(func(t *testing.T, raw string) {
+		got, err := input.ParseFirstPartyScopes(raw, true, entry)
+		if err != nil {
+			requireFixedRefusal(t, err, input.CodeInvalidOAuthScope, description)
+
+			return
+		}
+
+		if len(raw) > input.MaxOAuthScopeBytes {
+			t.Fatalf("accepted %d bytes", len(raw))
+		}
+
+		// Whatever was accepted is stored as only openid and the entry's scope, once
+		// each, and reads back through the strict parser.
+		for _, name := range got.Names() {
+			if name != input.OpenIDScope && !entry.HasScope(name) {
+				t.Fatalf("stored %q from %q", name, raw)
+			}
+		}
+
+		if len(got.Names()) > 0 {
+			again, err := input.ParseOAuthScopes(got.String(), true, entry)
+			if err != nil || again.String() != got.String() {
+				t.Fatalf("the stored %q does not read back: %v", got.String(), err)
+			}
+		}
+	})
 }

@@ -27,24 +27,26 @@ func TestSelect(t *testing.T) {
 				t.Fatalf("Development = %v, want %v", table.Development(), tt.wantDevelopment)
 			}
 
-			wantURL := resource.ProductionURL
+			wantURL, wantLogin := resource.ProductionURL, resource.ProductionLoginURL
 			if tt.wantDevelopment {
-				wantURL = resource.DevelopmentURL
+				wantURL, wantLogin = resource.DevelopmentURL, resource.DevelopmentLoginURL
 			}
 
 			entries := table.Entries()
-			if len(entries) != 1 || entries[0].URL != wantURL {
-				t.Errorf("entries = %+v, want one at %q", entries, wantURL)
+			if len(entries) != 2 || entries[0].URL != wantURL || entries[1].URL != wantLogin {
+				t.Errorf("entries = %+v, want the resource at %q then the login resource at %q", entries, wantURL, wantLogin)
 			}
 
-			// A table never lists the other table's resource.
-			other := resource.DevelopmentURL
+			// A table never lists the other table's resources.
+			others := []string{resource.DevelopmentURL, resource.DevelopmentLoginURL}
 			if tt.wantDevelopment {
-				other = resource.ProductionURL
+				others = []string{resource.ProductionURL, resource.ProductionLoginURL}
 			}
 
-			if _, found := table.Lookup(other); found {
-				t.Errorf("the table also knows %q", other)
+			for _, other := range others {
+				if _, found := table.Lookup(other); found {
+					t.Errorf("the table also knows %q", other)
+				}
 			}
 		})
 	}
@@ -96,33 +98,84 @@ func TestTablesAreWellFormed(t *testing.T) {
 }
 
 // TestTheTablesAreTheSameResource: development differs from production in the
-// URL alone, so what a developer sees is what production does.
+// URLs alone, so what a developer sees is what production does.
 func TestTheTablesAreTheSameResource(t *testing.T) {
 	t.Parallel()
 
 	prod := resource.Select(originProd).Entries()
 	dev := resource.Select(originLocal).Entries()
 
-	if len(prod) != 1 || len(dev) != 1 {
+	if len(prod) != 2 || len(dev) != 2 {
 		t.Fatalf("prod %d entries, dev %d", len(prod), len(dev))
 	}
 
-	if prod[0].URL != "https://api.susu.dev/mcp" || dev[0].URL != "http://localhost:8788/mcp" {
-		t.Errorf("urls = %q, %q", prod[0].URL, dev[0].URL)
+	wantURLs := []string{
+		"https://api.susu.dev/mcp", "http://localhost:8788/mcp", "https://app.susu.dev", "http://localhost:9894",
+	}
+	if got := []string{prod[0].URL, dev[0].URL, prod[1].URL, dev[1].URL}; !slices.Equal(got, wantURLs) {
+		t.Errorf("urls = %q, want %q", got, wantURLs)
 	}
 
 	if resource.DevelopmentPort != 8788 {
 		t.Errorf("DevelopmentPort = %d", resource.DevelopmentPort)
 	}
 
-	dev[0].URL = prod[0].URL
-	if prod[0].Name != dev[0].Name || !slices.Equal(prod[0].Scopes, dev[0].Scopes) ||
-		!slices.Equal(prod[0].Defaults, dev[0].Defaults) {
-		t.Errorf("tables differ beyond the URL: %+v and %+v", prod[0], dev[0])
+	for i := range prod {
+		dev[i].URL = prod[i].URL
+		if !sameEntry(prod[i], dev[i]) {
+			t.Errorf("tables differ beyond the URL: %+v and %+v", prod[i], dev[i])
+		}
+	}
+}
+
+// TestTheTwoResources: the MCP resource defines the two mcp scopes for anyone, and
+// the login resource is first-party and defines only profile.
+func TestTheTwoResources(t *testing.T) {
+	t.Parallel()
+
+	entries := resource.Select(originProd).Entries()
+
+	if !slices.Equal(entries[0].Scopes, []string{scopeRead, scopeWrite}) || entries[0].FirstParty {
+		t.Errorf("the MCP resource = %+v", entries[0])
 	}
 
-	if !slices.Equal(prod[0].Scopes, []string{scopeRead, scopeWrite}) {
-		t.Errorf("scopes = %v", prod[0].Scopes)
+	login := entries[1]
+	if !login.FirstParty || !slices.Equal(login.Scopes, []string{resource.ScopeProfile}) ||
+		!slices.Equal(login.Defaults, []string{resource.ScopeProfile}) || login.HasScope(scopeRead) {
+		t.Errorf("the login resource = %+v", login)
+	}
+}
+
+// sameEntry reports whether two entries are equal.
+func sameEntry(a, b resource.Entry) bool {
+	return a.URL == b.URL && a.Name == b.Name && slices.Equal(a.Scopes, b.Scopes) &&
+		slices.Equal(a.Defaults, b.Defaults) && a.FirstParty == b.FirstParty
+}
+
+// TestTrusted: a client is trusted by the exact client_id of its table and no
+// other spelling, in the table of its deployment only, and the zero table
+// trusts nobody.
+func TestTrusted(t *testing.T) {
+	t.Parallel()
+
+	for name, want := range trustedCases() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			id := want.id
+
+			if got := resource.Select(originProd).Trusted(id); got != want.production {
+				t.Errorf("production: Trusted(%q) = %v, want %v", id, got, want.production)
+			}
+
+			if got := resource.Select(originLocalPort).Trusted(id); got != want.development {
+				t.Errorf("development: Trusted(%q) = %v, want %v", id, got, want.development)
+			}
+
+			if (resource.Table{}).Trusted(id) {
+				t.Errorf("the zero table trusts %q", id)
+			}
+		})
 	}
 }
 

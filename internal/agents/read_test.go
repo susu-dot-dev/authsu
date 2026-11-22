@@ -100,3 +100,33 @@ func TestAnIdThatIsNotAnAgentIdNeverReachesTheStore(t *testing.T) {
 		}
 	}
 }
+
+// firstPartyJSON is agentJSON for an agent authsu created for a first-party
+// login: the body is the same with firstParty true after the labels.
+func firstPartyJSON(id, name string, createdAt int64) string {
+	body := agentJSON(id, name, createdAt, nil)
+
+	return body[:len(body)-1] + `,"firstParty":true}`
+}
+
+// TestFirstPartyAgentIsMarked: an agent authsu created for a first-party login is
+// an ordinary agent in every way but the flag a UI may group or hide it by: it is
+// listed and read by its user with firstParty true, and an agent a user made has
+// no such member.
+func TestFirstPartyAgentIsMarked(t *testing.T) {
+	t.Parallel()
+
+	login := stored(agentA2, "Pages", 200, nil)
+	login.FirstParty = true
+
+	rg := newRig(t)
+	rg.seed(userA, stored(agentA1, nameAlpha, 100, nil), login)
+	cookie := rg.signIn(userA, roleMember)
+
+	wantOK(t, rg, rg.as(cookie, http.MethodGet, itemPrefix+agentA2, ""), http.StatusOK,
+		firstPartyJSON(agentA2, "Pages", 200)+"\n")
+	wantOK(t, rg, rg.as(cookie, http.MethodGet, itemPrefix+agentA1, ""), http.StatusOK,
+		agentJSON(agentA1, nameAlpha, 100, nil)+"\n")
+	wantOK(t, rg, rg.as(cookie, http.MethodGet, collection, ""), http.StatusOK,
+		`{"agents":[`+firstPartyJSON(agentA2, "Pages", 200)+`,`+agentJSON(agentA1, nameAlpha, 100, nil)+`]}`+"\n")
+}

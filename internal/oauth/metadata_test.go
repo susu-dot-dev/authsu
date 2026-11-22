@@ -57,7 +57,8 @@ func openIDMetadata(issuer string, scopes ...string) map[string]any {
 	maps.Copy(doc, map[string]any{
 		"subject_types_supported":               strs("public"),
 		"id_token_signing_alg_values_supported": strs("RS256"),
-		"claims_supported":                      strs("iss", "sub", "aud", "iat", "exp", "auth_time", "nonce"),
+		"claims_supported": strs(
+			"iss", "sub", "aud", "iat", "exp", "auth_time", "nonce", "name", "email", "email_verified"),
 	})
 
 	return doc
@@ -85,7 +86,7 @@ func decodeObject(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 func TestDiscoveryDocuments(t *testing.T) {
 	t.Parallel()
 
-	scopes := []string{"openid", "mcp:read", "mcp:write"}
+	scopes := []string{"openid", "mcp:read", "mcp:write", "profile", "email", "offline_access"}
 
 	tests := map[string]struct {
 		env    map[string]string

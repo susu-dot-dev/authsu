@@ -35,6 +35,17 @@ const (
 // token.
 const OpenIDScope = "openid"
 
+// The two OpenID Connect scope names a first-party client sends that no resource
+// defines. See ParseFirstPartyScopes.
+const (
+	// EmailScope is OpenID Connect's scope for the email claim. authsu has one
+	// profile scope, of which the email is a part, so it is read as that.
+	EmailScope = "email"
+	// OfflineAccessScope is OpenID Connect's request for a refresh token. authsu
+	// issues one with every code exchange, so it asks for nothing more.
+	OfflineAccessScope = "offline_access"
+)
+
 // Error codes of the resource types.
 const (
 	CodeInvalidResource   = "invalid_resource"
@@ -134,8 +145,68 @@ func ParseOAuthScopes(raw string, present bool, entry resource.Entry) (OAuthScop
 	return scopesOf(names), nil
 }
 
-// scopeNames splits raw and reports whether it is a valid list of names.
-func scopeNames(raw string, entry resource.Entry) ([]string, bool) {
+// ParseFirstPartyScopes reads the "scope" parameter of a request for a first-party
+// login resource (resource.Entry.FirstParty), which only a trusted client may
+// make. It is ParseOAuthScopes with the two OpenID Connect names that a
+// resource does not define, EmailScope and OfflineAccessScope, tolerated: a
+// standard OpenID Connect client sends "openid email profile offline_access"
+// without knowing what authsu calls things, and refusing it would refuse the
+// first-party app.
+//
+// The tolerance is as narrow as it can be and widens nothing:
+//   - the list is first checked as ParseOAuthScopes checks it, with the two names
+//     allowed, so everything else about it (the bounds, a repeated name, an
+//     unknown one, a name of another resource such as an MCP scope) is refused as
+//     it would be there;
+//   - the name offline_access is dropped, because it asks for what is always
+//     given;
+//   - the name email is read as the entry's profile scope, so it is neither
+//     stored nor repeated: a list that names both email and profile names profile
+//     once, and the stored list is only names the entry defines, plus openid;
+//   - what is stored is the stored form of the result, so a grant never holds
+//     either name and the schema's bounds are those of ParseOAuthScopes.
+//
+// An absent scope is the entry's defaults, as for ParseOAuthScopes. The caller
+// refuses a list with no name of the entry in it. The first-party scope is a
+// property of the entry and not of the name "profile": the entry's first scope is
+// what email stands for.
+func ParseFirstPartyScopes(raw string, present bool, entry resource.Entry) (OAuthScopes, error) {
+	if !present {
+		return scopesOf(entry.Defaults), nil
+	}
+
+	names, ok := scopeNames(raw, entry, EmailScope, OfflineAccessScope)
+	if !ok || len(entry.Scopes) == 0 {
+		return OAuthScopes{}, refuse(CodeInvalidOAuthScope, descInvalidOAuthScope)
+	}
+
+	kept := make([]string, 0, len(names))
+
+	for _, name := range names {
+		switch name {
+		case OfflineAccessScope:
+		case EmailScope:
+			kept = appendOnce(kept, entry.Scopes[0])
+		default:
+			kept = appendOnce(kept, name)
+		}
+	}
+
+	return scopesOf(kept), nil
+}
+
+// appendOnce appends name unless the list has it.
+func appendOnce(names []string, name string) []string {
+	if slices.Contains(names, name) {
+		return names
+	}
+
+	return append(names, name)
+}
+
+// scopeNames splits raw and reports whether it is a valid list of names: each
+// openid, one the entry defines, or one of tolerated.
+func scopeNames(raw string, entry resource.Entry, tolerated ...string) ([]string, bool) {
 	if raw == "" || len(raw) > MaxOAuthScopeBytes {
 		return nil, false
 	}
@@ -146,7 +217,7 @@ func scopeNames(raw string, entry resource.Entry) ([]string, bool) {
 	}
 
 	for _, name := range names {
-		if name != OpenIDScope && !entry.HasScope(name) {
+		if name != OpenIDScope && !entry.HasScope(name) && !slices.Contains(tolerated, name) {
 			return nil, false
 		}
 	}

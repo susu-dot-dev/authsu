@@ -160,6 +160,13 @@ type Agent struct {
 	// SandboxID is the sandbox the agent is confined to. It is absent for an
 	// ordinary agent.
 	SandboxID *string `json:"sandboxId,omitempty"`
+
+	// FirstParty is true for an agent authsu created for a first-party app's
+	// sign-in, and not the user (docs/agents_design.md). It is for a UI to group
+	// or hide such agents, and it is absent (false) for every other, so an
+	// ordinary agent's body is what it always was. It grants and limits nothing:
+	// the agent is listed, counted and revoked like any other.
+	FirstParty bool `json:"firstParty,omitempty"`
 }
 
 // present is the client's view of a stored agent. Any revoked_at at all
@@ -173,5 +180,6 @@ func present(stored store.Agent) Agent {
 	return Agent{
 		ID: stored.ID, Name: stored.Name, Scopes: scope.Read(stored.Scopes).Claim(), Status: status,
 		RevokedAt: stored.RevokedAt, CreatedAt: stored.CreatedAt, Labels: stored.Labels, SandboxID: stored.SandboxID,
+		FirstParty: stored.FirstParty,
 	}
 }

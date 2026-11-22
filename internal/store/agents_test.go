@@ -46,15 +46,17 @@ const (
 func agentIDAt(n int) string { return fmt.Sprintf("01900000-0000-7000-8000-%012d", n) }
 
 // agentRowAt is a returned agent row: id, name, scopes, revoked_at, created_at,
-// labels (the JSON text of an array, as json_group_array returns it) and
-// sandbox_id (NULL for an ordinary agent).
+// labels (the JSON text of an array, as json_group_array returns it),
+// sandbox_id (NULL for an ordinary agent) and first_party (0 for one a user
+// made).
 func agentRowAt(n int) []any {
-	return row(agentIDAt(n), "agent "+strconv.Itoa(n), `["default:agent"]`, nil, int64(1_700_000_000+n), "[]", nil)
+	return row(agentIDAt(n), "agent "+strconv.Itoa(n), `["default:agent"]`, nil, int64(1_700_000_000+n), "[]", nil,
+		int64(0))
 }
 
 // agentRow is the row of the agent agentTarget.
 func agentRow() []any {
-	return row(agentTarget, "build bot", `["default:agent"]`, nil, int64(1_700_000_000), "[]", nil)
+	return row(agentTarget, "build bot", `["default:agent"]`, nil, int64(1_700_000_000), "[]", nil, int64(0))
 }
 
 // agentRevokedRow is agentRow once it is revoked.
@@ -290,6 +292,10 @@ func agentDecodingCases() []agentDecodingCase {
 			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
 			Labels: []string{}, SandboxID: new(agentSandbox),
 		}},
+		{name: "an agent authsu created for a first-party login", row: with(agentRow(), 7, int64(1)), want: store.Agent{
+			ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: nil, CreatedAt: 1_700_000_000,
+			Labels: []string{}, FirstParty: true,
+		}},
 		{name: "a revoked agent in a sandbox, with labels",
 			row: with(with(agentRevokedRow(), 6, agentSandbox), 5, `["a"]`), want: store.Agent{
 				ID: agentTarget, Name: "build bot", Scopes: `["default:agent"]`, RevokedAt: &revokedAt, CreatedAt: 1_700_000_000,
@@ -328,10 +334,39 @@ func TestAgentDecoding(t *testing.T) {
 func TestAgentDefects(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name string
-		row  []any
-	}{
+	for _, op := range agentReadOps(t) {
+		for _, test := range agentDefectCases() {
+			t.Run(op.name+"/"+test.name, func(t *testing.T) {
+				t.Parallel()
+
+				fake := newFake(op.outcome(test.row))
+
+				got, err := op.call(fake.store())
+
+				checkErr(t, err, defectOf(op.rejected))
+
+				if len(got) > 0 && got[0].ID != "" {
+					t.Errorf("a defective row returned %+v", got)
+				}
+			})
+		}
+	}
+}
+
+// agentDefectCase is a row that is not the agent the statement promises.
+type agentDefectCase struct {
+	name string
+	row  []any
+}
+
+// agentDefectCases are the rows TestAgentDefects reads, by what is wrong with
+// them.
+func agentDefectCases() []agentDefectCase {
+	return []agentDefectCase{
+		{name: "first_party is 2", row: with(agentRow(), 7, int64(2))},
+		{name: "first_party is NULL", row: with(agentRow(), 7, nil)},
+		{name: "first_party is text", row: with(agentRow(), 7, "1")},
+		{name: "first_party is missing", row: agentRow()[:7]},
 		{name: "id is an integer", row: with(agentRow(), 0, int64(1))},
 		{name: "id is NULL", row: with(agentRow(), 0, nil)},
 		{name: "name is NULL", row: with(agentRow(), 1, nil)},
@@ -364,24 +399,6 @@ func TestAgentDefects(t *testing.T) {
 		{name: "the labels column is missing", row: agentRow()[:5]},
 		{name: "a column too many", row: append(agentRow(), "extra")},
 		{name: "an empty row", row: row()},
-	}
-
-	for _, op := range agentReadOps(t) {
-		for _, test := range tests {
-			t.Run(op.name+"/"+test.name, func(t *testing.T) {
-				t.Parallel()
-
-				fake := newFake(op.outcome(test.row))
-
-				got, err := op.call(fake.store())
-
-				checkErr(t, err, defectOf(op.rejected))
-
-				if len(got) > 0 && got[0].ID != "" {
-					t.Errorf("a defective row returned %+v", got)
-				}
-			})
-		}
 	}
 }
 
@@ -666,7 +683,7 @@ func TestGetAgentStatement(t *testing.T) {
 			checkBatch(t, fake, wantStatement{
 				fragments: []string{
 					"SELECT id, name, scopes, revoked_at, created_at,",
-					"sandbox_id FROM agents",
+					"sandbox_id, first_party FROM agents",
 					"WHERE id = ?1 AND user_id = ?2 AND (?3 = 0 OR sandbox_id IS ?4)",
 				},
 				args: []any{agentTarget, agentOwner, test.confined, test.confinedTo},

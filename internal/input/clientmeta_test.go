@@ -632,3 +632,62 @@ func requireDocumentSaysSo(t *testing.T, body []byte) {
 		}
 	}
 }
+
+// clientNameCases are client names at and around the bounds and in the scripts
+// the display rule treats specially.
+func clientNameCases() map[string]string {
+	return map[string]string{
+		"plain":                   "Pages",
+		"one byte":                "P",
+		"at the byte bound":       strings.Repeat("a", input.MaxClientNameBytes),
+		"four-byte runes":         strings.Repeat("🤖", input.MaxClientNameBytes/4),
+		"three-byte runes":        strings.Repeat("ボ", input.MaxClientNameBytes/3),
+		"mixed scripts and emoji": "Pages ボット 🌐 Ünïcode",
+		"an inner no-break space": "Pages\u00a0App",
+		"normalised accents":      "\u00e9 Pages",
+	}
+}
+
+// TestClientNameIsAnAgentName: a first-party login names its agent after the
+// client (oauth.pendingRequest.firstPartyName parses the client's name as an
+// agent's and panics if that is refused), so every client name that is accepted
+// is accepted as an agent name, unchanged. A client name is at most 128 bytes
+// and an agent name at most 256 runes, and the agent rule is the looser display
+// rule, so this holds; the test is what keeps it so when either bound moves.
+func TestClientNameIsAnAgentName(t *testing.T) {
+	t.Parallel()
+
+	for name, raw := range clientNameCases() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			client, err := input.ParseClientName(raw)
+			if err != nil {
+				t.Fatalf("ParseClientName(%q) = %v, want it accepted", raw, err)
+			}
+
+			agent, err := input.ParseAgentName(client.String())
+			if err != nil || agent.String() != raw {
+				t.Errorf("ParseAgentName(%q) = %q, %v, want it unchanged", raw, agent.String(), err)
+			}
+		})
+	}
+}
+
+func FuzzClientNameIsAnAgentName(f *testing.F) {
+	for _, raw := range clientNameCases() {
+		f.Add(raw)
+	}
+
+	f.Fuzz(func(t *testing.T, raw string) {
+		client, err := input.ParseClientName(raw)
+		if err != nil {
+			return
+		}
+
+		agent, err := input.ParseAgentName(client.String())
+		if err != nil || agent.String() != raw {
+			t.Fatalf("client name %q is not an agent name: %q, %v", raw, agent.String(), err)
+		}
+	})
+}

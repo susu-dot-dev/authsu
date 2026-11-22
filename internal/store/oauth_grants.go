@@ -70,6 +70,10 @@ var (
 	ErrSessionInactive = errors.New("the approving session is no longer active")
 )
 
+// FirstPartyAgentScopes is the scope list of the agent a first-party login
+// creates: empty, as for any agent consent creates (GrantAgentScopes).
+const FirstPartyAgentScopes = GrantAgentScopes
+
 // GrantAgent is an agent that consent creates for a grant.
 type GrantAgent struct {
 	// Name is the label the user gave it.
@@ -95,6 +99,16 @@ type NewGrant struct {
 	// the id of the agent to create, a fresh UUIDv7 (GrantAgentScopes, none).
 	AgentID  string
 	NewAgent *GrantAgent
+
+	// FirstParty is set for a first-party login (resource.Entry.FirstParty), where
+	// nobody chooses an agent: the grant is held by the agent authsu keeps for
+	// this owner and ClientID (agents.first_party_client), which the write creates
+	// under AgentID with the name FirstPartyName if the owner has none, and
+	// otherwise finds. It is an ordinary agent, flagged first_party, so it is
+	// listed, counted against the limit and revocable. NewAgent must be nil.
+	FirstParty          bool
+	FirstPartyName      input.AgentName
+	FirstPartyMaxActive int
 
 	// What the user approved, stored on the grant as it is: the client, the name
 	// its metadata document gave it, the redirect URI, the resource, the scopes
@@ -158,7 +172,11 @@ type NewGrant struct {
 //     cannot attach one (the agent reads as unavailable, as a revoked one
 //     does). For an agent created in this batch the subselect finds it; when
 //     the agent insert matched nothing (the account was revoked, or the user
-//     was at the limit) it is NULL;
+//     was at the limit) it is NULL. For a first-party login (?16 is 1) it is the
+//     owner's agent for this client (first_party_client), which must be active:
+//     the agent ?4 would name is not used, so a first-party login cannot attach
+//     to any agent the user chose. A revoked first-party agent is not it: the
+//     agent insert of the same batch creates a fresh one in its place;
 //   - auth_time is the created_at of the approving session's secret, which must
 //     be that user's session and active at ?14. It is never taken from the
 //     request.
@@ -175,22 +193,55 @@ type NewGrant struct {
 // Arguments, by number: ?1 grant id, ?2 kind, ?3 user id, ?4 agent id, ?5
 // client_id, ?6 client_name, ?7 redirect_uri, ?8 resource, ?9 scope, ?10
 // code_challenge, ?11 nonce (NULL for none), ?12 the session's secret id, ?13
-// the session kind, ?14 now (unix seconds), ?15 granted_from.
+// the session kind, ?14 now (unix seconds), ?15 granted_from, ?16 whether the
+// grant is a first-party login's (1), held by the owner's agent for ?5, or not
+// (0), held by the agent ?4 names.
 const insertGrantQuery = `
 INSERT INTO oauth_grants (id, kind, user_id, agent_id, client_id, client_name, redirect_uri, resource, scope,
                           code_challenge, nonce, auth_time, granted_from)
 VALUES (?1, ?2,
         (SELECT u.id FROM users u WHERE u.id = ?3 AND u.revoked_at IS NULL),
-        (SELECT a.id FROM agents a WHERE a.id = ?4 AND a.user_id = ?3 AND a.revoked_at IS NULL
-                                         AND a.sandbox_id IS NULL),
+        (SELECT a.id FROM agents a WHERE a.user_id = ?3 AND a.revoked_at IS NULL AND a.sandbox_id IS NULL
+                                         AND ((?16 = 0 AND a.id = ?4)
+                                              OR (?16 = 1 AND a.first_party_client = ?5))),
         ?5, ?6, ?7, ?8, ?9, ?10, ?11,
         (SELECT s.created_at FROM secrets s JOIN sessions x ON x.id = s.id AND x.kind = s.kind
          WHERE s.id = ?12 AND s.kind = ?13 AND x.user_id = ?3
            AND (s.revoked_at IS NULL OR s.revoked_at > ?14) AND s.expires_at > ?14),
         ?15)`
 
+// insertFirstPartyAgentQuery creates the agent of a first-party login if the
+// owner has none for this client, in the batch of its consent and before the
+// grant. It is insertAgentQuery with the first_party columns and the same
+// conditions: the owner is active and has room (ownerHasRoomForAgent), so the
+// agent counts against the limit as any does. The unique index
+// (user_id, first_party_client) and ON CONFLICT DO NOTHING make the first login
+// create it and a later one, or one racing it, find it.
+//
+// A user who already has the agent can sign in again at the limit: the room
+// condition is waived when an active one exists, because nothing is added. A
+// revoked agent does not count as existing: the unique index covers active agents
+// only (migrations/0002_agent_first_party.sql), so after the user revokes it the
+// next login creates a fresh agent, which needs room as any new one does. A user
+// at the limit who has none gets no row, the grant's agent_id is NULL, and the
+// batch fails as the limit, as for a consent that creates an agent.
+//
+// Arguments, by number: ?1 id, ?2 name, ?3 scopes, ?4 created_at, ?5 user id, ?6
+// the maximum active agents a user may have, ?7 the client_id.
+const insertFirstPartyAgentQuery = `
+INSERT INTO agents (id, user_id, name, scopes, created_at, first_party, first_party_client)
+SELECT ?1, u.id, ?2, ?3, ?4, 1, ?7
+FROM users u
+WHERE u.id = ?5
+  AND u.revoked_at IS NULL
+  AND (EXISTS (SELECT 1 FROM agents f WHERE f.user_id = u.id AND f.first_party_client = ?7
+                      AND f.revoked_at IS NULL)
+       OR ` + ownerHasRoomForAgent + `)
+ON CONFLICT DO NOTHING`
+
 // CreateGrant writes a grant for an approved request as one batch: the agent
-// when the user chose to create one, the secret of the authorization code, and
+// when the user chose to create one (for a first-party login, the agent authsu
+// keeps for the client, created if the owner has none), the secret of the authorization code, and
 // the grant's own row. Either all of them exist or none does.
 //
 // It returns one of the refusals above, wrapping the database's error for the
@@ -223,10 +274,22 @@ func (s *Store) CreateGrant(ctx context.Context, grant NewGrant) error {
 
 	statements := make([]Statement, 0, maxGrantStatements)
 
-	if grant.NewAgent != nil {
+	switch {
+	case grant.FirstParty:
+		statements = append(statements,
+			Statement{Query: insertFirstPartyAgentQuery, Args: []any{
+				grant.AgentID, grant.FirstPartyName.String(), FirstPartyAgentScopes, created, grant.Owner,
+				int64(grant.FirstPartyMaxActive), grant.ClientID.String(),
+			}})
+	case grant.NewAgent != nil:
 		statements = append(statements, agentInsert(
 			grant.AgentID, grant.NewAgent.Name.String(), GrantAgentScopes, created, grant.Owner,
 			grant.NewAgent.MaxActive, ""))
+	}
+
+	firstParty := int64(0)
+	if grant.FirstParty {
+		firstParty = 1
 	}
 
 	statements = append(statements,
@@ -234,37 +297,45 @@ func (s *Store) CreateGrant(ctx context.Context, grant NewGrant) error {
 		Statement{Query: insertGrantQuery, Args: []any{
 			grant.ID, KindOAuthGrant, grant.Owner, grant.AgentID, grant.ClientID.String(), grant.ClientName,
 			grant.RedirectURI.String(), grant.Resource.String(), grant.Scope.String(), grant.CodeChallenge.String(),
-			nonce, grant.SessionID, KindSession, created, grant.GrantedFrom,
+			nonce, grant.SessionID, KindSession, created, grant.GrantedFrom, firstParty,
 		}},
 	)
 
 	_, err := s.run(ctx, o, statements...)
 
-	return refuseGrant(err, grant.NewAgent != nil)
+	return refuseGrant(err, grant.NewAgent != nil || grant.FirstParty)
 }
 
 // refuseGrant names the refusal a failed CreateGrant batch is: see CreateGrant.
-// newAgent says whether the batch created an agent, which is what a missing
-// agent_id means.
+// newAgent says whether the batch could create an agent (a chosen new one, or a
+// first-party login's), which is what a missing agent_id means.
 func refuseGrant(err error, newAgent bool) error {
-	switch {
-	case err == nil:
-		return nil
-	case !errors.Is(err, ErrConflict):
-		return err
-	case failedOn(err, "oauth_grants.user_id"):
-		return fmt.Errorf("%w: %w", ErrUserInactive, err)
-	case failedOn(err, "oauth_grants.agent_id") && newAgent:
-		return fmt.Errorf("%w: %w", ErrAgentLimit, err)
-	case failedOn(err, "oauth_grants.agent_id"):
-		return fmt.Errorf("%w: %w", ErrAgentUnavailable, err)
-	case failedOn(err, "oauth_grants.auth_time"):
-		return fmt.Errorf("%w: %w", ErrSessionInactive, err)
-	case failedOn(err, "oauth_grants.granted_from"):
-		return fmt.Errorf("%w: %w", ErrGrantReplayed, err)
-	default:
+	if err == nil || !errors.Is(err, ErrConflict) {
 		return err
 	}
+
+	// The first that names its column is the one reported, in the order the
+	// database checks them (user_id first).
+	agentID := ErrAgentUnavailable
+	if newAgent {
+		agentID = ErrAgentLimit
+	}
+
+	for _, refusal := range []struct {
+		column string
+		is     error
+	}{
+		{"oauth_grants.user_id", ErrUserInactive},
+		{"oauth_grants.agent_id", agentID},
+		{"oauth_grants.auth_time", ErrSessionInactive},
+		{"oauth_grants.granted_from", ErrGrantReplayed},
+	} {
+		if failedOn(err, refusal.column) {
+			return fmt.Errorf("%w: %w", refusal.is, err)
+		}
+	}
+
+	return err
 }
 
 // failedOn reports whether the database's error text names the column

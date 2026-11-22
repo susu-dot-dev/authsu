@@ -52,7 +52,8 @@ type answer struct {
 
 	// newAgent is the name of the agent to create, or nil; agentID is the id of
 	// the agent to attach to, or nil. An approval has exactly one of the two, and
-	// a refusal neither.
+	// a refusal neither, and neither does the approval of a first-party login:
+	// authsu keeps the agent for that.
 	newAgent *input.AgentName
 	agentID  *input.ID
 }
@@ -63,24 +64,29 @@ var (
 	errRefusalAgent    = errors.New("a refusal names an agent")
 	errNoAgentChoice   = errors.New("an approval names neither a new agent nor an existing one")
 	errBothAgentChoice = errors.New("an approval names both a new agent and an existing one")
+	errLoginAgent      = errors.New("a first-party login names an agent")
 )
 
 // invalidConsent is the 400 for a body that is not an answer.
 func invalidConsent(cause error) *apierr.Error {
 	return apierr.New(apierr.BadRequest, CodeInvalidConsent,
-		"the body must say approve, and an approval must choose one agent: a new one or an existing one").
+		"the body must say approve, and an approval must choose one agent (a new one or an existing one), "+
+			"except a first-party login, which must choose none").
 		WithCause(cause)
 }
 
-// parseAnswer parses what the user chose. The rules are strict, because this is
-// what authorizes:
+// parseAnswer parses what the user chose, before the pending request is read.
+// The rules are strict, because this is what authorizes:
 //
 //   - approve must be present and a boolean (the decoder refuses another type
 //     and an unknown member);
 //   - a refusal must not name an agent, because there is nothing for an agent to
 //     hold, and a client that sends one has misunderstood the call;
-//   - an approval must name exactly one of agent.new (a name) and agent.id (an
-//     id), parsed as an agent's name and as an id.
+//   - an approval that names an agent must name exactly one of agent.new (a
+//     name) and agent.id (an id), parsed as an agent's name and as an id. An
+//     approval that names none is parsed as such, and is only acceptable for a
+//     first-party login: which kind it is belongs to the pending request, so it
+//     is decided by chooseAgent once the request is open.
 func parseAnswer(body consentBody) result.Result[answer] {
 	switch {
 	case body.Approve == nil:
@@ -89,13 +95,36 @@ func parseAnswer(body consentBody) result.Result[answer] {
 		return result.Fail[answer](invalidConsent(errRefusalAgent))
 	case !*body.Approve:
 		return result.Ok(answer{approve: false})
-	case body.Agent == nil || (body.Agent.New == nil && body.Agent.ID == nil):
+	case body.Agent == nil:
+		return result.Ok(answer{approve: true})
+	case body.Agent.New == nil && body.Agent.ID == nil:
 		return result.Fail[answer](invalidConsent(errNoAgentChoice))
 	case body.Agent.New != nil && body.Agent.ID != nil:
 		return result.Fail[answer](invalidConsent(errBothAgentChoice))
 	}
 
 	return parseAgent(*body.Agent)
+}
+
+// chooseAgent holds an answer to what the opened request needs, which only the
+// request can say. An approval of a first-party login has no agent to choose, so
+// it must name none: authsu keeps the agent for it, and a first-party login
+// cannot be attached to an agent the user has. An approval of any other request
+// must have chosen one. A refusal needs nothing. The request, never the body,
+// says which kind it is.
+func chooseAgent(chosen answer, firstParty bool) error {
+	hasAgent := chosen.newAgent != nil || chosen.agentID != nil
+
+	switch {
+	case !chosen.approve:
+		return nil
+	case firstParty && hasAgent:
+		return invalidConsent(errLoginAgent)
+	case !firstParty && !hasAgent:
+		return invalidConsent(errNoAgentChoice)
+	default:
+		return nil
+	}
 }
 
 // parseAgent parses the one agent an approval chose.
@@ -142,11 +171,13 @@ func (d Deps) consent(call *auth.Call) result.Result[httpapi.Response] {
 		})
 }
 
-// respond opens the pending request and answers it as chosen.
+// respond opens the pending request and answers it as chosen, after holding the
+// choice to what the request needs (chooseAgent).
 func (d Deps) respond(call *auth.Call, raw string, chosen answer, now time.Time) result.Result[httpapi.Response] {
 	return result.Of(call.Config()).
 		Then(func(cfg config.Config) (httpapi.Response, error) {
 			return d.open(cfg, raw, now).
+				Check(func(pending opened) error { return chooseAgent(chosen, pending.request.firstPartyLogin()) }).
 				Then(func(pending opened) (ConsentResponse, error) {
 					return d.settle(call, cfg, pending, chosen, now).Get()
 				}).
@@ -220,10 +251,18 @@ func (d Deps) newGrant(call *auth.Call, pending opened, chosen answer, code auth
 		CodeHash: code.Hash, RetainUntil: now.Add(PendingLifetime), CreatedAt: now,
 	}
 
-	if chosen.newAgent != nil {
+	switch {
+	case request.firstPartyLogin():
+		// Authsu keeps one agent for the user and this client, named after the
+		// client, which the write creates the first time and finds after.
+		grant.AgentID = d.NewID()
+		grant.FirstParty = true
+		grant.FirstPartyName = request.firstPartyName()
+		grant.FirstPartyMaxActive = d.MaxAgents
+	case chosen.newAgent != nil:
 		grant.AgentID = d.NewID()
 		grant.NewAgent = &store.GrantAgent{Name: *chosen.newAgent, MaxActive: d.MaxAgents}
-	} else {
+	default:
 		grant.AgentID = chosen.agentID.String()
 	}
 

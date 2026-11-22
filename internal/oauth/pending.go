@@ -3,6 +3,7 @@ package oauth
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -136,6 +137,45 @@ func (w pendingWire) checkBookkeeping() error {
 	}
 }
 
+// parseScopes reads a scope against the entry it is for: the first-party login
+// entry tolerates what a standard OpenID Connect client sends (see
+// input.ParseFirstPartyScopes), every other is read strictly.
+func parseScopes(raw string, present bool, entry resource.Entry) (input.OAuthScopes, error) {
+	parse := input.ParseOAuthScopes
+	if entry.FirstParty {
+		parse = input.ParseFirstPartyScopes
+	}
+
+	scopes, err := parse(raw, present, entry)
+	if err != nil {
+		return input.OAuthScopes{}, fmt.Errorf("scope: %w", err)
+	}
+
+	return scopes, nil
+}
+
+// firstPartyLogin reports whether the request is a first-party login: it is for
+// a first-party login resource, which only a trusted client can have asked for
+// (admit). Its consent needs no screen and no agent: the grant is held by the
+// agent authsu keeps for this user and client (store.NewGrant.FirstParty), not
+// one the person chose.
+func (p pendingRequest) firstPartyLogin() bool {
+	return p.resource.Entry().FirstParty
+}
+
+// firstPartyName is the name of the agent a first-party login creates: the name
+// the client's own document gave itself, which is already bounded and has already
+// passed ClientName's stricter rules, so it is always a valid AgentName.
+func (p pendingRequest) firstPartyName() input.AgentName {
+	name, err := input.ParseAgentName(p.clientName.String())
+	// coverage:ignore: a client name is at most 128 bytes of text AgentName also accepts
+	if err != nil {
+		panic("oauth: a client name is not an agent name: " + err.Error())
+	}
+
+	return name
+}
+
 // requireResourceScope refuses a scope that names nothing of the resource, as the
 // authorization endpoint does: such a request is never sealed, so one that is
 // read back is not one of ours.
@@ -165,11 +205,15 @@ func (w pendingWire) parse(table resource.Table) result.Result[pendingRequest] {
 	state, stateErr := optional(w.State, input.ParseState)
 	nonce, nonceErr := optional(w.Nonce, input.ParseNonce)
 	target, targetErr := input.ParseResourceID(w.Resource, table)
-	scopes, scopeErr := input.ParseOAuthScopes(w.Scope, true, target.Entry())
+	scopes, scopeErr := parseScopes(w.Scope, true, target.Entry())
 
+	// The sealed value is read back as untrusted as any other, so the rule that a
+	// first-party login is for a trusted client is applied again here, against
+	// the table of now: a value sealed before a client stopped being trusted, or
+	// one forged for a first-party resource with another client's id, is refused.
 	err := errors.Join(
 		idErr, nameErr, redirectErr, codeErr, stateErr, nonceErr, targetErr, scopeErr,
-		requireResourceScope(scopes), w.checkBookkeeping())
+		requireResourceScope(scopes), w.checkBookkeeping(), admitSealed(table, clientID, target, idErr, targetErr))
 	if err != nil {
 		return result.Fail[pendingRequest](invalidPending(err))
 	}
@@ -178,6 +222,17 @@ func (w pendingWire) parse(table resource.Table) result.Result[pendingRequest] {
 		clientID: clientID, clientName: name, redirectURI: redirectURI, challenge: code,
 		state: state, nonce: nonce, resource: target, scope: scopes, expiresAt: w.ExpiresAt,
 	})
+}
+
+// admitSealed applies admit to what a sealed value holds, when both parsed. A
+// member that did not parse is already an error of its own, joined with this one
+// by the caller, so there is nothing more to say about it here.
+func admitSealed(table resource.Table, client input.ClientID, target input.ResourceID, idErr, targetErr error) error {
+	if errors.Join(idErr, targetErr) != nil {
+		return errors.Join(idErr, targetErr)
+	}
+
+	return admit(table, client, target)
 }
 
 // invalidPending is the 400 for a pending request that cannot be used.

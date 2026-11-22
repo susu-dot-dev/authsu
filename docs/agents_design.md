@@ -56,6 +56,8 @@ An agent has a stable identity and any number of credentials that let it act:
 - **API keys scoped to the agent**, which are [secrets](secrets_design.md) like every other credential.
 - **OAuth grants**, for agents that live in other services and fit a standard authorization flow better than a pasted key. Every grant binds to an agent, and how a person's consent creates or picks that agent is in [oauth_design.md](oauth_design.md#grants-belong-to-agents).
 
+An agent can also be created by authsu rather than the user, for a first-party app's sign-in, where there is no screen to choose one on ([oauth_design.md](oauth_design.md#first-party-login)). It is still an agent of the user in every way, and is only marked so that a UI can tell it from the ones the user made.
+
 As with invitations, the credential is not the identity. A key can be rotated or revoked without touching the agent. Revoking the agent ends all of its credentials, and the audit trail names a stable agent rather than whichever credential was in use.
 
 ## Subject and actor

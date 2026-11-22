@@ -21,6 +21,7 @@ var (
 	errMissingParameter = errors.New("a required parameter is missing")
 	errNotRegistered    = errors.New("the client's document does not register the redirect URI")
 	errNoResourceScope  = errors.New("the scope names no scope of the resource")
+	errNotTrusted       = errors.New("the resource is a first-party login and the client is not a trusted one")
 )
 
 // trusted is a client and a redirect URI that the client's own document
@@ -78,8 +79,13 @@ func (d Deps) authorizeWith(call *auth.Call, cfg config.Config) httpapi.Response
 
 	state := echoable(call.Request)
 
-	text, err := d.parseRequest(call.Request, table, vouched).
-		Then(func(request pendingRequest) (string, error) { return d.seal(cfg, request, d.Now()).Get() }).
+	location, err := d.parseRequest(call.Request, table, vouched).
+		Then(func(request pendingRequest) (string, error) {
+			return d.seal(cfg, request, d.Now()).
+				Map(func(text string) string {
+					return uiPage(cfg, uiPathFor(request), url.Values{"request": {text}})
+				}).Get()
+		}).
 		Get()
 	if err != nil {
 		d.Log(call.Request, apierr.As(err))
@@ -87,7 +93,18 @@ func (d Deps) authorizeWith(call *auth.Call, cfg config.Config) httpapi.Response
 		return redirect(errorURL(cfg, vouched.redirect, state, oauthCode(err)))
 	}
 
-	return redirect(uiPage(cfg, uiConsentPath, url.Values{"request": {text}}))
+	return redirect(location)
+}
+
+// uiPathFor is the page of the UI a request is sent to: the consent screen, or
+// for a first-party login, which has nothing to approve, the page that only
+// signs the person in.
+func uiPathFor(request pendingRequest) string {
+	if request.firstPartyLogin() {
+		return uiLoginPath
+	}
+
+	return uiConsentPath
 }
 
 // errorURL is where the browser is sent for an error after the redirect URI is
@@ -308,10 +325,16 @@ func withNonce(params httpapi.Params, req pendingRequest) result.Result[pendingR
 // the table, even while the table has one entry, so a client that does not say
 // which resource it wants is found out now and not when a second is added. Both
 // a missing and an unknown resource are invalid_target.
+//
+// A first-party login resource (resource.Entry.FirstParty) may be named only by a
+// trusted client (resource.Table.Trusted), and is refused as invalid_target to any
+// other, exactly as an unknown resource is, so a stranger cannot tell the
+// resource exists.
 func withResource(table resource.Table) func(httpapi.Params, pendingRequest) result.Result[pendingRequest] {
 	return func(params httpapi.Params, req pendingRequest) result.Result[pendingRequest] {
 		return required(params, "resource").
 			Then(func(raw string) (input.ResourceID, error) { return input.ParseResourceID(raw, table) }).
+			Check(func(target input.ResourceID) error { return admit(table, req.clientID, target) }).
 			MapErr(refusing(oauthInvalidTarget)).
 			Map(func(target input.ResourceID) pendingRequest {
 				req.resource = target
@@ -321,15 +344,30 @@ func withResource(table resource.Table) func(httpapi.Params, pendingRequest) res
 	}
 }
 
+// admit refuses a first-party login resource to a client that is not trusted.
+func admit(table resource.Table, client input.ClientID, target input.ResourceID) error {
+	if target.Entry().FirstParty && !table.Trusted(client.String()) {
+		return errNotTrusted
+	}
+
+	return nil
+}
+
 // withScope reads the scope against the resource's. An absent scope is the
 // resource's defaults, written out. A scope that names no scope of the resource
 // (only openid) is refused: an ID token grants nothing, and a grant is the
 // delegation of access to a resource, which the user approves for an agent, so a
 // request with nothing to delegate has nothing to approve.
+//
+// For a first-party login resource the scope is read as
+// input.ParseFirstPartyScopes does, which also tolerates the OpenID Connect
+// names email and offline_access (see there). That is decided by the resource,
+// which only a trusted client can have reached (withResource), never by the
+// client's own claim.
 func withScope(params httpapi.Params, req pendingRequest) result.Result[pendingRequest] {
 	raw, present := params.Get("scope")
 
-	return result.Of(input.ParseOAuthScopes(raw, present, req.resource.Entry())).
+	return result.Of(parseScopes(raw, present, req.resource.Entry())).
 		Check(requireResourceScope).
 		MapErr(refusing(oauthInvalidScope)).
 		Map(func(scope input.OAuthScopes) pendingRequest {

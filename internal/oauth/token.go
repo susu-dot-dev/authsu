@@ -1,8 +1,10 @@
 package oauth
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/auth"
@@ -39,8 +41,10 @@ type TokenResponse struct {
 
 // idClaims are the claims of the ID token (OpenID Connect Core section 2): the
 // issuer, the user's id as subject, the client as audience, the issue and expiry
-// times, when the user signed in, and the nonce the client sent, if it did. Every
-// number is an integer of seconds, which jws.Sign holds to 2^53-1.
+// times, when the user signed in, and the nonce the client sent, if it did. For a
+// grant of a first-party login resource that holds its profile scope the user's
+// name and email are added, with email_verified false. Every number is an integer of seconds, which
+// jws.Sign holds to 2^53-1.
 type idClaims struct {
 	Issuer   string  `json:"iss"`
 	Subject  string  `json:"sub"`
@@ -49,6 +53,17 @@ type idClaims struct {
 	Expires  int64   `json:"exp"`
 	AuthTime int64   `json:"auth_time"` //nolint:tagliatelle // OpenID Connect Core section 2 names this claim
 	Nonce    *string `json:"nonce,omitempty"`
+
+	// Name, Email and EmailVerified are the profile claims (OpenID Connect Core
+	// section 5.1), present only when the grant holds the first-party profile
+	// scope. Name and Email are read from the user's stored profile. authsu does
+	// not verify an email address, so EmailVerified is always false when it is
+	// sent: it is a pointer so that false is written and not omitted, and the
+	// relying party is told outright that the address is unverified.
+	Name  *string `json:"name,omitempty"`
+	Email *string `json:"email,omitempty"`
+	//nolint:tagliatelle // OpenID Connect Core section 5.1 names this claim
+	EmailVerified *bool `json:"email_verified,omitempty"`
 }
 
 // Why a token request was refused, for the log.
@@ -374,27 +389,92 @@ func (d Deps) redeem(tc tokenCall, req codeRequest, key config.SigningKey) resul
 // server_error.
 func (d Deps) identify(tc tokenCall, key config.SigningKey, grant store.Exchanged) result.Result[string] {
 	return result.Of(input.ParseResourceID(grant.Resource, d.table(tc.cfg))).
-		Then(func(target input.ResourceID) (input.OAuthScopes, error) {
-			return input.ParseOAuthScopes(grant.Scope, true, target.Entry())
+		Then(func(target input.ResourceID) (identified, error) {
+			scopes, err := parseScopes(grant.Scope, true, target.Entry())
+
+			return identified{target: target, scopes: scopes}, err
 		}).
 		MapErr(refusing(oauthServerError)).
-		Then(func(scopes input.OAuthScopes) (string, error) {
+		Then(func(found identified) (string, error) {
+			target, scopes := found.target, found.scopes
+
 			if !scopes.OpenID() {
 				return "", nil
 			}
 
-			return signIDToken(tc, key, grant).Get()
+			return signIDToken(tc, key, grant, profileOf(target, scopes, grant)).Get()
 		})
+}
+
+// identified is a grant's resource and scope, parsed back from what is stored.
+type identified struct {
+	target input.ResourceID
+	scopes input.OAuthScopes
+}
+
+// profileClaims are the profile claims of an ID token.
+type profileClaims struct {
+	name, email *string
+}
+
+// storedProfile is users.profile as registration writes it (store.profile): the
+// name and the email the person gave, each kept raw so that one member of the
+// wrong type is left out without costing the other.
+type storedProfile struct {
+	Name  json.RawMessage `json:"name"`
+	Email json.RawMessage `json:"email"`
+}
+
+// text reads a profile member as a string, or nil when it is absent, is JSON
+// null or is not a string: a null decodes to "" without an error, which would
+// otherwise be sent as an empty claim.
+func text(raw json.RawMessage) *string {
+	var value *string
+
+	err := json.Unmarshal(raw, &value)
+	if err != nil {
+		return nil
+	}
+
+	return value
+}
+
+// profileOf is the profile claims for a grant, or nil when it gets none: only a
+// grant of a first-party login resource that holds that resource's scope gets
+// them, so the claims are never added for a client that did not ask for the
+// profile and was not trusted with it (withResource refuses a first-party
+// resource to any other). A stored profile that does not decode is no profile:
+// the token is issued without the claims and the sign-in is not failed for it.
+func profileOf(target input.ResourceID, scopes input.OAuthScopes, grant store.Exchanged) *profileClaims {
+	entry := target.Entry()
+	if !entry.FirstParty || !slices.Contains(scopes.Resource(), entry.Scopes[0]) {
+		return nil
+	}
+
+	var stored storedProfile
+
+	// An object that does not decode leaves both members empty, and so absent.
+	_ = json.Unmarshal([]byte(grant.Profile), &stored)
+
+	return &profileClaims{name: text(stored.Name), email: text(stored.Email)}
 }
 
 // signIDToken signs the ID token of a grant: see idClaims. It is issued at the
 // exchange only, with the sign-in time the grant recorded at consent and the
-// nonce the client sent at authorization.
-func signIDToken(tc tokenCall, key config.SigningKey, grant store.Exchanged) result.Result[string] {
+// nonce the client sent at authorization, and the profile claims if profile is
+// not nil.
+func signIDToken(
+	tc tokenCall, key config.SigningKey, grant store.Exchanged, profile *profileClaims,
+) result.Result[string] {
 	claims := idClaims{
 		Issuer: tc.cfg.API.String, Subject: grant.UserID, Audience: grant.ClientID,
 		IssuedAt: tc.now.Unix(), Expires: tc.now.Add(IDTokenLifetime).Unix(), AuthTime: grant.AuthTime.Unix(),
 		Nonce: grant.Nonce,
+	}
+
+	if profile != nil {
+		unverified := false
+		claims.Name, claims.Email, claims.EmailVerified = profile.name, profile.email, &unverified
 	}
 
 	return result.Of(jws.Sign(key.Private(), key.KeyID(), claims)).MapErr(refusing(oauthServerError))
