@@ -37,11 +37,11 @@ type beginBody struct {
 	// InvitationToken is the invitation token. The member keeps its name,
 	// invitationCode, as the clients know it.
 	InvitationToken string `json:"invitationCode"`
-	// Name is the account name. It is also the display name: one value, so
-	// the user types it once.
+	// Name is the account name. It is the passkey's display name; the passkey's
+	// username is the email address.
 	Name string `json:"name"`
-	// Email is the account's email address. It is not part of the creation
-	// options: begin takes it so a malformed one is refused before the user's
+	// Email is the account's email address. It is the passkey's username in the
+	// creation options. begin also refuses a malformed one before the user's
 	// biometric prompt, and binds it so finish cannot be given another.
 	Email string `json:"email"`
 }
@@ -173,11 +173,14 @@ func (h *handlers) options(cfg config.Config, cmd ceremony, now time.Time) (crea
 		return creationOptions{}, apierr.Wrap(err, apierr.Internal, CodeChallengeFailed, "could not start registration")
 	}
 
-	name := cmd.name.String()
+	// The passkey's username is the email address, which is what a passkey manager lists
+	// the account under. The display name is the person's name.
+	username := cmd.email.String()
+	displayName := cmd.name.String()
 
 	return creationOptions{PublicKey: publicKeyOptions{
 		RP:        rpEntity{ID: cfg.RP.ID, Name: cfg.RPName},
-		User:      userEntity{ID: b64(handle), Name: name, DisplayName: name},
+		User:      userEntity{ID: b64(handle), Name: username, DisplayName: displayName},
 		Challenge: b64(issued),
 		// -7 is ES256, the only algorithm the verifier accepts.
 		PubKeyCredParams: []credParam{{Type: publicKeyCredentialType, Alg: algES256}},

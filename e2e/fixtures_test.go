@@ -299,8 +299,9 @@ type creationOptions struct {
 			ID string `json:"id"`
 		} `json:"rp"`
 		User struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
 		} `json:"user"`
 		Challenge        string `json:"challenge"`
 		PubKeyCredParams []struct {

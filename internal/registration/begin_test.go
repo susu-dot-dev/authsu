@@ -36,7 +36,7 @@ func TestBeginSucceeds(t *testing.T) {
 	}
 
 	want := fmt.Sprintf(`{"publicKey":{"rp":{"id":"example.com","name":"example.com"},`+
-		`"user":{"id":%q,"name":"Alice","displayName":"Alice"},"challenge":%q,`+
+		`"user":{"id":%q,"name":"alice@example.com","displayName":"Alice"},"challenge":%q,`+
 		`"pubKeyCredParams":[{"type":"public-key","alg":-7}],"timeout":300000,"attestation":"none",`+
 		`"authenticatorSelection":{"residentKey":"required","userVerification":"required"}}}`+"\n",
 		b64(handle), b64(made))
@@ -91,8 +91,8 @@ func TestBeginAcceptsTheLongestEmail(t *testing.T) {
 }
 
 // TestBeginEchoesTheName: the name is shown by the browser's passkey prompt, so
-// it must come back exactly as it was given, as both name and displayName, for
-// text of any script.
+// it must come back exactly as it was given as the displayName, for text of any
+// script. The passkey's username is the email address.
 func TestBeginEchoesTheName(t *testing.T) {
 	t.Parallel()
 
@@ -122,8 +122,8 @@ func TestBeginEchoesTheName(t *testing.T) {
 				t.Fatalf("begin = %d %s (%v)", rec.Code, rec.Body, err)
 			}
 
-			if user := options.PublicKey.User; user.Name != name || user.DisplayName != name {
-				t.Errorf("user = %+v, want the name %q twice", user, name)
+			if user := options.PublicKey.User; user.Name != testEmail || user.DisplayName != name {
+				t.Errorf("user = %+v, want name %q and displayName %q", user, testEmail, name)
 			}
 		})
 	}
