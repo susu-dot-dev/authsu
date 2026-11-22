@@ -525,6 +525,10 @@ type createGrantCase struct {
 	// agent is the statement an agent that is created adds, nil for an existing
 	// agent.
 	newAgent bool
+
+	// firstParty is the statement a first-party login adds: the owner's agent for
+	// the client, created if there is none.
+	firstParty bool
 }
 
 func createGrantCases(t *testing.T) []createGrantCase {
@@ -553,20 +557,56 @@ func createGrantCases(t *testing.T) []createGrantCase {
 	withAgent.SessionID, withAgent.GrantedFrom, withAgent.CodeHash = grantIDAt(9), hashOf(4), hashOf(3)
 	withAgent.RetainUntil, withAgent.CreatedAt = now.Add(12*time.Minute), now.Add(time.Second)
 
+	login := typical
+	login.ID, login.AgentID = grantIDAt(11), grantNewAgent
+	login.FirstParty, login.FirstPartyMaxActive = true, 25
+	login.FirstPartyName = mustAgentName(t, "Pages 🌐")
+	login.Scope = mustOAuthScopes(t, "mcp:read")
+	login.SessionID, login.GrantedFrom, login.CodeHash = grantIDAt(13), hashOf(6), hashOf(5)
+
 	return []createGrantCase{
 		{name: "an existing agent and no nonce", grant: typical, newAgent: false},
 		{name: "a new agent, a nonce and multibyte names", grant: withAgent, newAgent: true},
+		{name: "a first-party login", grant: login, firstParty: true},
+	}
+}
+
+// firstPartyAgentWant is the statement that creates the agent of a first-party
+// login, or finds the active one the owner has for the client.
+func firstPartyAgentWant(grant store.NewGrant) wantStatement {
+	return wantStatement{
+		fragments: []string{
+			"INSERT INTO agents (id, user_id, name, scopes, created_at, first_party, first_party_client)",
+			"SELECT ?1, u.id, ?2, ?3, ?4, 1, ?7",
+			"WHERE u.id = ?5 AND u.revoked_at IS NULL",
+			// An agent the owner already has for the client is found and is not
+			// held to the limit; one that is not there is created within it.
+			// A revoked agent is not found: the user gets a fresh one, within the limit.
+			"AND (EXISTS (SELECT 1 FROM agents f WHERE f.user_id = u.id AND f.first_party_client = ?7 " +
+				"AND f.revoked_at IS NULL) " +
+				"OR (SELECT count(*) FROM agents a WHERE a.user_id = u.id AND a.revoked_at IS NULL",
+			") < ?6)",
+			"ON CONFLICT DO NOTHING",
+		},
+		args: []any{
+			grant.AgentID, grant.FirstPartyName.String(), "[]", grant.CreatedAt.Unix(), grant.Owner,
+			int64(grant.FirstPartyMaxActive), grant.ClientID.String(),
+		},
 	}
 }
 
 // createGrantWant is the batch a consent must write.
-func createGrantWant(grant store.NewGrant, newAgent bool) []wantStatement {
+func createGrantWant(grant store.NewGrant, newAgent, firstParty bool) []wantStatement {
 	var nonce any
 	if grant.Nonce != nil {
 		nonce = grant.Nonce.String()
 	}
 
 	var want []wantStatement
+
+	if firstParty {
+		want = append(want, firstPartyAgentWant(grant))
+	}
 
 	if newAgent {
 		want = append(want, wantStatement{
@@ -586,6 +626,11 @@ func createGrantWant(grant store.NewGrant, newAgent bool) []wantStatement {
 		})
 	}
 
+	firstPartyArg := int64(0)
+	if firstParty {
+		firstPartyArg = 1
+	}
+
 	return append(want,
 		wantStatement{
 			fragments: []string{"INSERT INTO secrets (id, kind, hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"},
@@ -601,9 +646,12 @@ func createGrantWant(grant store.NewGrant, newAgent bool) []wantStatement {
 				"(SELECT u.id FROM users u WHERE u.id = ?3 AND u.revoked_at IS NULL)",
 				// The agent must be the owner's, active and in no sandbox: one
 				// created in this batch is found, and none is NULL. An agent of a
-				// sandbox reads as unavailable, so consent cannot attach one.
-				"(SELECT a.id FROM agents a WHERE a.id = ?4 AND a.user_id = ?3 AND a.revoked_at IS NULL " +
-					"AND a.sandbox_id IS NULL)",
+				// sandbox reads as unavailable, so consent cannot attach one. For
+				// an ordinary consent it is the agent ?4 names; for a first-party
+				// login (?16) it is the owner's agent for the client and never one
+				// the user chose.
+				"(SELECT a.id FROM agents a WHERE a.user_id = ?3 AND a.revoked_at IS NULL " +
+					"AND a.sandbox_id IS NULL AND ((?16 = 0 AND a.id = ?4) OR (?16 = 1 AND a.first_party_client = ?5)))",
 				// auth_time is the approving session's secret's creation, and the
 				// session must be the owner's and active now.
 				"(SELECT s.created_at FROM secrets s JOIN sessions x ON x.id = s.id AND x.kind = s.kind " +
@@ -614,7 +662,7 @@ func createGrantWant(grant store.NewGrant, newAgent bool) []wantStatement {
 				grant.ID, store.KindOAuthGrant, grant.Owner, grant.AgentID, grant.ClientID.String(), grant.ClientName,
 				grant.RedirectURI.String(), grant.Resource.String(), grant.Scope.String(),
 				grant.CodeChallenge.String(), nonce, grant.SessionID, store.KindSession, grant.CreatedAt.Unix(),
-				grant.GrantedFrom,
+				grant.GrantedFrom, firstPartyArg,
 			},
 		},
 	)
@@ -633,7 +681,9 @@ func TestCreateGrantStatements(t *testing.T) {
 			t.Parallel()
 
 			statements := 2
-			if test.newAgent {
+
+			switch {
+			case test.firstParty, test.newAgent:
 				statements = 3
 			}
 
@@ -642,7 +692,7 @@ func TestCreateGrantStatements(t *testing.T) {
 			err := fake.store().CreateGrant(context.Background(), test.grant)
 			checkErr(t, err, nil)
 
-			checkBatch(t, fake, createGrantWant(test.grant, test.newAgent)...)
+			checkBatch(t, fake, createGrantWant(test.grant, test.newAgent, test.firstParty)...)
 
 			// The challenge is the 43 characters of an S256 challenge, never a verifier.
 			challenge, _ := fake.calls[0][len(fake.calls[0])-1].Args[9].(string)
@@ -659,7 +709,10 @@ type grantRefusal struct {
 	name     string
 	text     string
 	newAgent bool
-	want     error
+	// firstParty is a first-party login, which can create its agent and so is
+	// refused at the limit as a consent that creates one is.
+	firstParty bool
+	want       error
 }
 
 // grantRefusals are the failures CreateGrant names, as D1 reports them: the
@@ -677,6 +730,14 @@ func grantRefusals() []grantRefusal {
 			want: store.ErrAgentLimit},
 		{name: "the agent is not the user's or is revoked", text: notNull("oauth_grants.agent_id"), newAgent: false,
 			want: store.ErrAgentUnavailable},
+		{name: "a first-party login of a user at the limit", text: notNull("oauth_grants.agent_id"), firstParty: true,
+			want: store.ErrAgentLimit},
+		{name: "a first-party login whose account is revoked", text: notNull("oauth_grants.user_id"), firstParty: true,
+			want: store.ErrUserInactive},
+		{name: "a first-party login whose session ended", text: notNull("oauth_grants.auth_time"), firstParty: true,
+			want: store.ErrSessionInactive},
+		{name: "a first-party login that was used", firstParty: true, want: store.ErrGrantReplayed,
+			text: "D1_ERROR: UNIQUE constraint failed: oauth_grants.granted_from: SQLITE_CONSTRAINT_UNIQUE"},
 		{name: "the session ended", text: notNull("oauth_grants.auth_time"), newAgent: false,
 			want: store.ErrSessionInactive},
 		{name: "the session ended, creating an agent", text: notNull("oauth_grants.auth_time"), newAgent: true,
@@ -705,8 +766,12 @@ func TestCreateGrantRefusals(t *testing.T) {
 			t.Parallel()
 
 			grant, statements := cases[0].grant, 2
-			if test.newAgent {
+
+			switch {
+			case test.newAgent:
 				grant, statements = cases[1].grant, 3
+			case test.firstParty:
+				grant, statements = cases[2].grant, 3
 			}
 
 			fake := newFake(failing(store.Classify(dbError(test.text))))
@@ -813,7 +878,9 @@ func TestCreateGrantFailures(t *testing.T) {
 			t.Parallel()
 
 			statements := 2
-			if test.newAgent {
+
+			switch {
+			case test.firstParty, test.newAgent:
 				statements = 3
 			}
 

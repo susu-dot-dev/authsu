@@ -56,6 +56,11 @@ type Agent struct {
 	// SandboxID is the sandbox the agent is confined to, or nil for an ordinary
 	// agent.
 	SandboxID *string
+
+	// FirstParty is whether authsu created the agent for a trusted app's sign-in
+	// (migration 0002) and not the user. It says nothing about what the agent may
+	// do.
+	FirstParty bool
 }
 
 // AgentReach is which of a user's agents a request may reach. Every agent read
@@ -112,7 +117,7 @@ func (r AgentReach) args() (string, int64, any) {
 
 // readAgent reads one agent row, in the column order every agent statement
 // selects or returns: id, name, scopes, revoked_at, created_at, labels,
-// sandbox_id.
+// sandbox_id, first_party.
 //
 // labels is the agent's labels as the text of a JSON array, sorted, and "[]" for
 // none. Every statement computes it with a subselect over agent_labels, and not
@@ -130,6 +135,7 @@ func readAgent(r *row) Agent {
 
 	agent.Labels = r.labels()
 	agent.SandboxID = r.optText()
+	agent.FirstParty = r.boolean()
 
 	return agent
 }
@@ -166,7 +172,7 @@ const agentListQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
    FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
-  sandbox_id
+  sandbox_id, first_party
 FROM agents
 WHERE user_id = ?1 AND id < ?2
   AND (?4 IS NULL OR EXISTS (SELECT 1 FROM agent_labels f WHERE f.agent_id = agents.id AND f.label = ?4))
@@ -258,7 +264,7 @@ const agentGetQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
    FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
-  sandbox_id
+  sandbox_id, first_party
 FROM agents
 WHERE id = ?1 AND user_id = ?2 AND (?3 = 0 OR sandbox_id IS ?4)`
 
@@ -623,7 +629,7 @@ const agentPatchReadQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
    FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
-  sandbox_id
+  sandbox_id, first_party
 FROM agents
 WHERE id = ?1 AND user_id = ?2`
 
@@ -765,7 +771,7 @@ WHERE id = ?2 AND user_id = ?3
 RETURNING id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
    FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
-  sandbox_id`
+  sandbox_id, first_party`
 
 // agentRevokeKeysQuery revokes the secret of every key of an agent, and of every
 // OAuth grant it holds with the grant's access token, in the same batch as

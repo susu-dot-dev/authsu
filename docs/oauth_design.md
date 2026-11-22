@@ -50,10 +50,24 @@ There are two tables, one for production and one for development, and `API_ORIGI
 | | Production | Development |
 |---|---|---|
 | Resource | `https://api.susu.dev/mcp` | `http://localhost:8788/mcp` |
-| Scopes | `mcp:read`, `mcp:write` | the same |
-| Default scopes | both | both |
+| Login resource (first party) | `https://app.susu.dev` | `http://localhost:9894` |
+| Trusted client | `https://app.susu.dev/oauth/client.json` | `http://localhost:9894/oauth/client.json` |
+| Scopes | `mcp:read`, `mcp:write` (login resource: `profile`) | the same |
+| Default scopes | both (login resource: `profile`) | both |
+
+The tables also hold the first-party login resource and the trusted clients (below).
 
 The development port sits beside the API's own, as the UI's does. A request that names no `scope` gets the resource's default list, written out in full on the grant, as an API key with no scopes does ([permissions_design.md](permissions_design.md#issuing-keys)). An unknown or repeated scope is refused, and `openid` is the only scope that is not the resource's.
+
+## First-party login
+
+authsu is also the login for the products it is part of. Pages, a first-party app, uses it to learn who a person is, and needs an ID token and nothing at a resource server. Three decisions make that fit the flow above without a second one:
+
+- **A trusted client is a name in code, not a flag in a document.** The trusted clients are a hard-coded list beside the resource tables, compared byte for byte with the `client_id`. Trust changes nothing about how the client is identified: its metadata document is still fetched and still has to list the redirect URI, so a client cannot widen where the code is sent by being trusted. It only admits the client to the login resource.
+- **Login is a resource of its own.** The app's origin is a resource whose one scope is `profile`, and only a trusted client may name it; anyone else is told `invalid_target`, as for a resource that does not exist, so a stranger cannot tell it is there. It is a resource and not a special case so that everything bound to a resource still holds: a token for it is introspected at it and nowhere else, and a trusted client cannot reach an `mcp:` scope through it, because a scope must be one the named resource defines. The tolerance for what a standard OpenID Connect client sends is the same narrow: `email` is read as `profile` and `offline_access` is dropped (a refresh token is always issued), neither is stored, and it is decided by the resource, never by the client's say-so.
+- **There is nothing to approve, so there is no screen and no agent to choose.** The person is signing in to a product they opened. The authorization endpoint sends the browser to the UI's login page, which only needs a session, and the UI's approval names no agent. The grant still needs an actor, so authsu creates an ordinary agent named after the client, once per user and client, and finds it on every later login. It is an ordinary agent on purpose: the user sees it, it counts against their limit, revoking it revokes its grants, and revoking the user does. Revoking it does not lock the person out of the app: a revoked agent is not found again, so the next login creates a fresh agent and a fresh grant (needing room under the limit, as any new agent does). The only difference is a `first_party` flag, so a UI can group or hide it. What an approval must carry is a property of the pending request and not of the body, so a login that names an agent, and an approval for a third party that names none, are both refused.
+
+The ID token of such a grant also carries the user's name and email from their profile, and `email_verified` as `false`: authsu does not verify an address, and says so instead of leaving the relying party to assume.
 
 ## Access tokens stay opaque, so resource servers ask authsu
 

@@ -53,10 +53,11 @@ type openIDDocument struct {
 }
 
 // idTokenClaims are the claims of the ID token (docs/oauth_design.md): who
-// signed in and when, for whom the token is, and the request's nonce. The
-// token grants nothing, and it holds no profile.
+// signed in and when, for whom the token is, and the request's nonce, and for a
+// first-party login the user's name and email, with email_verified false because
+// authsu does not verify addresses. The token grants nothing.
 func idTokenClaims() []string {
-	return []string{"iss", "sub", "aud", "iat", "exp", "auth_time", "nonce"}
+	return []string{"iss", "sub", "aud", "iat", "exp", "auth_time", "nonce", "name", "email", "email_verified"}
 }
 
 // document builds the metadata for cfg's deployment. The "none" client
@@ -72,6 +73,13 @@ func (d Deps) document(cfg config.Config) metadataDocument {
 
 	for _, entry := range d.table(cfg).Entries() {
 		scopes = append(scopes, entry.Scopes...)
+
+		// A first-party login also accepts the two OpenID Connect names a
+		// standard client sends (input.ParseFirstPartyScopes), so the document
+		// lists them, once, for a client that checks.
+		if entry.FirstParty {
+			scopes = append(scopes, input.EmailScope, input.OfflineAccessScope)
+		}
 	}
 
 	return metadataDocument{

@@ -31,6 +31,16 @@
 // PendingLifetime; consent is single use because the grant row records the hash
 // of the sealed value in a unique column (store.CreateGrant).
 //
+// # First-party login
+//
+// A trusted client (resource.Table.Trusted) may name the first-party login
+// resource, and its request is sent to the UI's /oauth/login page, which only
+// signs the person in, instead of the consent page. The UI's approval names no
+// agent, and the grant is held by the agent authsu keeps for that user and
+// client (store.NewGrant.FirstParty). What an approval must carry follows the
+// opened request, never the body (chooseAgent). The ID token of such a grant
+// carries the user's name and email, with email_verified false.
+//
 // # The token endpoints
 //
 // The token, revocation and introspection endpoints are for software and not a
@@ -120,6 +130,7 @@ const (
 // to UI_ORIGIN.
 const (
 	uiConsentPath = "/oauth/consent"
+	uiLoginPath   = "/oauth/login"
 	uiErrorPath   = "/oauth/error"
 )
 

@@ -92,7 +92,7 @@ func TestOAuthDiscovery(t *testing.T) {
 			"token_endpoint_auth_methods_supported":         {"none"},
 			"revocation_endpoint_auth_methods_supported":    {"none"},
 			"introspection_endpoint_auth_methods_supported": {"none"},
-			"scopes_supported":                              {"openid", "mcp:read", "mcp:write"},
+			"scopes_supported":                              {"openid", "mcp:read", "mcp:write", "profile", "email", "offline_access"},
 		}
 
 		for name, wantList := range lists {
@@ -119,7 +119,7 @@ func TestOAuthDiscovery(t *testing.T) {
 		lists := map[string][]string{
 			"id_token_signing_alg_values_supported": {"RS256"},
 			"subject_types_supported":               {"public"},
-			"claims_supported":                      {"iss", "sub", "aud", "iat", "exp", "auth_time", "nonce"},
+			"claims_supported":                      {"iss", "sub", "aud", "iat", "exp", "auth_time", "nonce", "name", "email", "email_verified"},
 		}
 
 		for name, wantList := range lists {

@@ -230,6 +230,13 @@ type fakeStore struct {
 	revokedAgents map[string]bool
 	agentNames    map[string]string
 
+	// firstPartyAgents is the agent authsu keeps for an owner and a client, by
+	// "owner|client": what agents.first_party_client holds.
+	firstPartyAgents map[string]string
+
+	// profiles is users.profile by user id, which an exchange reports.
+	profiles map[string]string
+
 	// authTimes is when each session was created: a grant's auth_time.
 	authTimes map[string]time.Time
 
@@ -253,6 +260,9 @@ func newFakeStore() *fakeStore {
 		agentNames:    map[string]string{agentA1: "Agent A1", agentB1: "Agent B1"},
 		authTimes:     map[string]time.Time{},
 		used:          map[string]bool{},
+
+		firstPartyAgents: map[string]string{},
+		profiles:         map[string]string{userA: `{"name":"Alice A","email":"alice@example.com"}`},
 	}
 }
 
@@ -279,6 +289,10 @@ func (f *fakeStore) CreateGrant(_ context.Context, grant store.NewGrant) error {
 		f.agents[grant.AgentID] = grant.Owner
 		f.agentNames[grant.AgentID] = grant.NewAgent.Name.String()
 		f.activeAgents[grant.Owner]++
+	}
+
+	if grant.FirstParty {
+		f.holdFirstParty(grant)
 	}
 
 	return nil
@@ -495,6 +509,30 @@ func (f *fakeStore) RevokeGrant(_ context.Context, owner string, id input.ID, no
 	return store.Grant{}, store.ErrNotFound
 }
 
+// holdFirstParty is the effect of a first-party login's write: the owner's active
+// agent for the client is found, or one is created under the grant's agent id (a
+// revoked one is not found, and no longer counts against the limit), and holds
+// the grant.
+func (f *fakeStore) holdFirstParty(grant store.NewGrant) {
+	key := grant.Owner + "|" + grant.ClientID.String()
+
+	agent, found := f.firstPartyAgents[key]
+	if found && f.revokedAgents[agent] {
+		found = false
+		f.activeAgents[grant.Owner]--
+	}
+
+	if !found {
+		agent = grant.AgentID
+		f.firstPartyAgents[key] = agent
+		f.agents[agent] = grant.Owner
+		f.agentNames[agent] = grant.FirstPartyName.String()
+		f.activeAgents[grant.Owner]++
+	}
+
+	f.rows[len(f.rows)-1].grant.AgentID = agent
+}
+
 // goodCode reports whether the grant is the exchange's, in everything but the
 // resource.
 func (f *fakeStore) goodCode(g *grantRow, exchange store.CodeExchange, now time.Time) bool {
@@ -520,6 +558,7 @@ func (f *fakeStore) exchanged(g *grantRow) store.Exchanged {
 	out := store.Exchanged{
 		GrantID: g.grant.ID, UserID: g.grant.Owner, AgentID: g.grant.AgentID, ClientID: g.grant.ClientID.String(),
 		Resource: g.grant.Resource.String(), Scope: g.accessScope, AuthTime: g.authTime,
+		Profile: f.profiles[g.grant.Owner],
 	}
 
 	if g.grant.Nonce != nil {
@@ -612,11 +651,33 @@ func (f *fakeStore) refuseAgent(grant store.NewGrant) error {
 	switch {
 	case grant.NewAgent != nil && f.activeAgents[grant.Owner] >= grant.NewAgent.MaxActive:
 		return store.ErrAgentLimit
+	case grant.FirstParty:
+		return f.refuseFirstParty(grant)
 	case grant.NewAgent == nil && (f.agents[grant.AgentID] != grant.Owner || f.revokedAgents[grant.AgentID]):
 		return store.ErrAgentUnavailable
 	default:
 		return nil
 	}
+}
+
+// refuseFirstParty is the refusal of a first-party login's agent: an active one
+// that exists is used and is not held to the limit; one that is not there, or is
+// revoked, is created, which the limit refuses when the owner is at it (a revoked
+// one no longer counts against it).
+func (f *fakeStore) refuseFirstParty(grant store.NewGrant) error {
+	agent, found := f.firstPartyAgents[grant.Owner+"|"+grant.ClientID.String()]
+	active := found && !f.revokedAgents[agent]
+
+	used := f.activeAgents[grant.Owner]
+	if found && !active {
+		used--
+	}
+
+	if !active && used >= grant.FirstPartyMaxActive {
+		return store.ErrAgentLimit
+	}
+
+	return nil
 }
 
 // fetchAnswer is what the fake network answers for a URL.

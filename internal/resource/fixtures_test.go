@@ -1,3 +1,4 @@
+//nolint:goconst // table-driven tests repeat case names on purpose; a constant per row would hide the table
 package resource_test
 
 import (
@@ -141,12 +142,13 @@ func hasScopeCases() map[string]bool {
 }
 
 // checkURL fails unless the entry's URL is a plain absolute URL: a scheme, a
-// host and a path, with no userinfo, query or fragment, written canonically.
+// host and, for a resource server, a path, with no userinfo, query or fragment,
+// written canonically. A first-party login resource is an origin: no path.
 func checkURL(t *testing.T, e resource.Entry) {
 	t.Helper()
 
 	parsed, err := url.Parse(e.URL)
-	if err != nil || !plain(parsed) || parsed.String() != e.URL {
+	if err != nil || !plain(parsed, e.FirstParty) || parsed.String() != e.URL {
 		t.Errorf("URL %q is not a plain absolute URL: %v", e.URL, err)
 	}
 
@@ -167,8 +169,9 @@ func checkScopes(t *testing.T, e resource.Entry, grammar *regexp.Regexp) {
 	seen := map[string]bool{}
 
 	for _, name := range e.Scopes {
-		if !grammar.MatchString(name) || len(name) > scope.MaxNameBytes {
-			t.Errorf("scope %q is not a resource:action name", name)
+		if !scopeNameOK(e, name, grammar) {
+			t.Errorf("scope %q is not a resource:action name (or, for a first-party resource, not only %q)",
+				name, resource.ScopeProfile)
 		}
 
 		if seen[name] {
@@ -187,6 +190,17 @@ func checkScopes(t *testing.T, e resource.Entry, grammar *regexp.Regexp) {
 			t.Errorf("HasScope(%q) = false for a listed scope", name)
 		}
 	}
+}
+
+// scopeNameOK reports whether a scope's name is acceptable for its entry: a
+// resource:action name, except for the first-party login resource, whose one
+// scope is the OpenID Connect name "profile".
+func scopeNameOK(e resource.Entry, name string, grammar *regexp.Regexp) bool {
+	if e.FirstParty {
+		return name == resource.ScopeProfile && len(e.Scopes) == 1
+	}
+
+	return grammar.MatchString(name) && len(name) <= scope.MaxNameBytes
 }
 
 // checkDefaults fails unless the entry's defaults are a non-empty, unique subset
@@ -213,8 +227,40 @@ func checkDefaults(t *testing.T, e resource.Entry) {
 	}
 }
 
-// plain reports whether u has a scheme, a host and a path and nothing else.
-func plain(u *url.URL) bool {
-	return u.IsAbs() && u.Host != "" && u.Path != "" && u.User == nil &&
+// plain reports whether u has a scheme, a host and a path and nothing else; an
+// origin, with no path, when origin is true.
+func plain(u *url.URL, origin bool) bool {
+	hasPath := u.Path != ""
+
+	return u.IsAbs() && u.Host != "" && hasPath != origin && u.User == nil &&
 		u.RawQuery == "" && !u.ForceQuery && u.Fragment == ""
+}
+
+// trustedCases are the client_ids Trusted is tried with, with whether each
+// table trusts it.
+func trustedCases() map[string]struct {
+	id                      string
+	production, development bool
+} {
+	return map[string]struct {
+		id                      string
+		production, development bool
+	}{
+		"the production app":      {id: resource.ProductionClientID, production: true},
+		"the development app":     {id: resource.DevelopmentClientID, development: true},
+		"upper-case host":         {id: "https://APP.susu.dev/oauth/client.json"},
+		"trailing slash":          {id: resource.ProductionClientID + "/"},
+		"default port":            {id: "https://app.susu.dev:443/oauth/client.json"},
+		"query":                   {id: resource.ProductionClientID + "?x=1"},
+		"another path":            {id: "https://app.susu.dev/oauth/other.json"},
+		"another host":            {id: "https://evil.example/oauth/client.json"},
+		"a lookalike host":        {id: "https://app.susu.dev.evil.com/oauth/client.json"},
+		"userinfo":                {id: "https://app.susu.dev@evil.com/oauth/client.json"},
+		"leading space":           {id: " " + resource.ProductionClientID},
+		"trailing newline":        {id: resource.ProductionClientID + "\n"},
+		"the resource itself":     {id: resource.ProductionURL},
+		"the login resource":      {id: resource.ProductionLoginURL},
+		"empty":                   {id: ""},
+		"http for the production": {id: "http://app.susu.dev/oauth/client.json"},
+	}
 }

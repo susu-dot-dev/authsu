@@ -17,10 +17,30 @@
 //   - production in every other case, including a value that is not an origin
 //     at all, so a mistake can only ever select the stricter table.
 //
-// Production's one entry is https://api.susu.dev/mcp. Development's is the same
-// entry at http://localhost:8788/mcp. 8788 is fixed the way the dev UI's port
+// Each table has two entries. The first is the MCP resource: production's is
+// https://api.susu.dev/mcp, and development's is the same entry at
+// http://localhost:8788/mcp. 8788 is fixed the way the dev UI's port
 // (DEV_UI_PORT, 3000) is, one above the API's own (DEV_PORT, 8787), so the
 // development resource is a separate local server beside the API.
+//
+// The second is the first-party login resource: the origin of the Pages app
+// (https://app.susu.dev, development http://localhost:9894), with the one scope
+// "profile". It is not a server that holds data: it is the audience of the
+// sign-in a first-party app asks authsu for, so a token for it is bound to that
+// app as every token is bound to its resource. It is marked FirstParty, which
+// means only a trusted client may ask for it (below).
+//
+// # Trusted clients
+//
+// Each table also lists the trusted clients: the first-party apps, by the exact
+// client_id they are identified by (https://app.susu.dev/oauth/client.json, and
+// http://localhost:9894/oauth/client.json in development). The list is code for
+// the reason the resources are: a deployment setting would let a mistake make
+// any URL a first party. Being trusted changes nothing about how the client is
+// identified or its redirect URI is checked, which is by its own metadata
+// document as for every client; it only admits the client to a FirstParty
+// resource, where consent needs no agent and no screen (docs/oauth_design.md).
+// Trust is a comparison of the whole string and nothing is normalised.
 //
 // There is no build tag or other switch: one build carries both tables, and
 // only API_ORIGIN picks one.
@@ -63,6 +83,20 @@ const (
 	// ScopeRead and ScopeWrite are the scopes of the resource.
 	ScopeRead  = "mcp:read"
 	ScopeWrite = "mcp:write"
+
+	// LoginName is shown for the first-party login resource.
+	LoginName = "Susu"
+	// ProductionLoginURL and DevelopmentLoginURL are the first-party login
+	// resource in each table: the origin of the Pages app, with no path.
+	ProductionLoginURL  = "https://app.susu.dev"
+	DevelopmentLoginURL = "http://localhost:9894"
+	// ScopeProfile is the one scope of the first-party login resource.
+	ScopeProfile = "profile"
+
+	// ProductionClientID and DevelopmentClientID are the trusted client of each
+	// table: the Client ID Metadata Document of the Pages app.
+	ProductionClientID  = "https://app.susu.dev/oauth/client.json"
+	DevelopmentClientID = "http://localhost:9894/oauth/client.json"
 )
 
 // Entry is one resource server.
@@ -77,6 +111,11 @@ type Entry struct {
 	// Defaults is the scope list a grant gets when the client asks for none. It
 	// is a subset of Scopes.
 	Defaults []string
+	// FirstParty marks the first-party login resource: only a trusted client may
+	// ask for it, and a grant for it is held by the agent authsu keeps
+	// for the user and client and not by an agent the person chose. Every other entry is a resource a
+	// third party may ask for.
+	FirstParty bool
 }
 
 // HasScope reports whether the resource defines the scope, by exact match.
@@ -90,6 +129,7 @@ func (e Entry) HasScope(name string) bool {
 type Table struct {
 	development bool
 	entries     []Entry
+	trusted     []string
 }
 
 // Select returns the table for an API_ORIGIN: development for an http://localhost
@@ -97,10 +137,13 @@ type Table struct {
 func Select(apiOrigin string) Table {
 	origin, err := config.ParseOrigin(apiOrigin)
 	if err == nil && origin.Local() {
-		return Table{development: true, entries: []Entry{entry(DevelopmentURL)}}
+		return Table{
+			development: true, entries: []Entry{entry(DevelopmentURL), login(DevelopmentLoginURL)},
+			trusted: []string{DevelopmentClientID},
+		}
 	}
 
-	return Table{entries: []Entry{entry(ProductionURL)}}
+	return Table{entries: []Entry{entry(ProductionURL), login(ProductionLoginURL)}, trusted: []string{ProductionClientID}}
 }
 
 // entry is the one resource at a URL.
@@ -111,6 +154,25 @@ func entry(resourceURL string) Entry {
 		Scopes:   []string{ScopeRead, ScopeWrite},
 		Defaults: []string{ScopeRead, ScopeWrite},
 	}
+}
+
+// login is the first-party login resource at a URL: it defines "profile", which
+// is also its default, and only a trusted client may ask for it.
+func login(resourceURL string) Entry {
+	return Entry{
+		Name:       LoginName,
+		URL:        resourceURL,
+		Scopes:     []string{ScopeProfile},
+		Defaults:   []string{ScopeProfile},
+		FirstParty: true,
+	}
+}
+
+// Trusted reports whether clientID is one of the table's trusted clients, by
+// exact comparison: no normalisation, so another case, a trailing slash or a
+// default port written out is not trusted. The zero table trusts nobody.
+func (t Table) Trusted(clientID string) bool {
+	return slices.Contains(t.trusted, clientID)
 }
 
 // Development reports whether this is the development table.

@@ -21,15 +21,18 @@ import (
 const tokensUnavailable = "tokens are temporarily unavailable"
 
 // exchangedRow is the row a rotation returns: grant_id, user_id, agent_id,
-// client_id, resource, scope, nonce, auth_time.
+// client_id, resource, scope, nonce, auth_time, profile.
 func exchangedRow() []any {
 	return row(grantTarget, grantOwner, grantAgent, oauthClient, resource.ProductionURL, "mcp:read openid", "n-1",
-		int64(1_699_999_000))
+		int64(1_699_999_000), exchangedProfile)
 }
+
+// exchangedProfile is the users.profile an exchange reports.
+const exchangedProfile = `{"name":"Alice A","email":"alice@example.com"}`
 
 // exchangedKinds are the column kinds of exchangedRow, for defectResults.
 func exchangedKinds() []string {
-	return []string{"text", "text", "text", "text", "text", "text", "optText", "integer"}
+	return []string{"text", "text", "text", "text", "text", "text", "optText", "integer", "text"}
 }
 
 // tokensRotated is the batch of a rotation and the five statements after it: the
@@ -188,6 +191,8 @@ func exchangeStatements(ex store.CodeExchange) []wantStatement {
 				"(SELECT g.scope FROM oauth_grants g WHERE g.id = secrets.id) AS scope",
 				"(SELECT g.nonce FROM oauth_grants g WHERE g.id = secrets.id) AS nonce",
 				"(SELECT g.auth_time FROM oauth_grants g WHERE g.id = secrets.id) AS auth_time",
+				// The subject's profile, read in the same statement, for the ID token.
+				"(SELECT u.profile FROM oauth_grants g JOIN users u ON u.id = g.user_id WHERE g.id = secrets.id) AS profile",
 			},
 			args: append(append([]any{}, conditions...), tokens.RefreshHash, tokens.RefreshExpiresAt.Unix()),
 		},
@@ -247,10 +252,17 @@ func TestExchangeCodeDecoding(t *testing.T) {
 		{name: "a grant with a nonce", row: exchangedRow(), want: store.Exchanged{
 			GrantID: grantTarget, UserID: grantOwner, AgentID: grantAgent, ClientID: oauthClient,
 			Resource: resource.ProductionURL, Scope: "mcp:read openid", Nonce: &nonce, AuthTime: time.Unix(1_699_999_000, 0),
+			Profile: exchangedProfile,
 		}},
 		{name: "a grant with none", row: with(exchangedRow(), 6, nil), want: store.Exchanged{
 			GrantID: grantTarget, UserID: grantOwner, AgentID: grantAgent, ClientID: oauthClient,
 			Resource: resource.ProductionURL, Scope: "mcp:read openid", Nonce: nil, AuthTime: time.Unix(1_699_999_000, 0),
+			Profile: exchangedProfile,
+		}},
+		{name: "an empty profile is kept as it is", row: with(exchangedRow(), 8, `{}`), want: store.Exchanged{
+			GrantID: grantTarget, UserID: grantOwner, AgentID: grantAgent, ClientID: oauthClient,
+			Resource: resource.ProductionURL, Scope: "mcp:read openid", Nonce: &nonce,
+			AuthTime: time.Unix(1_699_999_000, 0), Profile: `{}`,
 		}},
 	}
 

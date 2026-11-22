@@ -97,16 +97,21 @@ type Exchanged struct {
 	// AuthTime is when the user signed in: the approving session's creation,
 	// recorded on the grant at consent.
 	AuthTime time.Time
+
+	// Profile is the subject's users.profile as stored, the JSON text of an
+	// object, read in the same statement as the rotation. It is for the ID token
+	// of a first-party login, and the caller decides whether any of it goes there.
+	Profile string
 }
 
 // readExchanged reads the row an exchange returns, in the order its statement
 // names the columns: grant_id, user_id, agent_id, client_id, resource, scope,
-// nonce, auth_time.
+// nonce, auth_time, profile.
 func readExchanged(r *row) Exchanged {
 	// Struct fields are evaluated in order, which is the column order.
 	return Exchanged{
 		GrantID: r.text(), UserID: r.text(), AgentID: r.text(), ClientID: r.text(), Resource: r.text(),
-		Scope: r.text(), Nonce: r.optText(), AuthTime: r.timestamp(),
+		Scope: r.text(), Nonce: r.optText(), AuthTime: r.timestamp(), Profile: r.text(),
 	}
 }
 
@@ -127,7 +132,8 @@ const exchangedReturning = `RETURNING id AS grant_id,
 // exchangedReturningRest is the rest of the RETURNING clause, after the scope.
 const exchangedReturningRest = `,
   (SELECT g.nonce FROM oauth_grants g WHERE g.id = secrets.id) AS nonce,
-  (SELECT g.auth_time FROM oauth_grants g WHERE g.id = secrets.id) AS auth_time`
+  (SELECT g.auth_time FROM oauth_grants g WHERE g.id = secrets.id) AS auth_time,
+  (SELECT u.profile FROM oauth_grants g JOIN users u ON u.id = g.user_id WHERE g.id = secrets.id) AS profile`
 
 // grantScopeReturning is the scope an exchange returns when it is not narrowed:
 // the grant's.
