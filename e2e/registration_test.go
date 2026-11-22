@@ -369,7 +369,7 @@ func TestRegistrationBegin(t *testing.T) {
 
 		pub := options.PublicKey
 
-		if pub.RP.ID != rpID || pub.User.Name != "Alice" || pub.Attestation != "none" {
+		if pub.RP.ID != rpID || pub.User.Name != testEmail || pub.User.DisplayName != "Alice" || pub.Attestation != "none" {
 			t.Errorf("begin %d options = %+v", i, pub)
 		}
 
@@ -878,9 +878,7 @@ func TestRegistrationNames(t *testing.T) {
 				t.Fatalf("test name %s: %v", tt.raw, err)
 			}
 
-			if options.PublicKey.User.Name != wantName {
-				t.Errorf("begin user.name = %q, want %q", options.PublicKey.User.Name, wantName)
-			}
+			regExpectPasskeyUser(t, options, wantName)
 
 			// A complete registration with the raw name.
 			auth := newAuthenticator()
@@ -902,6 +900,17 @@ func TestRegistrationNames(t *testing.T) {
 			expectCount(t, "users", "1")
 			expectCount(t, "credentials", "1")
 		})
+	}
+}
+
+// regExpectPasskeyUser checks the passkey's user in the creation options: the
+// username is the email address and the display name is the account name.
+func regExpectPasskeyUser(t *testing.T, options creationOptions, wantDisplayName string) {
+	t.Helper()
+
+	user := options.PublicKey.User
+	if user.DisplayName != wantDisplayName || user.Name != testEmail {
+		t.Errorf("begin user = %+v, want displayName %q and name %q", user, wantDisplayName, testEmail)
 	}
 }
 
