@@ -33,6 +33,14 @@ Every secret has an ordinary, non-secret identifier, and that identifier is how 
 
 The consequence is the API-token model everywhere. The value is shown once, when it is issued (in a response body, or set as a cookie), and never again. A lost value is not recovered: it is revoked and a new one issued. Logs and admin views name the identifier, never the value.
 
+## A secret in a response is sealed for anything but a browser
+
+A response body that carries a secret is read by whatever the caller routes it through. For a model-driven client that is inference, whose logs and caches are kept by someone else, and a secret that passes through them is exposed for as long as they live. So a route that returns a secret to a credential that is not a session returns it encrypted to a public key the request carries, and the client's own key opens it. The routes are the ones that issue a secret to software: an agent's first API key and an invitation. A browser session may omit the key and is sent the value as it is, because a browser is not a model's tool, and a session may still ask for it sealed.
+
+The scheme is HPKE from the standard library, with a key sent per request and nothing registered beforehand. It protects a response from being read where it is logged. It is not authentication: anyone who knows the public key can produce a value the client will open, and a replayed response opens again, which a plaintext response permits just as well. The request's own literals are out of its reach: a secret written into a request is already in the log. The other routes that return a secret are not sealed: `POST /api/key`, the consent and the login are session-only by their declarations, and the token endpoint's shape is fixed by OAuth.
+
+A key that is required and absent is refused before anything is generated or written, and a key that cannot be sealed to is refused before the write, so a refusal never leaves a secret that no one was given. The formats are in `internal/seal` and `internal/input`.
+
 ## The token
 
 A token is `susu_<tag>_` followed by 43 base64url characters: 32 bytes from a cryptographic random source, which tests inject so that issuing is deterministic.

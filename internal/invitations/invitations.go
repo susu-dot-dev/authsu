@@ -16,7 +16,10 @@
 // ("susu_inv_" and 43 base64url characters, see internal/secret) is shown once,
 // in the "code" field of the response to the POST that created it; only its
 // hash is stored (input.InvitationToken.Hash, the one place tokens are
-// hashed), so no route can return it again.
+// hashed), so no route can return it again. The create is sealed to the public
+// key its request carries (publicKey, see auth.Recipient): the token is then in
+// the "sealed" field and not in "code", so that a response read by a model or
+// kept in a log does not hold it. Only a session may omit the key.
 //
 // An invitation can name an organization (docs/orgs_design.md, principle 2): a
 // create may give orgId and orgRole ("member" or "admin"), and whoever registers
@@ -93,6 +96,9 @@ type Deps struct {
 	Entropy io.Reader
 	// NewID returns a fresh UUIDv7 in canonical text form.
 	NewID func() string
+	// Seal seals the invitation's token to the caller's public key (seal.Seal
+	// in production). It is a dependency so a test can make it fail.
+	Seal auth.Sealer
 }
 
 // Routes returns the four invitation routes. It panics when a dependency is
@@ -124,17 +130,19 @@ type handlers struct {
 	now     func() time.Time
 	entropy io.Reader
 	newID   func() string
+	seal    auth.Sealer
 }
 
 // newHandlers validates deps.
 func newHandlers(deps Deps) *handlers {
 	for name, missing := range map[string]bool{
 		"Store": deps.Store == nil, "Now": deps.Now == nil, "Entropy": deps.Entropy == nil, "NewID": deps.NewID == nil,
+		"Seal": deps.Seal == nil,
 	} {
 		if missing {
 			panic("invitations: Deps." + name + " is required")
 		}
 	}
 
-	return &handlers{store: deps.Store, now: deps.Now, entropy: deps.Entropy, newID: deps.NewID}
+	return &handlers{store: deps.Store, now: deps.Now, entropy: deps.Entropy, newID: deps.NewID, seal: deps.Seal}
 }

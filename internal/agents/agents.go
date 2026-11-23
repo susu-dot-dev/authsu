@@ -123,6 +123,10 @@ type Deps struct {
 	// IssueAPIKey issues an API key (auth.IssueAPIKey in production). It is a
 	// dependency so a test can make issuing fail, which no valid request does.
 	IssueAPIKey func(r io.Reader, newID func() string, now time.Time, lifetime time.Duration) (auth.Issued, error)
+
+	// Seal seals the first key's token to the caller's public key (seal.Seal in
+	// production). It is a dependency so a test can make it fail.
+	Seal auth.Sealer
 }
 
 // Status is where an agent stands. It is derived from the row, never stored.

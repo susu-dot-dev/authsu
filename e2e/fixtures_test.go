@@ -127,6 +127,10 @@ type request struct {
 	// keepRedirect hands a 3xx back as it is instead of following it, for the
 	// routes whose answer is a redirect (the OAuth authorization endpoint).
 	keepRedirect bool
+	// noSeal sends a create that returns a secret as it is. Without it, send
+	// acts as a client does for a key: it adds a publicKey and opens the
+	// sealed member of the response (sealclient_test.go).
+	noSeal bool
 }
 
 // build turns r into an http.Request against the Worker.
@@ -187,6 +191,27 @@ var noRedirectClient = &http.Client{ //nolint:gochecknoglobals // a stateless cl
 
 // send performs the request against the Worker.
 func send(t *testing.T, r request) reply {
+	t.Helper()
+
+	member, sealing := r.sealsFor()
+
+	var pair clientPair
+
+	if sealing {
+		pair = newClientPair(t)
+		r = r.withPublicKey(pair.public)
+	}
+
+	got := sendRaw(t, r)
+	if sealing {
+		got = pair.opened(t, member, got)
+	}
+
+	return got
+}
+
+// sendRaw performs the request exactly as it is.
+func sendRaw(t *testing.T, r request) reply {
 	t.Helper()
 
 	req := r.build(t)

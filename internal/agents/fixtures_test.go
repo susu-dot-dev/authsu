@@ -1,9 +1,11 @@
 package agents_test
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -23,6 +25,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/scope"
+	"github.com/susu-dot-dev/authsu/internal/seal"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -557,6 +560,10 @@ type rig struct {
 	// makes issuing fail without calling auth.IssueAPIKey.
 	issueCalls []issueCall
 	issueErr   error
+	// sealCalls records every secret the routes sealed, and sealErr, when set,
+	// makes sealing fail without calling seal.Seal.
+	sealCalls []sealCall
+	sealErr   error
 	// logged records every error the boundary turned into a response.
 	logged  []*apierr.Error
 	handler http.Handler
@@ -609,7 +616,26 @@ func (r *rig) deps() agents.Deps {
 		NewID:       r.newID,
 		Entropy:     readerFunc(func(p []byte) (int, error) { return r.entropy.Read(p) }),
 		IssueAPIKey: r.issueAPIKey,
+		Seal:        r.seal,
 	}
+}
+
+// sealCall is one call to the Seal the routes were given.
+type sealCall struct {
+	recipient []byte
+	plaintext string
+}
+
+// seal is the routes' Seal: seal.Seal, recorded, unless a test programmed a
+// failure, which is returned without calling it.
+func (r *rig) seal(recipient []byte, plaintext string) (string, error) {
+	r.sealCalls = append(r.sealCalls, sealCall{recipient: recipient, plaintext: plaintext})
+
+	if r.sealErr != nil {
+		return "", r.sealErr
+	}
+
+	return seal.Seal(recipient, plaintext) //nolint:wrapcheck // a test double passes the real sealer's answer through
 }
 
 // issueAPIKey is the routes' IssueAPIKey: auth.IssueAPIKey, recorded, unless a
@@ -739,8 +765,9 @@ func (r *rig) writes() int {
 func (r *rig) untouched() {
 	r.t.Helper()
 
-	if len(r.store.calls) != 0 || len(r.issueCalls) != 0 {
-		r.t.Errorf("the request reached the store (%+v) or issued %d keys", r.store.calls, len(r.issueCalls))
+	if len(r.store.calls) != 0 || len(r.issueCalls) != 0 || len(r.sealCalls) != 0 {
+		r.t.Errorf("the request reached the store (%+v), issued %d keys or sealed %d", r.store.calls, len(r.issueCalls),
+			len(r.sealCalls))
 	}
 }
 
@@ -887,11 +914,39 @@ func (r *rig) signInKey(spec keySpec) string {
 	return "Bearer " + issued.Token
 }
 
-// withKey sends method target with body, authorized by header (an API key).
+// withKey sends method target with body, authorized by header (an API key). A
+// create made with a key carries a publicKey, as every client's does, unless the
+// body already names one: a response to a key is sealed, and a test of the
+// absence of the key sends its request with serve.
 func (r *rig) withKey(header, method, target, body string) *httptest.ResponseRecorder {
 	r.t.Helper()
 
+	if method == http.MethodPost && target == collection && !strings.Contains(body, `"publicKey"`) {
+		body = withPublicKey(body)
+	}
+
 	return r.serve(request{method: method, target: target, body: body, authorization: header})
+}
+
+// clientKey is a public key as a client sends it, the suite byte and 32 bytes.
+func clientKey() string {
+	key := bytes.Repeat([]byte{0x2a}, seal.KeyLen)
+
+	return base64.RawURLEncoding.EncodeToString(append([]byte{seal.SuiteX25519}, key...))
+}
+
+// withPublicKey adds the publicKey member to a JSON object body.
+func withPublicKey(body string) string {
+	member := `"publicKey":"` + clientKey() + `"`
+
+	switch {
+	case body == "" || body == "{}":
+		return "{" + member + "}"
+	case strings.HasPrefix(body, "{"):
+		return "{" + member + "," + body[1:]
+	default:
+		return body
+	}
 }
 
 // storeKeyRow is the row the database would hold for the key a create wrote,

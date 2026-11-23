@@ -49,6 +49,7 @@ linters:
             - "**/internal/config/**"
             - "**/internal/scope/**"
             - "**/internal/secret/**"
+            - "**/internal/seal/**"
             - "**/internal/resource/**"
             - "**/internal/jws/**"
             - "**/internal/fetch/**"

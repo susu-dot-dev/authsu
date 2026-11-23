@@ -60,6 +60,11 @@ type createBody struct {
 	// registers is given an organization of its own.
 	OrgID   *string `json:"orgId"`
 	OrgRole *string `json:"orgRole"`
+	// PublicKey is the key the token is sealed to: the base64url of the suite
+	// byte and an X25519 public key (input.PublicKey). A session may omit it
+	// and be sent the token as it is; any other credential must send it
+	// (auth.Recipient).
+	PublicKey *string `json:"publicKey"`
 }
 
 // Created is the body of a created invitation. Code, the invitation token, is
@@ -69,8 +74,13 @@ type Created struct {
 
 	// Code is the invitation token ("susu_inv_" and 43 base64url characters) to
 	// hand to the invitee. It is not stored, and cannot be shown again: a lost
-	// token is revoked and replaced.
-	Code string `json:"code"`
+	// token is revoked and replaced. It is absent when the request carried a
+	// public key, and Sealed is present instead.
+	Code string `json:"code,omitempty"`
+
+	// Sealed is the token sealed to the request's public key (internal/seal).
+	// It is absent when Code is present.
+	Sealed string `json:"sealed,omitempty"`
 }
 
 // createCommand is a create request whose values have all been parsed.
@@ -82,6 +92,9 @@ type createCommand struct {
 	createdBy      string
 	// org is the organization the invitation names, which may be none.
 	org input.InvitationOrg
+	// recipient is the key the token is sealed to, the zero value when the
+	// caller is to be sent it as it is.
+	recipient input.PublicKey
 	// now is the request's clock reading, the one the expiry was checked
 	// against and the creation time.
 	now time.Time
@@ -135,6 +148,11 @@ func (h *handlers) parseCreate(principal auth.Principal, body createBody) result
 			return result.Of(input.ParseInvitationOrg(body.OrgID, body.OrgRole)).
 				Map(func(org input.InvitationOrg) createCommand { cmd.org = org; return cmd }).
 				Get()
+		}).
+		Then(func(cmd createCommand) (createCommand, error) {
+			return auth.Recipient(principal, body.PublicKey).
+				Map(func(to input.PublicKey) createCommand { cmd.recipient = to; return cmd }).
+				Get()
 		})
 }
 
@@ -146,17 +164,33 @@ func orgNotFound(cause error) error {
 
 // createInvitation generates the token and writes the invitation holding only
 // its hash. The response is the row the database stored, so it is the
-// database's view, with the token that is not in it. The store's failures are
+// database's view, with the token that is not in it, sealed to the caller's key
+// when there is one. It is sealed before the write, so a key that cannot be
+// sealed to creates nothing. The store's failures are
 // already classified, and wrapping one here keeps that.
 func (h *handlers) createInvitation(call *auth.Call, cmd createCommand) result.Result[Created] {
 	return result.Of(h.newToken()).
 		Then(func(token input.InvitationToken) (Created, error) {
-			return result.Of(h.store.CreateInvitation(call.Request.Context, h.newInvitation(cmd, token))).
-				MapErr(createRefused).
-				Map(func(row store.Invitation) Created {
-					return Created{Invitation: present(row, cmd.now), Code: token.String()}
-				}).
+			return auth.SealTo(h.seal, cmd.recipient, token.String()).
+				Then(func(sealed string) (Created, error) { return h.write(call, cmd, token, sealed).Get() }).
 				Get()
+		})
+}
+
+// write writes the invitation and builds the response: the token in Code, or
+// sealed in Sealed when it was sealed.
+func (h *handlers) write(
+	call *auth.Call, cmd createCommand, token input.InvitationToken, sealed string,
+) result.Result[Created] {
+	return result.Of(h.store.CreateInvitation(call.Request.Context, h.newInvitation(cmd, token))).
+		MapErr(createRefused).
+		Map(func(row store.Invitation) Created {
+			created := Created{Invitation: present(row, cmd.now), Code: token.String(), Sealed: ""}
+			if sealed != "" {
+				created.Code, created.Sealed = "", sealed
+			}
+
+			return created
 		})
 }
 
