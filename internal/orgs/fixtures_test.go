@@ -43,13 +43,11 @@ const (
 	roleMember = auth.RoleMember
 	roleAdmin  = auth.RoleAdmin
 
-	// userID signs in. otherID is another user. orgID, sandboxID, offerID and
-	// newID are the ids of the things acted on.
+	// userID signs in. otherID is another user. orgID, sandboxID and newID are the ids of the things acted on.
 	userID    = "01890000-0000-7000-8000-000000000001"
 	otherID   = "01890000-0000-7000-8000-0000000000aa"
 	orgID     = "01890000-0000-7000-8000-0000000000b1"
 	sandboxID = "01890000-0000-7000-8000-0000000000b2"
-	offerID   = "01890000-0000-7000-8000-0000000000c1"
 	cursorID  = "01890000-0000-7000-8000-0000000000d1"
 	invID     = "01890000-0000-7000-8000-0000000000e1"
 	newID     = "01890000-0000-7000-8000-0000000000f1"
@@ -85,8 +83,9 @@ const (
 	bodyUnauthenticated = `{"error":{"code":"unauthenticated","message":"not signed in"}}` + "\n"
 	bodyInternal        = `{"error":{"code":"internal","message":"internal error"}}` + "\n"
 	bodyOrgNotFound     = `{"error":{"code":"org_not_found","message":"no such organization"}}` + "\n"
-	bodyMemberNotFound  = `{"error":{"code":"member_not_found","message":"no such member"}}` + "\n"
-	bodyOfferNotFound   = `{"error":{"code":"offer_not_found","message":"no such offer"}}` + "\n"
+	bodyMemberRevoked   = `{"error":{"code":"member_revoked",` +
+		`"message":"a revoked member cannot be made an administrator"}}` + "\n"
+	bodyMemberNotFound = `{"error":{"code":"member_not_found","message":"no such member"}}` + "\n"
 )
 
 // unavailable is the failure the store reports for a database that is down: 503
@@ -112,15 +111,10 @@ type fakeStore struct {
 	get          reply[store.Org]
 	list         reply[store.OrgPage]
 	rename       reply[store.Org]
-	revoke       reply[store.OrgEnd]
+	remove       reply[store.Org]
 	members      reply[store.MemberPage]
 	setAdmin     reply[store.Member]
-	removeMember reply[store.Member]
-	createOffer  reply[store.Offer]
-	orgOffers    reply[store.OfferPage]
-	myOffers     reply[store.OfferPage]
-	accept       reply[store.Offer]
-	revokeOffer  reply[store.Offer]
+	revokeMember reply[store.Member]
 
 	calls []string
 }
@@ -135,9 +129,9 @@ func cursorText(cursor input.Cursor) string {
 	return "-"
 }
 
-func (f *fakeStore) CreateOrg(_ context.Context, org store.NewOrg) (store.Org, error) {
-	f.recordf("CreateOrg id=%s kind=%s name=%s creator=%s expires=%d limit=%d at=%d",
-		org.ID, org.Kind, org.Name, org.Creator, org.ExpiresAt.Unix(), org.Limit, org.CreatedAt.Unix())
+func (f *fakeStore) CreateSandbox(_ context.Context, sandbox store.NewSandbox) (store.Org, error) {
+	f.recordf("CreateSandbox id=%s name=%s creator=%s expires=%d limit=%d at=%d",
+		sandbox.ID, sandbox.Name, sandbox.Creator, sandbox.ExpiresAt.Unix(), sandbox.Limit, sandbox.CreatedAt.Unix())
 
 	return f.create.value, f.create.err
 }
@@ -164,12 +158,10 @@ func (f *fakeStore) RenameOrg(
 	return f.rename.value, f.rename.err
 }
 
-func (f *fakeStore) RevokeOrg(
-	_ context.Context, id input.ID, caller, adminRole string, now time.Time,
-) (store.OrgEnd, error) {
-	f.recordf("RevokeOrg id=%s caller=%s role=%s at=%d", id, caller, adminRole, now.Unix())
+func (f *fakeStore) DeleteSandbox(_ context.Context, id input.ID, caller, adminRole string) (store.Org, error) {
+	f.recordf("DeleteSandbox id=%s caller=%s role=%s", id, caller, adminRole)
 
-	return f.revoke.value, f.revoke.err
+	return f.remove.value, f.remove.err
 }
 
 func (f *fakeStore) ListMembers(
@@ -189,46 +181,12 @@ func (f *fakeStore) SetMemberAdmin(
 	return f.setAdmin.value, f.setAdmin.err
 }
 
-func (f *fakeStore) RemoveMember(_ context.Context, id input.ID, caller, adminRole string) (store.Member, error) {
-	f.recordf("RemoveMember id=%s caller=%s role=%s", id, caller, adminRole)
+func (f *fakeStore) RevokeMember(
+	_ context.Context, id input.ID, caller, adminRole string, now time.Time,
+) (store.Member, error) {
+	f.recordf("RevokeMember id=%s caller=%s role=%s at=%d", id, caller, adminRole, now.Unix())
 
-	return f.removeMember.value, f.removeMember.err
-}
-
-func (f *fakeStore) CreateOffer(_ context.Context, offer store.NewOffer) (store.Offer, error) {
-	f.recordf("CreateOffer id=%s org=%s user=%s role=%s caller=%s adminRole=%s at=%d",
-		offer.ID, offer.OrgID, offer.UserID, offer.Role, offer.Caller, offer.AdminRole, offer.CreatedAt.Unix())
-
-	return f.createOffer.value, f.createOffer.err
-}
-
-func (f *fakeStore) ListOrgOffers(
-	_ context.Context, id input.ID, caller, adminRole string, cursor input.Cursor, limit input.PageLimit,
-) (store.OfferPage, error) {
-	f.recordf("ListOrgOffers id=%s caller=%s role=%s cursor=%s limit=%d",
-		id, caller, adminRole, cursorText(cursor), limit.Int())
-
-	return f.orgOffers.value, f.orgOffers.err
-}
-
-func (f *fakeStore) ListMyOffers(
-	_ context.Context, caller string, cursor input.Cursor, limit input.PageLimit,
-) (store.OfferPage, error) {
-	f.recordf("ListMyOffers caller=%s cursor=%s limit=%d", caller, cursorText(cursor), limit.Int())
-
-	return f.myOffers.value, f.myOffers.err
-}
-
-func (f *fakeStore) AcceptOffer(_ context.Context, id input.ID, caller string, now time.Time) (store.Offer, error) {
-	f.recordf("AcceptOffer id=%s caller=%s at=%d", id, caller, now.Unix())
-
-	return f.accept.value, f.accept.err
-}
-
-func (f *fakeStore) RevokeOffer(_ context.Context, id input.ID, caller, adminRole string) (store.Offer, error) {
-	f.recordf("RevokeOffer id=%s caller=%s role=%s", id, caller, adminRole)
-
-	return f.revokeOffer.value, f.revokeOffer.err
+	return f.revokeMember.value, f.revokeMember.err
 }
 
 // recordf notes a call.
@@ -468,11 +426,10 @@ func wantCalls(t *testing.T, got, want []string) {
 
 // Stored rows the tests program the fake with.
 
-// storedOrg is a standard organization: active unless the test changes it.
+// storedOrg is a standard organization.
 func storedOrg(id string) store.Org {
 	return store.Org{
-		ID: id, Kind: store.OrgKindStandard, Name: "Acme", CreatedBy: userID, ExpiresAt: nil, RevokedAt: nil,
-		CreatedAt: 1_700_000_000,
+		ID: id, Kind: store.OrgKindStandard, Name: "Acme", CreatedBy: userID, ExpiresAt: nil, CreatedAt: 1_700_000_000,
 	}
 }
 
@@ -487,14 +444,6 @@ func storedSandbox(id string, expires int64) store.Org {
 // storedMember is a member of orgID.
 func storedMember(id string, admin bool) store.Member {
 	return store.Member{ID: id, OrgID: orgID, Admin: admin, RevokedAt: nil, CreatedAt: 1_700_000_001}
-}
-
-// storedOffer is an offer to userID.
-func storedOffer(id string) store.Offer {
-	return store.Offer{
-		ID: id, OrgID: orgID, OrgName: "Acme", UserID: new(userID), InvitationID: nil, Role: store.OfferRoleMember,
-		CreatedBy: otherID, CreatedAt: 1_700_000_002,
-	}
 }
 
 // wantRefusal checks a failure whose message is the parser's: the status, the

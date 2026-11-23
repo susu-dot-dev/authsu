@@ -22,20 +22,20 @@ const (
 	CodeOrgLookupRejected = "org_lookup_rejected"
 	CodeOrgUpdateFailed   = "org_update_failed"
 	CodeOrgUpdateRejected = "org_update_rejected"
-	CodeOrgRevokeFailed   = "org_revoke_failed"
-	CodeOrgRevokeRejected = "org_revoke_rejected"
+	CodeOrgDeleteFailed   = "org_delete_failed"
+	CodeOrgDeleteRejected = "org_delete_rejected"
 )
 
 // orgsDescription is the client-safe text of every organization operation's
-// Unavailable error. Members and offers use it too.
+// Unavailable error. Members use it too.
 const orgsDescription = "organizations are temporarily unavailable"
 
 // orgsFirstPage is the cursor bound of the first page of an organization, member
-// or offer list: every id is below it (see agentsFirstPage). It is internal:
+// list: every id is below it (see agentsFirstPage). It is internal:
 // callers pass an input.Cursor, which is empty for the first page.
 const orgsFirstPage = "g"
 
-// The outcomes of the organization, member and offer operations that are the
+// The outcomes of the organization and member operations that are the
 // state the request met and not a failure. A feature maps each to its client
 // code; the operations return them as they are.
 var (
@@ -43,37 +43,41 @@ var (
 	// request was authenticated, so nothing was written.
 	ErrAccountRevoked = errors.New("the account is revoked")
 
-	// ErrAlreadyMember means the account already belongs to an organization,
-	// so it can neither create a standard one nor join another.
-	ErrAlreadyMember = errors.New("the account already belongs to an organization")
-
-	// ErrOrgLimit means the account has reached the limit on what it may
-	// create: the most standard organizations it may ever create, or the most
-	// sandboxes it may hold that have not expired.
-	ErrOrgLimit = errors.New("the account has reached the limit of what it may create")
+	// ErrSandboxLimit means the account already holds the most sandboxes it may
+	// that have not expired.
+	ErrSandboxLimit = errors.New("the account has reached the limit of sandboxes")
 
 	// ErrNotAdmin means the caller can see the organization but does not
 	// administer it, and is not a platform administrator.
 	ErrNotAdmin = errors.New("the caller does not administer the organization")
 
-	// ErrInactive means the organization is revoked, or is a sandbox that has
-	// expired, and so cannot be changed.
-	ErrInactive = errors.New("the organization is revoked or has expired")
+	// ErrExpired means the organization is a sandbox that has expired, and so
+	// cannot be changed.
+	ErrExpired = errors.New("the sandbox has expired")
 
-	// ErrNotStandard means the organization is a sandbox, which has no members
-	// and receives no offers.
+	// ErrNotStandard means the organization is a sandbox, which has no members.
 	ErrNotStandard = errors.New("the organization is a sandbox")
+
+	// ErrNotSandbox means the organization is a standard organization, which is
+	// never deleted.
+	ErrNotSandbox = errors.New("the organization is not a sandbox")
+
+	// ErrMemberRevoked means a promotion named a member whose account is revoked,
+	// who never administers anything again.
+	ErrMemberRevoked = errors.New("a revoked member cannot be made an administrator")
 
 	// ErrLastOrgAdmin means the change would leave a standard organization
 	// without an unrevoked administrator.
-	ErrLastOrgAdmin = errors.New("the last unrevoked administrator of the organization cannot be removed")
+	ErrLastOrgAdmin = errors.New("the last unrevoked administrator of the organization cannot be demoted")
 
-	// ErrOfferExists means the user already has an offer from the organization.
-	ErrOfferExists = errors.New("the user already has an offer from the organization")
+	// ErrPlatformAdminTarget means an administrator of an organization tried to
+	// revoke a platform administrator, who only a platform administrator may
+	// revoke, even when they belong to the organization.
+	ErrPlatformAdminTarget = errors.New("only a platform administrator may revoke a platform administrator")
 
-	// ErrTargetNotFound means the user an offer is addressed to does not
-	// exist or is revoked.
-	ErrTargetNotFound = errors.New("the user to offer a place to was not found")
+	// ErrSelfRevoke means an administrator of an organization tried to revoke
+	// their own account, which only a platform administrator may do.
+	ErrSelfRevoke = errors.New("an organization administrator may not revoke themself")
 )
 
 // Org is an organization or a sandbox as stored.
@@ -91,29 +95,25 @@ type Org struct {
 	// standard organization.
 	ExpiresAt *int64
 
-	// RevokedAt is when a standard organization was revoked, in Unix seconds,
-	// and nil while it is not (and always for a sandbox).
-	RevokedAt *int64
-
 	// CreatedAt is in Unix seconds.
 	CreatedAt int64
 }
 
-// Active reports whether the organization works at now: a standard one is not
-// revoked, and a sandbox has not expired. It is the Go reading of the
+// Active reports whether the organization works at now: a standard one always
+// does, and a sandbox does until it expires. It is the Go reading of the
 // condition every write that needs an active organization states in SQL.
 func (o Org) Active(now time.Time) bool {
-	return o.RevokedAt == nil && (o.ExpiresAt == nil || *o.ExpiresAt > now.Unix())
+	return o.ExpiresAt == nil || *o.ExpiresAt > now.Unix()
 }
 
 // readOrg reads one organization row, in the column order every organization
 // statement selects or returns: id, kind, name, created_by, expires_at,
-// revoked_at, created_at.
+// created_at.
 func readOrg(r *row) Org {
 	// Struct fields are evaluated in order, which is the column order.
 	return Org{
 		ID: r.text(), Kind: r.text(), Name: r.text(), CreatedBy: r.text(),
-		ExpiresAt: r.optInteger(), RevokedAt: r.optInteger(), CreatedAt: r.integer(),
+		ExpiresAt: r.optInteger(), CreatedAt: r.integer(),
 	}
 }
 
@@ -151,8 +151,8 @@ func readOrgStanding(r *row) orgStanding {
 // once in a statement and the condition is never written again by hand, which is
 // how the places that ask it would come to disagree. A statement about the
 // organization with the id ?1 uses callerSeesOrg or callerAdministersOrg; one
-// about a user's own organization (members.go) or an offer's (offers.go) puts
-// that column between the halves (callerSeesTargetOrg and the others there).
+// about a user's own organization (members.go) puts that column between the
+// halves (callerSeesTargetOrg and the others there).
 const (
 	// orgSubjectFrom opens both conditions, and the expression naming the
 	// organization they are about follows it: a one-row table, so that the
@@ -180,159 +180,136 @@ const (
 	callerAdministersOrg = orgSubjectFrom + `?1` + callerAdministersOrgTo
 )
 
-// insertOrgQuery creates an organization or a sandbox for an account, if the
-// account may have another. The conditions are part of the write, so two
-// creates at a limit cannot both pass:
+// insertSandboxQuery creates a sandbox for an account, if the account may have
+// another. The conditions are part of the write, so two creates at the limit
+// cannot both pass:
 //
 //   - the creator must be an unrevoked account, read from users here and not
 //     trusted from the request;
-//   - a standard organization needs a creator that belongs to none (a user
-//     belongs to at most one);
-//   - the creator must have fewer than ?8 organizations of the kind counted
-//     as the limit says: all the standard organizations it ever created,
-//     revoked ones included, or the sandboxes that have not expired as of ?5.
-//     The organizations are their own record of both, so there is no counter.
+//   - the creator must have fewer than ?6 sandboxes that have not expired as of
+//     ?4. The sandboxes are their own record of it, so there is no counter. The
+//     count is of the sandbox kind (?5) only: the organization every account
+//     has is created by its own account too, and is not counted.
 //
 // A conditional INSERT ... SELECT that matches nothing is not an error, so the
-// statements that follow in the batch each depend on this row existing and do
-// nothing otherwise, and CreateOrg reads why from the last statement of the
-// batch (createOrgStandingQuery), as it reads the row from RETURNING. The id is
-// fresh, so the row exists only if this statement wrote it.
+// statement that follows in the batch depends on this row existing and does
+// nothing otherwise, and CreateSandbox reads why from the last statement of the
+// batch (callerStandingQuery), as it reads the row from RETURNING. The id
+// is fresh, so the row exists only if this statement wrote it.
 //
-// The sandbox kind needs an expiry and the standard kind none (the schema's
-// CHECKs), which is the caller's ?4: nil for a standard organization.
-//
-// Arguments, by number: ?1 id, ?2 kind, ?3 name, ?4 expires_at or NULL, ?5
-// created_at, ?6 creator id, ?7 the standard kind, ?8 the limit.
-const insertOrgQuery = `
-INSERT INTO orgs (id, kind, name, created_by, expires_at, revoked_at, created_at)
-SELECT ?1, ?2, ?3, u.id, ?4, NULL, ?5
+// Arguments, by number: ?1 id, ?2 name, ?3 expires_at, ?4 created_at, ?5 the
+// sandbox kind, ?6 the limit, ?7 creator id.
+const insertSandboxQuery = `
+INSERT INTO orgs (id, kind, name, created_by, expires_at, created_at)
+SELECT ?1, ?5, ?2, u.id, ?3, ?4
 FROM users u
-WHERE u.id = ?6
+WHERE u.id = ?7
   AND u.revoked_at IS NULL
-  AND (?2 <> ?7 OR u.org_id IS NULL)
   AND (SELECT count(*) FROM orgs g
-       WHERE g.created_by = u.id AND g.kind = ?2 AND (?2 = ?7 OR g.expires_at > ?5)) < ?8
-RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at`
+       WHERE g.created_by = u.id AND g.kind = ?5 AND g.expires_at > ?4) < ?6
+RETURNING id, kind, name, created_by, expires_at, created_at`
 
-// joinCreatedOrgQuery makes the creator a member of the standard organization
-// it has just created, in the same batch. It applies only when insertOrgQuery
-// wrote the organization (it names the creator's own, just created) and only
-// for the standard kind, since a sandbox has no members: the administrator of a
-// sandbox keeps their own organization.
+// insertCreatorAdminQuery makes the creator the administrator of the sandbox it
+// has just created. It applies only when insertSandboxQuery wrote the sandbox.
 //
-// Arguments, by number: ?1 organization id, ?2 creator id, ?3 kind, ?4 the
-// standard kind.
-const joinCreatedOrgQuery = `
-UPDATE users SET org_id = ?1
-WHERE id = ?2 AND org_id IS NULL AND ?3 = ?4
-  AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = ?1 AND o.created_by = ?2)`
-
-// insertCreatorAdminQuery makes the creator the administrator of what it has
-// just created, of either kind. It applies only when insertOrgQuery wrote the
-// organization.
-//
-// Arguments, by number: ?1 organization id, ?2 created_at.
+// Arguments, by number: ?1 sandbox id, ?2 created_at.
 const insertCreatorAdminQuery = `
 INSERT INTO org_admins (org_id, user_id, created_at)
 SELECT o.id, o.created_by, ?2 FROM orgs o WHERE o.id = ?1`
 
-// createOrgStandingQuery is the last statement of CreateOrg: why the creator was
-// refused, read in the same batch as the refused write and so from the state it
-// saw. No row is an account that does not exist.
+// callerStandingQuery is the last statement of a write that can be refused: whether
+// the caller was revoked, read in the same batch as the refused write and so from
+// the state it saw. No row is an account that does not exist. It is how a write
+// that matched nothing tells a revoked caller (401) from a caller who may not see
+// what they asked about (404): every write's conditions require an unrevoked
+// caller, so both look the same to it.
 //
-// Arguments: creator id.
-const createOrgStandingQuery = `
-SELECT u.revoked_at IS NOT NULL AS revoked, u.org_id IS NOT NULL AS member FROM users u WHERE u.id = ?1`
+// Arguments: caller id.
+const callerStandingQuery = `
+SELECT u.revoked_at IS NOT NULL AS revoked FROM users u WHERE u.id = ?1`
 
-// NewOrg is an organization or a sandbox to create.
-type NewOrg struct {
-	// ID is the new organization's id.
-	ID string
-
-	// Kind is what to create, and Name what to call it.
-	Kind input.OrgKind
+// NewSandbox is a sandbox to create.
+type NewSandbox struct {
+	// ID is the new sandbox's id, and Name what to call it.
+	ID   string
 	Name input.OrgName
 
-	// Creator is the account creating it. It administers it, and for a standard
-	// organization it also becomes its member.
+	// Creator is the account creating it. It administers it, and keeps its own
+	// organization.
 	Creator string
 
-	// ExpiresAt is when a sandbox stops working. It is not used for a standard
-	// organization, which does not expire.
+	// ExpiresAt is when the sandbox stops working.
 	ExpiresAt time.Time
 
-	// Limit is how many the creator may have of the kind: for a standard
-	// organization how many it may ever create, revoked ones included, and for
-	// a sandbox how many may exist that have not expired.
+	// Limit is how many sandboxes that have not expired the creator may hold.
 	Limit int
 
 	// CreatedAt is when it is created.
 	CreatedAt time.Time
 }
 
-// CreateOrg creates an organization or a sandbox, and its creator's
-// administration of it, as one batch; for a standard organization the creator
-// also joins it in the same batch. It returns the organization as stored.
+// CreateSandbox creates a sandbox and its creator's administration of it, as one
+// batch, and returns the sandbox as stored.
 //
-// It returns ErrAccountRevoked when the creator is revoked or gone,
-// ErrAlreadyMember when a standard organization is refused because the creator
-// belongs to one, and ErrOrgLimit when the creator has Limit of the kind. When
-// more than one holds, ErrAccountRevoked comes first and then ErrAlreadyMember.
-// None of these leaves anything written.
+// It returns ErrAccountRevoked when the creator is revoked or gone, and
+// ErrSandboxLimit when the creator already holds Limit sandboxes that have not
+// expired. Neither leaves anything written.
 //
 // Nothing the batch writes can collide with data that exists (the ids are
 // fresh), so a conflict of any kind is a defect, reported as the operation's
 // "_rejected" 500.
-func (s *Store) CreateOrg(ctx context.Context, org NewOrg) (Org, error) {
+func (s *Store) CreateSandbox(ctx context.Context, sandbox NewSandbox) (Org, error) {
 	o := op{failed: CodeOrgCreateFailed, rejected: CodeOrgCreateRejected, description: orgsDescription}
 
-	var expires any
-	if org.Kind.Sandbox() {
-		expires = org.ExpiresAt.Unix()
-	}
-
-	created := org.CreatedAt.Unix()
+	created := sandbox.CreatedAt.Unix()
 
 	return outcome(s.runChecked(ctx, o,
-		Statement{Query: insertOrgQuery, Args: []any{
-			org.ID, org.Kind.String(), org.Name.String(), expires, created, org.Creator, OrgKindStandard, int64(org.Limit),
+		Statement{Query: insertSandboxQuery, Args: []any{
+			sandbox.ID, sandbox.Name.String(), sandbox.ExpiresAt.Unix(), created, OrgKindSandbox, int64(sandbox.Limit),
+			sandbox.Creator,
 		}},
-		Statement{Query: joinCreatedOrgQuery, Args: []any{org.ID, org.Creator, org.Kind.String(), OrgKindStandard}},
-		Statement{Query: insertCreatorAdminQuery, Args: []any{org.ID, created}},
-		Statement{Query: createOrgStandingQuery, Args: []any{org.Creator}},
+		Statement{Query: insertCreatorAdminQuery, Args: []any{sandbox.ID, created}},
+		Statement{Query: callerStandingQuery, Args: []any{sandbox.Creator}},
 	).
 		Then(func(results []Result) (Org, error) {
 			return wroteOr(o, results[0].Rows, readOrg, func() (Org, error) {
-				return refusedBy[creatorStanding, Org](o, results[3].Rows, readCreatorStanding,
-					func(why found[creatorStanding]) error { return refusedCreate(org.Kind, why) })
+				return refusedBy[bool, Org](o, results[2].Rows, readCallerRevoked, refusedCreate)
 			})
 		}),
 	)
 }
 
-// creatorStanding is why a create was refused, as createOrgStandingQuery reads
-// it: the creator is revoked, or belongs to an organization.
-type creatorStanding struct{ revoked, member bool }
+// readCallerRevoked reads the column of callerStandingQuery: whether the caller
+// is revoked.
+func readCallerRevoked(r *row) bool { return r.boolean() }
 
-// readCreatorStanding reads the columns of createOrgStandingQuery.
-func readCreatorStanding(r *row) creatorStanding {
-	return creatorStanding{revoked: r.boolean(), member: r.boolean()}
+// unseen is why a write's standing statement found no row, read off the
+// callerStandingQuery that ended its batch: a caller who is revoked is told so
+// (ErrAccountRevoked), and anyone else cannot see what they asked about, which is
+// the same answer whether it exists or not (ErrNotFound). Both happen only when
+// the write matched nothing, so nothing was written.
+func unseen(o op, rows [][]any) error {
+	revoked, ok, err := findRow(rows, o, readCallerRevoked)
+
+	switch {
+	case err != nil:
+		return err
+	case ok && revoked:
+		return ErrAccountRevoked
+	default:
+		return ErrNotFound
+	}
 }
 
 // refusedCreate is the outcome of a create that wrote nothing, read off the
-// creator's standing: a creator who is gone or revoked is refused first, then a
-// user who belongs to an organization (for the standard kind only), and what is
-// left is the limit.
-func refusedCreate(kind input.OrgKind, why found[creatorStanding]) error {
-	switch {
-	case !why.ok || why.value.revoked:
+// creator's standing: a creator who is gone or revoked is refused first, and
+// what is left is the limit.
+func refusedCreate(why found[bool]) error {
+	if !why.ok || why.value {
 		return ErrAccountRevoked
-	case !kind.Sandbox() && why.value.member:
-		return ErrAlreadyMember
-	default:
-		return ErrOrgLimit
 	}
+
+	return ErrSandboxLimit
 }
 
 // defectOnConflict turns a conflict into a defect for an operation whose writes
@@ -362,7 +339,7 @@ func conflictIsDefect(o op) func(error) error {
 // administrator role.
 const getOrgQuery = `
 SELECT o.id AS id, o.kind AS kind, o.name AS name, o.created_by AS created_by, o.expires_at AS expires_at,
-       o.revoked_at AS revoked_at, o.created_at AS created_at
+       o.created_at AS created_at
 FROM orgs o
 WHERE o.id = ?1 AND ` + callerSeesOrg
 
@@ -379,7 +356,7 @@ func (s *Store) GetOrg(ctx context.Context, id input.ID, caller, adminRole strin
 
 // listOrgsQuery reads one page of the organizations the caller may see, newest
 // first: those they belong to or administer, or every one for a platform
-// administrator, revoked and expired ones included. The id is a UUIDv7, so it is
+// administrator, expired sandboxes included. The id is a UUIDv7, so it is
 // the sort key and the cursor, as for agents: the page is the organizations with
 // an id below the cursor, and a page asks for one row more than it returns so
 // the caller can tell whether there is a next page.
@@ -407,7 +384,7 @@ func (s *Store) GetOrg(ctx context.Context, id input.ID, caller, adminRole strin
 // page), ?3 rows wanted, ?4 the platform administrator role.
 const listOrgsQuery = `
 SELECT o.id AS id, o.kind AS kind, o.name AS name, o.created_by AS created_by, o.expires_at AS expires_at,
-       o.revoked_at AS revoked_at, o.created_at AS created_at
+       o.created_at AS created_at
 FROM orgs o
 WHERE o.id IN (
     SELECT id FROM (SELECT g.id AS id FROM orgs g
@@ -463,20 +440,19 @@ func pageWindow(cursor input.Cursor, limit input.PageLimit) (string, int) {
 }
 
 // renameOrgQuery renames an organization the caller administers, if it is
-// active: a standard organization that is not revoked, or a sandbox that has not
-// expired. A revoked or expired one is final, as a revoked invitation is:
-// changing it would suggest it could be revived. RETURNING gives the row as the
-// write left it, and no row means nothing matched: renameOrgStandingQuery says
-// why, in the same batch.
+// active: a standard organization always is, and a sandbox is until it expires.
+// An expired sandbox is final: changing it would suggest it could be revived.
+// RETURNING gives the row as the write left it, and no row means nothing
+// matched: orgStandingQuery says why, in the same batch.
 //
 // Arguments, by number: ?1 organization id, ?2 caller id, ?3 the platform
 // administrator role, ?4 name, ?5 now.
 const renameOrgQuery = `
 UPDATE orgs SET name = ?4
 WHERE id = ?1
-  AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?5)
+  AND (expires_at IS NULL OR expires_at > ?5)
   AND ` + callerAdministersOrg + `
-RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at`
+RETURNING id, kind, name, created_by, expires_at, created_at`
 
 // orgStandingQuery reads an organization the caller may see, with whether they
 // administer it: the last statement of an organization write that matched
@@ -488,7 +464,7 @@ RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at`
 // administrator role.
 const orgStandingQuery = `
 SELECT o.id AS id, o.kind AS kind, o.name AS name, o.created_by AS created_by, o.expires_at AS expires_at,
-       o.revoked_at AS revoked_at, o.created_at AS created_at, ` + callerAdministersOrg + ` AS administers
+       o.created_at AS created_at, ` + callerAdministersOrg + ` AS administers
 FROM orgs o
 WHERE o.id = ?1 AND ` + callerSeesOrg
 
@@ -496,9 +472,10 @@ WHERE o.id = ?1 AND ` + callerSeesOrg
 // of them, for a platform administrator) and returns it as the write left it.
 //
 // It returns ErrNotFound when the caller may not see the organization (which
-// includes one that does not exist), ErrNotAdmin when they can see it but do not
-// administer it, and ErrInactive when it is revoked or expired. A write that
-// matched nothing for any other reason is a defect.
+// includes one that does not exist), ErrAccountRevoked when the caller was
+// revoked, ErrNotAdmin when they can see it but do not administer it, and
+// ErrExpired when it is a sandbox that has expired. A write
+// that matched nothing for any other reason is a defect.
 func (s *Store) RenameOrg(
 	ctx context.Context, id input.ID, name input.OrgName, caller, adminRole string, now time.Time,
 ) (Org, error) {
@@ -507,95 +484,41 @@ func (s *Store) RenameOrg(
 	return outcome(s.runChecked(ctx, o,
 		Statement{Query: renameOrgQuery, Args: []any{id.String(), caller, adminRole, name.String(), now.Unix()}},
 		Statement{Query: orgStandingQuery, Args: []any{id.String(), caller, adminRole}},
+		Statement{Query: callerStandingQuery, Args: []any{caller}},
 	).
 		Then(func(results []Result) (Org, error) {
-			return wroteOr(o, results[0].Rows, readOrg, func() (Org, error) { return refusedOrg(o, results[1].Rows, now) })
+			return wroteOr(o, results[0].Rows, readOrg, func() (Org, error) {
+				return refusedRename(o, results[1].Rows, results[2].Rows, now)
+			})
 		}),
 	)
 }
 
-// refusedOrg is why a write to an organization the caller administers matched
-// nothing, read off the standing statement that followed it.
-func refusedOrg(o op, rows [][]any, now time.Time) (Org, error) {
+// refusedRename is why a rename matched nothing, read off the standing statement
+// that followed it, and the caller's standing after it for when there is none.
+func refusedRename(o op, rows, callerRows [][]any, now time.Time) (Org, error) {
 	return refusedBy[orgStanding, Org](o, rows, readOrgStanding, func(standing found[orgStanding]) error {
 		switch {
 		case !standing.ok:
-			return ErrNotFound
+			return unseen(o, callerRows)
 		case !standing.value.administer:
 			return ErrNotAdmin
 		case !standing.value.org.Active(now):
-			return ErrInactive
+			return ErrExpired
 		default:
 			return o.defect(fmt.Errorf("%w: nothing matched for a caller who administers", errChanges))
 		}
 	})
 }
 
-// revokeOrgQuery revokes a standard organization the caller administers, now.
-// The row is matched by id and kind, and one that is already revoked keeps its
-// earlier time (the COALESCE), so revoking twice succeeds and cannot move the
-// revocation later. RETURNING gives the row as it was left, and no row returned
-// means the caller may not revoke any standard organization with this id; the
-// statements below are conditioned on the same standing, so they too did nothing.
-//
-// Arguments, by number: ?1 organization id, ?2 caller id, ?3 the platform
-// administrator role, ?4 revoked_at, ?5 the standard kind.
-const revokeOrgQuery = `
-UPDATE orgs SET revoked_at = COALESCE(revoked_at, ?4)
-WHERE id = ?1 AND kind = ?5 AND ` + callerAdministersOrg + `
-RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at`
-
-// releaseMembersQuery releases every member of a standard organization the
-// caller administers once it is revoked, in the same batch and after
-// revokeOrgQuery: a user is never left belonging to an organization that no
-// longer works (docs/orgs_design.md, principle 3). It is a write of its own and
-// not a cascade, so that joining can require the organization to be active in
-// the write that sets it. It applies only when the organization is revoked,
-// which includes one that already was, so a repeated revocation finishes a
-// release that an earlier one did not.
-//
-// Arguments, by number: ?1 organization id, ?2 caller id, ?3 the platform
-// administrator role, ?4 the standard kind.
-const releaseMembersQuery = `
-UPDATE users SET org_id = NULL
-WHERE org_id = ?1
-  AND ` + callerAdministersOrg + `
-  AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = ?1 AND o.kind = ?4 AND o.revoked_at IS NOT NULL)`
-
-// deleteRevokedOrgOffersQuery deletes the offers of a standard organization the
-// caller administers once it is revoked: an offer means nothing once its
-// organization is. It is a delete, and so named in mayDelete of the store's
-// tests, from org_offers only. The platform invitation an offer rides on is
-// never touched.
-//
-// Arguments, by number: ?1 organization id, ?2 caller id, ?3 the platform
-// administrator role, ?4 the standard kind.
-const deleteRevokedOrgOffersQuery = `
-DELETE FROM org_offers
-WHERE org_id = ?1
-  AND ` + callerAdministersOrg + `
-  AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = ?1 AND o.kind = ?4 AND o.revoked_at IS NOT NULL)`
-
-// deleteRevokedOrgAdminsQuery deletes the administrator rows of a standard
-// organization the caller administers once it is revoked. It comes last of the
-// organization's statements, because the caller's own standing may be one of the
-// rows. It deletes from org_admins only.
-//
-// Arguments, by number: ?1 organization id, ?2 caller id, ?3 the platform
-// administrator role, ?4 the standard kind.
-const deleteRevokedOrgAdminsQuery = `
-DELETE FROM org_admins
-WHERE org_id = ?1
-  AND ` + callerAdministersOrg + `
-  AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = ?1 AND o.kind = ?4 AND o.revoked_at IS NOT NULL)`
-
 // deleteSandboxQuery deletes a sandbox the caller administers, by hand: the one
-// way a sandbox ends, apart from being inert once it has expired. It is the
-// whole of the deletion: the foreign keys do the rest (docs/orgs_design.md,
-// principle 5). The sandbox's administrator row goes with it and the
-// administrator stays. Its agents go with it, and with each agent its keys,
-// labels and OAuth grants, and with them the secrets behind keys and grants
-// (the delete triggers), so nothing that belonged to the sandbox is left.
+// way a sandbox ends, apart from being inert once it has expired, and the one
+// way an organization is ever deleted. An expired sandbox may be deleted too. It
+// is the whole of the deletion: the foreign keys do the rest
+// (docs/orgs_design.md, principle 5). The sandbox's administrator row goes with
+// it and the administrator stays. Its agents go with it, and with each agent its
+// keys, labels and OAuth grants, and with them the secrets behind keys and
+// grants (the delete triggers), so nothing that belonged to the sandbox is left.
 // RETURNING gives the row as it was, and no row means the caller may not delete
 // any sandbox with this id.
 //
@@ -604,58 +527,52 @@ WHERE org_id = ?1
 const deleteSandboxQuery = `
 DELETE FROM orgs
 WHERE id = ?1 AND kind = ?4 AND ` + callerAdministersOrg + `
-RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at`
+RETURNING id, kind, name, created_by, expires_at, created_at`
 
-// OrgEnd is how an organization ended: a standard organization was revoked, and
-// stays as the record, and a sandbox was deleted, and is gone.
-type OrgEnd struct {
-	// Org is the organization as the write left it. For a deleted sandbox it is
-	// the row as it was just before it was deleted.
-	Org Org
-
-	// Deleted is true for a sandbox, which no longer exists.
-	Deleted bool
-}
-
-// RevokeOrg ends an organization the caller administers (or any, for a platform
-// administrator) as one batch. A standard organization is revoked: it keeps its
-// row, its members are released, and its offers and administrator rows are
-// deleted. A sandbox is deleted, with everything that belonged to it. Revoking a
-// standard organization that is already revoked succeeds and keeps the earlier
-// time, so the call is idempotent for a platform administrator; its former
-// administrators no longer administer it, and are told it is not found.
+// DeleteSandbox deletes a sandbox the caller administers (or any, for a platform
+// administrator), with everything that belonged to it, and returns the row as it
+// was just before.
 //
-// It returns ErrNotFound when the caller may not see the organization, and
-// ErrNotAdmin when they can see it but do not administer it. A write that
-// matched nothing for any other reason is a defect.
-func (s *Store) RevokeOrg(
-	ctx context.Context, id input.ID, caller, adminRole string, now time.Time,
-) (OrgEnd, error) {
-	o := op{failed: CodeOrgRevokeFailed, rejected: CodeOrgRevokeRejected, description: orgsDescription}
+// It returns ErrNotFound when the caller may not see the organization,
+// ErrAccountRevoked when the caller was revoked, ErrNotAdmin
+// when they can see it but do not administer it, and ErrNotSandbox when it is a
+// standard organization, which is never deleted. An administrator is told it is
+// not a sandbox only after it is known they could administer it: the caller must
+// see the organization to learn what it is. A write that matched nothing for any
+// other reason is a defect.
+func (s *Store) DeleteSandbox(
+	ctx context.Context, id input.ID, caller, adminRole string,
+) (Org, error) {
+	o := op{failed: CodeOrgDeleteFailed, rejected: CodeOrgDeleteRejected, description: orgsDescription}
 
 	args := []any{id.String(), caller, adminRole}
 
 	return outcome(s.runChecked(ctx, o,
-		Statement{Query: revokeOrgQuery, Args: slices.Concat(args, []any{now.Unix(), OrgKindStandard})},
-		Statement{Query: releaseMembersQuery, Args: slices.Concat(args, []any{OrgKindStandard})},
-		Statement{Query: deleteRevokedOrgOffersQuery, Args: slices.Concat(args, []any{OrgKindStandard})},
-		Statement{Query: deleteRevokedOrgAdminsQuery, Args: slices.Concat(args, []any{OrgKindStandard})},
 		Statement{Query: deleteSandboxQuery, Args: slices.Concat(args, []any{OrgKindSandbox})},
 		Statement{Query: orgStandingQuery, Args: args},
+		Statement{Query: callerStandingQuery, Args: []any{caller}},
 	).
-		Then(func(results []Result) (OrgEnd, error) {
-			return wroteOr(o, results[0].Rows, readRevoked, func() (OrgEnd, error) {
-				return wroteOr(o, results[4].Rows, readDeleted, func() (OrgEnd, error) {
-					_, err := refusedOrg(o, results[5].Rows, now)
-
-					return OrgEnd{}, err
-				})
+		Then(func(results []Result) (Org, error) {
+			return wroteOr(o, results[0].Rows, readOrg, func() (Org, error) {
+				return refusedDelete(o, results[1].Rows, results[2].Rows)
 			})
 		}),
 	)
 }
 
-// readRevoked reads the row of a revoked standard organization as the end of it,
-// and readDeleted that of a deleted sandbox: the columns of readOrg.
-func readRevoked(r *row) OrgEnd { return OrgEnd{Org: readOrg(r), Deleted: false} }
-func readDeleted(r *row) OrgEnd { return OrgEnd{Org: readOrg(r), Deleted: true} }
+// refusedDelete is why a delete matched nothing, read off the standing statement
+// that followed it, and the caller's standing after it for when there is none.
+func refusedDelete(o op, rows, callerRows [][]any) (Org, error) {
+	return refusedBy[orgStanding, Org](o, rows, readOrgStanding, func(standing found[orgStanding]) error {
+		switch {
+		case !standing.ok:
+			return unseen(o, callerRows)
+		case !standing.value.administer:
+			return ErrNotAdmin
+		case standing.value.org.Kind != OrgKindSandbox:
+			return ErrNotSandbox
+		default:
+			return o.defect(fmt.Errorf("%w: nothing matched for a caller who administers a sandbox", errChanges))
+		}
+	})
+}

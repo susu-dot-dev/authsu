@@ -48,11 +48,10 @@ type Invitation struct {
 	CreatedBy *string `json:"createdBy,omitempty"`
 	// CreatedAt is in Unix seconds.
 	CreatedAt int64 `json:"createdAt"`
-	// OrgID and OrgRole are the offer to join an organization that the
-	// invitation carries, present together while the offer exists: whoever
-	// registers with the invitation joins that organization as that role. They
-	// are absent when it carries none, was withdrawn, or its organization was
-	// revoked.
+	// OrgID and OrgRole are the organization the invitation names and the role
+	// in it, present together: whoever registers with the invitation joins that
+	// organization as that role. They are absent when it names none, and the
+	// account that registers with it is then given an organization of its own.
 	OrgID   *string `json:"orgId,omitempty"`
 	OrgRole *string `json:"orgRole,omitempty"`
 }

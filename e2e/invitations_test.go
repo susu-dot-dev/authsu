@@ -261,7 +261,7 @@ func invUsersOf(t *testing.T, family, invitation string, n int, revokedAt *int64
 	t.Helper()
 
 	for i := range n {
-		seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, revoked_at, created_at) "+
+		seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, revoked_at, created_at) "+
 			"VALUES (?, randomblob(16), 'e2e_none', ?, ?, strftime('%s','now'))", idN(family, i+1), invitation, revokedAt)
 	}
 }
@@ -1518,7 +1518,10 @@ func TestInvitationConcurrentUpdates(t *testing.T) {
 	const n = 16
 
 	for round := range 4 {
-		seed(t, "DELETE FROM users WHERE role = 'e2e_none'")
+		for _, id := range rowsOf(t, "SELECT id FROM users WHERE role = 'e2e_none'") {
+			deleteAccount(t, id)
+		}
+
 		seed(t, "DELETE FROM invitations WHERE id = ?", idInvitationA)
 		seedInvitation(t, idInvitationA, 20)
 		seedUsers(t, idInvitationA, 3)
@@ -1771,7 +1774,7 @@ func TestInvitationRevokeClosesRegistration(t *testing.T) {
 	// what refuses the code from here on. Worker idle: nothing in flight.
 	seed(t, "DELETE FROM sessions")
 	seed(t, "DELETE FROM credentials")
-	seed(t, "DELETE FROM users")
+	deleteAccounts(t)
 
 	beginRegistration(t, code, "Late").expect(t, "begin after revoke", http.StatusForbidden, invCodeInvalidReg)
 

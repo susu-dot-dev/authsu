@@ -11,10 +11,10 @@ import (
 
 // This file extends the seam of schema_test.go to the organization tables, with
 // that file's bound table and checks. orgs.name bounds BYTES and refuses NUL
-// like agents.name; orgs.kind and org_offers.role are open-ended text that Go
+// like agents.name; orgs.kind and invitation_orgs.role are open-ended text that Go
 // owns (docs/DATABASE.md), so only their size is checked, against the longest
 // value the parsers accept. Like the other schema tests it reads the
-// migrations' text and cannot run SQL: what the constraints do when executed is
+// migration's text and cannot run SQL: what the constraints do when executed is
 // checked by the e2e tests against the real database.
 
 // orgWorstName is the longest OrgName by bytes: the most runes the parser
@@ -47,7 +47,7 @@ func longestAndShortest(values []string) (int, int) {
 func orgSchemaBounds(t *testing.T) []bound {
 	t.Helper()
 
-	lowestKind, highestKind := longestAndShortest(input.OrgKinds())
+	lowestKind, highestKind := longestAndShortest([]string{input.OrgKindStandard, input.OrgKindSandbox})
 	lowestRole, highestRole := longestAndShortest(input.OrgRoles())
 
 	return []bound{
@@ -59,8 +59,8 @@ func orgSchemaBounds(t *testing.T) []bound {
 			pattern: `CREATE TABLE orgs \(.*? kind TEXT NOT NULL CHECK \(typeof\(kind\) = 'text' ` +
 				`AND length\(kind\) BETWEEN (\d+) AND (\d+)\)`,
 			lowest: lowestKind, highest: highestKind, exact: false},
-		{name: "org_offers.role length",
-			pattern: `CREATE TABLE org_offers \(.*? role TEXT NOT NULL CHECK \(typeof\(role\) = 'text' ` +
+		{name: "invitation_orgs.role length",
+			pattern: `CREATE TABLE invitation_orgs \(.*? role TEXT NOT NULL CHECK \(typeof\(role\) = 'text' ` +
 				`AND length\(role\) BETWEEN (\d+) AND (\d+)\)`,
 			lowest: lowestRole, highest: highestRole, exact: false},
 	}
@@ -112,8 +112,8 @@ func TestOrgBoundsAreMeaningful(t *testing.T) {
 
 // TestOrgKindsMatchTheMigration holds that each Go constant is exactly the
 // literal the schema writes where the value is an invariant: the kind a user
-// may belong to, the kind an agent may be confined to, the kind an offer may be
-// for, and the two kinds' own rules.
+// may belong to, the kind an agent may be confined to, the kind an invitation may
+// name, and the two kinds' own rules.
 func TestOrgKindsMatchTheMigration(t *testing.T) {
 	t.Parallel()
 
@@ -129,11 +129,11 @@ func TestOrgKindsMatchTheMigration(t *testing.T) {
 		{"an agent is confined only to a sandbox",
 			`sandbox_kind TEXT NOT NULL DEFAULT '` + store.OrgKindSandbox + `' ` +
 				`CHECK \(sandbox_kind = '` + store.OrgKindSandbox + `'\)`},
-		{"an offer is only for a standard organization",
-			`CREATE TABLE org_offers \(.*? kind TEXT NOT NULL DEFAULT '` + store.OrgKindStandard +
+		{"an invitation names only a standard organization",
+			`CREATE TABLE invitation_orgs \(.*? kind TEXT NOT NULL DEFAULT '` + store.OrgKindStandard +
 				`' CHECK \(kind = '` + store.OrgKindStandard + `'\)`},
-		{"a sandbox expires and is never revoked",
-			`CHECK \(kind <> '` + store.OrgKindSandbox + `' OR \(expires_at IS NOT NULL AND revoked_at IS NULL\)\)`},
+		{"a sandbox expires",
+			`CHECK \(kind <> '` + store.OrgKindSandbox + `' OR expires_at IS NOT NULL\)`},
 		{"a standard organization does not expire",
 			`CHECK \(kind <> '` + store.OrgKindStandard + `' OR expires_at IS NULL\)`},
 	}
@@ -151,7 +151,7 @@ func TestOrgKindsMatchTheMigration(t *testing.T) {
 	// The constants are the parsers' values, so a client's spelling and the
 	// store's binding cannot differ.
 	if store.OrgKindStandard != input.OrgKindStandard || store.OrgKindSandbox != input.OrgKindSandbox ||
-		store.OfferRoleMember != input.OrgRoleMember || store.OfferRoleAdmin != input.OrgRoleAdmin {
+		store.OrgRoleMember != input.OrgRoleMember || store.OrgRoleAdmin != input.OrgRoleAdmin {
 		t.Error("a store constant differs from the value the input parser accepts")
 	}
 }
@@ -160,7 +160,7 @@ func TestOrgKindsMatchTheMigration(t *testing.T) {
 // on and that no Go value can show: the keys that keep a user in a standard
 // organization and an agent in a sandbox, the cascade that deletes a sandbox's
 // agents, the absence of one on everything a standard organization holds, the
-// uniqueness that stops a second offer, and the NOT NULL columns that turn a
+// primary key that stops a second organization on an invitation, and the NOT NULL columns that turn a
 // conditional insert that matched nothing into a failed batch.
 func TestOrgSchemaShape(t *testing.T) {
 	t.Parallel()
@@ -175,8 +175,8 @@ func TestOrgSchemaShape(t *testing.T) {
 		{"an organization's creator is required and is never deleted",
 			`CREATE TABLE orgs \(.*? created_by TEXT NOT NULL REFERENCES users \(id\),`},
 		{"a user's membership is on the id and the kind, with no ON DELETE action",
-			`FOREIGN KEY \(org_id, org_kind\) REFERENCES orgs \(id, kind\) \);`},
-		{"a user may belong to none", `org_id TEXT, org_kind TEXT NOT NULL`},
+			`FOREIGN KEY \(org_id, org_kind\) REFERENCES orgs \(id, kind\) DEFERRABLE INITIALLY DEFERRED \);`},
+		{"a user belongs to one", `org_id TEXT NOT NULL, org_kind TEXT NOT NULL`},
 		{"an agent's sandbox is on the id and the kind and cascades",
 			`FOREIGN KEY \(sandbox_id, sandbox_kind\) REFERENCES orgs \(id, kind\) ON DELETE CASCADE`},
 		{"an agent may belong to none", `sandbox_id TEXT, sandbox_kind TEXT NOT NULL`},
@@ -186,28 +186,23 @@ func TestOrgSchemaShape(t *testing.T) {
 			`CREATE TABLE org_admins \( org_id TEXT NOT NULL REFERENCES orgs \(id\) ON DELETE CASCADE,`},
 		{"an administrator row dies with its user",
 			`user_id TEXT NOT NULL REFERENCES users \(id\) ON DELETE CASCADE, created_at`},
-		{"an offer is for a user or an invitation, not both and not neither",
-			`CHECK \(\(user_id IS NULL\) <> \(invitation_id IS NULL\)\)`},
-		{"a user is offered an organization once", `CREATE TABLE org_offers \(.*? UNIQUE \(org_id, user_id\),`},
-		{"an invitation carries one offer, which dies with it",
-			`invitation_id TEXT UNIQUE REFERENCES invitations \(id\) ON DELETE CASCADE`},
-		{"an offer to a user dies with the user",
-			`CREATE TABLE org_offers \(.*? user_id TEXT REFERENCES users \(id\) ON DELETE CASCADE,`},
-		{"an offer's organization has no ON DELETE action",
-			`FOREIGN KEY \(org_id, kind\) REFERENCES orgs \(id, kind\) \);`},
-		{"an offer has a creator and a role",
-			`role TEXT NOT NULL CHECK .*? created_by TEXT NOT NULL REFERENCES users \(id\),`},
+		// NOT NULL is spelled out: SQLite lets a bare TEXT PRIMARY KEY hold NULL.
+		{"an invitation names at most one organization, which goes with the invitation",
+			`CREATE TABLE invitation_orgs \( invitation_id TEXT NOT NULL PRIMARY KEY ` +
+				`REFERENCES invitations \(id\) ON DELETE CASCADE,`},
+		{"the organization an invitation names is on the id and the kind, with no ON DELETE action",
+			`CREATE TABLE invitation_orgs \(.*? FOREIGN KEY \(org_id, kind\) REFERENCES orgs \(id, kind\) \);`},
+		{"the organization an invitation names is required",
+			`CREATE TABLE invitation_orgs \(.*? org_id TEXT NOT NULL, kind TEXT`},
 		// Ending in id, the members' sort key and cursor, so a page of them is read
 		// in order without sorting the whole organization.
 		{"the members of an organization are indexed in the order they are listed",
-			`CREATE INDEX users_org_id ON users \(org_id, id\) WHERE org_id IS NOT NULL;`},
+			`CREATE INDEX users_org_id ON users \(org_id, id\);`},
 		{"the agents of a sandbox are indexed",
 			`CREATE INDEX agents_sandbox_id ON agents \(sandbox_id\) WHERE sandbox_id IS NOT NULL;`},
-		{"the creation limits are indexed",
+		{"the sandbox limit is indexed",
 			`CREATE INDEX orgs_created_by ON orgs \(created_by, kind, expires_at\);`},
 		{"the administrators of a user are indexed", `CREATE INDEX org_admins_user_id ON org_admins \(user_id\);`},
-		{"the offers of a user are indexed",
-			`CREATE INDEX org_offers_user_id ON org_offers \(user_id\) WHERE user_id IS NOT NULL;`},
 	}
 
 	for _, test := range tests {

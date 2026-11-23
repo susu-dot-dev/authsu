@@ -268,8 +268,8 @@ func TestSchemaSecretsAreBounded(t *testing.T) {
 func TestSchemaUserProfileIsBounded(t *testing.T) {
 	schemaWorld(t)
 
-	const insert = "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
-		"VALUES (?, randomblob(16), 'member', ?, ?, 1)"
+	const insert = "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) " +
+		"VALUES (?, randomblob(16), 'member', ?, ?, 1, (SELECT id FROM orgs LIMIT 1))"
 
 	// padded is a profile whose name member makes it n characters in all.
 	padded := func(filler string, n int) string {
@@ -407,7 +407,7 @@ func TestSchemaDeletionGoesBothWays(t *testing.T) {
 		seedSession(t, idN("0f40", 9), idUserC)
 		seedAPIKey(t, idN("0f40", 10), idUserC, "")
 
-		seed(t, "DELETE FROM users WHERE id = ?", idUserB)
+		deleteAccount(t, idUserB)
 
 		gone(t, ids.session, ids.key, ids.agentKey)
 		expectCount(t, "agents WHERE user_id = ?", "0", idUserB)
@@ -473,7 +473,7 @@ func TestSchemaDeletionGoesBothWays(t *testing.T) {
 		schemaWorld(t)
 		invInsert(t, idInvitationB, "made by B", 1, 1, nil, nil, new(idUserB))
 
-		seed(t, "DELETE FROM users WHERE id = ?", idUserB)
+		deleteAccount(t, idUserB)
 
 		intact(t, idInvitationB)
 		expectCount(t, "invitations WHERE id = ? AND created_by IS NULL", "1", idInvitationB)
@@ -800,7 +800,7 @@ func TestSchemaOAuthDeletionCascades(t *testing.T) {
 	t.Run("deleting a user deletes its grants", func(t *testing.T) {
 		seedWorld(t)
 
-		seed(t, "DELETE FROM users WHERE id = ?", idUserB)
+		deleteAccount(t, idUserB)
 
 		for _, id := range []string{idN(agentGrant, 1), idN(agentAccess, 1)} {
 			expectCount(t, "secrets WHERE id = ?", "0", id)

@@ -221,7 +221,7 @@ VALUES (?1, ?2,
 // A user who already has the agent can sign in again at the limit: the room
 // condition is waived when an active one exists, because nothing is added. A
 // revoked agent does not count as existing: the unique index covers active agents
-// only (migrations/0002_agent_first_party.sql), so after the user revokes it the
+// only (the agents_first_party index), so after the user revokes it the
 // next login creates a fresh agent, which needs room as any new one does. A user
 // at the limit who has none gets no row, the grant's agent_id is NULL, and the
 // batch fails as the limit, as for a consent that creates an agent.

@@ -109,10 +109,11 @@ func bodyUnavailable(code string) string { return errorBody(code, unavailableTex
 
 // storeCall is one call to the account store.
 type storeCall struct {
-	op   string
-	id   string
-	role string
-	now  time.Time
+	op     string
+	id     string
+	caller string
+	role   string
+	now    time.Time
 }
 
 // fakeStore is the account store with a programmable outcome per operation. It
@@ -131,19 +132,21 @@ type fakeStore struct {
 }
 
 func (f *fakeStore) ListUsers(context.Context) ([]store.User, error) {
-	f.calls = append(f.calls, storeCall{op: opList, id: "", role: "", now: time.Time{}})
+	f.calls = append(f.calls, storeCall{op: opList, id: "", caller: "", role: "", now: time.Time{}})
 
 	return f.users, f.listErr
 }
 
 func (f *fakeStore) GetUser(_ context.Context, id input.ID) (store.User, error) {
-	f.calls = append(f.calls, storeCall{op: opGet, id: id.String(), role: "", now: time.Time{}})
+	f.calls = append(f.calls, storeCall{op: opGet, id: id.String(), caller: "", role: "", now: time.Time{}})
 
 	return f.got, f.getErr
 }
 
-func (f *fakeStore) RevokeUser(_ context.Context, id input.ID, adminRole string, now time.Time) (store.User, error) {
-	f.calls = append(f.calls, storeCall{op: opRevoke, id: id.String(), role: adminRole, now: now})
+func (f *fakeStore) RevokeUser(
+	_ context.Context, id input.ID, caller, adminRole string, now time.Time,
+) (store.User, error) {
+	f.calls = append(f.calls, storeCall{op: opRevoke, id: id.String(), caller: caller, role: adminRole, now: now})
 
 	return f.revoked, f.revokeErr
 }
@@ -480,11 +483,13 @@ func wantNoHandle(t *testing.T, body string) {
 var clockAt = time.Date(2026, time.November, 17, 12, 30, 45, 123_456_789, time.FixedZone("test", 5*60*60))
 
 // readCall is the call of a read: it has no role and no time.
-func readCall(op, id string) storeCall { return storeCall{op: op, id: id, role: "", now: time.Time{}} }
+func readCall(op, id string) storeCall {
+	return storeCall{op: op, id: id, caller: "", role: "", now: time.Time{}}
+}
 
 // revokeCall is the call a revocation of id makes at clockAt.
 func revokeCall(id string) storeCall {
-	return storeCall{op: opRevoke, id: id, role: auth.RoleAdmin, now: clockAt}
+	return storeCall{op: opRevoke, id: id, caller: adminID, role: auth.RoleAdmin, now: clockAt}
 }
 
 // outcomeCase is one request to a route, with the store programmed to answer it

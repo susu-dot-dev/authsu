@@ -79,7 +79,14 @@ func TestSessionRead(t *testing.T) {
 	before := sesStored(t, sesSnapshot, id)
 	got := get(t, pathSession, token)
 
-	expected := `{"userId":"` + pk.userID + `","role":"admin","expiresAt":` + sesStored(t, "expires_at", id) + `}` + "\n"
+	// Registration gave the account its organization, which the session names.
+	org := scalar(t, "SELECT org_id FROM users WHERE id = ?", pk.userID)
+	if org == "" {
+		t.Fatal("the registered account has no organization")
+	}
+
+	expected := `{"userId":"` + pk.userID + `","role":"admin","orgId":"` + org + `","expiresAt":` +
+		sesStored(t, "expires_at", id) + `}` + "\n"
 	if got.status != http.StatusOK || got.body != expected {
 		t.Errorf("GET /api/session = %d %q, want 200 %q", got.status, got.body, expected)
 	}
@@ -288,7 +295,16 @@ func TestSessionStopsWorkingWhenItsRowsAreNotUsable(t *testing.T) {
 		{"its account revoked", "UPDATE users SET revoked_at = strftime('%s','now') WHERE id = '{USER}'", false},
 		{"its account revoked in the future", "UPDATE users SET revoked_at = strftime('%s','now') + 3600 WHERE id = '{USER}'", false},
 		{"its account revoked at zero", "UPDATE users SET revoked_at = 0 WHERE id = '{USER}'", false},
-		{"its account deleted", "DELETE FROM users WHERE id = '{USER}'", false},
+		{
+			// The account holds its organization and the organization its creator:
+			// the organization goes first, and the account's key to it is checked
+			// when the statements commit.
+			"its account deleted",
+			"DELETE FROM org_admins WHERE user_id = '{USER}'; " +
+				"DELETE FROM orgs WHERE created_by = '{USER}'; " +
+				"DELETE FROM users WHERE id = '{USER}'",
+			false,
+		},
 		{"unrelated secrets revoked", "UPDATE secrets SET revoked_at = strftime('%s','now') - 1 WHERE id <> '{ID}'", true},
 		{"another account revoked", "UPDATE users SET revoked_at = strftime('%s','now') WHERE id = '" + idUserB + "'", true},
 		{"its passkey flags changed", "UPDATE credentials SET flags = 29 WHERE id = '{CRED}'", true},
@@ -311,7 +327,7 @@ func TestSessionStopsWorkingWhenItsRowsAreNotUsable(t *testing.T) {
 			cred := scalar(t, "SELECT credential_id FROM sessions WHERE id = ?", id)
 			stmt := strings.NewReplacer("{ID}", id, "{USER}", pk.userID, "{CRED}", cred).Replace(tt.update)
 
-			seed(t, stmt)
+			seedAll(t, sqlStmt(stmt))
 
 			got := get(t, pathSession, token)
 			if tt.works {

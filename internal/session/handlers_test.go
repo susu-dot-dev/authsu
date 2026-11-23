@@ -85,7 +85,8 @@ func TestWhoAmI(t *testing.T) {
 	base := time.Date(2026, time.December, 1, 8, 0, 0, 0, time.UTC)
 
 	want := func(owner, role string, expires time.Time) string {
-		return `{"userId":"` + owner + `","role":"` + role + `","expiresAt":` + strconv.FormatInt(expires.Unix(), 10) + `}`
+		return `{"userId":"` + owner + `","role":"` + role + `","orgId":"` + rigOrg + `","expiresAt":` +
+			strconv.FormatInt(expires.Unix(), 10) + `}`
 	}
 
 	tests := []struct {
@@ -149,46 +150,29 @@ func TestWhoAmI(t *testing.T) {
 }
 
 // TestWhoAmIOrganization: the organization is the account's, read with the
-// stored row, for a session and a key alike. It is absent from the body, and not
-// null or empty, for an account that belongs to none.
+// stored row, for a session and a key alike.
 func TestWhoAmIOrganization(t *testing.T) {
 	t.Parallel()
 
-	const orgID = "00000000-0000-7000-8000-0000000000b1"
-
-	tests := []struct {
-		name string
-		org  string
-		want string
-	}{
-		{
-			name: "none: the member is absent", org: "",
-			want: `{"userId":"` + userID + `","role":"member","expiresAt":1900000000}`,
-		},
-		{
-			name: "a member of an organization", org: orgID,
-			want: `{"userId":"` + userID + `","role":"member","orgId":"` + orgID + `","expiresAt":1900000000}`,
-		},
-	}
+	const orgID = "00000000-0000-7000-8000-0000000000b2"
 
 	for _, p := range presenters() {
-		for _, tt := range tests {
-			t.Run(p.name+"/"+tt.name, func(t *testing.T) {
-				t.Parallel()
+		t.Run(p.name, func(t *testing.T) {
+			t.Parallel()
 
-				rig := newRig(t)
-				rig.org = tt.org
+			rig := newRig(t)
+			rig.org = orgID
 
-				req, _, _ := rig.secretFor(p, userID, roleMember, time.Unix(1_900_000_000, 0))
-				req.method, req.target, req.contentType = http.MethodGet, session.PathSession, "-"
+			req, _, _ := rig.secretFor(p, userID, roleMember, time.Unix(1_900_000_000, 0))
+			req.method, req.target, req.contentType = http.MethodGet, session.PathSession, "-"
 
-				rec := rig.serve(req)
+			rec := rig.serve(req)
 
-				if rec.Code != http.StatusOK || rec.Body.String() != tt.want+"\n" {
-					t.Errorf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), tt.want)
-				}
-			})
-		}
+			want := `{"userId":"` + userID + `","role":"member","orgId":"` + orgID + `","expiresAt":1900000000}`
+			if rec.Code != http.StatusOK || rec.Body.String() != want+"\n" {
+				t.Errorf("response = %d %q, want 200 %q", rec.Code, rec.Body.String(), want)
+			}
+		})
 	}
 }
 

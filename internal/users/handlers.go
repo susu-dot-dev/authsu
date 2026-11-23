@@ -44,7 +44,7 @@ type Status string
 const (
 	// StatusActive means the account can log in.
 	StatusActive Status = "active"
-	// StatusRevoked means an admin revoked it.
+	// StatusRevoked means it was revoked, which is final.
 	StatusRevoked Status = "revoked"
 )
 
@@ -96,9 +96,11 @@ func (h handlers) get(call *auth.Call) result.Result[httpapi.Response] {
 
 // revoke answers DELETE /api/user/{id}. Revoking an account that is already
 // revoked succeeds and reports the earlier time, and so does an admin revoking
-// themself while another active admin remains.
+// themself while another active admin remains. The caller is the admin: the
+// route's access is the role, and the store checks it again in the write.
 func (h handlers) revoke(call *auth.Call) result.Result[httpapi.Response] {
-	return result.Of(h.store.RevokeUser(call.Request.Context, call.ID(), auth.RoleAdmin, h.now())).
+	return result.Of(h.store.RevokeUser(
+		call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin, h.now())).
 		MapErr(outcome).
 		Map(func(stored store.User) User { return h.present(call.Request, stored) }).
 		Map(ok)
@@ -113,6 +115,9 @@ func outcome(err error) error {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return refuse(apierr.NotFound, CodeNotFound, "no such user", err)
+	case errors.Is(err, store.ErrAccountRevoked):
+		// The caller was revoked after the request was authenticated.
+		return auth.Unauthenticated(err) //nolint:wrapcheck // the boundary's own classified 401, with err as its cause
 	case errors.Is(err, store.ErrLastAdmin):
 		return refuse(apierr.Conflict, CodeLastAdmin, "the last active administrator cannot be revoked", err)
 	default:

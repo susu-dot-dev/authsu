@@ -61,16 +61,18 @@ That keeps the admin-creates-admin and bootstrap cases from needing special code
 
 The kinds of invitation, and the role each grants, are fixed in code together, not in configuration, so a deployment cannot be wired with a kind of invitation that grants no role. First run is creatable only by the bootstrap itself.
 
-An invitation can also carry an offer to join an organization, which is a side effect of registration and never a condition of it ([orgs_design.md](orgs_design.md), principle 2).
+An invitation can also name an organization and a role in it, member or administrator. The account joins that organization when it is created. An invitation that names none gets an organization created for its account, which the account administers. Either way the organization is settled in the same write as the account and is never a reason to refuse it ([orgs_design.md](orgs_design.md), principle 2). Because organizations gain accounts only through invitations, the caps are how the platform controls the size of each.
 
 ## Managing invitations
 
 Admins list, create, change the cap of and revoke invitations. Every action requires an admin, the role is read on each request so demoting an admin takes effect at once ([users_design.md](users_design.md)), and the code is in the response that created it and nowhere else.
 
+An admin revoked after the request was authenticated and before it was written creates nothing: the creator's standing is a condition of the write that creates the invitation, and the answer is a 401 as for any revoked caller.
+
 - **Revoke, never delete.** Accounts refer to the invitation, and "who came from this code?" must stay answerable, so revoking keeps the invitation. Revoking twice keeps the first time.
 - **Every invitation expires.** The admin chooses when, up to ten years ahead, and it is ten years when they do not. There is no invitation that works forever by default.
 - **Status is derived, not stored**: revoked, expired, exhausted or active, decided from the facts and the clock. There is no status to fall out of step with what it summarises.
-- **The cap can never go below the accounts already created.** That condition is part of the write, because a registration can finish between a read and a write. A revoked invitation cannot be changed: revocation is final, and editing one would suggest it could be revived.
+- **The cap can never go below the accounts already created.** That condition is part of the write, because a registration can finish between a read and a write. A seat is an admission: revoking an account does not free its seat, and the way to give capacity back is to raise the cap. A revoked invitation cannot be changed: revocation is final, and editing one would suggest it could be revived.
 - **A refused change says why**, and the reason comes from the same statement that attempted the write, so it describes the same instant as the refusal.
 
 ## Where invitations are stored

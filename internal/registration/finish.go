@@ -208,7 +208,7 @@ func (h *handlers) authorize(call *auth.Call, cmd finishCommand, ok verified, no
 	return authorized{verified: ok, invitationType: invitationType, role: role}, nil
 }
 
-// createAccount writes the account and its first passkey. A conflict means the
+// createAccount writes the account, its organization and its first passkey. A conflict means the
 // invitation was used up or this registration was already submitted.
 func (h *handlers) createAccount(
 	call *auth.Call, cmd finishCommand, ok authorized, now time.Time,
@@ -219,6 +219,7 @@ func (h *handlers) createAccount(
 		UserID:         userID,
 		UserHandle:     ok.handle,
 		Role:           ok.role,
+		OrgName:        input.OrgNameOf(cmd.name),
 		Name:           cmd.name,
 		Email:          cmd.email,
 		Token:          cmd.token,
@@ -231,12 +232,15 @@ func (h *handlers) createAccount(
 		FirstRunID:        h.newID(),
 		FirstRunLabel:     FirstRunLabel,
 		FirstRunExpiresAt: now.Add(input.ExpiryHorizon),
-		CredentialID:      ok.credential.ID,
-		PublicKey:         ok.credential.PublicKey,
-		Flags:             ok.credential.Flags.Stored(),
-		AAGUID:            formatAAGUID(ok.credential.AAGUID),
-		Transports:        ok.credential.Transports,
-		CreatedAt:         now,
+		// The organization the account is given when its invitation names none.
+		// Its id is taken last, after the others, so they do not depend on it.
+		OrgID:        h.newID(),
+		CredentialID: ok.credential.ID,
+		PublicKey:    ok.credential.PublicKey,
+		Flags:        ok.credential.Flags.Stored(),
+		AAGUID:       formatAAGUID(ok.credential.AAGUID),
+		Transports:   ok.credential.Transports,
+		CreatedAt:    now,
 	})
 	if errors.Is(err, store.ErrConflict) {
 		return FinishResponse{}, apierr.Wrap(err, apierr.Conflict, CodeAcceptFailed, descConflict)

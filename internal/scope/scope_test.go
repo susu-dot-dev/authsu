@@ -95,10 +95,13 @@ func TestBundlesAreComplete(t *testing.T) {
 
 	all := scope.Scopes()
 
+	// nonAdmin is what default:user holds: every scope that is not an admin scope,
+	// except the one that revokes other people's accounts, which a key must be
+	// given by naming it (default:session holds it).
 	var nonAdmin []scope.Scope
 
 	for _, s := range all {
-		if !scope.IsAdmin(s) {
+		if !scope.IsAdmin(s) && s != scope.MemberRevoke {
 			nonAdmin = append(nonAdmin, s)
 		}
 	}
@@ -167,50 +170,94 @@ func TestGrantScopesAreForPeopleNotAgents(t *testing.T) {
 
 // TestOrganizationScopes: each organization scope exists, is not an admin scope
 // (who may look after an organization is decided in the store's write, with the
-// platform administrator's override), and is held by a login session and a
-// user's own keys but never by default:agent, whatever it grows to hold.
+// platform administrator's override), and is held by a login session, never by
+// default:agent, whatever it grows to hold, and by a user's own keys except for
+// member:revoke, which revokes other people's accounts and so must be named.
 func TestOrganizationScopes(t *testing.T) {
 	t.Parallel()
 
-	resources := map[string][]string{
-		"org":    {"read", "create", "update", "revoke"},
-		"member": {"read", "update", "revoke"},
-		"offer":  {"read", "create", "update", "revoke"},
+	tests := []struct {
+		name string
+		// user is whether default:user holds it.
+		user bool
+	}{
+		{"org:read", true},
+		{"org:update", true},
+		{"sandbox:create", true},
+		{"sandbox:revoke", true},
+		{"member:read", true},
+		{"member:update", true},
+		{"member:revoke", false},
 	}
 
-	count := 0
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	for resource, verbs := range resources {
-		for _, verb := range verbs {
-			count++
-			name := resource + ":" + verb
+			if !scope.Known(tt.name) || !slices.Contains(scope.Scopes(), scope.Scope(tt.name)) {
+				t.Fatalf("%s is not a scope", tt.name)
+			}
 
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
+			if scope.IsAdmin(scope.Scope(tt.name)) {
+				t.Errorf("%s is an admin scope", tt.name)
+			}
 
-				if !scope.Known(name) || !slices.Contains(scope.Scopes(), scope.Scope(name)) {
-					t.Fatalf("%s is not a scope", name)
+			for bundle, want := range map[string]bool{
+				scope.DefaultSession: true, scope.DefaultUser: tt.user, scope.DefaultAgent: false,
+			} {
+				members, _ := scope.Bundle(bundle)
+
+				if got := slices.Contains(members, scope.Scope(tt.name)); got != want {
+					t.Errorf("%s holds %s = %v, want %v", bundle, tt.name, got, want)
 				}
+			}
+		})
+	}
+}
 
-				if scope.IsAdmin(scope.Scope(name)) {
-					t.Errorf("%s is an admin scope", name)
-				}
+// TestRevokingOtherAccountsNeedsNaming: the scopes that end other people's
+// accounts or hand out places for new ones (user:revoke, member:revoke,
+// invitation:create) are held by a login session alone: a user's default key does
+// not hold member:revoke (and no admin scope at all), and an agent holds none.
+func TestRevokingOtherAccountsNeedsNaming(t *testing.T) {
+	t.Parallel()
 
-				for bundle, want := range map[string]bool{
-					scope.DefaultSession: true, scope.DefaultUser: true, scope.DefaultAgent: false,
-				} {
-					members, _ := scope.Bundle(bundle)
-
-					if got := slices.Contains(members, scope.Scope(name)); got != want {
-						t.Errorf("%s holds %s = %v, want %v", bundle, name, got, want)
-					}
-				}
-			})
-		}
+	tests := []struct {
+		scope                 scope.Scope
+		session, user, agents bool
+	}{
+		{scope.UserRevoke, true, false, false},
+		{scope.MemberRevoke, true, false, false},
+		{scope.InvitationCreate, true, false, false},
+		{scope.UserRead, true, false, false},
+		{scope.MemberUpdate, true, true, false},
+		{scope.SandboxRevoke, true, true, false},
 	}
 
-	if count != 11 {
-		t.Errorf("%d organization scopes are tested, want 11", count)
+	for _, tt := range tests {
+		t.Run(string(tt.scope), func(t *testing.T) {
+			t.Parallel()
+
+			for bundle, want := range map[string]bool{
+				scope.DefaultSession: tt.session, scope.DefaultUser: tt.user, scope.DefaultAgent: tt.agents,
+			} {
+				members, _ := scope.Bundle(bundle)
+
+				if got := slices.Contains(members, tt.scope); got != want {
+					t.Errorf("%s holds %s = %v, want %v", bundle, tt.scope, got, want)
+				}
+			}
+
+			// Naming the scope grants it: a key that lists it holds it, and
+			// the default bundle alone does not.
+			if !(scope.List{string(tt.scope)}).Expand().Has(tt.scope) {
+				t.Errorf("a key naming %s does not hold it", tt.scope)
+			}
+
+			if got := (scope.List{scope.DefaultUser}).Expand().Has(tt.scope); got != tt.user {
+				t.Errorf("a default:user key holds %s = %v, want %v", tt.scope, got, tt.user)
+			}
+		})
 	}
 }
 
@@ -244,16 +291,12 @@ func TestIsAdmin(t *testing.T) {
 		{"grant read", scope.GrantRead, false},
 		{"grant revoke", scope.GrantRevoke, false},
 		{"org read", scope.OrgRead, false},
-		{"org create", scope.OrgCreate, false},
+		{"sandbox create", scope.SandboxCreate, false},
 		{"org update", scope.OrgUpdate, false},
-		{"org revoke", scope.OrgRevoke, false},
+		{"sandbox revoke", scope.SandboxRevoke, false},
 		{"member read", scope.MemberRead, false},
 		{"member update", scope.MemberUpdate, false},
 		{"member revoke", scope.MemberRevoke, false},
-		{"offer read", scope.OfferRead, false},
-		{"offer create", scope.OfferCreate, false},
-		{"offer update", scope.OfferUpdate, false},
-		{"offer revoke", scope.OfferRevoke, false},
 		{"unknown scope", "nope:read", false},
 		{"a bundle is not an admin scope", scope.DefaultSession, false},
 		{"empty", "", false},
@@ -282,17 +325,16 @@ func TestKnown(t *testing.T) {
 		{"grant:read", true},
 		{"grant:revoke", true},
 		{"org:read", true},
-		{"org:create", true},
+		{"sandbox:create", true},
 		{"org:update", true},
-		{"org:revoke", true},
+		{"sandbox:revoke", true},
 		{"member:read", true},
 		{"member:update", true},
 		{"member:revoke", true},
-		{"offer:read", true},
-		{"offer:create", true},
-		{"offer:update", true},
-		{"offer:revoke", true},
+		{"org:create", false},
+		{"org:revoke", false},
 		{"org:delete", false},
+		{"sandbox:delete", false},
 		{"member:create", false},
 		{"orgs:read", false},
 		{"default:user", true},

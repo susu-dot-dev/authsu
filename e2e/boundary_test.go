@@ -124,33 +124,26 @@ func bndSessionInventory() []bndRoute {
 // bndOrgInventory are the organization routes. Each needs a session and its own
 // scope and no role: whether the caller may act on an organization is decided
 // in the write, so at the boundary they are any-session routes. The ids in the
-// patterns are an organization's, a user's (a member is named by its user) or an
-// offer's; bndWorld.idFor says which a pattern takes.
+// patterns are an organization's or a user's (a member is named by its user);
+// bndWorld.idFor says which a pattern takes.
 func bndOrgInventory() []bndRoute {
 	const (
 		org    = "/api/org/" + bndIDToken
 		member = "/api/member/" + bndIDToken
-		offer  = "/api/offer/" + bndIDToken
 	)
 
 	session := bndAnySession
 
 	return []bndRoute{
-		bndRouteOf("org create", http.MethodPost, "/api/org", session, 8*bndKiB, `{"kind":"standard","name":"bnd"}`, "orgs"),
+		bndRouteOf("sandbox create", http.MethodPost, "/api/org", session, 8*bndKiB, `{"name":"bnd"}`, "orgs"),
 		bndRouteOf("org list", http.MethodGet, "/api/org", session, bndKiB, "", ""),
 		bndRouteOf("org get", http.MethodGet, org, session, bndKiB, "", ""),
 		bndRouteOf("org rename", http.MethodPatch, org, session, 8*bndKiB, `{"name":"renamed"}`,
 			"orgs WHERE name = 'renamed'"),
-		bndRouteOf("org revoke", http.MethodDelete, org, session, bndKiB, "", "orgs WHERE revoked_at IS NOT NULL"),
+		bndRouteOf("org delete", http.MethodDelete, org, session, bndKiB, "", "orgs"),
 		bndRouteOf("member list", http.MethodGet, org+"/member", session, bndKiB, "", ""),
 		bndRouteOf("member update", http.MethodPatch, member, session, bndKiB, `{"admin":true}`, "org_admins"),
-		bndRouteOf("member revoke", http.MethodDelete, member, session, bndKiB, "", "users WHERE org_id IS NOT NULL"),
-		bndRouteOf("offer create", http.MethodPost, org+"/offer", session, bndKiB,
-			`{"userId":"`+idMissing+`","role":"member"}`, "org_offers"),
-		bndRouteOf("org offer list", http.MethodGet, org+"/offer", session, bndKiB, "", ""),
-		bndRouteOf("offer list", http.MethodGet, "/api/offer", session, bndKiB, "", ""),
-		bndRouteOf("offer accept", http.MethodPost, offer+"/accept", session, bndKiB, "", "users WHERE org_id IS NOT NULL"),
-		bndRouteOf("offer revoke", http.MethodDelete, offer, session, bndKiB, "", "org_offers"),
+		bndRouteOf("member revoke", http.MethodDelete, member, session, bndKiB, "", "users WHERE revoked_at IS NOT NULL"),
 	}
 }
 
@@ -274,24 +267,23 @@ type bndWorld struct {
 	agentID         string
 	invitationID    string
 	invitationToken string
-	// orgID is a standard organization the admin created and administers, and
-	// offerID an offer from it to the member. The admin has not joined it: the
-	// schema does not ask that, and a world where the member and the admin are
-	// both outside it lets the matrix create, accept and join without a state
-	// to undo beyond bndRestore's.
-	orgID   string
-	offerID string
+	// orgID is a standard organization the admin created and administers. The
+	// admin does not belong to it: the schema does not ask that, and a world
+	// where the member and the admin are both outside it lets the matrix act
+	// on it without a state to undo beyond bndRestore's.
+	orgID string
+	// adminOrgID and adminOrgName are the organization registration created for
+	// the admin, which the admin belongs to and bndRestore keeps.
+	adminOrgID   string
+	adminOrgName string
 }
 
-// bndOrgID and bndOfferID are the ids of the organization and the offer a
-// bndWorld holds.
+// bndOrgID is the id of the organization a bndWorld holds.
 func bndOrgID() string { return idN("0b10", 1) }
 
-func bndOfferID() string { return idN("0b11", 1) }
-
 // idFor is the id a pattern's {id} takes in this world: the organization for
-// the organization routes, the member for a member (a user's id), the offer for
-// an offer, and the agent, the invitation or the user the older routes address.
+// the organization routes, the member for a member (a user's id), and the
+// agent, the invitation or the user the older routes address.
 func (w bndWorld) idFor(pattern string) string {
 	switch {
 	case strings.HasPrefix(pattern, "/api/invitation"):
@@ -300,23 +292,19 @@ func (w bndWorld) idFor(pattern string) string {
 		return w.member.userID
 	case strings.HasPrefix(pattern, "/api/org"):
 		return w.orgID
-	case strings.HasPrefix(pattern, "/api/offer"):
-		return w.offerID
 	default:
 		return w.agentID
 	}
 }
 
-// bndSeedOrg seeds the world's organization, administered by the admin, with an
-// offer to the member. It is written only while the Worker is idle.
-func bndSeedOrg(t *testing.T, admin, member string) {
+// bndSeedOrg seeds the world's organization, administered by the admin. It is
+// written only while the Worker is idle.
+func bndSeedOrg(t *testing.T, admin string) {
 	t.Helper()
 
 	seed(t, "INSERT INTO orgs (id, kind, name, created_by, created_at) "+
 		"VALUES (?, 'standard', 'bnd', ?, strftime('%s','now'))", bndOrgID(), admin)
 	seed(t, "INSERT INTO org_admins (org_id, user_id, created_at) VALUES (?, ?, strftime('%s','now'))", bndOrgID(), admin)
-	seed(t, "INSERT INTO org_offers (id, org_id, user_id, role, created_by, created_at) "+
-		"VALUES (?, ?, ?, 'member', ?, strftime('%s','now'))", bndOfferID(), bndOrgID(), member, admin)
 }
 
 // bndNewWorld resets the deployment and creates an admin (through the real
@@ -341,12 +329,15 @@ func bndNewWorld(t *testing.T) bndWorld {
 
 	seedAgent(t, idAgentA, admin.userID, "seeded")
 
-	bndSeedOrg(t, admin.userID, member.userID)
+	bndSeedOrg(t, admin.userID)
 
 	return bndWorld{
 		admin: admin, adminToken: adminToken, member: member, memberToken: memberToken,
 		agentID: idAgentA, invitationID: idInvitationA, invitationToken: invitationToken,
-		orgID: bndOrgID(), offerID: bndOfferID(),
+		orgID:      bndOrgID(),
+		adminOrgID: scalar(t, "SELECT org_id FROM users WHERE id = ?", admin.userID),
+		adminOrgName: scalar(t,
+			"SELECT name FROM orgs WHERE id = (SELECT org_id FROM users WHERE id = ?)", admin.userID),
 	}
 }
 
@@ -364,7 +355,7 @@ func bndSeedMember(t *testing.T) passkey {
 
 	cose := coseES256(t, priv.X.FillBytes(make([]byte, 32)), priv.Y.FillBytes(make([]byte, 32)))
 
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
 		"VALUES (?, ?, 'e2e_member', (SELECT id FROM invitations LIMIT 1), strftime('%s','now'))", userID, handle)
 	seed(t, "INSERT INTO credentials (id, user_id, credential_id, public_key, flags, metadata, created_at) "+
 		"VALUES (?, ?, ?, ?, 5, '{}', strftime('%s','now'))", idN("0c00", 77), userID, credID, cose)
@@ -446,9 +437,9 @@ func bndSnapshot(t *testing.T) string {
 		"agent_labels="+scalar(t, "SELECT group_concat(agent_id||':'||label) "+
 			"FROM (SELECT agent_id, label FROM agent_labels ORDER BY agent_id, label)"),
 		"org_members="+scalar(t, "SELECT group_concat(id||':'||org_id) "+
-			"FROM (SELECT id, org_id FROM users WHERE org_id IS NOT NULL ORDER BY id)"),
-		"org_cells="+scalar(t, "SELECT group_concat(id||':'||name||':'||ifnull(revoked_at, '')) "+
-			"FROM (SELECT id, name, revoked_at FROM orgs ORDER BY id)"),
+			"FROM (SELECT id, org_id FROM users ORDER BY id)"),
+		"org_cells="+scalar(t, "SELECT group_concat(id||':'||name) "+
+			"FROM (SELECT id, name FROM orgs ORDER BY id)"),
 		"org_admin_roles="+scalar(t, "SELECT group_concat(org_id||':'||user_id) "+
 			"FROM (SELECT org_id, user_id FROM org_admins ORDER BY org_id, user_id)"),
 		"invite_caps="+scalar(t, "SELECT group_concat(num_invites) FROM (SELECT num_invites FROM invitations ORDER BY id)"),
@@ -554,8 +545,8 @@ func TestBndInventoryIsTheWholeSurface(t *testing.T) {
 			seen[key] = true
 		}
 
-		if len(seen) != 33 {
-			t.Errorf("inventory has %d routes, want the 33 the product declares", len(seen))
+		if len(seen) != 28 {
+			t.Errorf("inventory has %d routes, want the 28 the product declares", len(seen))
 		}
 	})
 }
@@ -1407,7 +1398,7 @@ func TestBndValidButMissingIDIsNoOracle(t *testing.T) {
 		"/api/user/" + bndIDToken:       world.admin.userID,
 	}
 
-	// idOf is the existing id of a route: the organization, member and offer
+	// idOf is the existing id of a route: the organization, and member
 	// routes take the world's own, and the older ones their map entry.
 	idOf := func(route bndRoute) string {
 		if id, ok := existing[route.pattern]; ok {
@@ -1942,11 +1933,14 @@ func bndStateBreaks() []struct {
 				"WHERE id = (SELECT user_id FROM sessions WHERE id = '{ID}')",
 		},
 		{
-			// An account that created an organization cannot be deleted while it
-			// stands (the creator is kept for the limits), so the organizations and
-			// the offers that name them go first.
+			// An account and its organizations hold each other (the account its
+			// organization, the organization its creator), so the organizations it
+			// created and the invitations that name them go first, and the
+			// account's key to its organization is checked when the statements
+			// commit.
 			"user deleted",
-			"DELETE FROM org_offers; " +
+			"DELETE FROM invitation_orgs; " +
+				"DELETE FROM org_admins WHERE user_id = (SELECT user_id FROM sessions WHERE id = '{ID}'); " +
 				"DELETE FROM orgs WHERE created_by = (SELECT user_id FROM sessions WHERE id = '{ID}'); " +
 				"DELETE FROM users WHERE id = (SELECT user_id FROM sessions WHERE id = '{ID}')",
 		},
@@ -1971,7 +1965,7 @@ func TestBndStoredSessionStateMatrix(t *testing.T) {
 			get(t, pathSession, world.adminToken).expect(t, "before", http.StatusOK, "")
 
 			id := idOfToken(t, world.adminToken)
-			seed(t, strings.ReplaceAll(stateBreak.sql, "{ID}", id))
+			seedAll(t, sqlStmt(strings.ReplaceAll(stateBreak.sql, "{ID}", id)))
 
 			for _, route := range bndSessionRoutes() {
 				got := send(
@@ -2157,7 +2151,7 @@ func bndExpected(access bndAccess, who string) bndOutcome {
 // bndRestore puts back what a let-through request may have changed, so the
 // next case in the matrix starts from the same world: the admin's and the
 // member's sessions (a logout revokes one), the agent, the invitation, the
-// member, and the organization with its offer.
+// member, and the organization.
 func bndRestore(t *testing.T, world bndWorld) {
 	t.Helper()
 
@@ -2174,13 +2168,14 @@ func bndRestore(t *testing.T, world bndWorld) {
 	seed(t, "DELETE FROM invitations WHERE id <> ? AND type <> 'first_run'", world.invitationID)
 	seed(t, "UPDATE users SET revoked_at = NULL WHERE id IN (?, ?)", world.admin.userID, world.member.userID)
 
-	// The organizations: whoever joined or created one leaves it, and the
-	// world's own organization and offer are put back as they were.
-	seed(t, "UPDATE users SET org_id = NULL")
-	seed(t, "DELETE FROM org_offers")
-	seed(t, "DELETE FROM org_admins")
-	seed(t, "DELETE FROM orgs")
-	bndSeedOrg(t, world.admin.userID, world.member.userID)
+	// The organizations: every account keeps its own, the admin administers the
+	// one registration created for it, and the world's own organization, which
+	// no account belongs to, is put back as it was.
+	seed(t, "DELETE FROM invitation_orgs")
+	seed(t, "DELETE FROM org_admins WHERE NOT (org_id = ? AND user_id = ?)", world.adminOrgID, world.admin.userID)
+	seed(t, "DELETE FROM orgs WHERE id NOT IN (SELECT org_id FROM users)")
+	seed(t, "UPDATE orgs SET name = ? WHERE id = ?", world.adminOrgName, world.adminOrgID)
+	bndSeedOrg(t, world.admin.userID)
 }
 
 // bndSeedExtraAccount seeds another account with the role and a passkey.
@@ -2194,7 +2189,7 @@ func bndSeedExtraAccount(t *testing.T, n int, role string) passkey {
 
 	cose := coseES256(t, priv.X.FillBytes(make([]byte, 32)), priv.Y.FillBytes(make([]byte, 32)))
 
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
 		"VALUES (?, ?, ?, (SELECT id FROM invitations LIMIT 1), strftime('%s','now'))", userID, handle, role)
 	seed(t, "INSERT INTO credentials (id, user_id, credential_id, public_key, flags, metadata, created_at) "+
 		"VALUES (?, ?, ?, ?, 5, '{}', strftime('%s','now'))", idN("0c00", 100+n), userID, credID, cose)

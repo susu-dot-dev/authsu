@@ -33,7 +33,7 @@ The alternative, agents as principals of their own, would mean every authorizati
 
 Authority moves in one direction only:
 
-- **Admins invite users.** This is unchanged: invitations are the only way to create an account.
+- **Platform administrators invite users.** Invitations are the only way to create an account.
 - **Users create agents, and only for themselves.** Creating an agent is a user delegating their own authority, so the agent's owner is whoever made the request. Nobody, including an admin, creates an agent for someone else.
 - **An agent may create agents only if it has been explicitly allowed to**, and that permission is elevated and never a default. An agent made this way is an agent of the same user (in the same sandbox as its creator, if it has one: [orgs_design.md](orgs_design.md), principle 4), not a child of the agent that created it. It can be no more capable than its creator, and it counts against a per-user limit on how many agents there are.
 
@@ -47,7 +47,7 @@ Creating an agent hands out authority, so it must come from the person whose aut
 
 These rules are expressed with scopes rather than special cases. [permissions_design.md](permissions_design.md) sets them out.
 
-Some authority is never delegated at all. Managing principals (inviting users, administering accounts) stays with people, so "only admins invite users" means an admin, not something an admin configured.
+Some authority is never delegated at all. Managing principals (inviting users, administering accounts and organizations, revoking anyone) stays with people, so "only admins invite users" means an admin, not something an admin configured.
 
 ## Credentials
 
@@ -91,7 +91,7 @@ These scopes only ever subtract from the user's access. They never stand alone, 
 ## Revocation
 
 - **Revoking an agent revokes that agent and its credentials, and nothing else.** Other agents, including any it created, are unaffected. Each was a separate decision, and each answers only to the user.
-- **Revoking a user revokes all of their agents**, because every agent's authority is borrowed from its user.
+- **Revoking a user revokes all of their agents**, because every agent's authority is borrowed from its user. An agent never revokes a user, including its own.
 - **Revoke, never delete**, as for invitations and users, so "who did this?" stays answerable.
 
 ## Open questions

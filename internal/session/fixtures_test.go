@@ -189,9 +189,12 @@ type rig struct {
 	logged []*apierr.Error
 
 	// org is the organization of the account of every secret the rig stores
-	// from now on, or "" for none.
+	// from now on.
 	org string
 }
+
+// rigOrg is the organization of the accounts of a new rig.
+const rigOrg = "00000000-0000-7000-8000-0000000000b1"
 
 func newRig(t *testing.T) *rig {
 	t.Helper()
@@ -210,6 +213,7 @@ func newRig(t *testing.T) *rig {
 		entropy:   counterEntropy(),
 		ids:       0,
 		logged:    nil,
+		org:       rigOrg,
 	}
 }
 

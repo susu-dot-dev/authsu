@@ -7,8 +7,10 @@
 // A scope names one thing a credential may do, as "resource:action": both
 // halves are lower-case ASCII words (underscores between words), the resource
 // is a singular noun matching the API path (/api/agent is "agent"), and the
-// action is one of Read (list and get alike), Create, Update or Revoke. Nothing
-// is deleted, so there is no delete action. "default" is reserved as a
+// action is one of Read (list and get alike), Create, Update or Revoke. There is
+// no delete action: deleting a sandbox is "sandbox:revoke". Sandboxes have
+// their own scopes to create and revoke; org:read and org:update apply to
+// organizations and sandboxes alike. "default" is reserved as a
 // resource so a bundle can never look like a scope.
 //
 // A bundle is a named set of scopes, written "default:<name>". Bundles never
@@ -39,7 +41,7 @@
 // scope (internal/auth), so an admin scope on a member's credential grants
 // nothing. Scopes only ever narrow what the user may already do.
 //
-// The organization scopes (org, member and offer) are not admin scopes. Who may
+// The organization scopes (org, sandbox and member) are not admin scopes. Who may
 // look after a given organization is a fact about that organization, so the
 // store decides it in the write that depends on it, with the platform
 // administrator's override beside it; the scope only says whether the
@@ -89,28 +91,19 @@ const (
 	// OrgRead lists and reads organizations and sandboxes the caller belongs to
 	// or administers.
 	OrgRead Scope = "org:read"
-	// OrgCreate creates an organization or a sandbox.
-	OrgCreate Scope = "org:create"
+	// SandboxCreate creates a sandbox.
+	SandboxCreate Scope = "sandbox:create"
 	// OrgUpdate renames an organization or a sandbox.
 	OrgUpdate Scope = "org:update"
-	// OrgRevoke revokes an organization, or deletes a sandbox.
-	OrgRevoke Scope = "org:revoke"
+	// SandboxRevoke deletes a sandbox.
+	SandboxRevoke Scope = "sandbox:revoke"
 
 	// MemberRead lists the members of an organization.
 	MemberRead Scope = "member:read"
 	// MemberUpdate promotes or demotes a member as an administrator.
 	MemberUpdate Scope = "member:update"
-	// MemberRevoke removes a member from an organization, or leaves it.
+	// MemberRevoke revokes the account of a member of an organization.
 	MemberRevoke Scope = "member:revoke"
-
-	// OfferRead lists offers to join an organization.
-	OfferRead Scope = "offer:read"
-	// OfferCreate offers a user a place in an organization.
-	OfferCreate Scope = "offer:create"
-	// OfferUpdate accepts an offer addressed to the caller.
-	OfferUpdate Scope = "offer:update"
-	// OfferRevoke withdraws or declines an offer.
-	OfferRevoke Scope = "offer:revoke"
 
 	// InvitationRead lists invitations. Admin only.
 	InvitationRead Scope = "invitation:read"
@@ -131,8 +124,9 @@ const (
 	// DefaultSession is every scope. A login session has it: a session is the
 	// user acting in person, so it is limited only by the user's role.
 	DefaultSession = "default:session"
-	// DefaultUser is every scope that is not an admin scope: the default for a
-	// user's own API keys.
+	// DefaultUser is every scope that is not an admin scope, except the ones that
+	// revoke other people's accounts (member:revoke): the default for a user's own
+	// API keys. A key can still be given those by naming them.
 	DefaultUser = "default:user"
 	// DefaultAgent is the default for an agent and its keys.
 	DefaultAgent = "default:agent"
@@ -151,9 +145,8 @@ func definitions() []definition {
 		{AgentRead, false}, {AgentCreate, false}, {AgentUpdate, false}, {AgentRevoke, false},
 		{KeyRead, false}, {KeyCreate, false}, {KeyUpdate, false}, {KeyRevoke, false},
 		{GrantRead, false}, {GrantRevoke, false},
-		{OrgRead, false}, {OrgCreate, false}, {OrgUpdate, false}, {OrgRevoke, false},
+		{OrgRead, false}, {SandboxCreate, false}, {OrgUpdate, false}, {SandboxRevoke, false},
 		{MemberRead, false}, {MemberUpdate, false}, {MemberRevoke, false},
-		{OfferRead, false}, {OfferCreate, false}, {OfferUpdate, false}, {OfferRevoke, false},
 		{InvitationRead, true}, {InvitationCreate, true}, {InvitationUpdate, true}, {InvitationRevoke, true},
 		{UserRead, true}, {UserRevoke, true},
 	}
@@ -161,21 +154,20 @@ func definitions() []definition {
 
 // bundles are the named groups of scopes, each listing its scopes explicitly.
 // A test requires DefaultSession to hold every scope and DefaultUser every
-// scope that is not an admin scope, so a new scope cannot be left out of them.
+// scope that is not an admin scope, except member:revoke, so a new scope cannot be
+// left out of them.
 func bundles() map[string][]Scope {
 	return map[string][]Scope{
 		DefaultSession: {
 			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke,
 			GrantRead, GrantRevoke,
-			OrgRead, OrgCreate, OrgUpdate, OrgRevoke, MemberRead, MemberUpdate, MemberRevoke,
-			OfferRead, OfferCreate, OfferUpdate, OfferRevoke,
+			OrgRead, SandboxCreate, OrgUpdate, SandboxRevoke, MemberRead, MemberUpdate, MemberRevoke,
 			InvitationRead, InvitationCreate, InvitationUpdate, InvitationRevoke, UserRead, UserRevoke,
 		},
 		DefaultUser: {
 			AgentRead, AgentCreate, AgentUpdate, AgentRevoke, KeyRead, KeyCreate, KeyUpdate, KeyRevoke,
 			GrantRead, GrantRevoke,
-			OrgRead, OrgCreate, OrgUpdate, OrgRevoke, MemberRead, MemberUpdate, MemberRevoke,
-			OfferRead, OfferCreate, OfferUpdate, OfferRevoke,
+			OrgRead, SandboxCreate, OrgUpdate, SandboxRevoke, MemberRead, MemberUpdate,
 		},
 		DefaultAgent: {AgentRead},
 	}

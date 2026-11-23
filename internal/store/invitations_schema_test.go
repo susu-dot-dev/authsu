@@ -197,11 +197,13 @@ func TestInvitationStoreSendsNothingLargerThanItsBounds(t *testing.T) {
 
 	secretArgs, invitationArgs := fake.calls[0][0].Args, fake.calls[0][1].Args
 
-	if got, _ := invitationArgs[4].(int64); got != input.MaxNumInvites || got > input.MaxSafeInteger {
-		t.Errorf("num_invites = %v", invitationArgs[4])
+	// The arguments are: id, kind, type, the creator (for the subselect that
+	// tests it is unrevoked), label, num_invites and the creator.
+	if got, _ := invitationArgs[5].(int64); got != input.MaxNumInvites || got > input.MaxSafeInteger {
+		t.Errorf("num_invites = %v", invitationArgs[5])
 	}
 
-	if got, _ := invitationArgs[3].(string); len(got) != input.MaxInvitationLabelRunes {
+	if got, _ := invitationArgs[4].(string); len(got) != input.MaxInvitationLabelRunes {
 		t.Errorf("label has %d bytes, want %d", len(got), input.MaxInvitationLabelRunes)
 	}
 

@@ -165,7 +165,7 @@ func agSeedMemberLogin(t *testing.T, id, role string) passkey {
 	credID := randomBytes(32)
 	cose := coseES256(t, key.X.FillBytes(make([]byte, 32)), key.Y.FillBytes(make([]byte, 32)))
 
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
 		"VALUES (?, ?, ?, (SELECT id FROM invitations LIMIT 1), '{\"name\":\"seeded\"}', strftime('%s','now'))",
 		id, handle, role)
 	seed(t, "INSERT INTO credentials (id, credential_id, user_id, public_key, flags, metadata, created_at) "+

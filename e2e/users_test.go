@@ -239,7 +239,7 @@ func TestUserListShape(t *testing.T) {
 		handle := randomBytes(16)
 		handles[r.id] = handle
 
-		seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, revoked_at, created_at) "+
+		seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, revoked_at, created_at) "+
 			"VALUES (?, ?, 'e2e_none', ?, '{\"name\":\"seeded\"}', ?, ?)", r.id, handle, invitation, r.revoked, r.created)
 	}
 
@@ -570,10 +570,10 @@ func TestUserProfileDefects(t *testing.T) {
 			id := idN("0c20", i+1)
 
 			// A Go string with invalid UTF-8 is bound as TEXT with those bytes.
-			seed(t, "DELETE FROM users WHERE id = ?", id)
+			deleteAccount(t, id)
 
-			refusedBySchema := refused(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
-				"VALUES (?, randomblob(16), 'e2e_none', ?, ?, 1)", id, invitation, tt.profile)
+			refusedBySchema := refused(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) "+
+				"VALUES (?, randomblob(16), 'e2e_none', ?, ?, 1, (SELECT id FROM orgs LIMIT 1))", id, invitation, tt.profile)
 			if refusedBySchema {
 				t.Skipf("the schema's json_valid CHECK refuses %q already; the handler's check is unreachable for it", tt.profile)
 			}
@@ -616,7 +616,7 @@ func TestUserProfileDefects(t *testing.T) {
 			}
 
 			get(t, usrItem(admin.userID), token).expect(t, "GET the admin", http.StatusOK, "")
-			seed(t, "DELETE FROM users WHERE id = ?", id)
+			deleteAccount(t, id)
 		})
 	}
 
@@ -626,7 +626,7 @@ func TestUserProfileDefects(t *testing.T) {
 func usrSeedProfileFor(t *testing.T, id, invitation string, profile any) {
 	t.Helper()
 
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
 		"VALUES (?, randomblob(16), 'e2e_none', ?, ?, 1)", id, invitation, profile)
 }
 
@@ -642,7 +642,7 @@ func TestUserListLarge(t *testing.T) {
 	invitation := scalar(t, "SELECT id FROM invitations")
 
 	for i := range n {
-		seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+		seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
 			"VALUES (?, randomblob(16), 'e2e_none', ?, ?, ?)", idN("0c30", i+1), invitation,
 			`{"name":"`+strings.Repeat("<", 128)+`"}`, 1000+i)
 	}
@@ -945,7 +945,7 @@ func TestUserConcurrentRevokesOfOneMember(t *testing.T) {
 		seed(t, "DELETE FROM api_keys WHERE user_id = ?", idUserB)
 		seed(t, "DELETE FROM sessions WHERE user_id = ?", idUserB)
 		seed(t, "DELETE FROM agents WHERE user_id = ?", idUserB)
-		seed(t, "DELETE FROM users WHERE id = ?", idUserB)
+		deleteAccount(t, idUserB)
 		seedUser(t, idUserB, roleMember)
 		usrSeedKeys(t, "0c80", idUserB)
 
@@ -983,9 +983,9 @@ func TestUserRevokeKeepsTheInvitationUseCount(t *testing.T) {
 	token := login(t, admin)
 
 	invSeedAt(t, idInvitationA, 2, 1000, nil, nil)
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
 		"VALUES (?, randomblob(16), 'e2e_none', ?, 1000)", idUserB, idInvitationA)
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
 		"VALUES (?, randomblob(16), 'e2e_none', ?, 1000)", idUserC, idInvitationA)
 
 	before := invFind(t, token, idInvitationA)

@@ -250,7 +250,8 @@ func TestQueriesAreFound(t *testing.T) {
 		"invitationQuery", "insertUserQuery", "insertCredentialQuery", "credentialQuery",
 		"firstRunStateQuery", "insertFirstRunSecretQuery", "insertFirstRunInvitationQuery",
 		"listInvitationsQuery", "readInvitationQuery", "insertInvitationQuery", "updateNumInvitesQuery",
-		"revokeInvitationSecretQuery", "insertInvitationOfferQuery", "insertOrgAdminQuery",
+		"revokeInvitationSecretQuery", "insertInvitationOrgQuery", "insertPersonalOrgQuery",
+		"insertOrgAdminQuery",
 		"listUsersQuery", "getUserQuery", "revokeUserQuery", "revokeUserSecretsQuery", "revokeUserAgentsQuery",
 		"agentRevokeKeysQuery",
 		"keyListQuery", "keyGetQuery", "insertUserKeyQuery", "keyRenameQuery", "keyRevokeQuery",
@@ -258,13 +259,10 @@ func TestQueriesAreFound(t *testing.T) {
 		"rotateCodeQuery", "rotateRefreshQuery", "replaceAccessQuery", "insertAccessSecretQuery",
 		"insertAccessRowQuery", "introspectQuery", "revokeRefreshTokenQuery", "revokeRefreshAccessQuery",
 		"revokeAccessTokenQuery",
-		"insertOrgQuery", "joinCreatedOrgQuery", "insertCreatorAdminQuery", "createOrgStandingQuery", "getOrgQuery",
-		"listOrgsQuery", "renameOrgQuery", "orgStandingQuery", "revokeOrgQuery", "releaseMembersQuery",
-		"deleteRevokedOrgOffersQuery", "deleteRevokedOrgAdminsQuery", "deleteSandboxQuery",
+		"insertSandboxQuery", "insertCreatorAdminQuery", "callerStandingQuery", "getOrgQuery",
+		"listOrgsQuery", "renameOrgQuery", "orgStandingQuery", "deleteSandboxQuery",
 		"listMembersQuery", "memberStandingQuery", "promoteMemberQuery", "demoteMemberQuery",
-		"removeMemberAdminQuery", "removeMemberQuery",
-		"insertOfferQuery", "offerStandingQuery", "listOrgOffersQuery", "listMyOffersQuery", "acceptStandingQuery",
-		"acceptOfferAdminQuery", "acceptOfferQuery", "acceptOfferDeleteQuery", "revokeOfferQuery",
+		"revokeStandingQuery",
 	} {
 		if _, ok := queries[name]; !ok {
 			t.Errorf("query %s was not found", name)
@@ -283,18 +281,12 @@ func TestQueriesAreFound(t *testing.T) {
 var mayDelete = map[string]string{
 	"agentLabelRemoveQuery": "agent_labels",
 
-	// Organizations: a sandbox is deleted by hand and is always deleted; a
-	// standard organization is revoked and stays, and its offers and
-	// administrator rows are deleted with it. An offer is deleted when it is
-	// accepted, declined or withdrawn, and an administrator row when its member is
-	// demoted or leaves. None of them is a record that must outlive its subject.
-	"deleteSandboxQuery":          "orgs",
-	"deleteRevokedOrgOffersQuery": "org_offers",
-	"deleteRevokedOrgAdminsQuery": "org_admins",
-	"demoteMemberQuery":           "org_admins",
-	"removeMemberAdminQuery":      "org_admins",
-	"acceptOfferDeleteQuery":      "org_offers",
-	"revokeOfferQuery":            "org_offers",
+	// Organizations: a sandbox is deleted by hand and is the only organization
+	// ever deleted; a standard organization stays for life. An administrator row
+	// is deleted when its member is demoted. Neither is a record that must
+	// outlive its subject.
+	"deleteSandboxQuery": "orgs",
+	"demoteMemberQuery":  "org_admins",
 }
 
 // TestNoQueryDeletes holds that nothing is ever deleted, except the labels of an
@@ -338,7 +330,8 @@ func TestNoQueryDeletes(t *testing.T) {
 // TestQueriesBindValuesTheCodeOwns holds that the values Go gives meaning to
 // are bound as arguments from their one definition and not repeated as
 // literals in SQL: the invitation type that is redeemable only once, the
-// kind of every secret, the kinds of organization and the roles of an offer.
+// kind of every secret, the kinds of organization and the roles of an invitation's
+// organization.
 // The schema fixes each kind in a CHECK, which is a different place and is held
 // to the constants by TestKindsMatchTheMigration and TestOrgKindsMatchTheMigration.
 func TestQueriesBindValuesTheCodeOwns(t *testing.T) {
@@ -350,7 +343,7 @@ func TestQueriesBindValuesTheCodeOwns(t *testing.T) {
 			"'" + store.KindSession + "'", "'" + store.KindAPIKey + "'",
 			"'" + store.KindOAuthGrant + "'", "'" + store.KindOAuthAccess + "'",
 			"'" + store.OrgKindStandard + "'", "'" + store.OrgKindSandbox + "'",
-			"'" + store.OfferRoleMember + "'", "'" + store.OfferRoleAdmin + "'",
+			"'" + store.OrgRoleMember + "'", "'" + store.OrgRoleAdmin + "'",
 		} {
 			if strings.Contains(query, literal) {
 				t.Errorf("%s contains the literal %s; bind the constant instead", name, literal)
@@ -780,7 +773,7 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 	invitation := newInvitation(t)
 	invitation.ExpiresAt = invExpiry(t, now.Add(input.ExpiryHorizon).Unix(), now)
 	invitation.CreatedAt = farthest
-	invitation.Offer = newOffer(t, "admin")
+	invitation.Org = newInvitationOrg(t, "admin")
 
 	return map[string]func(*store.Store){
 		"ResolveSession": func(s *store.Store) {
@@ -817,7 +810,7 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		"ListUsers":        func(s *store.Store) { _, _ = s.ListUsers(ctx) },
 		"GetUser":          func(s *store.Store) { _, _ = s.GetUser(ctx, mustUserID(t, userID1)) },
 		"RevokeUser": func(s *store.Store) {
-			_, _ = s.RevokeUser(ctx, mustUserID(t, userID1), userAdminRole, farthest)
+			_, _ = s.RevokeUser(ctx, mustUserID(t, userID1), userID2, userAdminRole, farthest)
 		},
 		"ListAgents": func(s *store.Store) {
 			filter := mustAgentFilter(t, strings.Repeat("z", input.MaxLabelBytes))
@@ -883,9 +876,9 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		"RevokeAccessToken": func(s *store.Store) {
 			_ = s.RevokeAccessToken(ctx, mustAccessToken(t, 3), oauthWorstClientID(t), farthest)
 		},
-		"CreateOrg": func(s *store.Store) {
-			_, _ = s.CreateOrg(ctx, store.NewOrg{
-				ID: "id", Kind: orgKindOf(t, store.OrgKindSandbox), Name: orgWorstName(t), Creator: "owner",
+		"CreateSandbox": func(s *store.Store) {
+			_, _ = s.CreateSandbox(ctx, store.NewSandbox{
+				ID: "id", Name: orgWorstName(t), Creator: "owner",
 				ExpiresAt: farthest, Limit: 1 << 30, CreatedAt: farthest,
 			})
 		},
@@ -893,27 +886,15 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		"ListOrgs": func(s *store.Store) {
 			_, _ = s.ListOrgs(ctx, "owner", "role", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
 		},
-		"RenameOrg": func(s *store.Store) { _, _ = s.RenameOrg(ctx, agentID, orgWorstName(t), "owner", "role", farthest) },
-		"RevokeOrg": func(s *store.Store) { _, _ = s.RevokeOrg(ctx, agentID, "owner", "role", farthest) },
+		"RenameOrg": func(s *store.Store) {
+			_, _ = s.RenameOrg(ctx, agentID, orgWorstName(t), "owner", "role", farthest)
+		},
+		"DeleteSandbox": func(s *store.Store) { _, _ = s.DeleteSandbox(ctx, agentID, "owner", "role") },
 		"ListMembers": func(s *store.Store) {
 			_, _ = s.ListMembers(ctx, agentID, "owner", "role", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
 		},
 		"SetMemberAdmin": func(s *store.Store) { _, _ = s.SetMemberAdmin(ctx, agentID, true, "owner", "role", farthest) },
-		"RemoveMember":   func(s *store.Store) { _, _ = s.RemoveMember(ctx, agentID, "owner", "role") },
-		"CreateOffer": func(s *store.Store) {
-			_, _ = s.CreateOffer(ctx, store.NewOffer{
-				ID: "id", OrgID: agentID, UserID: agentID, Role: orgRoleOf(t, store.OfferRoleAdmin), Caller: "owner",
-				AdminRole: "role", CreatedAt: farthest,
-			})
-		},
-		"ListOrgOffers": func(s *store.Store) {
-			_, _ = s.ListOrgOffers(ctx, agentID, "owner", "role", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
-		},
-		"ListMyOffers": func(s *store.Store) {
-			_, _ = s.ListMyOffers(ctx, "owner", orgCursorOf(t, agentIDAt(1)), orgLimitOf(t, "100"))
-		},
-		"AcceptOffer": func(s *store.Store) { _, _ = s.AcceptOffer(ctx, agentID, "owner", farthest) },
-		"RevokeOffer": func(s *store.Store) { _, _ = s.RevokeOffer(ctx, agentID, "owner", "role") },
+		"RevokeMember":   func(s *store.Store) { _, _ = s.RevokeMember(ctx, agentID, "owner", "role", farthest) },
 	}
 }
 

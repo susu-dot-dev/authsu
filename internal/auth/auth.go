@@ -125,8 +125,8 @@ type Principal struct {
 	// ExpiresAt is when the credential stops being active.
 	ExpiresAt time.Time
 
-	// OrgID is the standard organization the account belongs to now, read with
-	// the account, or "" when it belongs to none.
+	// OrgID is the standard organization the account belongs to, read with the
+	// account.
 	OrgID string
 	// AgentID is the agent acting, or "" when the user is.
 	AgentID string

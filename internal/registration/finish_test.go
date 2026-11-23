@@ -3,6 +3,7 @@ package registration_test
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -36,6 +37,9 @@ const (
 	// firstRunID3 is the id offered for the first-run invitation: the third id
 	// finish asks for, after the user's and the passkey's.
 	firstRunID3 = "00000000-0000-7000-8000-000000000003"
+	// orgID4 is the id offered for the organization of the account, the fourth
+	// id finish asks for, for the case that its invitation names none.
+	orgID4 = "00000000-0000-7000-8000-000000000004"
 )
 
 // Where the parts of a challenge are (see package challenge).
@@ -571,6 +575,17 @@ func successes() []success {
 	}
 }
 
+// checkTokenHash holds that the store looks the invitation up by the hash of the
+// whole token as the client sent it.
+func checkTokenHash(t *testing.T, r *rig) {
+	t.Helper()
+
+	if want := secret.Hash(testCode); len(r.store.created) != 1 ||
+		!bytes.Equal(r.store.created[0].Token.Hash(), want[:]) {
+		t.Errorf("account token hash = %x, want secret.Hash(%q)", r.store.created[0].Token.Hash(), testCode)
+	}
+}
+
 // TestFinishSucceeds pins the whole of a successful finish: the response, and
 // exactly what is written, for each shape of authenticator.
 func TestFinishSucceeds(t *testing.T) {
@@ -607,6 +622,8 @@ func TestFinishSucceeds(t *testing.T) {
 				UserID:          userID1,
 				UserHandle:      unb64(t, options.PublicKey.User.ID),
 				Role:            "admin",
+				OrgID:           orgID4,
+				OrgName:         mustOrgName(t, testName+"'s org"),
 				Name:            mustName(t, testName),
 				Email:           mustEmail(t, testEmail),
 				Token:           mustToken(t, testCode),
@@ -630,12 +647,7 @@ func TestFinishSucceeds(t *testing.T) {
 				t.Errorf("account written = %+v\nwant              %+v", r.store.created, wantAccount)
 			}
 
-			// The store looks the invitation up by this hash: the whole token
-			// as the client sent it.
-			if want := secret.Hash(testCode); len(r.store.created) != 1 ||
-				!bytes.Equal(r.store.created[0].Token.Hash(), want[:]) {
-				t.Errorf("account token hash = %x, want secret.Hash(%q)", r.store.created[0].Token.Hash(), testCode)
-			}
+			checkTokenHash(t, r)
 		})
 	}
 }
@@ -651,6 +663,63 @@ func checkCreatedResponse(t *testing.T, r *rig, rec *httptest.ResponseRecorder) 
 	}
 
 	wantQuietSuccess(t, r, rec)
+}
+
+// TestFinishNamesTheAccountsOrganizationAfterIt: the organization the account is
+// given is named exactly as the account is, whatever the name, so the parser of
+// an organization's name never refuses what the parser of an account's name
+// accepted (the store is never handed a name its column would refuse): the
+// longest and the most escaped names, and names in every script.
+func TestFinishNamesTheAccountsOrganizationAfterIt(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		testName,
+		"A",
+		strings.Repeat("a", input.MaxAccountNameBytes),
+		strings.Repeat("<", input.MaxAccountNameBytes),
+		strings.Repeat("\u00e9", input.MaxAccountNameBytes/2),
+		strings.Repeat("\u65e5", input.MaxAccountNameBytes/3),
+		"\U0001F600 emoji",
+		"  padded  ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newRig(t)
+			a := newAuthenticator(t)
+
+			rec := r.begin(name)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("begin = %d %s, want 200", rec.Code, rec.Body)
+			}
+
+			var options creationOptions
+
+			err := json.Unmarshal(rec.Body.Bytes(), &options)
+			if err != nil {
+				t.Fatalf("begin body: %v", err)
+			}
+
+			body := a.respond(t, options)
+			body["name"] = name
+
+			rec = r.finish(body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("finish = %d %s, want 201", rec.Code, rec.Body)
+			}
+
+			if len(r.store.created) != 1 {
+				t.Fatalf("accounts written = %d, want 1", len(r.store.created))
+			}
+
+			got := r.store.created[0]
+			if got.OrgID != orgID4 || got.OrgName.String() != name+"'s org" || got.Name.String() != name {
+				t.Errorf("organization %q named %q for the account %q, want %q named %q",
+					got.OrgID, got.OrgName.String(), got.Name.String(), orgID4, name+"'s org")
+			}
+		})
+	}
 }
 
 // sameAccount compares accounts, treating no transports and an empty list as the

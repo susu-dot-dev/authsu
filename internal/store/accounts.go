@@ -151,31 +151,29 @@ WHERE EXISTS (SELECT 1 FROM secrets WHERE id = ? AND kind = ?)`
 // value, so a type that changed between the read and the write cannot get a role
 // chosen for a different one. The client supplies neither.
 //
-// The user joins the organization the invitation offers, if it offers one and
-// that organization is standard and unrevoked AT THIS WRITE (org_id is a
-// subselect, NULL when there is no offer or it fails the condition). The
-// organization is a side effect of registration and never a condition of it
-// (docs/orgs_design.md, principle 2): a revoked organization leaves org_id NULL
-// and the account is created without one. Revoking an organization releases
-// its members in a batch of its own, which runs either before this write, when
-// the condition fails, or after it, when it finds this user a member and
-// releases them, so nobody is left in an organization that no longer works. The
-// offer is not consumed: an invitation that admits several people offers the
-// organization to each.
+// The user joins the organization the invitation names, if it names one (the
+// subselect), and otherwise the personal organization insertPersonalOrgQuery
+// creates next, whose id is bound as a value. The invitation's organization is
+// standard and exists, which the schema's key on it and its kind enforces, and
+// standard organizations are never deleted, so there is nothing to check at this
+// write: the account's organization is never a reason for registration to fail
+// (docs/orgs_design.md, principle 2). The invitation names the organization for
+// each person it admits: it is not consumed. The key from the user to its
+// organization is deferred, so the personal organization may be written after
+// the user in the same batch.
 //
 // If no invitation satisfies the conditions the insert matches nothing. A
 // conditional insert that matches nothing is not an error, so on its own it
 // would not roll the batch back; insertCredentialQuery's required reference to
-// the new user is what turns it into a failure.
+// the new user is what turns it into a failure, and every statement between
+// them does nothing for a user that was not written.
 //
-// Arguments, in order: id, user_handle, role, profile, created_at, organization
-// kind, hash, kind, type, now, now (unix seconds), first-run type.
+// Arguments, in order: id, user_handle, role, profile, created_at, personal
+// organization id, hash, kind, type, now, now (unix seconds), first-run type.
 const insertUserQuery = `
 INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id)
 SELECT ?, ?, ?, i.id, ?, ?,
-       (SELECT o.org_id FROM org_offers o
-        JOIN orgs g ON g.id = o.org_id AND g.kind = o.kind
-        WHERE o.invitation_id = i.id AND g.kind = ? AND g.revoked_at IS NULL)
+       COALESCE((SELECT o.org_id FROM invitation_orgs o WHERE o.invitation_id = i.id), ?)
 FROM secrets s
 JOIN invitations i ON i.id = s.id AND i.kind = s.kind
 WHERE s.hash = ?
@@ -185,32 +183,44 @@ WHERE s.hash = ?
   AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites
   AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))`
 
-// insertOrgAdminQuery is the statement after insertUserQuery: it makes the new
-// user an administrator of the organization they joined, when the invitation's
-// offer says they join as one. Which organization is not decided again here: it
-// is the user's own org_id as the previous statement left it, and it counts only
-// if it is the organization of the invitation's offer, the offer's role is the
-// administrator's and the organization is still standard and unrevoked. So an
-// administrator row exists only for a user who really got that organization:
-// a registration whose user insert matched nothing, or whose organization was
-// revoked (so org_id is NULL), inserts nothing, and never leaves an
-// administrator of an organization they are not in.
+// insertPersonalOrgQuery is the statement after insertUserQuery: it creates the
+// standard organization of an account whose invitation names none, with the
+// account as its creator. It is written only for a user the previous statement
+// wrote with this organization's id: the user is matched by id, which is fresh
+// for every call, and by org_id, which is the new organization's only when the
+// invitation named none, so a registration whose user insert matched nothing, or
+// whose invitation named an organization, inserts nothing and never leaves an
+// organization without an account.
 //
-// The user is matched by id, which is fresh for every call. The invitation is
-// the user's own (users.invitation_id), so no other invitation's offer can
+// Arguments, in order: id, kind, name, created_at, user id, id.
+const insertPersonalOrgQuery = `
+INSERT INTO orgs (id, kind, name, created_by, created_at)
+SELECT ?, ?, ?, u.id, ?
+FROM users u
+WHERE u.id = ? AND u.org_id = ?`
+
+// insertOrgAdminQuery makes the new user an administrator of their organization
+// when they are meant to be: when they created it (the personal organization of
+// an account whose invitation names none), or when the invitation names it with
+// the administrator's role. Which organization is not decided again here: it is
+// the user's own org_id as the previous statements left it. So an administrator
+// row exists only for a user who really got that organization: a registration
+// whose user insert matched nothing inserts nothing, and a member's invitation
+// never makes an administrator.
+//
+// The user is matched by id, which is fresh for every call, and the invitation is
+// the user's own (users.invitation_id), so no other invitation's organization can
 // apply.
 //
-// Arguments, in order: created_at, user id, organization kind, role.
+// Arguments, in order: created_at, user id, role.
 const insertOrgAdminQuery = `
 INSERT INTO org_admins (org_id, user_id, created_at)
 SELECT u.org_id, u.id, ?
 FROM users u
-JOIN org_offers o ON o.invitation_id = u.invitation_id AND o.org_id = u.org_id
-JOIN orgs g ON g.id = o.org_id AND g.kind = o.kind
 WHERE u.id = ?
-  AND g.kind = ?
-  AND g.revoked_at IS NULL
-  AND o.role = ?`
+  AND (EXISTS (SELECT 1 FROM orgs g WHERE g.id = u.org_id AND g.created_by = u.id)
+       OR EXISTS (SELECT 1 FROM invitation_orgs o
+                  WHERE o.invitation_id = u.invitation_id AND o.org_id = u.org_id AND o.role = ?))`
 
 // insertCredentialQuery stores the passkey for the user insertUserQuery just
 // created, found by its unique user handle. user_id is NOT NULL and references
@@ -254,6 +264,12 @@ type NewAccount struct {
 	// Role is the account's role, chosen from the invitation's type.
 	Role string
 
+	// OrgID and OrgName are the account's own organization, created for it when
+	// the invitation names none (OrgID is a fresh id, and OrgName is the
+	// organization's name). They are unused when the invitation names one.
+	OrgID   string
+	OrgName input.OrgName
+
 	// Name is the display name the registrant gave.
 	Name input.AccountName
 
@@ -291,11 +307,14 @@ type NewAccount struct {
 	CreatedAt time.Time
 }
 
-// CreateAccount creates the account and its passkey in one batch, with the
-// invitation's conditions in the write itself (see insertUserQuery). When the
-// invitation carries an offer to join an organization, the account joins it in
-// the same batch, as an administrator too when the offer says so (see
-// insertOrgAdminQuery); registration never fails because of the organization.
+// CreateAccount creates the account, its organization and its passkey in one
+// batch, with the invitation's conditions in the write itself (see
+// insertUserQuery). When the invitation names an organization, the account
+// joins it, as an administrator too when the invitation says so; when it names
+// none, a new organization is created for the account, which administers it (see
+// insertPersonalOrgQuery and insertOrgAdminQuery). Every account therefore
+// belongs to exactly one standard organization from its first write, and
+// registration never fails because of the organization.
 //
 // The batch starts with the first-run invitation's two inserts, which take
 // effect only for the configured first-run secret on an empty database (see
@@ -346,10 +365,13 @@ func (s *Store) CreateAccount(ctx context.Context, account NewAccount) error {
 			account.FirstRunID, KindInvitation,
 		}},
 		Statement{Query: insertUserQuery, Args: []any{
-			account.UserID, account.UserHandle, account.Role, string(profileJSON), created, OrgKindStandard,
+			account.UserID, account.UserHandle, account.Role, string(profileJSON), created, account.OrgID,
 			account.Token.Hash(), KindInvitation, account.InvitationType, created, created, InvitationFirstRun,
 		}},
-		Statement{Query: insertOrgAdminQuery, Args: []any{created, account.UserID, OrgKindStandard, OfferRoleAdmin}},
+		Statement{Query: insertPersonalOrgQuery, Args: []any{
+			account.OrgID, OrgKindStandard, account.OrgName.String(), created, account.UserID, account.OrgID,
+		}},
+		Statement{Query: insertOrgAdminQuery, Args: []any{created, account.UserID, OrgRoleAdmin}},
 		Statement{Query: insertCredentialQuery, Args: []any{
 			account.CredentialRowID, account.CredentialID, account.UserHandle, account.PublicKey,
 			int64(account.Flags), string(metadataJSON), created,

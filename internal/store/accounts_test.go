@@ -2,6 +2,7 @@
 package store_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"reflect"
@@ -163,7 +164,7 @@ func newAccount(t *testing.T, edit func(*store.NewAccount)) store.NewAccount {
 
 	account := store.NewAccount{
 		UserID: "user-1", UserHandle: []byte{1, 2, 3}, Role: "admin",
-		Name: mustName(t, "Ann"), Email: mustEmail(t, "ann@example.com"),
+		OrgID: "org-1", OrgName: mustOrgName(t, "Ann"), Name: mustName(t, "Ann"), Email: mustEmail(t, "ann@example.com"),
 		Token: mustInvitationToken(t, 1), InvitationType: "member",
 		CredentialRowID: "cred-row-1", CredentialID: []byte{4, 5}, PublicKey: []byte{6, 7, 8}, Flags: 0x45,
 		AAGUID: aaguid, Transports: []string{"usb"}, CreatedAt: now,
@@ -185,9 +186,11 @@ func metadataOf(transports string) string {
 // TestCreateAccountStatements pins the batch registration writes: the two
 // inserts that create the first-run invitation when the configured secret is
 // presented on an empty database, the user insert carrying the invitation's
-// conditions, then the insert of an organization administrator, then the
-// credential insert that fails the batch when the user insert matched nothing;
-// the JSON columns the store builds; and every argument
+// conditions and the account's organization (the invitation's, or the id of its
+// own), then the account's own organization (created only for a user written
+// with its id), then the insert of an organization
+// administrator, then the credential insert that fails the batch when the user
+// insert matched nothing; the JSON columns the store builds; and every argument
 // in placeholder order.
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
@@ -196,9 +199,8 @@ func TestCreateAccountStatements(t *testing.T) {
 
 	userFragments := []string{
 		"INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id)",
-		"SELECT ?, ?, ?, i.id, ?, ?, (SELECT o.org_id FROM org_offers o " +
-			"JOIN orgs g ON g.id = o.org_id AND g.kind = o.kind " +
-			"WHERE o.invitation_id = i.id AND g.kind = ? AND g.revoked_at IS NULL) FROM secrets s",
+		"SELECT ?, ?, ?, i.id, ?, ?, COALESCE((SELECT o.org_id FROM invitation_orgs o " +
+			"WHERE o.invitation_id = i.id), ?) FROM secrets s",
 		"JOIN invitations i ON i.id = s.id AND i.kind = s.kind",
 		"WHERE s.hash = ?",
 		"AND s.kind = ?",
@@ -207,11 +209,16 @@ func TestCreateAccountStatements(t *testing.T) {
 		"AND (SELECT count(*) FROM users u WHERE u.invitation_id = i.id) < i.num_invites",
 		"AND (i.type <> ? OR NOT EXISTS (SELECT 1 FROM users))",
 	}
+	orgFragments := []string{
+		"INSERT INTO orgs (id, kind, name, created_by, created_at) SELECT ?, ?, ?, u.id, ? FROM users u",
+		"WHERE u.id = ? AND u.org_id = ?",
+	}
 	adminFragments := []string{
 		"INSERT INTO org_admins (org_id, user_id, created_at) SELECT u.org_id, u.id, ? FROM users u",
-		"JOIN org_offers o ON o.invitation_id = u.invitation_id AND o.org_id = u.org_id",
-		"JOIN orgs g ON g.id = o.org_id AND g.kind = o.kind",
-		"WHERE u.id = ? AND g.kind = ? AND g.revoked_at IS NULL AND o.role = ?",
+		"WHERE u.id = ?",
+		"AND (EXISTS (SELECT 1 FROM orgs g WHERE g.id = u.org_id AND g.created_by = u.id)",
+		"OR EXISTS (SELECT 1 FROM invitation_orgs o WHERE o.invitation_id = u.invitation_id " +
+			"AND o.org_id = u.org_id AND o.role = ?))",
 	}
 	credentialFragments := []string{
 		"INSERT INTO credentials (id, credential_id, user_id, public_key, flags, metadata, created_at)",
@@ -235,6 +242,9 @@ func TestCreateAccountStatements(t *testing.T) {
 		edit     func(*store.NewAccount)
 		profile  string
 		metadata string
+		// orgName is the name the organization is written with: "Ann", unless
+		// the case gives the account another.
+		orgName string
 		// configuredHash is the argument for the configured first-run hash.
 		configuredHash any
 	}{
@@ -261,6 +271,9 @@ func TestCreateAccountStatements(t *testing.T) {
 		{name: "the email is kept as given, in its own case",
 			edit:    func(a *store.NewAccount) { a.Email = mustEmail(t, "Ann.O'Neil+Tag@Example.COM") },
 			profile: `{"name":"Ann","email":"Ann.O'Neil+Tag@Example.COM"}`, metadata: metadataOf(`["usb"]`)},
+		{name: "the organization is written with the name it was given, not the account's",
+			edit:    func(a *store.NewAccount) { a.OrgName = mustOrgName(t, "Acme Corp") },
+			profile: annProfile, metadata: metadataOf(`["usb"]`), orgName: "Acme Corp"},
 		{name: "the first-run type is bound apart from the redeemed type",
 			edit:    func(a *store.NewAccount) { a.InvitationType = store.InvitationFirstRun },
 			profile: annProfile, metadata: metadataOf(`["usb"]`)},
@@ -271,13 +284,15 @@ func TestCreateAccountStatements(t *testing.T) {
 			t.Parallel()
 
 			account := newAccount(t, test.edit)
-			fake := newFake(applied(5))
+			fake := newFake(applied(6))
 
 			checkErr(t, fake.store().CreateAccount(context.Background(), account), nil)
 
 			created := now.Unix()
 
-			checkStatements(t, fake,
+			orgName := cmp.Or(test.orgName, "Ann")
+
+			checkBatch(t, fake,
 				wantStatement{
 					fragments: firstRunSecretFragments,
 					args: []any{
@@ -295,14 +310,18 @@ func TestCreateAccountStatements(t *testing.T) {
 				wantStatement{
 					fragments: userFragments,
 					args: []any{
-						"user-1", []byte{1, 2, 3}, "admin", test.profile, created, store.OrgKindStandard,
+						"user-1", []byte{1, 2, 3}, "admin", test.profile, created, "org-1",
 						account.Token.Hash(), store.KindInvitation, account.InvitationType, created, created,
 						store.InvitationFirstRun,
 					},
 				},
 				wantStatement{
+					fragments: orgFragments,
+					args:      []any{"org-1", store.OrgKindStandard, orgName, created, "user-1", "org-1"},
+				},
+				wantStatement{
 					fragments: adminFragments,
-					args:      []any{created, "user-1", store.OrgKindStandard, store.OfferRoleAdmin},
+					args:      []any{created, "user-1", store.OrgRoleAdmin},
 				},
 				wantStatement{
 					fragments: credentialFragments,
@@ -336,7 +355,7 @@ func TestCreateAccountEncodingFailure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := newFake(applied(5))
+			fake := newFake(applied(6))
 			calls := 0
 
 			s := store.NewWithMarshal(fake.exec, func(_ any) ([]byte, error) {
@@ -369,7 +388,7 @@ func TestCreateAccountEncodingFailure(t *testing.T) {
 func TestCreateAccountFailures(t *testing.T) {
 	t.Parallel()
 
-	runFailures(t, 5, store.CodeRegistrationAcceptFailed, store.CodeRegistrationAcceptRejected, registrationDescription,
+	runFailures(t, 6, store.CodeRegistrationAcceptFailed, store.CodeRegistrationAcceptRejected, registrationDescription,
 		func(s *store.Store) error { return passErr(s.CreateAccount(context.Background(), newAccount(t, nil))) })
 }
 
