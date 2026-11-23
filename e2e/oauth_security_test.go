@@ -227,7 +227,7 @@ func TestOAuthTokenConfusion(t *testing.T) {
 
 	t.Run("a token is inactive at any other resource", func(t *testing.T) {
 		for _, resource := range []string{
-			"https://api.susu.dev/mcp", oauthResource + "/", strings.ToUpper(oauthResource), oauthResource + "?x=1",
+			"https://auth.susu.dev/mcp", oauthResource + "/", strings.ToUpper(oauthResource), oauthResource + "?x=1",
 			"http://localhost:8788", "http://localhost:8789/mcp", "http://127.0.0.1:8788/mcp", target.apiOrigin, "x", "%00",
 		} {
 			expectInactive(t, "the access token at "+resource, issued.tokens.AccessToken, resource)

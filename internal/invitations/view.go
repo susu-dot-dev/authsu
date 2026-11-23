@@ -106,3 +106,15 @@ func (h *handlers) list(call *auth.Call) result.Result[httpapi.Response] {
 			return httpapi.JSON(http.StatusOK, out)
 		})
 }
+
+// get answers GET /api/invitation/{id}: the invitation the list would show for
+// that id, with the same use count and status, at the request's one clock
+// reading. An id no invitation has is 404 invitation_not_found, the code the
+// other routes of an item give.
+func (h *handlers) get(call *auth.Call) result.Result[httpapi.Response] {
+	return result.Of(h.store.GetInvitation(call.Request.Context, call.ID())).
+		MapErr(missing).
+		Map(func(row store.Invitation) httpapi.Response {
+			return httpapi.JSON(http.StatusOK, present(row, h.now()))
+		})
+}

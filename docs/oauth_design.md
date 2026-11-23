@@ -8,7 +8,7 @@ Related: [secrets_design.md](secrets_design.md), [agents_design.md](agents_desig
 
 authsu's credentials are presented only to authsu ([secrets_design.md](secrets_design.md)). Two needs fall outside that:
 
-- **Other services need to know who a request speaks for.** `api.susu.dev` must not be handed a session or an API key, because whoever holds one *is* the user at authsu.
+- **Other services need to know who a request speaks for.** A resource server must not be handed a session or an API key, because whoever holds one *is* the user at authsu.
 - **Third-party clients need a standard way to be authorized by a person.** A coding harness talking to a remote MCP server expects to open a browser, let the user sign in with their passkey and approve, and come back with a token.
 
 OAuth 2.1 is the standard answer. authsu is the authorization server, the other services are resource servers, and the user is always the subject.
@@ -17,7 +17,7 @@ OAuth 2.1 is the standard answer. authsu is the authorization server, the other 
 
 | Scenario | How it is served |
 |---|---|
-| A client uses the MCP server at `api.susu.dev` | Authorization code with PKCE, client identified by a Client ID Metadata Document |
+| A client uses the MCP server | Authorization code with PKCE, client identified by a Client ID Metadata Document |
 | An agent holds an OAuth credential instead of an API key | The same flow, with the grant bound to an agent |
 
 Both share one authorize endpoint, one token endpoint and one kind of grant. A grant is a [secret](secrets_design.md) like the others and follows its lifecycle. An agent cannot start the flow itself: it takes its authority from a passkey assertion by a person who is present ([agents_design.md](agents_design.md#goals)), so a person initializes the grant, or the agent uses an API key.
@@ -49,13 +49,13 @@ There are two tables, one for production and one for development, and `API_ORIGI
 
 | | Production | Development |
 |---|---|---|
-| Resource | `https://api.susu.dev/mcp` | `http://localhost:8788/mcp` |
+| Resource | `https://auth.susu.dev/mcp` | `http://localhost:8788/mcp` |
 | Login resource (first party) | `https://app.susu.dev` | `http://localhost:9894` |
 | Trusted client | `https://app.susu.dev/oauth/client.json` | `http://localhost:9894/oauth/client.json` |
 | Scopes | `mcp:read`, `mcp:write` (login resource: `profile`) | the same |
 | Default scopes | both (login resource: `profile`) | both |
 
-The tables also hold the first-party login resource and the trusted clients (below).
+The resource is the MCP endpoint this service serves at `/mcp` ([mcp_design.md](mcp_design.md)). The endpoint does not accept access tokens yet, so for now this entry is the target of the flow and not something a token is spent at. The tables also hold the first-party login resource and the trusted clients (below).
 
 The development port sits beside the API's own, as the UI's does. A request that names no `scope` gets the resource's default list, written out in full on the grant, as an API key with no scopes does ([permissions_design.md](permissions_design.md#issuing-keys)). An unknown or repeated scope is refused, and `openid` is the only scope that is not the resource's.
 
@@ -148,7 +148,7 @@ Four assumptions in the current HTTP boundary do not hold for OAuth, and are cha
 
 ## Decisions
 
-- **authsu is the authorization server** for `api.susu.dev`. Resource servers are two fixed tables in code, production and development, selected by `API_ORIGIN`.
+- **authsu is the authorization server** for its resource servers. Resource servers are two fixed tables in code, production and development, selected by `API_ORIGIN`.
 - **Public clients only**, with PKCE (S256), identified by a metadata document. No client secrets, no registration.
 - **Access and refresh tokens are opaque secrets**, read live. Resource servers ask authsu; they do not verify.
 - **Introspection is unauthenticated and audience-bound.** The caller names the resource, and the answer is active only for a live access token issued for exactly it. This deliberately deviates from RFC 7662 section 2.1.

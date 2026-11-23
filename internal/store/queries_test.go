@@ -800,6 +800,7 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		"CredentialByID":  func(s *store.Store) { _, _, _ = s.CredentialByID(ctx, []byte{1}) },
 		"FirstRunState":   func(s *store.Store) { _, _ = s.FirstRunState(ctx) },
 		"ListInvitations": func(s *store.Store) { _, _ = s.ListInvitations(ctx) },
+		"GetInvitation":   func(s *store.Store) { _, _ = s.GetInvitation(ctx, invID(t)) },
 		"CreateInvitation": func(s *store.Store) {
 			_, _ = s.CreateInvitation(ctx, invitation)
 		},

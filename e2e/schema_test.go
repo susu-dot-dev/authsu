@@ -500,7 +500,7 @@ const insertOAuthGrant = "INSERT INTO oauth_grants (id, kind, user_id, agent_id,
 func oauthGrantArgs(mutate func(args []any)) []any {
 	args := []any{
 		idN("0f50", 1), kindOAuthGrant, idUserB, idAgentA, "https://client.example/app", "Client",
-		"https://client.example/cb", "https://api.susu.dev/mcp", "mcp:read openid", strings.Repeat("c", 43), "n-1",
+		"https://client.example/cb", "https://auth.susu.dev/mcp", "mcp:read openid", strings.Repeat("c", 43), "n-1",
 		int64(1_700_000_000), tokenHash("a pending request"),
 	}
 

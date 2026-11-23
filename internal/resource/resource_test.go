@@ -110,7 +110,7 @@ func TestTheTablesAreTheSameResource(t *testing.T) {
 	}
 
 	wantURLs := []string{
-		"https://api.susu.dev/mcp", "http://localhost:8788/mcp", "https://app.susu.dev", "http://localhost:9894",
+		"https://auth.susu.dev/mcp", "http://localhost:8788/mcp", "https://app.susu.dev", "http://localhost:9894",
 	}
 	if got := []string{prod[0].URL, dev[0].URL, prod[1].URL, dev[1].URL}; !slices.Equal(got, wantURLs) {
 		t.Errorf("urls = %q, want %q", got, wantURLs)

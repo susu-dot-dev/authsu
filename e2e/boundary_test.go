@@ -160,6 +160,7 @@ func bndAdminInventory() []bndRoute {
 	return []bndRoute{
 		bndRouteOf("invitation list", http.MethodGet, "/api/invitation", admin, 4*bndKiB, "", ""),
 		bndRouteOf("invitation create", http.MethodPost, "/api/invitation", admin, 4*bndKiB, create, "invitations"),
+		bndRouteOf("invitation get", http.MethodGet, inviteItem, admin, 4*bndKiB, "", ""),
 		bndRouteOf("invitation update", http.MethodPatch, inviteItem, admin, 4*bndKiB, `{"numInvites":7}`,
 			"invitations WHERE num_invites = 7"),
 		bndRouteOf("invitation revoke", http.MethodDelete, inviteItem, admin, 4*bndKiB, "",
@@ -545,8 +546,8 @@ func TestBndInventoryIsTheWholeSurface(t *testing.T) {
 			seen[key] = true
 		}
 
-		if len(seen) != 28 {
-			t.Errorf("inventory has %d routes, want the 28 the product declares", len(seen))
+		if len(seen) != 29 {
+			t.Errorf("inventory has %d routes, want the 29 the product declares", len(seen))
 		}
 	})
 }

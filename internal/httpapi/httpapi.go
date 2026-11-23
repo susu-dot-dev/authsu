@@ -159,9 +159,16 @@ func (r Response) WithCookies(cookies ...*http.Cookie) Response {
 // same thing to every parser. Unknown members are rejected so a typo in a
 // client is not silently ignored.
 func Decode[T any](req Request) result.Result[T] {
+	return DecodeBody[T](req.Body)
+}
+
+// DecodeBody is Decode for a JSON document that is not a request's body: the
+// same strictness and the same errors. It is for a value a request carries
+// inside its body, such as the params of a JSON-RPC message.
+func DecodeBody[T any](body []byte) result.Result[T] {
 	var out T
 
-	strict := json.NewDecoder(bytes.NewReader(req.Body))
+	strict := json.NewDecoder(bytes.NewReader(body))
 	strict.UseNumber() // a number is checked, not converted, so none can overflow here
 
 	err := checkStrict(strict, reflect.TypeFor[T]())
@@ -169,7 +176,7 @@ func Decode[T any](req Request) result.Result[T] {
 		return result.Fail[T](decodeError(err))
 	}
 
-	decoder := json.NewDecoder(bytes.NewReader(req.Body))
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	// checkStrict has already refused unknown members; this is a backstop.
 	decoder.DisallowUnknownFields()
 
@@ -491,16 +498,29 @@ func write(writer http.ResponseWriter, logger Logger, req Request, format ErrorF
 	// A failure while encoding the success body can only be reported as an
 	// Internal error, and nothing has been written yet because send encodes
 	// before it writes.
-	data, marshalErr := marshalFailure(failure, format)
-	if marshalErr != nil {
-		// Unreachable for real values; keep the contract that something valid
-		// is always written.
-		data = []byte(`{"error":{"code":"internal","message":"internal error"}}` + "\n")
-	}
-
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(failure.Kind.Status())
-	_, _ = writer.Write(data)
+	_, _ = writer.Write(failureBody(failure, format))
+}
+
+// FailureBody is the body the API answers a failure with, in its own format:
+// {"error":{"code","message","data?"}} and a newline, an Internal failure
+// reduced to the bare "internal". It is how a feature that carries a refusal
+// somewhere other than a response (an MCP tool's result) says it in the one
+// shape a client already reads.
+func FailureBody(failure *apierr.Error) []byte { return failureBody(failure, ErrorsAPI) }
+
+// failureBody is the body of an error response in format. Something valid is
+// always returned.
+func failureBody(failure *apierr.Error, format ErrorFormat) []byte {
+	data, err := marshalFailure(failure, format)
+	if err != nil {
+		// Unreachable for real values; keep the contract that something valid
+		// is always written.
+		return []byte(`{"error":{"code":"internal","message":"internal error"}}` + "\n")
+	}
+
+	return data
 }
 
 // marshalFailure builds the body of an error response in format.

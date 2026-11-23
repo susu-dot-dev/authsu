@@ -169,7 +169,7 @@ func TestOAuthAuthorizeOutcomes(t *testing.T) {
 		{name: "a nonce of 129 bytes", mutate: func(_ *oauthClient, q url.Values) { q.Set("nonce", strings.Repeat("n", 129)) }, kind: clientError, code: "invalid_request", fetched: true},
 		{name: "a nonce of 128 bytes", mutate: func(_ *oauthClient, q url.Values) { q.Set("nonce", strings.Repeat("n", 128)) }, kind: consentPage, fetched: true},
 		{name: "no resource", mutate: func(_ *oauthClient, q url.Values) { q.Del("resource") }, kind: clientError, code: "invalid_target", fetched: true},
-		{name: "the production resource under the development table", mutate: func(_ *oauthClient, q url.Values) { q.Set("resource", "https://api.susu.dev/mcp") }, kind: clientError, code: "invalid_target", fetched: true},
+		{name: "the production resource under the development table", mutate: func(_ *oauthClient, q url.Values) { q.Set("resource", "https://auth.susu.dev/mcp") }, kind: clientError, code: "invalid_target", fetched: true},
 		{name: "a resource with a trailing slash", mutate: func(_ *oauthClient, q url.Values) { q.Set("resource", oauthResource+"/") }, kind: clientError, code: "invalid_target", fetched: true},
 		{name: "two resources", mutate: func(_ *oauthClient, q url.Values) { q.Add("resource", oauthResource) }, kind: clientError, code: "invalid_request", fetched: true},
 		{name: "only openid", mutate: func(_ *oauthClient, q url.Values) { q.Set("scope", "openid") }, kind: clientError, code: "invalid_scope", fetched: true},

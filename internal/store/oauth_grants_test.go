@@ -64,7 +64,7 @@ func grantColumnKinds() []string {
 //
 //nolint:gochecknoglobals // fixed tables shared by the tests
 var (
-	oauthTable    = resource.Select("https://api.susu.dev")
+	oauthTable    = resource.Select("https://auth.susu.dev")
 	oauthDevTable = resource.Select("http://localhost:8787")
 )
 

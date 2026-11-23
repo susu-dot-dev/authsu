@@ -4,13 +4,15 @@
 //
 //	GET    /api/invitation        list every invitation, revoked ones included
 //	POST   /api/invitation        create an invitation
+//	GET    /api/invitation/{id}   read one invitation: the list's entry for it
 //	PATCH  /api/invitation/{id}   change the number of accounts it may create
 //	DELETE /api/invitation/{id}   revoke it
 //
-// Every route needs a session (401) whose account is an admin (403): both are
-// declared on the routes and enforced by the auth boundary before a handler
-// runs. The role is the one stored on the account, read on each request, so
-// demoting an admin takes effect at once.
+// Every route needs a credential (401), a session or an API key, whose account
+// is an admin (403) and which holds the route's scope: all of it is declared on
+// the routes and enforced by the auth boundary before a handler runs. The role
+// is the one stored on the account, read on each request, so demoting an admin
+// takes effect at once.
 //
 // An invitation is identified by its id, never by its token. The token
 // ("susu_inv_" and 43 base64url characters, see internal/secret) is shown once,
@@ -54,7 +56,7 @@ import (
 )
 
 // The routes' paths. The collection takes GET and POST; one invitation takes
-// PATCH and DELETE.
+// GET, PATCH and DELETE.
 const (
 	CollectionPath = "/api/invitation"
 	ItemPath       = CollectionPath + "/{id}"
@@ -71,6 +73,9 @@ const MaxBody = 4 << 10
 type Store interface {
 	// ListInvitations returns every invitation, newest first.
 	ListInvitations(ctx context.Context) ([]store.Invitation, error)
+	// GetInvitation returns one invitation as the list shows it, or
+	// store.ErrNotFound when there is no such row.
+	GetInvitation(ctx context.Context, id input.ID) (store.Invitation, error)
 	// CreateInvitation inserts an invitation and returns the stored row, or
 	// store.ErrAccountRevoked or store.ErrInvitationOrgUnavailable.
 	CreateInvitation(ctx context.Context, invitation store.NewInvitation) (store.Invitation, error)
@@ -101,7 +106,7 @@ type Deps struct {
 	Seal auth.Sealer
 }
 
-// Routes returns the four invitation routes. It panics when a dependency is
+// Routes returns the five invitation routes. It panics when a dependency is
 // missing, a programming error.
 func Routes(deps Deps) []auth.Route {
 	handlers := newHandlers(deps)
@@ -109,6 +114,7 @@ func Routes(deps Deps) []auth.Route {
 	return []auth.Route{
 		route(http.MethodGet, CollectionPath, scope.InvitationRead, handlers.list),
 		route(http.MethodPost, CollectionPath, scope.InvitationCreate, handlers.create),
+		route(http.MethodGet, ItemPath, scope.InvitationRead, handlers.get),
 		route(http.MethodPatch, ItemPath, scope.InvitationUpdate, handlers.update),
 		route(http.MethodDelete, ItemPath, scope.InvitationRevoke, handlers.revoke),
 	}

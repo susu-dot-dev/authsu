@@ -10,6 +10,9 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/scope"
 )
 
+// itemPattern is the path of the item routes as they are declared.
+const itemPattern = "/api/invitation/{id}"
+
 // validCreate is a body POST accepts.
 const validCreate = `{"type":"member","numInvites":3,"label":"November workshop"}`
 
@@ -30,6 +33,7 @@ func allRoutes() []routeCase {
 	return []routeCase{
 		{name: opList, method: http.MethodGet, target: collectionPath, body: "", success: http.StatusOK},
 		{name: opCreate, method: http.MethodPost, target: collectionPath, body: validCreate, success: http.StatusCreated},
+		{name: opGet, method: http.MethodGet, target: itemPath, body: "", success: http.StatusOK},
 		{name: opUpdate, method: http.MethodPatch, target: itemPath, body: validUpdate, success: http.StatusOK},
 		{name: opRevoke, method: http.MethodDelete, target: itemPath, body: "", success: http.StatusOK},
 	}
@@ -37,6 +41,7 @@ func allRoutes() []routeCase {
 
 // programmed gives the store answers that make every route succeed.
 func programmed(harn *harness) {
+	harn.store.got = storedRow(nil)
 	harn.store.updated = storedRow(nil)
 	harn.store.applied = true
 	harn.store.revoked = storedRow(nil)
@@ -58,8 +63,9 @@ func TestRoutesAreDeclaredAsAdminOnlySessions(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/invitation", scope.InvitationRead},
 		{http.MethodPost, "/api/invitation", scope.InvitationCreate},
-		{http.MethodPatch, "/api/invitation/{id}", scope.InvitationUpdate},
-		{http.MethodDelete, "/api/invitation/{id}", scope.InvitationRevoke},
+		{http.MethodGet, itemPattern, scope.InvitationRead},
+		{http.MethodPatch, itemPattern, scope.InvitationUpdate},
+		{http.MethodDelete, itemPattern, scope.InvitationRevoke},
 	}
 
 	if len(routes) != len(want) {
@@ -233,8 +239,8 @@ func TestUnknownMethodsAreRefusedWithTheMethodsAPathHas(t *testing.T) {
 	tests := []struct{ name, method, target, allow string }{
 		{"put on the collection", http.MethodPut, collectionPath, "GET, POST"},
 		{"delete on the collection", http.MethodDelete, collectionPath, "GET, POST"},
-		{"get on an item", http.MethodGet, itemPath, "DELETE, PATCH"},
-		{"post on an item", http.MethodPost, itemPath, "DELETE, PATCH"},
+		{"put on an item", http.MethodPut, itemPath, "DELETE, GET, PATCH"},
+		{"post on an item", http.MethodPost, itemPath, "DELETE, GET, PATCH"},
 	}
 
 	for _, tt := range tests {
@@ -346,6 +352,7 @@ func TestBodiesAreLimited(t *testing.T) {
 			return `{"numInvites":1,"x":"` + strings.Repeat("a", size-len(`{"numInvites":1,"x":""}`)) + `"}`
 		}, http.StatusBadRequest},
 		{opList, http.MethodGet, collectionPath, func(size int) string { return strings.Repeat(" ", size) }, http.StatusOK},
+		{opGet, http.MethodGet, itemPath, func(size int) string { return strings.Repeat(" ", size) }, http.StatusOK},
 		{opRevoke, http.MethodDelete, itemPath, func(size int) string { return strings.Repeat(" ", size) }, http.StatusOK},
 	}
 

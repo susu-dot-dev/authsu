@@ -17,8 +17,9 @@
 //   - production in every other case, including a value that is not an origin
 //     at all, so a mistake can only ever select the stricter table.
 //
-// Each table has two entries. The first is the MCP resource: production's is
-// https://api.susu.dev/mcp, and development's is the same entry at
+// Each table has two entries. The first is the MCP resource, the MCP endpoint
+// this service itself serves at /mcp (internal/mcp): production's is
+// https://auth.susu.dev/mcp, and development's is the same entry at
 // http://localhost:8788/mcp. 8788 is fixed the way the dev UI's port
 // (DEV_UI_PORT, 3000) is, one above the API's own (DEV_PORT, 8787), so the
 // development resource is a separate local server beside the API.
@@ -73,7 +74,7 @@ const (
 	// Name is shown at consent.
 	Name = "Susu MCP"
 	// ProductionURL is the resource's URL in the production table.
-	ProductionURL = "https://api.susu.dev/mcp"
+	ProductionURL = "https://auth.susu.dev/mcp"
 	// DevelopmentURL is the resource's URL in the development table. Its port,
 	// 8788, is DevelopmentPort.
 	DevelopmentURL = "http://localhost:8788/mcp"
