@@ -154,6 +154,8 @@ func invitationOps(t *testing.T) []invitationOp {
 
 				return list[0], nil
 			}},
+		{name: "get", shape: asIs, rejected: store.CodeInvitationReadRejected, notFound: true, outcome: returning,
+			call: func(s *store.Store) (store.Invitation, error) { return s.GetInvitation(ctx, id) }},
 		{name: "create", shape: asIs, rejected: store.CodeInvitationCreateRejected, notFound: false,
 			outcome: readLast(2),
 			call:    func(s *store.Store) (store.Invitation, error) { return s.CreateInvitation(ctx, newInvitation(t)) }},
@@ -579,6 +581,26 @@ func TestListInvitationsStatement(t *testing.T) {
 	if strings.Contains(squash(fake.calls[0][0].Query), "WHERE i.") {
 		t.Error("the list filters invitations; revoked ones must be included")
 	}
+}
+
+// TestGetInvitationStatement pins the read: one invitation by its id, with the
+// columns and joins of the list, and nothing that writes.
+func TestGetInvitationStatement(t *testing.T) {
+	t.Parallel()
+
+	fake := newFake(returning(invitationRow()))
+
+	got, err := fake.store().GetInvitation(context.Background(), invID(t))
+	checkErr(t, err, nil)
+
+	if got.ID != invitationID {
+		t.Errorf("id = %q, want %q", got.ID, invitationID)
+	}
+
+	checkStatements(t, fake, wantStatement{
+		fragments: []string{invitationSelect + " WHERE i.id = ?"},
+		args:      []any{invitationID},
+	})
 }
 
 // TestCreateInvitationStatements pins the batch: the secret, then the
@@ -1154,6 +1176,8 @@ func TestInvitationFailures(t *testing.T) {
 	}{
 		{name: "list", failed: store.CodeInvitationListFailed, rejected: store.CodeInvitationListRejected,
 			run: func(s *store.Store) error { return lastErr(s.ListInvitations(ctx)) }},
+		{name: "get", failed: store.CodeInvitationReadFailed, rejected: store.CodeInvitationReadRejected,
+			run: func(s *store.Store) error { return lastErr(s.GetInvitation(ctx, id)) }},
 		{name: "update", failed: store.CodeInvitationUpdateFailed, rejected: store.CodeInvitationUpdateRejected,
 			run: func(s *store.Store) error { return lastErr2(s.UpdateNumInvites(ctx, id, invNum(t, 3), now)) }},
 	}

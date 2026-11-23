@@ -1402,8 +1402,8 @@ func TestInvitationPathIDs(t *testing.T) {
 	})
 
 	t.Run("wrong methods", func(t *testing.T) {
-		send(t, request{method: http.MethodGet, path: invItem(idInvitationA), token: token}).
-			expect(t, "GET item", http.StatusMethodNotAllowed, codeMethodNotAllow)
+		send(t, request{method: http.MethodPut, path: invItem(idInvitationA), body: []byte(`{}`), token: token}).
+			expect(t, "PUT item", http.StatusMethodNotAllowed, codeMethodNotAllow)
 		send(t, request{method: http.MethodPatch, path: pathInvitation, body: []byte(`{}`), token: token}).
 			expect(t, "PATCH collection", http.StatusMethodNotAllowed, codeMethodNotAllow)
 		send(t, request{method: http.MethodDelete, path: pathInvitation, token: token}).

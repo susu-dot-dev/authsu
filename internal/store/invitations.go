@@ -15,6 +15,8 @@ import (
 const (
 	CodeInvitationListFailed     = "invitation_list_failed"
 	CodeInvitationListRejected   = "invitation_list_rejected"
+	CodeInvitationReadFailed     = "invitation_read_failed"
+	CodeInvitationReadRejected   = "invitation_read_rejected"
 	CodeInvitationCreateFailed   = "invitation_create_failed"
 	CodeInvitationCreateRejected = "invitation_create_rejected"
 	CodeInvitationUpdateFailed   = "invitation_update_failed"
@@ -124,6 +126,17 @@ func (s *Store) ListInvitations(ctx context.Context) ([]Invitation, error) {
 		description: invitationsDescription}
 
 	return queryAll(ctx, s, o, Statement{Query: listInvitationsQuery, Args: nil}, readInvitation)
+}
+
+// GetInvitation returns the invitation with the id, as listInvitationsQuery
+// would show it: the same columns, so an admin sees the same use count and
+// organization whichever route they asked. It returns ErrNotFound when there
+// is no such invitation. It is the read statement alone: it writes nothing.
+func (s *Store) GetInvitation(ctx context.Context, id input.ID) (Invitation, error) {
+	o := op{failed: CodeInvitationReadFailed, rejected: CodeInvitationReadRejected,
+		description: invitationsDescription}
+
+	return queryOne(ctx, s, o, Statement{Query: readInvitationQuery, Args: []any{id.String()}}, readInvitation)
 }
 
 // readInvitationQuery is the last statement of an invitation create and revoke:

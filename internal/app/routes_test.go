@@ -181,6 +181,7 @@ func coreInventory() []inventoryRoute {
 		sessionRoute(http.MethodDelete, "/api/key/"+someID),
 		sessionRoute(http.MethodGet, "/api/invitation"),
 		sessionRoute(http.MethodPost, "/api/invitation"),
+		sessionRoute(http.MethodGet, "/api/invitation/"+someID),
 		sessionRoute(http.MethodPatch, "/api/invitation/"+someID),
 		sessionRoute(http.MethodDelete, "/api/invitation/"+someID),
 		sessionRoute(http.MethodGet, "/api/user"),
@@ -194,6 +195,9 @@ func coreInventory() []inventoryRoute {
 		sessionRoute(http.MethodGet, "/api/org/"+someID+"/member"),
 		sessionRoute(http.MethodPatch, "/api/member/"+someID),
 		sessionRoute(http.MethodDelete, "/api/member/"+someID),
+		// The MCP endpoint is called with an API key, not a session, but it
+		// answers a request with no credential as every Authenticated route does.
+		sessionRoute(http.MethodPost, "/mcp"),
 	}
 }
 
@@ -501,6 +505,7 @@ func TestBodyLimits(t *testing.T) {
 		"key revoke":        {http.MethodDelete, "/api/key/" + someID, 8 << 10, unauth, nil},
 		"invitation list":   {http.MethodGet, "/api/invitation", 4 << 10, unauth, nil},
 		"invitation create": {http.MethodPost, "/api/invitation", 4 << 10, unauth, nil},
+		"invitation get":    {http.MethodGet, "/api/invitation/" + someID, 4 << 10, unauth, nil},
 		"invitation patch":  {http.MethodPatch, "/api/invitation/" + someID, 4 << 10, unauth, nil},
 		"invitation revoke": {http.MethodDelete, "/api/invitation/" + someID, 4 << 10, unauth, nil},
 		"user list":         {http.MethodGet, "/api/user", 1024, unauth, nil},
@@ -514,6 +519,7 @@ func TestBodyLimits(t *testing.T) {
 		"member list":       {http.MethodGet, "/api/org/" + someID + "/member", 1024, unauth, nil},
 		"member update":     {http.MethodPatch, "/api/member/" + someID, 1024, unauth, nil},
 		"member remove":     {http.MethodDelete, "/api/member/" + someID, 1024, unauth, nil},
+		"mcp":               {http.MethodPost, "/mcp", 16 << 10, unauth, nil},
 
 		"oauth metadata":       {http.MethodGet, "/.well-known/oauth-authorization-server", 1024, http.StatusOK, nil},
 		"openid configuration": {http.MethodGet, "/.well-known/openid-configuration", 1024, http.StatusOK, nil},

@@ -3,7 +3,9 @@
 //
 // Each feature declares its endpoints as auth.Routes. app collects them, adds
 // the health check, hands the whole table to auth.Handler (which authenticates
-// and dispatches every route the same way) and puts CORS around the result.
+// and dispatches every route the same way) and puts CORS around the result. The
+// MCP endpoint is the one route built over the others: it is given a handler
+// for the table without itself (see NewHandler).
 // Nothing here decides who may do what: that is each route's own declaration.
 //
 // The runtime is fixed: the real clock, crypto/rand and UUIDv7 ids. The
@@ -27,6 +29,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/invitations"
 	"github.com/susu-dot-dev/authsu/internal/keys"
 	"github.com/susu-dot-dev/authsu/internal/login"
+	"github.com/susu-dot-dev/authsu/internal/mcp"
 	"github.com/susu-dot-dev/authsu/internal/oauth"
 	"github.com/susu-dot-dev/authsu/internal/orgs"
 	"github.com/susu-dot-dev/authsu/internal/registration"
@@ -100,9 +103,15 @@ func NewHandler(platform Platform) http.Handler {
 		}),
 	)
 
-	handler := auth.Handler(routes, auth.Deps{
-		Credentials: db, Now: time.Now, Getenv: platform.Getenv, Log: platform.Log,
-	})
+	deps := auth.Deps{Credentials: db, Now: time.Now, Getenv: platform.Getenv, Log: platform.Log}
+
+	// The MCP endpoint runs each tool as a request to the routes above, through
+	// a table that does not hold the endpoint itself, so a tool can reach every
+	// route but /mcp and the route's own declaration is the rule that applies.
+	api := auth.Handler(routes, deps)
+	tools := mcp.Routes(mcp.Deps{Do: httpapi.Local(api)})
+
+	handler := auth.Handler(slices.Concat(routes, tools), deps)
 
 	// CORS is outermost so a preflight is answered before routing, which would
 	// otherwise answer OPTIONS with 405. The one allowed origin is the UI's,

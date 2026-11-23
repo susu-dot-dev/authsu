@@ -32,8 +32,11 @@ cd "$(dirname "$0")/.."
 # crypto/internal/fips140/mldsa (about 270 KB, linked only because x509 can parse
 # an ML-DSA key); the rest is the oauth feature, its parsers, store queries and
 # the outbound fetch client. The budget stays about 250 KB above the build, as the
-# earlier ones did.
-MAX_WASM_BYTES="${MAX_WASM_BYTES:-4200000}"
+# earlier ones did. Then 4.3 MB for the MCP endpoint (internal/mcp, 4.19 MB to
+# 4.22 MB, 32 KB): a hand-written JSON-RPC handler over encoding/json, which is
+# already linked. A library for it would have added about 1.8 MB, which is why
+# there is none.
+MAX_WASM_BYTES="${MAX_WASM_BYTES:-4300000}"
 TOP="${TOP:-15}"
 
 # Heavy packages that are NOT in the baseline build, so seeing one linked means

@@ -70,6 +70,7 @@ const (
 
 	// The operations of the fake store, as recorded in its calls.
 	opList   = "list"
+	opGet    = "get"
 	opCreate = "create"
 	opUpdate = "update"
 	opRevoke = "revoke"
@@ -166,6 +167,8 @@ type fakeStore struct {
 	// created, when set, is what CreateInvitation returns instead of echoing
 	// what it was given as the database would.
 	created *store.Invitation
+	// got is what GetInvitation returns.
+	got store.Invitation
 	// updated and applied are what UpdateNumInvites returns.
 	updated store.Invitation
 	applied bool
@@ -177,6 +180,12 @@ func (f *fakeStore) ListInvitations(context.Context) ([]store.Invitation, error)
 	f.calls = append(f.calls, storeCall{op: opList})
 
 	return f.list, f.err
+}
+
+func (f *fakeStore) GetInvitation(_ context.Context, id input.ID) (store.Invitation, error) {
+	f.calls = append(f.calls, storeCall{op: opGet, id: id.String()})
+
+	return f.got, f.err
 }
 
 func (f *fakeStore) CreateInvitation(_ context.Context, in store.NewInvitation) (store.Invitation, error) {

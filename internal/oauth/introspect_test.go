@@ -150,7 +150,7 @@ func inactives() map[string]inactive {
 		"a resource that is unknown":          askedAbout("https://other.example.com/mcp"),
 		"the resource with a trailing slash":  askedAbout(resourceURL + "/"),
 		"the resource in capitals":            askedAbout(strings.ToUpper(resourceURL)),
-		"the resource with its port written":  askedAbout("https://api.susu.dev:443/mcp"),
+		"the resource with its port written":  askedAbout("https://auth.susu.dev:443/mcp"),
 		"a resource with a space":             askedAbout(resourceURL + " "),
 		"an access token nobody holds":        asked(func(c *inactive) { c.token = literal(nobodys) }),
 		"a token revoked by its client": asked(func(c *inactive) {
