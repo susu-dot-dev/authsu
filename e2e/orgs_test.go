@@ -3,18 +3,17 @@
 //nolint:goconst,funlen,cyclop,lll // table-driven tests repeat case names and inputs on purpose and the case table is the test; a constant or a line break per row would hide it
 package e2e_test
 
-// orgs_test.go drives the organization routes (/api/org, /api/member and
-// /api/offer) against the real Worker: the TinyGo wasm, the real D1 driver and
-// the real SQLite the migrations created. The unit tests fake the database, so
-// this file proves what only the real build can:
+// orgs_test.go drives the organization routes (/api/org and /api/member) against
+// the real Worker: the TinyGo wasm, the real D1 driver and the real SQLite the
+// migrations created. The unit tests fake the database, so this file proves what
+// only the real build can:
 //
-//   - that every conditional write of internal/store/orgs.go, members.go and
-//     offers.go does what its SQL text says, for each caller standing;
-//   - that races between requests (revoking against accepting, two creates at a
-//     limit, two administrators demoting or leaving at once, accepting two
-//     offers at once) end in a state no sequential order could not have
-//     produced, and never leave a user in a revoked organization or an
-//     organization without an administrator;
+//   - that every conditional write of internal/store/orgs.go and members.go does
+//     what its SQL text says, for each caller standing;
+//   - that races between requests (two creates at the sandbox limit, a sandbox
+//     deleted against what is created in it, two administrators demoting or
+//     revoking each other at once) end in a state no sequential order could not
+//     have produced, and never leave an organization without an administrator;
 //   - and, through the Worker, the depth test of the design: deleting a sandbox
 //     that holds agents with keys, labels and OAuth grants with access tokens
 //     leaves none of them and no secret without its row.
@@ -40,35 +39,31 @@ import (
 const (
 	pathOrg    = "/api/org"
 	pathMember = "/api/member"
-	pathOffer  = "/api/offer"
 )
 
 // Error codes of the organization API, as internal/orgs documents them.
 const (
 	orgCodeNotFound      = "org_not_found"
 	orgCodeMemberMissing = "member_not_found"
-	orgCodeOfferMissing  = "offer_not_found"
-	orgCodeUserMissing   = "offer_user_not_found"
 	orgCodeNotAdmin      = "org_admin_required"
-	orgCodeInactive      = "org_inactive"
+	orgCodeExpired       = "sandbox_expired"
 	orgCodeNotStandard   = "org_not_standard"
-	orgCodeAlready       = "org_already_member"
-	orgCodeOrgLimit      = "org_limit_reached"
+	orgCodeNotSandbox    = "org_not_sandbox"
 	orgCodeSandboxLimit  = "sandbox_limit_reached"
 	orgCodeLastAdmin     = "org_last_admin"
-	orgCodeOfferExists   = "offer_exists"
+	orgCodePlatformAdmin = "platform_admin_protected"
+	orgCodeSelfRevoke    = "self_revoke_refused"
+	orgCodeLastPlatform  = "user_last_admin"
 	orgCodeMissingAdmin  = "missing_admin"
+	orgCodeMemberRevoked = "member_revoked"
 	orgCodeTooLarge      = "body_too_large"
 	orgCodeInvalidID     = "invalid_id"
 
 	orgMaxSandboxes = 25
-	orgMaxStandard  = 5
 	orgSandboxLife  = 7 * 24 * 3600
 	orgNameRunes    = 256
 	orgBodyCap      = 8 << 10
 
-	// orgNone is how orgMembership reads a user who belongs to no organization.
-	orgNone     = "NULL"
 	orgSmallCap = 1 << 10
 )
 
@@ -77,17 +72,15 @@ const (
 	orgFamUser     = "0e50"
 	orgFamSession  = "0e51"
 	orgFamOrg      = "0e52"
-	orgFamOffer    = "0e53"
 	orgFamInvite   = "0e54"
 	orgFamSandbox  = "0e55"
 	orgFamAgent    = "0e56"
 	orgFamKey      = "0e57"
-	orgFamRevoked  = "0e58"
 	orgFamExpired  = "0e59"
 	orgFamCreation = "0e5a"
 )
 
-// orgView, orgMember, orgOfferView and their pages are the JSON the routes serve.
+// orgView, orgMember and their pages are the JSON the routes serve.
 type orgView struct {
 	ID        string `json:"id"`
 	Kind      string `json:"kind"`
@@ -95,7 +88,6 @@ type orgView struct {
 	CreatedBy string `json:"createdBy"`
 	CreatedAt int64  `json:"createdAt"`
 	ExpiresAt *int64 `json:"expiresAt"`
-	RevokedAt *int64 `json:"revokedAt"`
 	Status    string `json:"status"`
 }
 
@@ -108,21 +100,9 @@ type orgMemberView struct {
 	RevokedAt *int64 `json:"revokedAt"`
 }
 
-type orgOfferView struct {
-	ID           string  `json:"id"`
-	OrgID        string  `json:"orgId"`
-	OrgName      string  `json:"orgName"`
-	UserID       *string `json:"userId"`
-	InvitationID *string `json:"invitationId"`
-	Role         string  `json:"role"`
-	CreatedBy    string  `json:"createdBy"`
-	CreatedAt    int64   `json:"createdAt"`
-}
-
 type orgPage struct {
 	Orgs    []orgView       `json:"orgs"`
 	Members []orgMemberView `json:"members"`
-	Offers  []orgOfferView  `json:"offers"`
 	Next    string          `json:"next"`
 }
 
@@ -145,9 +125,10 @@ func orgDecode[T any](t *testing.T, r reply) T {
 
 // orgWorld is a deployment with five accounts, each signed in: an administrator
 // and a member of the organization org (who both belong to it), a second
-// administrator of it, an outsider who belongs to nothing, and a platform
-// administrator. Its sessions are seeded, so a test spends its requests on the
-// routes under test.
+// administrator of it, an outsider and a platform administrator, who each belong
+// to an organization of their own, whose id is not the account's (a route that
+// took a user id for an organization id, or the other way, would be found out).
+// Its sessions are seeded, so a test spends its requests on the routes under test.
 type orgWorld struct {
 	admin, member, second, outsider, platform string
 	adminToken, memberToken, secondToken      string
@@ -155,6 +136,10 @@ type orgWorld struct {
 
 	// org is a standard organization of admin, member and second.
 	org string
+
+	// outsiderOrg and platformOrg are the organizations the outsider and the
+	// platform administrator belong to: their own, with ids of their own.
+	outsiderOrg, platformOrg string
 }
 
 // orgUser is the n-th account of the file.
@@ -169,17 +154,18 @@ func orgNewWorld(t *testing.T) orgWorld {
 
 	world := orgWorld{
 		admin: orgUser(1), member: orgUser(2), second: orgUser(3), outsider: orgUser(4), platform: orgUser(5),
-		org: idN(orgFamOrg, 1),
+		org: idN(orgFamOrg, 1), outsiderOrg: idN(orgFamOrg, 21), platformOrg: idN(orgFamOrg, 22),
 	}
 
+	// The administrator is written with the organization it created, which the
+	// member and the second administrator join; the others have one of their own.
+	seedUserWithOrg(t, world.admin, roleMember, world.org, "Acme")
+	seedUserIn(t, world.member, roleMember, world.org)
+	seedUserIn(t, world.second, roleMember, world.org)
+	seedUserOwn(t, world.outsider, roleMember, world.outsiderOrg)
+	seedUserOwn(t, world.platform, roleAdmin, world.platformOrg)
+
 	for i, id := range []string{world.admin, world.member, world.second, world.outsider, world.platform} {
-		role := roleMember
-		if id == world.platform {
-			role = roleAdmin
-		}
-
-		seedUser(t, id, role)
-
 		token := seedSession(t, idN(orgFamSession, i+1), id)
 
 		switch id {
@@ -196,10 +182,8 @@ func orgNewWorld(t *testing.T) orgWorld {
 		}
 	}
 
-	orgSeedStandard(t, world.org, world.admin)
-	orgJoin(t, world.org, world.admin, true)
-	orgJoin(t, world.org, world.member, false)
-	orgJoin(t, world.org, world.second, true)
+	seed(t, "INSERT INTO org_admins (org_id, user_id, created_at) VALUES (?, ?, 1), (?, ?, 1)",
+		world.org, world.admin, world.org, world.second)
 
 	return world
 }
@@ -208,7 +192,7 @@ func orgNewWorld(t *testing.T) orgWorld {
 func orgSeedStandard(t *testing.T, id, creator string) {
 	t.Helper()
 
-	seed(t, insertOrg, id, schemaKindStandard, "Acme", creator, nil, nil, int64(1_700_000_000))
+	seed(t, insertOrg, id, schemaKindStandard, "Acme", creator, nil, int64(1_700_000_000))
 }
 
 // orgJoin makes user a member of org, and an administrator of it when admin.
@@ -220,14 +204,6 @@ func orgJoin(t *testing.T, org, user string, admin bool) {
 	if admin {
 		seed(t, "INSERT INTO org_admins (org_id, user_id, created_at) VALUES (?, ?, 1)", org, user)
 	}
-}
-
-// orgOfferSeed inserts an offer of org to user with role.
-func orgOfferSeed(t *testing.T, id, org, user, role, creator string) {
-	t.Helper()
-
-	seed(t, "INSERT INTO org_offers (id, org_id, user_id, role, created_by, created_at) VALUES (?, ?, ?, ?, ?, 1)",
-		id, org, user, role, creator)
 }
 
 // orgRelease starts n goroutines at once, each running fn(i), and returns their
@@ -286,31 +262,26 @@ func orgJSON(t *testing.T, members map[string]any) []byte {
 	return mustJSON(t, members)
 }
 
-func orgCreateBody(t *testing.T, kind, name string) []byte {
+func orgCreateBody(t *testing.T, name string) []byte {
 	t.Helper()
 
-	return orgJSON(t, map[string]any{"kind": kind, "name": name})
+	return orgJSON(t, map[string]any{"name": name})
 }
 
-func orgCreate(t *testing.T, token, kind, name string) reply {
+// orgCreate creates a sandbox, the only thing a create makes.
+func orgCreate(t *testing.T, token, name string) reply {
 	t.Helper()
 
-	return post(t, pathOrg, orgCreateBody(t, kind, name), token)
-}
-
-func orgOfferBody(t *testing.T, user, role string) []byte {
-	t.Helper()
-
-	return orgJSON(t, map[string]any{"userId": user, "role": role})
+	return post(t, pathOrg, orgCreateBody(t, name), token)
 }
 
 func orgItem(id string) string { return pathOrg + "/" + id }
 
-// orgIsMember reports whether the user belongs to the organization, as a number.
+// orgMembership is the organization the user belongs to.
 func orgMembership(t *testing.T, user string) string {
 	t.Helper()
 
-	return scalar(t, "SELECT ifnull(org_id, '"+orgNone+"') FROM users WHERE id = ?", user)
+	return scalar(t, "SELECT org_id FROM users WHERE id = ?", user)
 }
 
 // orgAdminCount is how many administrator rows the organization has.
@@ -328,25 +299,18 @@ func orgAdminCount(t *testing.T, org string) string {
 //nolint:paralleltest // shares one database
 func TestOrgRoutesNeedASession(t *testing.T) {
 	world := orgNewWorld(t)
-	orgOfferSeed(t, idN(orgFamOffer, 1), world.org, world.outsider, "member", world.admin)
-
 	routes := []struct {
 		name, method, path string
 		body               []byte
 	}{
-		{"create", http.MethodPost, pathOrg, orgCreateBody(t, "sandbox", "x")},
+		{"create", http.MethodPost, pathOrg, orgCreateBody(t, "x")},
 		{"list", http.MethodGet, pathOrg, nil},
 		{"get", http.MethodGet, orgItem(world.org), nil},
 		{"rename", http.MethodPatch, orgItem(world.org), []byte(`{"name":"x"}`)},
-		{"revoke", http.MethodDelete, orgItem(world.org), nil},
+		{"delete", http.MethodDelete, orgItem(world.org), nil},
 		{"members", http.MethodGet, orgItem(world.org) + "/member", nil},
 		{"promote", http.MethodPatch, pathMember + "/" + world.member, []byte(`{"admin":true}`)},
-		{"remove", http.MethodDelete, pathMember + "/" + world.member, nil},
-		{"offer", http.MethodPost, orgItem(world.org) + "/offer", orgOfferBody(t, world.outsider, "member")},
-		{"org offers", http.MethodGet, orgItem(world.org) + "/offer", nil},
-		{"my offers", http.MethodGet, pathOffer, nil},
-		{"accept", http.MethodPost, pathOffer + "/" + idN(orgFamOffer, 1) + "/accept", nil},
-		{"decline", http.MethodDelete, pathOffer + "/" + idN(orgFamOffer, 1), nil},
+		{"revoke", http.MethodDelete, pathMember + "/" + world.member, nil},
 	}
 
 	for _, rt := range routes {
@@ -356,58 +320,55 @@ func TestOrgRoutesNeedASession(t *testing.T) {
 		})
 	}
 
-	expectCount(t, "orgs", "1")
-	expectCount(t, "org_offers", "1")
+	expectCount(t, "orgs", "3") // the organization, and the two accounts' own
 	expectCount(t, "org_admins", "2")
-	expectCount(t, "users WHERE org_id IS NOT NULL", "3")
+	expectCount(t, "users WHERE org_id = ?", "3", world.org)
 
 	// A revoked account is told it is not signed in, on a read and on a write.
 	seed(t, "UPDATE users SET revoked_at = strftime('%s','now') WHERE id = ?", world.member)
 	get(t, pathOrg, world.memberToken).expect(t, "revoked, list", http.StatusUnauthorized, codeUnauthenticated)
-	orgCreate(t, world.memberToken, "sandbox", "x").expect(t, "revoked, create", http.StatusUnauthorized, codeUnauthenticated)
+	orgCreate(t, world.memberToken, "x").expect(t, "revoked, create", http.StatusUnauthorized, codeUnauthenticated)
 }
 
 // ---- create ----------------------------------------------------------------
 
-// TestOrgCreateStandard: the creator becomes a member and an administrator in
-// one write, the response is exactly the stored row, and the account then
-// belongs to the organization it made.
+// TestOrgCreateIsOnlyASandbox: POST /api/org makes a sandbox whoever asks, and no
+// body can make a standard organization: a member of an organization, an
+// administrator of one and a platform administrator are all given a sandbox, and
+// keep the organization they have.
 //
 //nolint:paralleltest // shares one database
-func TestOrgCreateStandard(t *testing.T) {
+func TestOrgCreateIsOnlyASandbox(t *testing.T) {
 	world := orgNewWorld(t)
 
-	before := time.Now().Unix()
-	got := orgCreate(t, world.outsiderToken, "standard", "Mine")
-	after := time.Now().Unix()
+	for _, who := range []struct{ name, token, user string }{
+		{"a member", world.memberToken, world.member},
+		{"an administrator", world.adminToken, world.admin},
+		{"a platform administrator", world.platformToken, world.platform},
+	} {
+		before := orgMembership(t, who.user)
 
-	got.expect(t, "create", http.StatusCreated, "")
+		got := orgCreate(t, who.token, "Scratch")
+		got.expect(t, who.name+" creates", http.StatusCreated, "")
 
-	if got.header.Get("Cache-Control") != "no-store" {
-		t.Errorf("Cache-Control = %q, want no-store", got.header.Get("Cache-Control"))
+		if view := orgDecode[orgView](t, got); view.Kind != "sandbox" || view.Status != "active" || view.CreatedBy != who.user {
+			t.Errorf("%s created %+v, want an active sandbox of theirs", who.name, view)
+		}
+
+		if after := orgMembership(t, who.user); after != before {
+			t.Errorf("%s belonged to %s and now belongs to %s, want it unchanged", who.name, before, after)
+		}
 	}
 
-	view := orgDecode[orgView](t, got)
-
-	if view.Kind != "standard" || view.Name != "Mine" || view.CreatedBy != world.outsider || view.Status != "active" ||
-		view.ExpiresAt != nil || view.RevokedAt != nil || view.CreatedAt < before || view.CreatedAt > after {
-		t.Errorf("created = %+v, want an active standard organization of the outsider made in [%d, %d]", view, before, after)
+	// A kind cannot be asked for: a standard organization is not created through
+	// the API, and neither is a sandbox said to be one.
+	for _, body := range []string{`{"kind":"standard","name":"Mine"}`, `{"kind":"sandbox","name":"Mine"}`} {
+		post(t, pathOrg, []byte(body), world.outsiderToken).expect(t, body, http.StatusBadRequest, "unknown_field")
 	}
 
-	expectCount(t, "orgs WHERE id = ? AND kind = 'standard' AND name = 'Mine' AND created_by = ?", "1", view.ID, world.outsider)
-	expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", view.ID, world.outsider)
-
-	if got := orgMembership(t, world.outsider); got != view.ID {
-		t.Errorf("the creator's org_id = %s, want %s", got, view.ID)
-	}
-
-	// Already a member of one: no second, and nothing written.
-	orgCreate(t, world.outsiderToken, "standard", "Again").expect(t, "second standard", http.StatusConflict, orgCodeAlready)
-	orgCreate(t, world.adminToken, "standard", "Again").expect(t, "member of another", http.StatusConflict, orgCodeAlready)
-	expectCount(t, "orgs", "2")
-
-	// A sandbox is not refused for belonging to an organization.
-	orgCreate(t, world.adminToken, "sandbox", "Scratch").expect(t, "sandbox of a member", http.StatusCreated, "")
+	expectCount(t, "orgs WHERE kind = 'standard'", "3")
+	expectCount(t, "orgs WHERE kind = 'sandbox'", "3")
+	expectCount(t, "orgs", "6")
 }
 
 // TestOrgCreateSandbox: a sandbox expires a week after it is made, its creator
@@ -418,38 +379,71 @@ func TestOrgCreateSandbox(t *testing.T) {
 	world := orgNewWorld(t)
 
 	before := time.Now().Unix()
-	got := orgCreate(t, world.outsiderToken, "sandbox", "Scratch")
+	got := orgCreate(t, world.outsiderToken, "Scratch")
 	after := time.Now().Unix()
 
 	got.expect(t, "create", http.StatusCreated, "")
 
 	view := orgDecode[orgView](t, got)
 
-	if view.Kind != "sandbox" || view.Status != "active" || view.RevokedAt != nil || view.ExpiresAt == nil ||
+	if view.Kind != "sandbox" || view.Status != "active" || view.ExpiresAt == nil ||
 		*view.ExpiresAt < before+orgSandboxLife || *view.ExpiresAt > after+orgSandboxLife {
 		t.Errorf("created = %+v, want an active sandbox expiring a week after [%d, %d]", view, before, after)
 	}
 
 	expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", view.ID, world.outsider)
 
-	if got := orgMembership(t, world.outsider); got != orgNone {
-		t.Errorf("the sandbox's creator belongs to %s, want no organization", got)
+	if got := orgMembership(t, world.outsider); got != world.outsiderOrg {
+		t.Errorf("the sandbox's creator belongs to %s, want its own organization", got)
 	}
 
-	// Its administrator reads it, and a member of no organization has it listed.
+	// Its administrator reads it, and it is listed for them.
 	get(t, orgItem(view.ID), world.outsiderToken).expect(t, "read", http.StatusOK, "")
 
 	page := orgDecode[orgPage](t, get(t, pathOrg, world.outsiderToken))
-	if len(page.Orgs) != 1 || page.Orgs[0].ID != view.ID {
-		t.Errorf("list = %+v, want the sandbox", page.Orgs)
+	if len(page.Orgs) != 2 || page.Orgs[0].ID != view.ID || page.Orgs[1].ID != world.outsiderOrg {
+		t.Errorf("list = %+v, want the sandbox and then their own organization", page.Orgs)
 	}
 
-	// A sandbox has no members and receives no offers.
+	// A sandbox has no members.
 	get(t, orgItem(view.ID)+"/member", world.outsiderToken).expect(t, "members", http.StatusConflict, orgCodeNotStandard)
-	get(t, orgItem(view.ID)+"/offer", world.outsiderToken).expect(t, "offers", http.StatusConflict, orgCodeNotStandard)
-	post(t, orgItem(view.ID)+"/offer", orgOfferBody(t, world.member, "member"), world.outsiderToken).
-		expect(t, "offer", http.StatusConflict, orgCodeNotStandard)
-	expectCount(t, "org_offers", "0")
+}
+
+// orgNameCase is a body that carries an organization's or sandbox's name at a
+// bound of its parser: code is the refusal, or "" when it is accepted as stored.
+type orgNameCase struct {
+	name, body, code, stored string
+}
+
+// orgNameCases are the names at their bounds, which a create and a rename
+// treat alike: the bound is 256 runes, and not bytes (a four-byte rune is the
+// widest, 1024 bytes in all, which is also what the column's CHECK allows), and
+// a name that is not text a person could read, or that no JSON parser reads
+// the same way, is refused.
+func orgNameCases() []orgNameCase {
+	four := "\U0001F600"
+
+	return []orgNameCase{
+		{"256 four-byte runes (1024 bytes)", `{"name":"` + strings.Repeat(four, orgNameRunes) + `"}`, "", strings.Repeat(four, orgNameRunes)},
+		{"256 four-byte runes, each escaped as a surrogate pair", `{"name":"` + strings.Repeat(`\ud83d\ude00`, orgNameRunes) + `"}`, "", strings.Repeat(four, orgNameRunes)},
+		{"256 ASCII runes", `{"name":"` + strings.Repeat("x", orgNameRunes) + `"}`, "", strings.Repeat("x", orgNameRunes)},
+		{"257 four-byte runes (1028 bytes)", `{"name":"` + strings.Repeat(four, orgNameRunes+1) + `"}`, "invalid_org_name", ""},
+		{"257 four-byte runes, each escaped as a surrogate pair", `{"name":"` + strings.Repeat(`\ud83d\ude00`, orgNameRunes+1) + `"}`, "invalid_org_name", ""},
+		{"257 ASCII runes", `{"name":"` + strings.Repeat("x", orgNameRunes+1) + `"}`, "invalid_org_name", ""},
+		{"256 four-byte runes and one more of one byte", `{"name":"` + strings.Repeat(four, orgNameRunes) + `x"}`, "invalid_org_name", ""},
+		{"an escaped NUL", `{"name":"a\u0000b"}`, "invalid_org_name", ""},
+		{"a name that is only an escaped NUL", `{"name":"\u0000"}`, "invalid_org_name", ""},
+		{"a raw NUL byte", "{\"name\":\"a\x00b\"}", "invalid_json", ""},
+		{"invalid UTF-8", "{\"name\":\"a\xffb\"}", "invalid_text", ""},
+		{"invalid UTF-8 at the end", "{\"name\":\"a\xf0\x9f\"}", "invalid_text", ""},
+		{"an overlong encoding", "{\"name\":\"\xc0\xaf\"}", "invalid_text", ""},
+		{"a lone high surrogate escape", `{"name":"a\ud800"}`, "invalid_text", ""},
+		{"a lone low surrogate escape", `{"name":"a\udc00"}`, "invalid_text", ""},
+		{"an escaped replacement character", `{"name":"a\ufffdb"}`, "invalid_text", ""},
+		{"a replacement character", "{\"name\":\"a\ufffdb\"}", "invalid_text", ""},
+		{"a name of spaces", `{"name":"   "}`, "invalid_org_name", ""},
+		{"a name of a control character", `{"name":"a\u0007b"}`, "invalid_org_name", ""},
+	}
 }
 
 // TestOrgCreateInput: what a create refuses before anything is written, and the
@@ -466,18 +460,16 @@ func TestOrgCreateInput(t *testing.T) {
 	}{
 		{"no body", ``, "empty_body"},
 		{"not JSON", `{`, "invalid_json"},
-		{"no kind", `{"name":"x"}`, "invalid_org_kind"},
-		{"an unknown kind", `{"kind":"enterprise","name":"x"}`, "invalid_org_kind"},
-		{"a kind in another case", `{"kind":"Sandbox","name":"x"}`, "invalid_org_kind"},
-		{"a kind with a space", `{"kind":" sandbox","name":"x"}`, "invalid_org_kind"},
-		{"no name", `{"kind":"sandbox"}`, "invalid_org_name"},
-		{"an empty name", `{"kind":"sandbox","name":""}`, "invalid_org_name"},
-		{"a name with NUL", `{"kind":"sandbox","name":"a\u0000b"}`, "invalid_org_name"},
-		{"a name of 257 runes", `{"kind":"sandbox","name":"` + strings.Repeat("x", orgNameRunes+1) + `"}`, "invalid_org_name"},
-		{"an expiry of the client's choosing", `{"kind":"sandbox","name":"x","expiresAt":1}`, "unknown_field"},
-		{"a creator of the client's choosing", `{"kind":"sandbox","name":"x","createdBy":"` + world.admin + `"}`, "unknown_field"},
-		{"a repeated kind", `{"kind":"sandbox","kind":"standard","name":"x"}`, "duplicate_field"},
-		{"a kind that is a number", `{"kind":1,"name":"x"}`, "invalid_field_type"},
+		{"a kind of standard", `{"kind":"standard","name":"x"}`, "unknown_field"},
+		{"a kind of sandbox", `{"kind":"sandbox","name":"x"}`, "unknown_field"},
+		{"no name", `{}`, "invalid_org_name"},
+		{"an empty name", `{"name":""}`, "invalid_org_name"},
+		{"a name with NUL", `{"name":"a\u0000b"}`, "invalid_org_name"},
+		{"a name of 257 runes", `{"name":"` + strings.Repeat("x", orgNameRunes+1) + `"}`, "invalid_org_name"},
+		{"an expiry of the client's choosing", `{"name":"x","expiresAt":1}`, "unknown_field"},
+		{"a creator of the client's choosing", `{"name":"x","createdBy":"` + world.admin + `"}`, "unknown_field"},
+		{"a repeated name", `{"name":"x","name":"y"}`, "duplicate_field"},
+		{"a name that is a number", `{"name":1}`, "invalid_field_type"},
 	}
 
 	for _, tc := range bad {
@@ -486,7 +478,27 @@ func TestOrgCreateInput(t *testing.T) {
 		})
 	}
 
-	expectCount(t, "orgs", "1")
+	expectCount(t, "orgs", "3")
+
+	for _, tc := range orgNameCases() {
+		t.Run("a name of "+tc.name, func(t *testing.T) {
+			got := post(t, pathOrg, []byte(tc.body), world.outsiderToken)
+
+			if tc.code != "" {
+				got.expect(t, tc.name, http.StatusBadRequest, tc.code)
+
+				return
+			}
+
+			got.expect(t, tc.name, http.StatusCreated, "")
+
+			if view := orgDecode[orgView](t, got); view.Name != tc.stored {
+				t.Errorf("name came back as %d bytes, want the %d sent", len(view.Name), len(tc.stored))
+			}
+
+			expectCount(t, "orgs WHERE id = ? AND name = ?", "1", orgDecode[orgView](t, got).ID, tc.stored)
+		})
+	}
 
 	for name, value := range map[string]string{
 		"256 ASCII runes":                strings.Repeat("x", orgNameRunes),
@@ -496,7 +508,7 @@ func TestOrgCreateInput(t *testing.T) {
 		"a name that is a path or a tag": "../<b>x</b>",
 	} {
 		t.Run("accepts "+name, func(t *testing.T) {
-			got := orgCreate(t, world.outsiderToken, "sandbox", value)
+			got := orgCreate(t, world.outsiderToken, value)
 			got.expect(t, name, http.StatusCreated, "")
 
 			view := orgDecode[orgView](t, got)
@@ -517,7 +529,7 @@ func orgSeedSandboxes(t *testing.T, fam string, n int, creator string, expires i
 	t.Helper()
 
 	for i := range n {
-		seed(t, insertOrg, idN(fam, i+1), schemaKindSandbox, "seeded", creator, expires, nil, int64(1_700_000_000))
+		seed(t, insertOrg, idN(fam, i+1), schemaKindSandbox, "seeded", creator, expires, int64(1_700_000_000))
 		seed(t, "INSERT INTO org_admins (org_id, user_id, created_at) VALUES (?, ?, 1)", idN(fam, i+1), creator)
 	}
 }
@@ -536,10 +548,10 @@ func TestOrgSandboxLimit(t *testing.T) {
 	orgSeedSandboxes(t, orgFamSandbox, orgMaxSandboxes-2, world.outsider, now+3600)
 
 	// 23 live ones: two creates at once, one place left... and one more.
-	first := orgCreate(t, world.outsiderToken, "sandbox", "24th")
+	first := orgCreate(t, world.outsiderToken, "24th")
 	first.expect(t, "24th", http.StatusCreated, "")
 
-	replies := orgRelease(4, func(int) reply { return orgCreate(t, world.outsiderToken, "sandbox", "race") })
+	replies := orgRelease(4, func(int) reply { return orgCreate(t, world.outsiderToken, "race") })
 	orgNo5xx(t, "creates at the limit", replies)
 
 	tally := orgTally(replies)
@@ -549,19 +561,19 @@ func TestOrgSandboxLimit(t *testing.T) {
 
 	expectCount(t, "orgs WHERE kind = 'sandbox' AND created_by = ? AND expires_at > strftime('%s','now')", "25", world.outsider)
 
-	orgCreate(t, world.outsiderToken, "sandbox", "26th").expect(t, "26th", http.StatusConflict, orgCodeSandboxLimit)
+	orgCreate(t, world.outsiderToken, "26th").expect(t, "26th", http.StatusConflict, orgCodeSandboxLimit)
 
 	// The limit is per user: another account has all 25 of its own.
-	orgCreate(t, world.memberToken, "sandbox", "other user").expect(t, "another user", http.StatusCreated, "")
+	orgCreate(t, world.memberToken, "other user").expect(t, "another user", http.StatusCreated, "")
 
 	// Deleting one makes room, and only one.
 	del(t, orgItem(first.mustView(t).ID), world.outsiderToken).expect(t, "delete", http.StatusOK, "")
-	orgCreate(t, world.outsiderToken, "sandbox", "again").expect(t, "after delete", http.StatusCreated, "")
-	orgCreate(t, world.outsiderToken, "sandbox", "over").expect(t, "over again", http.StatusConflict, orgCodeSandboxLimit)
+	orgCreate(t, world.outsiderToken, "again").expect(t, "after delete", http.StatusCreated, "")
+	orgCreate(t, world.outsiderToken, "over").expect(t, "over again", http.StatusConflict, orgCodeSandboxLimit)
 
 	// A sandbox that expires this very second no longer counts.
 	seed(t, "UPDATE orgs SET expires_at = strftime('%s','now') WHERE id = ?", idN(orgFamSandbox, 1))
-	orgCreate(t, world.outsiderToken, "sandbox", "after expiry").expect(t, "expired one", http.StatusCreated, "")
+	orgCreate(t, world.outsiderToken, "after expiry").expect(t, "expired one", http.StatusCreated, "")
 }
 
 // mustView decodes a created organization.
@@ -569,53 +581,6 @@ func (r reply) mustView(t *testing.T) orgView {
 	t.Helper()
 
 	return orgDecode[orgView](t, r)
-}
-
-// TestOrgStandardLimit: five standard organizations in a lifetime, revoked ones
-// included, and the count is not given back by revoking.
-//
-//nolint:paralleltest // shares one database
-func TestOrgStandardLimit(t *testing.T) {
-	world := orgNewWorld(t)
-
-	// Four organizations the outsider made earlier and that were revoked, which
-	// leaves them belonging to none.
-	for i := range orgMaxStandard - 1 {
-		seed(t, insertOrg, idN(orgFamRevoked, i+1), schemaKindStandard, "old", world.outsider, nil, int64(1_700_000_001),
-			int64(1_700_000_000))
-	}
-
-	// Two creates at the limit: the fifth and a sixth. Either one may win, only
-	// one does, and the loser is told why.
-	replies := orgRelease(2, func(int) reply { return orgCreate(t, world.outsiderToken, "standard", "race") })
-	orgNo5xx(t, "creates at the limit", replies)
-
-	tally := orgTally(replies)
-	if tally["Created"] != 1 || len(tally) != 2 {
-		t.Fatalf("tally = %v, want one Created and one refusal", tally)
-	}
-
-	if tally["Conflict "+orgCodeOrgLimit]+tally["Conflict "+orgCodeAlready] != 1 {
-		t.Errorf("tally = %v, want the loser told org_limit_reached or org_already_member", tally)
-	}
-
-	expectCount(t, "orgs WHERE created_by = ? AND kind = 'standard'", "5", world.outsider)
-
-	// Revoking the fifth does not give its place back.
-	var made orgView
-
-	for _, r := range replies {
-		if r.status == http.StatusCreated {
-			made = orgDecode[orgView](t, r)
-		}
-	}
-
-	del(t, orgItem(made.ID), world.outsiderToken).expect(t, "revoke", http.StatusOK, "")
-	orgCreate(t, world.outsiderToken, "standard", "sixth").expect(t, "sixth", http.StatusConflict, orgCodeOrgLimit)
-	expectCount(t, "orgs WHERE created_by = ? AND kind = 'standard'", "5", world.outsider)
-
-	// And a sandbox is a different count.
-	orgCreate(t, world.outsiderToken, "sandbox", "sbx").expect(t, "sandbox", http.StatusCreated, "")
 }
 
 // ---- reads and standing -----------------------------------------------------
@@ -642,13 +607,12 @@ func TestOrgStanding(t *testing.T) {
 		name, token string
 		get, rename outcome
 		members     outcome
-		offers      outcome
 	}{
-		{"an administrator", world.adminToken, ok, ok, ok, ok},
-		{"a second administrator", world.secondToken, ok, ok, ok, ok},
-		{"a member", world.memberToken, ok, denied, ok, denied},
-		{"an outsider", world.outsiderToken, hidden, hidden, hidden, hidden},
-		{"a platform administrator", world.platformToken, ok, ok, ok, ok},
+		{"an administrator", world.adminToken, ok, ok, ok},
+		{"a second administrator", world.secondToken, ok, ok, ok},
+		{"a member", world.memberToken, ok, denied, ok},
+		{"an outsider", world.outsiderToken, hidden, hidden, hidden},
+		{"a platform administrator", world.platformToken, ok, ok, ok},
 	}
 
 	for _, actor := range actors {
@@ -662,37 +626,34 @@ func TestOrgStanding(t *testing.T) {
 			check("get", get(t, orgItem(world.org), actor.token), actor.get)
 			check("rename", patch(t, orgItem(world.org), []byte(`{"name":"Acme"}`), actor.token), actor.rename)
 			check("members", get(t, orgItem(world.org)+"/member", actor.token), actor.members)
-			check("offers", get(t, orgItem(world.org)+"/offer", actor.token), actor.offers)
 		})
 	}
 
 	// A member who is not an administrator cannot change the organization or its
 	// people: nothing below changes a row.
 	for what, got := range map[string]reply{
-		"revoke":  del(t, orgItem(world.org), world.memberToken),
-		"offer":   post(t, orgItem(world.org)+"/offer", orgOfferBody(t, world.outsider, "member"), world.memberToken),
+		"delete":  del(t, orgItem(world.org), world.memberToken),
 		"promote": patch(t, pathMember+"/"+world.member, []byte(`{"admin":true}`), world.memberToken),
 		"demote":  patch(t, pathMember+"/"+world.admin, []byte(`{"admin":false}`), world.memberToken),
-		"remove":  del(t, pathMember+"/"+world.second, world.memberToken),
+		"revoke":  del(t, pathMember+"/"+world.second, world.memberToken),
 	} {
 		got.expect(t, what+" by a member", http.StatusForbidden, orgCodeNotAdmin)
 	}
 
 	for what, got := range map[string]reply{
-		"revoke":  del(t, orgItem(world.org), world.outsiderToken),
-		"offer":   post(t, orgItem(world.org)+"/offer", orgOfferBody(t, world.outsider, "member"), world.outsiderToken),
+		"delete":  del(t, orgItem(world.org), world.outsiderToken),
 		"promote": patch(t, pathMember+"/"+world.member, []byte(`{"admin":true}`), world.outsiderToken),
-		"remove":  del(t, pathMember+"/"+world.member, world.outsiderToken),
+		"revoke":  del(t, pathMember+"/"+world.member, world.outsiderToken),
 	} {
 		code := orgCode(what)
 		got.expect(t, what+" by an outsider", http.StatusNotFound, code)
 	}
 
-	expectCount(t, "orgs WHERE revoked_at IS NOT NULL", "0")
+	expectCount(t, "orgs", "3")
 	expectCount(t, "org_admins WHERE org_id = ?", "2", world.org)
 	expectCount(t, "users WHERE org_id = ?", "3", world.org)
-	expectCount(t, "org_offers", "0")
-	expectCount(t, "orgs WHERE name <> 'Acme'", "0")
+	expectCount(t, "users WHERE revoked_at IS NOT NULL", "0")
+	expectCount(t, "orgs WHERE id = ? AND name <> 'Acme'", "0", world.org)
 
 	// A missing organization is the outsider's answer, byte for byte.
 	missing := get(t, orgItem(idMissing), world.adminToken)
@@ -712,28 +673,27 @@ func TestOrgStanding(t *testing.T) {
 // orgCode is the code of the 404 an outsider is told on each route of
 // TestOrgStanding: an organization is hidden, and so is a user in one.
 func orgCode(what string) string {
-	if what == "promote" || what == "remove" || what == "demote" {
+	if what == "promote" || what == "revoke" || what == "demote" {
 		return orgCodeMemberMissing
 	}
 
 	return orgCodeNotFound
 }
 
-// TestOrgListAndPaging: a member lists their organization, an outsider none, a
-// platform administrator all of them including revoked ones and sandboxes, with
-// keyset paging that neither skips nor repeats a row.
+// TestOrgListAndPaging: a member lists their organization, an outsider their own
+// organization and their sandboxes, a platform administrator all of them, with keyset paging that
+// neither skips nor repeats a row.
 //
 //nolint:paralleltest // shares one database
 func TestOrgListAndPaging(t *testing.T) {
 	world := orgNewWorld(t)
 
-	// Seven more organizations nobody here belongs to, one of them revoked, and
-	// three sandboxes of the outsider.
+	// Seven more organizations nobody here belongs to, and three sandboxes of the
+	// outsider, who has an organization of their own besides.
 	for i := range 7 {
-		seed(t, insertOrg, idN(orgFamOrg, 10+i), schemaKindStandard, "other", world.platform, nil, nil, int64(1_700_000_000))
+		seed(t, insertOrg, idN(orgFamOrg, 10+i), schemaKindStandard, "other", world.platform, nil, int64(1_700_000_000))
 	}
 
-	seed(t, "UPDATE orgs SET revoked_at = 5 WHERE id = ?", idN(orgFamOrg, 10))
 	orgSeedSandboxes(t, orgFamSandbox, 3, world.outsider, time.Now().Unix()+3600)
 
 	list := func(token, query string) orgPage {
@@ -755,12 +715,13 @@ func TestOrgListAndPaging(t *testing.T) {
 		t.Errorf("an administrator who is a member lists %+v, want their organization once", page.Orgs)
 	}
 
-	if page := list(world.outsiderToken, ""); len(page.Orgs) != 3 {
-		t.Errorf("an outsider lists %d, want only their three sandboxes", len(page.Orgs))
+	if page := list(world.outsiderToken, ""); len(page.Orgs) != 4 {
+		t.Errorf("an outsider lists %d, want their organization and their three sandboxes", len(page.Orgs))
 	}
 
-	// The outsider's three sandboxes, one to a page, come newest first and none is
-	// skipped or repeated: each source of the list is cut at the cursor.
+	// The outsider's three sandboxes and their own organization, one to a page,
+	// come newest first and none is skipped or repeated: each source of the list
+	// is cut at the cursor.
 	var ids []string
 
 	for cursor, pages := "", 0; pages < 5; pages++ {
@@ -779,11 +740,13 @@ func TestOrgListAndPaging(t *testing.T) {
 		}
 	}
 
-	if want := []string{idN(orgFamSandbox, 3), idN(orgFamSandbox, 2), idN(orgFamSandbox, 1)}; !slices.Equal(ids, want) {
+	if want := []string{
+		idN(orgFamSandbox, 3), idN(orgFamSandbox, 2), idN(orgFamSandbox, 1), world.outsiderOrg,
+	}; !slices.Equal(ids, want) {
 		t.Errorf("the outsider paged through %v, want %v", ids, want)
 	}
 
-	// All of them, 11 in all, three at a time: ids newest first, none twice.
+	// All of them, 13 in all, three at a time: ids newest first, none twice.
 	seen := map[string]bool{}
 	cursor := ""
 
@@ -809,13 +772,13 @@ func TestOrgListAndPaging(t *testing.T) {
 
 		cursor = page.Next
 
-		if pages > 6 {
+		if pages > 8 {
 			t.Fatal("paging does not end")
 		}
 	}
 
-	if len(seen) != 11 {
-		t.Errorf("a platform administrator paged through %d organizations, want all 11", len(seen))
+	if len(seen) != 13 {
+		t.Errorf("a platform administrator paged through %d organizations, want all 13", len(seen))
 	}
 
 	for _, query := range []string{"?limit=0", "?limit=101", "?limit=x", "?limit=1&limit=2", "?cursor=nope", "?cursor="} {
@@ -825,16 +788,12 @@ func TestOrgListAndPaging(t *testing.T) {
 
 // ---- change ----------------------------------------------------------------
 
-// TestOrgRenameAndRevoke: renaming, revoking and the platform administrator's
-// override. A revoked organization releases its members and deletes its offers
-// and administrator rows; it cannot be renamed; revoking twice is a no-op for a
-// platform administrator and a 404 for a former administrator.
+// TestOrgRename: renaming, and the platform administrator's override. A rename
+// changes the name and nothing else.
 //
 //nolint:paralleltest // shares one database
-func TestOrgRenameAndRevoke(t *testing.T) {
+func TestOrgRename(t *testing.T) {
 	world := orgNewWorld(t)
-	orgOfferSeed(t, idN(orgFamOffer, 1), world.org, world.outsider, "admin", world.admin)
-
 	renamed := patch(t, orgItem(world.org), []byte(`{"name":"Renamed"}`), world.adminToken)
 	renamed.expect(t, "rename", http.StatusOK, "")
 
@@ -848,49 +807,88 @@ func TestOrgRenameAndRevoke(t *testing.T) {
 	patch(t, orgItem(world.org), []byte(`{"name":"`+strings.Repeat("x", orgNameRunes+1)+`"}`), world.adminToken).
 		expect(t, "a long name", http.StatusBadRequest, "invalid_org_name")
 
-	// The platform administrator renames and revokes anything.
+	// The names at the bounds of the parser, as a create has them: a refusal
+	// leaves the name as it was, and an acceptance stores it as sent.
+	for _, tc := range orgNameCases() {
+		t.Run("a name of "+tc.name, func(t *testing.T) {
+			current := scalar(t, "SELECT name FROM orgs WHERE id = ?", world.org)
+			got := patch(t, orgItem(world.org), []byte(tc.body), world.adminToken)
+
+			if tc.code != "" {
+				got.expect(t, tc.name, http.StatusBadRequest, tc.code)
+				expectCount(t, "orgs WHERE id = ? AND name = ?", "1", world.org, current)
+
+				return
+			}
+
+			got.expect(t, tc.name, http.StatusOK, "")
+
+			if view := orgDecode[orgView](t, got); view.Name != tc.stored {
+				t.Errorf("name came back as %d bytes, want the %d sent", len(view.Name), len(tc.stored))
+			}
+
+			expectCount(t, "orgs WHERE id = ? AND name = ?", "1", world.org, tc.stored)
+		})
+	}
+
+	// The same bound holds for a sandbox, whose name its administrator changes.
+	sandbox := idN(orgFamSandbox, 1)
+	orgSeedSandboxes(t, orgFamSandbox, 1, world.outsider, time.Now().Unix()+3600)
+
+	for _, tc := range orgNameCases() {
+		t.Run("a sandbox's name of "+tc.name, func(t *testing.T) {
+			got := patch(t, orgItem(sandbox), []byte(tc.body), world.outsiderToken)
+
+			if tc.code != "" {
+				got.expect(t, tc.name, http.StatusBadRequest, tc.code)
+
+				return
+			}
+
+			got.expect(t, tc.name, http.StatusOK, "")
+			expectCount(t, "orgs WHERE id = ? AND name = ?", "1", sandbox, tc.stored)
+		})
+	}
+
+	// The platform administrator renames anything.
 	patch(t, orgItem(world.org), []byte(`{"name":"By platform"}`), world.platformToken).
 		expect(t, "platform rename", http.StatusOK, "")
 
-	revoked := del(t, orgItem(world.org), world.adminToken)
-	revoked.expect(t, "revoke", http.StatusOK, "")
+	expectCount(t, "orgs WHERE id = ? AND name = 'By platform' AND kind = 'standard'", "1", world.org)
+	expectCount(t, "users WHERE org_id = ?", "3", world.org)
+	expectCount(t, "org_admins WHERE org_id = ?", "2", world.org)
+}
 
-	view := orgDecode[orgView](t, revoked)
-	if view.Status != "revoked" || view.RevokedAt == nil || view.Kind != "standard" || view.Name != "By platform" {
-		t.Errorf("revoked = %+v", view)
+// TestOrgDeleteRefusesAStandardOrganization: a standard organization is never
+// deleted, by anyone. Whoever can see it is told so (409), after the checks on
+// who may act: a member who does not administer it is told that first (403), and
+// an outsider is told it is not found, as for an id that does not exist.
+//
+//nolint:paralleltest // shares one database
+func TestOrgDeleteRefusesAStandardOrganization(t *testing.T) {
+	world := orgNewWorld(t)
+
+	for _, tc := range []struct {
+		name, token string
+		status      int
+		code        string
+	}{
+		{"an administrator", world.adminToken, http.StatusConflict, orgCodeNotSandbox},
+		{"a second administrator", world.secondToken, http.StatusConflict, orgCodeNotSandbox},
+		{"a platform administrator", world.platformToken, http.StatusConflict, orgCodeNotSandbox},
+		{"a member", world.memberToken, http.StatusForbidden, orgCodeNotAdmin},
+		{"an outsider", world.outsiderToken, http.StatusNotFound, orgCodeNotFound},
+	} {
+		del(t, orgItem(world.org), tc.token).expect(t, tc.name, tc.status, tc.code)
 	}
 
-	expectCount(t, "users WHERE org_id IS NOT NULL", "0")
-	expectCount(t, "org_admins", "0")
-	expectCount(t, "org_offers", "0")
-	expectCount(t, "orgs WHERE id = ? AND revoked_at IS NOT NULL", "1", world.org)
-	expectCount(t, "users", "5")
+	// The refusal is the same each time, and nothing changed.
+	del(t, orgItem(world.org), world.adminToken).expect(t, "again", http.StatusConflict, orgCodeNotSandbox)
 
-	// Final: cannot be renamed, by anyone who can still see it.
-	patch(t, orgItem(world.org), []byte(`{"name":"Revived"}`), world.platformToken).
-		expect(t, "rename revoked", http.StatusConflict, orgCodeInactive)
-
-	// Former administrators and members no longer see it at all.
-	for _, token := range []string{world.adminToken, world.memberToken, world.secondToken} {
-		get(t, orgItem(world.org), token).expect(t, "former member", http.StatusNotFound, orgCodeNotFound)
-		del(t, orgItem(world.org), token).expect(t, "former revoke", http.StatusNotFound, orgCodeNotFound)
-	}
-
-	// The platform administrator revokes again: success, and the time stays.
-	first := *view.RevokedAt
-
-	again := del(t, orgItem(world.org), world.platformToken)
-	again.expect(t, "revoke again", http.StatusOK, "")
-
-	if got := orgDecode[orgView](t, again); got.RevokedAt == nil || *got.RevokedAt != first {
-		t.Errorf("revoked again at %v, want the first time %d", got.RevokedAt, first)
-	}
-
-	// The members can now create and join elsewhere; the revoked one still
-	// counts for its creator's limit.
-	orgCreate(t, world.memberToken, "standard", "Fresh").expect(t, "create after release", http.StatusCreated, "")
-	expectCount(t, "orgs WHERE created_by = ? AND kind = 'standard'", "1", world.member)
-	expectCount(t, "users WHERE org_id IS NOT NULL", "1")
+	expectCount(t, "orgs WHERE id = ? AND kind = 'standard'", "1", world.org)
+	expectCount(t, "org_admins WHERE org_id = ?", "2", world.org)
+	expectCount(t, "users WHERE org_id = ?", "3", world.org)
+	get(t, orgItem(world.org), world.memberToken).expect(t, "still readable", http.StatusOK, "")
 }
 
 // ---- members ---------------------------------------------------------------
@@ -905,8 +903,10 @@ func orgMembers(t *testing.T, org, token, query string) orgPage {
 	return orgDecode[orgPage](t, got)
 }
 
-// TestOrgMembers: the member list with who administers, a revoked member who
-// stays listed, promoting, demoting, removing and leaving.
+// TestOrgMembers: the member list with who administers, paging, the body of a
+// promotion or a demotion, and how a revoked member is listed. Who may promote
+// and demote whom, each idempotent, with the last unrevoked administrator never
+// demoted and a revoked member never promoted, is TestOrgMemberAuthority.
 //
 //nolint:paralleltest // shares one database
 func TestOrgMembers(t *testing.T) {
@@ -941,34 +941,10 @@ func TestOrgMembers(t *testing.T) {
 		t.Fatalf("second page = %+v", rest)
 	}
 
-	// Promote and demote, each idempotent.
-	promote := patch(t, pathMember+"/"+world.member, []byte(`{"admin":true}`), world.adminToken)
-	promote.expect(t, "promote", http.StatusOK, "")
-
-	if m := orgDecode[orgMemberView](t, promote); !m.Admin || m.ID != world.member {
-		t.Errorf("promoted = %+v", m)
-	}
-
-	patch(t, pathMember+"/"+world.member, []byte(`{"admin":true}`), world.adminToken).expect(t, "again", http.StatusOK, "")
-	expectCount(t, "org_admins WHERE org_id = ?", "3", world.org)
-
-	demote := patch(t, pathMember+"/"+world.member, []byte(`{"admin":false}`), world.secondToken)
-	demote.expect(t, "demote", http.StatusOK, "")
-
-	if m := orgDecode[orgMemberView](t, demote); m.Admin {
-		t.Errorf("demoted = %+v", m)
-	}
-
-	patch(t, pathMember+"/"+world.member, []byte(`{"admin":false}`), world.adminToken).expect(t, "demote again", http.StatusOK, "")
-	expectCount(t, "org_admins WHERE org_id = ?", "2", world.org)
-
-	// A member who is not in any organization is not found, and so is one in an
-	// organization the caller cannot see.
-	patch(t, pathMember+"/"+world.outsider, []byte(`{"admin":true}`), world.adminToken).
-		expect(t, "outsider", http.StatusNotFound, orgCodeMemberMissing)
-	patch(t, pathMember+"/"+idMissing, []byte(`{"admin":true}`), world.adminToken).
-		expect(t, "missing", http.StatusNotFound, orgCodeMemberMissing)
-
+	// A body that does not say whether the member is to administer, or says it as
+	// no boolean, is refused before anyone's authority is asked: nothing is
+	// written. Who may promote or demote whom, with what answer, is
+	// TestOrgMemberAuthority's table.
 	for _, body := range []string{`{}`, `{"admin":null}`} {
 		patch(t, pathMember+"/"+world.member, []byte(body), world.adminToken).
 			expect(t, body, http.StatusBadRequest, orgCodeMissingAdmin)
@@ -978,281 +954,153 @@ func TestOrgMembers(t *testing.T) {
 		patch(t, pathMember+"/"+world.member, []byte(body), world.adminToken).expect(t, body, http.StatusBadRequest, "")
 	}
 
-	// Another organization's administrator has no say in this one's members.
+	expectCount(t, "org_admins WHERE org_id = ?", "2", world.org)
+
+	// A revoked member stays listed, as revoked and never as an administrator
+	// whatever they administered.
+	seed(t, "UPDATE users SET revoked_at = 5 WHERE id = ?", world.second)
+
+	for _, m := range orgMembers(t, world.org, world.adminToken, "").Members {
+		if m.ID == world.second && (m.Status != "revoked" || m.RevokedAt == nil || m.Admin) {
+			t.Errorf("revoked member = %+v, want it listed as revoked and not an administrator", m)
+		}
+	}
+}
+
+// orgRevoked decodes a member reply and holds that it shows the account as
+// revoked, at the stored time, and not as an administrator.
+func orgRevoked(t *testing.T, what string, got reply, id string) {
+	t.Helper()
+
+	got.expect(t, what, http.StatusOK, "")
+
+	member := orgDecode[orgMemberView](t, got)
+	stored := scalar(t, "SELECT revoked_at FROM users WHERE id = ?", id)
+
+	if member.ID != id || member.Status != "revoked" || member.Admin || member.RevokedAt == nil ||
+		strconv.FormatInt(*member.RevokedAt, 10) != stored {
+		t.Errorf("%s: %+v, want %s revoked at %s", what, member, id, stored)
+	}
+}
+
+// TestOrgRevokeMember is what a revocation through DELETE /api/member/{id} does
+// (docs/users_design.md), told as one sequence: a revoked account stays in the
+// organization, listed as revoked and no longer as an administrator, its keys and
+// agents end with it, a second revocation keeps the first time, and a platform
+// administrator reaches the last administrator of an organization. Who may
+// revoke whom, and that every refusal changes nothing, is the table of
+// TestOrgRevokeMemberAuthority.
+//
+//nolint:paralleltest // shares one database
+func TestOrgRevokeMember(t *testing.T) {
+	world := orgNewWorld(t)
+
+	// The platform administrator also belongs to the organization, as an
+	// account of one does, without administering it. A key and an agent for
+	// each of the member and the second administrator.
+	orgJoin(t, world.org, world.platform, false)
+
+	seedAgent(t, idN(orgFamAgent, 1), world.member, "agent")
+	memberKey := seedAPIKey(t, idN(orgFamKey, 1), world.member, "")
+	seedAgent(t, idN(orgFamAgent, 3), world.second, "agent")
+	seedAPIKey(t, idN(orgFamKey, 3), world.second, idN(orgFamAgent, 3))
+
+	// Who may revoke whom, and that a refusal changes nothing, is the table of
+	// TestOrgRevokeMemberAuthority. What follows is what a revocation does.
+
+	// A foreign administrator is told what a missing user is told, byte for byte.
 	other := idN(orgFamOrg, 2)
 	orgSeedStandard(t, other, world.outsider)
 	orgJoin(t, other, world.outsider, true)
 
-	patch(t, pathMember+"/"+world.member, []byte(`{"admin":true}`), world.outsiderToken).
-		expect(t, "foreign admin promotes", http.StatusNotFound, orgCodeMemberMissing)
-	del(t, pathMember+"/"+world.member, world.outsiderToken).
-		expect(t, "foreign admin removes", http.StatusNotFound, orgCodeMemberMissing)
-	expectCount(t, "users WHERE org_id = ?", "3", world.org)
+	foreign := del(t, pathMember+"/"+world.member, world.outsiderToken)
+	missing := del(t, pathMember+"/"+idMissing, world.outsiderToken)
+	foreign.expect(t, "foreign administrator", http.StatusNotFound, orgCodeMemberMissing)
 
-	// An administrator removes a member; a member cannot remove another.
-	del(t, pathMember+"/"+world.second, world.memberToken).expect(t, "member removes", http.StatusForbidden, orgCodeNotAdmin)
-
-	removed := del(t, pathMember+"/"+world.member, world.adminToken)
-	removed.expect(t, "remove", http.StatusOK, "")
-
-	if orgMembership(t, world.member) != orgNone {
-		t.Errorf("the removed member still belongs to %s", orgMembership(t, world.member))
+	if foreign.body != missing.body {
+		t.Errorf("foreign administrator is told %q, a missing user %q", foreign.body, missing.body)
 	}
 
-	del(t, pathMember+"/"+world.member, world.adminToken).expect(t, "remove again", http.StatusNotFound, orgCodeMemberMissing)
+	// An administrator revokes a member: shown as revoked, kept in the
+	// organization, its secrets and agents revoked, nobody else's touched.
+	orgRevoked(t, "revoke a member", del(t, pathMember+"/"+world.member, world.adminToken), world.member)
 
-	// Removing an administrator removes their administration with them, and
-	// leaving is removing oneself.
-	left := del(t, pathMember+"/"+world.second, world.secondToken)
-	left.expect(t, "leave", http.StatusOK, "")
-
-	if m := orgDecode[orgMemberView](t, left); m.Admin || m.ID != world.second {
-		t.Errorf("left = %+v", m)
+	if got := orgMembership(t, world.member); got != world.org {
+		t.Errorf("the revoked member belongs to %s, want the organization %s", got, world.org)
 	}
 
-	expectCount(t, "org_admins WHERE org_id = ?", "1", world.org)
-	expectCount(t, "org_admins WHERE user_id = ?", "0", world.second)
+	expectCount(t, "secrets WHERE id = ? AND revoked_at IS NOT NULL", "1", idOfToken(t, memberKey))
+	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NOT NULL", "1", world.member)
+	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NOT NULL", "0", world.second)
+	expectCount(t, "users WHERE revoked_at IS NOT NULL", "1")
+	get(t, pathSession, world.memberToken).expect(t, "the revoked member's session", http.StatusUnauthorized, "")
 
-	// The last administrator can neither leave, be removed nor be demoted, by
-	// themself or by a platform administrator, and nothing changes.
-	for what, got := range map[string]reply{
-		"leave":            del(t, pathMember+"/"+world.admin, world.adminToken),
-		"remove, platform": del(t, pathMember+"/"+world.admin, world.platformToken),
-		"demote":           patch(t, pathMember+"/"+world.admin, []byte(`{"admin":false}`), world.adminToken),
-		"demote, platform": patch(t, pathMember+"/"+world.admin, []byte(`{"admin":false}`), world.platformToken),
-	} {
-		got.expect(t, "the last administrator: "+what, http.StatusConflict, orgCodeLastAdmin)
+	// Revoking again keeps the first time, for the administrator and for a platform
+	// administrator, and a revoked account is still listed with its organization.
+	first := scalar(t, "SELECT revoked_at FROM users WHERE id = ?", world.member)
+
+	orgRevoked(t, "revoke again", del(t, pathMember+"/"+world.member, world.adminToken), world.member)
+	orgRevoked(t, "revoke again, platform", del(t, pathMember+"/"+world.member, world.platformToken), world.member)
+
+	if got := scalar(t, "SELECT revoked_at FROM users WHERE id = ?", world.member); got != first {
+		t.Errorf("revoked_at moved from %s to %s", first, got)
 	}
 
-	expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", world.org, world.admin)
-	expectCount(t, "users WHERE org_id = ?", "1", world.org)
+	// An administrator revokes the other administrator, who stays listed as
+	// revoked and is no longer an administrator, and the organization keeps the
+	// one who revoked.
+	orgRevoked(t, "revoke an administrator", del(t, pathMember+"/"+world.second, world.adminToken), world.second)
+	expectCount(t, "agents WHERE user_id = ? AND revoked_at IS NOT NULL", "1", world.second)
+	expectCount(t, "api_keys k JOIN secrets s ON s.id = k.id WHERE k.user_id = ? AND s.revoked_at IS NOT NULL", "1",
+		world.second)
+	expectCount(t, "org_admins a JOIN users u ON u.id = a.user_id WHERE a.org_id = ? AND u.revoked_at IS NULL", "1",
+		world.org)
 
-	// A revoked administrator does not count as one: the other may not leave.
-	orgJoin(t, world.org, world.second, true)
-	seed(t, "UPDATE users SET org_id = ? WHERE id = ?", world.org, world.second)
-	seed(t, "UPDATE users SET revoked_at = 5 WHERE id = ?", world.second)
+	var listed int
 
-	del(t, pathMember+"/"+world.admin, world.adminToken).expect(t, "leave, other revoked", http.StatusConflict, orgCodeLastAdmin)
+	for _, m := range orgMembers(t, world.org, world.adminToken, "").Members {
+		if m.Status == "revoked" {
+			listed++
 
-	// A revoked member is listed as such, and may be removed by an administrator
-	// (and, being revoked, cannot remove themself: they cannot sign in).
-	page = orgMembers(t, world.org, world.adminToken, "")
-
-	var seenRevoked bool
-
-	for _, m := range page.Members {
-		if m.ID == world.second {
-			seenRevoked = m.Status == "revoked" && m.RevokedAt != nil && m.Admin
+			if m.Admin || m.OrgID != world.org || m.RevokedAt == nil {
+				t.Errorf("revoked member listed as %+v", m)
+			}
 		}
 	}
 
-	if !seenRevoked {
-		t.Errorf("members = %+v, want the revoked account listed as revoked", page.Members)
+	if listed != 2 {
+		t.Errorf("%d revoked members listed, want 2", listed)
 	}
 
-	del(t, pathMember+"/"+world.second, world.adminToken).expect(t, "remove a revoked member", http.StatusOK, "")
-	expectCount(t, "org_admins WHERE org_id = ?", "1", world.org)
+	// The revoked administrator can do nothing, and the one left cannot be
+	// demoted into an organization without one.
+	patch(t, pathMember+"/"+world.admin, []byte(`{"admin":false}`), world.adminToken).
+		expect(t, "demoting the last administrator", http.StatusConflict, orgCodeLastAdmin)
+
+	// A platform administrator revokes a platform administrator, an
+	// administrator of an organization and the last administrator of one, and
+	// then may revoke themself only while another remains.
+	extra := orgUser(6)
+	seedUser(t, extra, roleAdmin)
+	orgJoin(t, world.org, extra, false)
+
+	orgRevoked(t, "platform revokes platform", del(t, pathMember+"/"+extra, world.platformToken), extra)
+	orgRevoked(t, "platform revokes the last administrator", del(t, pathMember+"/"+world.admin, world.platformToken), world.admin)
+	expectCount(t, "org_admins a JOIN users u ON u.id = a.user_id WHERE a.org_id = ? AND u.revoked_at IS NULL", "0",
+		world.org)
+	orgSoleStillRefused(t, world)
 }
 
-// ---- offers ----------------------------------------------------------------
+// orgSoleStillRefused holds that the only platform administrator, who has revoked
+// everyone else they could, still cannot revoke themself, through either route.
+func orgSoleStillRefused(t *testing.T, world orgWorld) {
+	t.Helper()
 
-// TestOrgOffers: offering, the refusals, the lists, accepting and declining.
-//
-//nolint:paralleltest // shares one database
-func TestOrgOffers(t *testing.T) {
-	world := orgNewWorld(t)
-	offers := orgItem(world.org) + "/offer"
-
-	made := post(t, offers, orgOfferBody(t, world.outsider, "admin"), world.adminToken)
-	made.expect(t, "offer", http.StatusCreated, "")
-
-	offer := orgDecode[orgOfferView](t, made)
-	if offer.OrgID != world.org || offer.OrgName != "Acme" || offer.Role != "admin" || offer.CreatedBy != world.admin ||
-		offer.UserID == nil || *offer.UserID != world.outsider || offer.InvitationID != nil {
-		t.Errorf("offer = %+v", offer)
-	}
-
-	expectCount(t, "org_offers WHERE id = ? AND kind = 'standard'", "1", offer.ID)
-
-	refusals := []struct {
-		name   string
-		token  string
-		path   string
-		body   []byte
-		status int
-		code   string
-	}{
-		{"a second offer to the same user", world.adminToken, offers, orgOfferBody(t, world.outsider, "member"),
-			http.StatusConflict, orgCodeOfferExists},
-		{"to a member of it", world.adminToken, offers, orgOfferBody(t, world.member, "member"),
-			http.StatusConflict, orgCodeAlready},
-		{"to a user who does not exist", world.adminToken, offers, orgOfferBody(t, idMissing, "member"),
-			http.StatusNotFound, orgCodeUserMissing},
-		{"by a member", world.memberToken, offers, orgOfferBody(t, world.platform, "member"),
-			http.StatusForbidden, orgCodeNotAdmin},
-		{"by an outsider", world.outsiderToken, offers, orgOfferBody(t, world.platform, "member"),
-			http.StatusNotFound, orgCodeNotFound},
-		{"of an organization that does not exist", world.adminToken, orgItem(idMissing) + "/offer",
-			orgOfferBody(t, world.platform, "member"), http.StatusNotFound, orgCodeNotFound},
-		{"with a role that does not exist", world.adminToken, offers, orgOfferBody(t, world.platform, "owner"),
-			http.StatusBadRequest, "invalid_org_role"},
-		{"with no role", world.adminToken, offers, []byte(`{"userId":"` + world.platform + `"}`),
-			http.StatusBadRequest, "invalid_org_role"},
-		{"to a user id in capitals", world.adminToken, offers,
-			[]byte(`{"userId":"` + strings.ToUpper(world.platform) + `","role":"member"}`), http.StatusBadRequest, orgCodeInvalidID},
-		{"with an unknown field", world.adminToken, offers,
-			[]byte(`{"userId":"` + world.platform + `","role":"member","orgId":"x"}`), http.StatusBadRequest, "unknown_field"},
-	}
-
-	for _, tc := range refusals {
-		t.Run(tc.name, func(t *testing.T) {
-			post(t, tc.path, tc.body, tc.token).expect(t, tc.name, tc.status, tc.code)
-		})
-	}
-
-	expectCount(t, "org_offers", "1")
-
-	// A revoked user receives none.
-	seed(t, "UPDATE users SET revoked_at = 5 WHERE id = ?", world.platform)
-	post(t, offers, orgOfferBody(t, world.platform, "member"), world.adminToken).
-		expect(t, "to a revoked user", http.StatusNotFound, orgCodeUserMissing)
-	seed(t, "UPDATE users SET revoked_at = NULL WHERE id = ?", world.platform)
-
-	// The organization's list shows it to its administrators only.
-	page := orgDecode[orgPage](t, get(t, offers, world.secondToken))
-	if len(page.Offers) != 1 || page.Offers[0].ID != offer.ID {
-		t.Errorf("org offers = %+v, want the one", page.Offers)
-	}
-
-	// The user's own list shows it to them and to nobody else.
-	mine := orgDecode[orgPage](t, get(t, pathOffer, world.outsiderToken))
-	if len(mine.Offers) != 1 || mine.Offers[0].ID != offer.ID {
-		t.Errorf("my offers = %+v, want the one", mine.Offers)
-	}
-
-	if other := orgDecode[orgPage](t, get(t, pathOffer, world.memberToken)); len(other.Offers) != 0 {
-		t.Errorf("a member lists %+v, want none", other.Offers)
-	}
-
-	// Only the addressee accepts; another account is told it is not found, as
-	// for an id that does not exist.
-	accept := pathOffer + "/" + offer.ID + "/accept"
-	post(t, accept, nil, world.memberToken).expect(t, "someone else accepts", http.StatusNotFound, orgCodeOfferMissing)
-	post(t, accept, nil, world.adminToken).expect(t, "the offerer accepts", http.StatusNotFound, orgCodeOfferMissing)
-	post(t, accept, nil, world.platformToken).expect(t, "a platform administrator accepts", http.StatusNotFound, orgCodeOfferMissing)
-	post(t, pathOffer+"/"+idMissing+"/accept", nil, world.outsiderToken).
-		expect(t, "missing", http.StatusNotFound, orgCodeOfferMissing)
-	expectCount(t, "org_offers", "1")
-
-	got := post(t, accept, nil, world.outsiderToken)
-	got.expect(t, "accept", http.StatusOK, "")
-
-	if view := orgDecode[orgOfferView](t, got); view.ID != offer.ID || view.Role != "admin" {
-		t.Errorf("accepted = %+v", view)
-	}
-
-	if orgMembership(t, world.outsider) != world.org {
-		t.Errorf("the user belongs to %s, want %s", orgMembership(t, world.outsider), world.org)
-	}
-
-	expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", world.org, world.outsider)
-	expectCount(t, "org_offers", "0")
-
-	post(t, accept, nil, world.outsiderToken).expect(t, "accept again", http.StatusNotFound, orgCodeOfferMissing)
-
-	// A user who belongs to an organization cannot accept another's offer, and
-	// the offer stays for them.
-	other := idN(orgFamOrg, 2)
-	orgSeedStandard(t, other, world.platform)
-	orgJoin(t, other, world.platform, true)
-	orgOfferSeed(t, idN(orgFamOffer, 2), other, world.member, "admin", world.platform)
-
-	post(t, pathOffer+"/"+idN(orgFamOffer, 2)+"/accept", nil, world.memberToken).
-		expect(t, "already a member", http.StatusConflict, orgCodeAlready)
-	expectCount(t, "org_offers WHERE id = ?", "1", idN(orgFamOffer, 2))
-	expectCount(t, "org_admins WHERE user_id = ?", "0", world.member)
-
-	// The addressee declines; an administrator withdraws; neither the offerer's
-	// bystanders nor strangers may.
-	orgOfferSeed(t, idN(orgFamOffer, 3), world.org, world.platform, "member", world.admin)
-	orgOfferSeed(t, idN(orgFamOffer, 4), world.org, world.second, "member", world.admin)
-
-	seedUser(t, orgUser(8), roleMember)
-	stranger := seedSession(t, idN(orgFamSession, 8), orgUser(8))
-
-	del(t, pathOffer+"/"+idN(orgFamOffer, 3), world.memberToken).expect(t, "a member withdraws", http.StatusNotFound, orgCodeOfferMissing)
-	del(t, pathOffer+"/"+idN(orgFamOffer, 3), stranger).expect(t, "a stranger", http.StatusNotFound, orgCodeOfferMissing)
-	del(t, pathOffer+"/"+idN(orgFamOffer, 4), world.platformToken).expect(t, "a platform administrator withdraws another user's offer", http.StatusOK, "")
-	orgOfferSeed(t, idN(orgFamOffer, 4), world.org, world.second, "member", world.admin)
-	expectCount(t, "org_offers WHERE id IN (?, ?)", "2", idN(orgFamOffer, 3), idN(orgFamOffer, 4))
-
-	del(t, pathOffer+"/"+idN(orgFamOffer, 3), world.platformToken).expect(t, "decline", http.StatusOK, "")
-	del(t, pathOffer+"/"+idN(orgFamOffer, 4), world.adminToken).expect(t, "withdraw", http.StatusOK, "")
-	del(t, pathOffer+"/"+idN(orgFamOffer, 4), world.adminToken).expect(t, "withdraw again", http.StatusNotFound, orgCodeOfferMissing)
-	expectCount(t, "org_offers WHERE id IN (?, ?)", "0", idN(orgFamOffer, 3), idN(orgFamOffer, 4))
-}
-
-// TestOrgOfferOnAnInvitation: an offer that rides on an invitation is listed to
-// the organization's administrators and withdrawn by them, and withdrawing it
-// leaves the invitation untouched; it is not in anyone's own list, and nobody
-// can accept it.
-//
-//nolint:paralleltest // shares one database
-func TestOrgOfferOnAnInvitation(t *testing.T) {
-	world := orgNewWorld(t)
-
-	seedInvitation(t, idN(orgFamInvite, 1), 3)
-	seed(t, "INSERT INTO org_offers (id, org_id, invitation_id, role, created_by, created_at) VALUES (?, ?, ?, 'admin', ?, 1)",
-		idN(orgFamOffer, 1), world.org, idN(orgFamInvite, 1), world.admin)
-
-	page := orgDecode[orgPage](t, get(t, orgItem(world.org)+"/offer", world.adminToken))
-	if len(page.Offers) != 1 || page.Offers[0].InvitationID == nil || *page.Offers[0].InvitationID != idN(orgFamInvite, 1) ||
-		page.Offers[0].UserID != nil {
-		t.Fatalf("org offers = %+v, want the invitation's offer", page.Offers)
-	}
-
-	for _, token := range []string{world.memberToken, world.outsiderToken, world.platformToken} {
-		if mine := orgDecode[orgPage](t, get(t, pathOffer, token)); len(mine.Offers) != 0 {
-			t.Errorf("my offers = %+v, want none", mine.Offers)
-		}
-
-		post(t, pathOffer+"/"+idN(orgFamOffer, 1)+"/accept", nil, token).
-			expect(t, "accept an invitation's offer", http.StatusNotFound, orgCodeOfferMissing)
-	}
-
-	del(t, pathOffer+"/"+idN(orgFamOffer, 1), world.memberToken).expect(t, "a member withdraws", http.StatusNotFound, orgCodeOfferMissing)
-	del(t, pathOffer+"/"+idN(orgFamOffer, 1), world.secondToken).expect(t, "withdraw", http.StatusOK, "")
-
-	expectCount(t, "org_offers", "0")
-	expectCount(t, "invitations WHERE id = ?", "1", idN(orgFamInvite, 1))
-	expectCount(t, "secrets WHERE id = ? AND revoked_at IS NULL", "1", idN(orgFamInvite, 1))
-}
-
-// TestOrgOfferOfARevokedOrganization: offers die with the organization, and one
-// that somehow outlived it is neither listed nor acceptable.
-//
-//nolint:paralleltest // shares one database
-func TestOrgOfferOfARevokedOrganization(t *testing.T) {
-	world := orgNewWorld(t)
-
-	orgOfferSeed(t, idN(orgFamOffer, 1), world.org, world.outsider, "member", world.admin)
-	del(t, orgItem(world.org), world.adminToken).expect(t, "revoke", http.StatusOK, "")
-	expectCount(t, "org_offers", "0")
-
-	// Put an offer back behind the Worker's back, as a stale row would be.
-	orgOfferSeed(t, idN(orgFamOffer, 1), world.org, world.outsider, "member", world.admin)
-
-	if mine := orgDecode[orgPage](t, get(t, pathOffer, world.outsiderToken)); len(mine.Offers) != 0 {
-		t.Errorf("my offers = %+v, want none of a revoked organization", mine.Offers)
-	}
-
-	post(t, pathOffer+"/"+idN(orgFamOffer, 1)+"/accept", nil, world.outsiderToken).
-		expect(t, "accept", http.StatusNotFound, orgCodeOfferMissing)
-	expectCount(t, "users WHERE org_id IS NOT NULL", "0")
-
-	// No new offers of it.
-	post(t, orgItem(world.org)+"/offer", orgOfferBody(t, world.outsider, "member"), world.platformToken).
-		expect(t, "offer of a revoked organization", http.StatusConflict, orgCodeInactive)
+	del(t, pathMember+"/"+world.platform, world.platformToken).
+		expect(t, "the only platform administrator by member", http.StatusConflict, orgCodeLastPlatform)
+	del(t, usrItem(world.platform), world.platformToken).
+		expect(t, "the only platform administrator by user", http.StatusConflict, orgCodeLastPlatform)
+	expectCount(t, "users WHERE id = ? AND revoked_at IS NULL", "1", world.platform)
 }
 
 // ---- races -----------------------------------------------------------------
@@ -1284,19 +1132,17 @@ type orgRace struct {
 }
 
 // orgExpectSound holds what no interleaving may ever produce, whatever the
-// race: a user stranded in a revoked organization, an offer, or an administrator,
-// of one; an administrator who is not a member; an active organization with no
-// administrator; an agent that survives its sandbox, or a key its agent; and a
-// secret with no row.
+// race: an administrator of a standard organization who is not a member; a
+// standard organization with no administrator; an agent that survives its
+// sandbox, or a key its agent; and a secret with no row.
 func orgExpectSound(t *testing.T) {
 	t.Helper()
 
-	expectCount(t, "users u WHERE EXISTS (SELECT 1 FROM orgs o WHERE o.id = u.org_id AND o.revoked_at IS NOT NULL)", "0")
-	expectCount(t, "org_offers f JOIN orgs o ON o.id = f.org_id WHERE o.revoked_at IS NOT NULL", "0")
-	expectCount(t, "org_admins a JOIN orgs o ON o.id = a.org_id WHERE o.revoked_at IS NOT NULL", "0")
 	expectCount(t, "org_admins a JOIN orgs o ON o.id = a.org_id WHERE o.kind = 'standard' "+
 		"AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = a.user_id AND u.org_id = a.org_id)", "0")
-	expectCount(t, "orgs o WHERE o.kind = 'standard' AND o.revoked_at IS NULL "+
+	// The own organization a seeded account is given (seedAccount) is named
+	// "seeded" and has no administrator row.
+	expectCount(t, "orgs o WHERE o.kind = 'standard' AND o.name <> 'seeded' "+
 		"AND NOT EXISTS (SELECT 1 FROM org_admins a WHERE a.org_id = o.id)", "0")
 	expectCount(t, "agents WHERE sandbox_id IS NOT NULL AND sandbox_id NOT IN (SELECT id FROM orgs)", "0")
 	expectCount(t, "api_keys WHERE agent_id IS NOT NULL AND agent_id NOT IN (SELECT id FROM agents)", "0")
@@ -1310,23 +1156,6 @@ func orgOneOf(t *testing.T, what string, got reply, statuses ...int) {
 	if !slices.Contains(statuses, got.status) {
 		t.Errorf("%s: %d %s, want one of %v", what, got.status, got.body, statuses)
 	}
-}
-
-// orgRevokeOrgRacer revokes the organization as its administrator.
-func orgRevokeOrgRacer(t *testing.T, world orgWorld) func() reply {
-	t.Helper()
-
-	return func() reply { return del(t, orgItem(world.org), world.adminToken) }
-}
-
-// orgReleaseMembers makes the organization hold only its administrator, so that
-// the others are free to accept offers to it.
-func orgReleaseMembers(t *testing.T, world orgWorld) {
-	t.Helper()
-
-	seed(t, "UPDATE users SET org_id = NULL")
-	seed(t, "DELETE FROM org_admins")
-	orgJoin(t, world.org, world.admin, true)
 }
 
 // orgRaceDemote: two administrators demote each other at once. Exactly one request may succeed, and an
@@ -1362,42 +1191,48 @@ func orgRaceDemote() orgRace {
 	}
 }
 
-// orgRaceLeave: two administrators leave at once. One leaves, the other is refused as the last
-// administrator, and the organization keeps one, who is still a member.
-func orgRaceLeave() orgRace {
+// orgRaceRevokeEachOther: two administrators revoke each other at once. Exactly one revocation succeeds:
+// the other was made by an account that was revoked first, which is told it is signed out or that
+// the member is not found, and the organization keeps one unrevoked administrator.
+func orgRaceRevokeEachOther() orgRace {
 	return orgRace{
-		name: "two administrators leave", rounds: 12,
+		name: "two administrators revoke each other", rounds: 12,
 		build: func(t *testing.T, world orgWorld) orgRound {
 			t.Helper()
 
 			return orgRound{
 				racers: []func() reply{
-					func() reply { return del(t, pathMember+"/"+world.admin, world.adminToken) },
-					func() reply { return del(t, pathMember+"/"+world.second, world.secondToken) },
+					func() reply { return del(t, pathMember+"/"+world.second, world.adminToken) },
+					func() reply { return del(t, pathMember+"/"+world.admin, world.secondToken) },
 				},
 				judge: func(t *testing.T, replies []reply) {
 					t.Helper()
 
-					tally := orgTally(replies)
-					if tally["OK"] != 1 || tally["Conflict "+orgCodeLastAdmin] != 1 {
-						t.Errorf("tally = %v, want one OK and one Conflict %s", tally, orgCodeLastAdmin)
+					if tally := orgTally(replies); tally["OK"] != 1 {
+						t.Errorf("tally = %v, want exactly one OK", tally)
 					}
 
-					expectCount(t, "users u WHERE u.org_id = ? AND u.id IN (SELECT user_id FROM org_admins WHERE org_id = ?)",
-						"1", world.org, world.org)
-					expectCount(t, "org_admins WHERE org_id = ?", "1", world.org)
+					for i, got := range replies {
+						if got.status != http.StatusOK {
+							orgOneOf(t, "the revocation "+strconv.Itoa(i), got, http.StatusNotFound, http.StatusUnauthorized)
+						}
+					}
+
+					expectCount(t, "users WHERE id IN (?, ?) AND revoked_at IS NOT NULL", "1", world.admin, world.second)
+					expectCount(t, "org_admins a JOIN users u ON u.id = a.user_id "+
+						"WHERE a.org_id = ? AND u.revoked_at IS NULL", "1", world.org)
 				},
 			}
 		},
 	}
 }
 
-// orgRaceDemoteWhileLeaving: an administrator is demoted by the other while they leave. The one who stays
-// is untouched and is the administrator whichever order the two take, and the one who is demoted or
-// leaves is no administrator.
-func orgRaceDemoteWhileLeaving() orgRace {
+// orgRaceDemoteWhileRevoking: an administrator is demoted by the other while they revoke the other.
+// Whichever is first, the second finds the state it left: a demoted administrator may not revoke, and
+// a revoked one may not demote. One administrator is left whichever order the two take.
+func orgRaceDemoteWhileRevoking() orgRace {
 	return orgRace{
-		name: "an administrator is demoted while they leave", rounds: 12,
+		name: "an administrator is demoted while they revoke the one who demotes them", rounds: 12,
 		build: func(t *testing.T, world orgWorld) orgRound {
 			t.Helper()
 
@@ -1406,31 +1241,31 @@ func orgRaceDemoteWhileLeaving() orgRace {
 					func() reply {
 						return patch(t, pathMember+"/"+world.second, []byte(`{"admin":false}`), world.adminToken)
 					},
-					func() reply { return del(t, pathMember+"/"+world.second, world.secondToken) },
+					func() reply { return del(t, pathMember+"/"+world.admin, world.secondToken) },
 				},
 				judge: func(t *testing.T, replies []reply) {
 					t.Helper()
 
-					orgOneOf(t, "the demotion", replies[0], http.StatusOK, http.StatusNotFound)
-					orgOneOf(t, "the leaving", replies[1], http.StatusOK, http.StatusNotFound)
-
-					if replies[0].status != http.StatusOK && replies[1].status != http.StatusOK {
-						t.Errorf("neither the demotion nor the leaving succeeded: %v", orgTally(replies))
+					if tally := orgTally(replies); tally["OK"] != 1 {
+						t.Errorf("tally = %v, want exactly one OK", tally)
 					}
 
-					expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", world.org, world.admin)
-					expectCount(t, "org_admins WHERE user_id = ?", "0", world.second)
+					orgOneOf(t, "the demotion", replies[0], http.StatusOK, http.StatusNotFound, http.StatusUnauthorized)
+					orgOneOf(t, "the revocation", replies[1], http.StatusOK, http.StatusForbidden)
+
+					expectCount(t, "org_admins a JOIN users u ON u.id = a.user_id "+
+						"WHERE a.org_id = ? AND u.revoked_at IS NULL", "1", world.org)
 				},
 			}
 		},
 	}
 }
 
-// orgRaceDemoteAndLeave: both administrators demote each other and leave at once. However the four
-// requests fall, one administrator remains, and is a member.
-func orgRaceDemoteAndLeave() orgRace {
+// orgRaceDemoteAndRevoke: both administrators demote each other and revoke each other at once. However
+// the four requests fall, one unrevoked administrator remains.
+func orgRaceDemoteAndRevoke() orgRace {
 	return orgRace{
-		name: "two administrators demote and leave at once", rounds: 12,
+		name: "two administrators demote and revoke each other at once", rounds: 12,
 		build: func(t *testing.T, world orgWorld) orgRound {
 			t.Helper()
 
@@ -1442,281 +1277,14 @@ func orgRaceDemoteAndLeave() orgRace {
 					func() reply {
 						return patch(t, pathMember+"/"+world.admin, []byte(`{"admin":false}`), world.secondToken)
 					},
-					func() reply { return del(t, pathMember+"/"+world.admin, world.adminToken) },
-					func() reply { return del(t, pathMember+"/"+world.second, world.secondToken) },
+					func() reply { return del(t, pathMember+"/"+world.second, world.adminToken) },
+					func() reply { return del(t, pathMember+"/"+world.admin, world.secondToken) },
 				},
-				judge: func(t *testing.T, replies []reply) {
+				judge: func(t *testing.T, _ []reply) {
 					t.Helper()
 
-					if got := orgAdminCount(t, world.org); got != "1" {
-						t.Errorf("%s administrators, want exactly 1 (%v)", got, orgTally(replies))
-					}
-
-					// The one who administers is a member, and exactly one of the two
-					// is left in the organization as one.
-					expectCount(t, "org_admins a JOIN users u ON u.id = a.user_id AND u.org_id = a.org_id "+
-						"WHERE a.org_id = ?", "1", world.org)
-				},
-			}
-		},
-	}
-}
-
-// orgRaceRevokeAgainstAccept: the organization is revoked while its offers are accepted. Whatever the
-// order, nobody belongs to the revoked organization, no offer survives it, and no administrator row is
-// left for a user who is not a member.
-func orgRaceRevokeAgainstAccept() orgRace {
-	return orgRace{
-		name: "the organization is revoked while its offers are accepted", rounds: 12,
-		build: func(t *testing.T, world orgWorld) orgRound {
-			t.Helper()
-
-			orgReleaseMembers(t, world)
-			orgOfferSeed(t, idN(orgFamOffer, 1), world.org, world.outsider, "admin", world.admin)
-			orgOfferSeed(t, idN(orgFamOffer, 2), world.org, world.member, "member", world.admin)
-			orgOfferSeed(t, idN(orgFamOffer, 3), world.org, world.platform, "admin", world.admin)
-
-			accept := func(n int, token string) func() reply {
-				return func() reply { return post(t, pathOffer+"/"+idN(orgFamOffer, n)+"/accept", nil, token) }
-			}
-
-			return orgRound{
-				racers: []func() reply{
-					orgRevokeOrgRacer(t, world),
-					accept(1, world.outsiderToken), accept(2, world.memberToken), accept(3, world.platformToken),
-				},
-				judge: func(t *testing.T, replies []reply) {
-					t.Helper()
-
-					expectCount(t, "users WHERE org_id = ?", "0", world.org)
-					expectCount(t, "org_offers", "0")
-					expectCount(t, "org_admins", "0")
-					expectCount(t, "orgs WHERE id = ? AND revoked_at IS NOT NULL", "1", world.org)
-
-					orgOneOf(t, "the revocation", replies[0], http.StatusOK)
-
-					for i, accepted := range replies[1:] {
-						orgOneOf(t, "accept "+strconv.Itoa(i+1), accepted, http.StatusOK, http.StatusNotFound)
-					}
-				},
-			}
-		},
-	}
-}
-
-// orgRaceWithdrawAgainstAccept: an offer is accepted while it is withdrawn. Exactly one wins, and the
-// state agrees with the one that did.
-func orgRaceWithdrawAgainstAccept() orgRace {
-	return orgRace{
-		name: "an offer is accepted while it is withdrawn", rounds: 12,
-		build: func(t *testing.T, world orgWorld) orgRound {
-			t.Helper()
-
-			orgOfferSeed(t, idN(orgFamOffer, 1), world.org, world.outsider, "admin", world.admin)
-
-			return orgRound{
-				racers: []func() reply{
-					func() reply { return post(t, pathOffer+"/"+idN(orgFamOffer, 1)+"/accept", nil, world.outsiderToken) },
-					func() reply { return del(t, pathOffer+"/"+idN(orgFamOffer, 1), world.adminToken) },
-				},
-				judge: func(t *testing.T, replies []reply) {
-					t.Helper()
-
-					accepted := replies[0].status == http.StatusOK
-					withdrawn := replies[1].status == http.StatusOK
-
-					if accepted == withdrawn {
-						t.Fatalf("accept = %d, withdraw = %d: neither won, or both did", replies[0].status, replies[1].status)
-					}
-
-					member := orgMembership(t, world.outsider) == world.org
-					isAdmin := count(t, "org_admins WHERE user_id = ?", world.outsider) == "1"
-
-					if member != accepted || isAdmin != accepted {
-						t.Errorf("accepted = %t, withdrawn = %t, but member = %t and admin = %t",
-							accepted, withdrawn, member, isAdmin)
-					}
-
-					expectCount(t, "org_offers", "0")
-				},
-			}
-		},
-	}
-}
-
-// orgRaceTwoAccepts: one user accepts two offers of two organizations at once, both naming them an
-// administrator. Exactly one wins, the other is told they belong to one already, and there is one
-// administrator row, of the organization they joined.
-func orgRaceTwoAccepts() orgRace {
-	return orgRace{
-		name: "one user accepts two offers", rounds: 12,
-		build: func(t *testing.T, world orgWorld) orgRound {
-			t.Helper()
-
-			other := idN(orgFamOrg, 2)
-			orgSeedStandard(t, other, world.platform)
-			orgJoin(t, other, world.platform, true)
-
-			orgOfferSeed(t, idN(orgFamOffer, 1), world.org, world.outsider, "admin", world.admin)
-			orgOfferSeed(t, idN(orgFamOffer, 2), other, world.outsider, "admin", world.platform)
-
-			accept := func(n int) func() reply {
-				return func() reply { return post(t, pathOffer+"/"+idN(orgFamOffer, n)+"/accept", nil, world.outsiderToken) }
-			}
-
-			return orgRound{
-				racers: []func() reply{accept(1), accept(2)},
-				judge: func(t *testing.T, replies []reply) {
-					t.Helper()
-
-					tally := orgTally(replies)
-					if tally["OK"] != 1 || tally["Conflict "+orgCodeAlready] != 1 {
-						t.Errorf("tally = %v, want one OK and one Conflict %s", tally, orgCodeAlready)
-					}
-
-					joined := orgMembership(t, world.outsider)
-					expectCount(t, "org_admins WHERE user_id = ?", "1", world.outsider)
-					expectCount(t, "org_admins WHERE user_id = ? AND org_id = ?", "1", world.outsider, joined)
-					expectCount(t, "org_offers", "1")
-				},
-			}
-		},
-	}
-}
-
-// orgRaceTwoCreates: a user who belongs to none creates six organizations at once. One is made, the
-// others are refused as a member, and there is one administrator row.
-func orgRaceTwoCreates() orgRace {
-	return orgRace{
-		name: "a user creates six organizations", rounds: 4,
-		build: func(t *testing.T, world orgWorld) orgRound {
-			t.Helper()
-
-			creators := make([]func() reply, 6)
-			for i := range creators {
-				creators[i] = func() reply { return orgCreate(t, world.outsiderToken, "standard", "race") }
-			}
-
-			return orgRound{
-				racers: creators,
-				judge: func(t *testing.T, replies []reply) {
-					t.Helper()
-
-					tally := orgTally(replies)
-					if tally["Created"] != 1 || tally["Conflict "+orgCodeAlready] != 5 {
-						t.Errorf("tally = %v, want one Created and five Conflict %s", tally, orgCodeAlready)
-					}
-
-					expectCount(t, "orgs WHERE created_by = ?", "1", world.outsider)
-					expectCount(t, "org_admins WHERE user_id = ?", "1", world.outsider)
-				},
-			}
-		},
-	}
-}
-
-// orgRaceRevokeAgainstOffers: the organization is revoked while offers of it are made. An offer is
-// either refused or deleted by the revocation: none outlives it.
-func orgRaceRevokeAgainstOffers() orgRace {
-	return orgRace{
-		name: "the organization is revoked while offers are made", rounds: 12,
-		build: func(t *testing.T, world orgWorld) orgRound {
-			t.Helper()
-
-			offer := func(user, role, token string) func() reply {
-				return func() reply { return post(t, orgItem(world.org)+"/offer", orgOfferBody(t, user, role), token) }
-			}
-
-			return orgRound{
-				racers: []func() reply{
-					orgRevokeOrgRacer(t, world),
-					offer(world.outsider, "admin", world.adminToken),
-					offer(world.platform, "member", world.secondToken),
-				},
-				judge: func(t *testing.T, replies []reply) {
-					t.Helper()
-
-					orgOneOf(t, "the revocation", replies[0], http.StatusOK)
-					orgOneOf(t, "an offer by the administrator", replies[1], http.StatusCreated, http.StatusNotFound, http.StatusConflict)
-					orgOneOf(t, "an offer by the second administrator", replies[2], http.StatusCreated, http.StatusNotFound, http.StatusConflict)
-
-					expectCount(t, "org_offers", "0")
-					expectCount(t, "orgs WHERE id = ? AND revoked_at IS NOT NULL", "1", world.org)
-				},
-			}
-		},
-	}
-}
-
-// orgRaceRevokeAgainstInvitations: the organization is revoked while invitations that offer it are
-// created. An invitation is either refused, and nothing is created, or created and its offer deleted by
-// the revocation: the invitation, the record of who was admitted, is kept either way.
-func orgRaceRevokeAgainstInvitations() orgRace {
-	return orgRace{
-		name: "the organization is revoked while invitations offer it", rounds: 12,
-		build: func(t *testing.T, world orgWorld) orgRound {
-			t.Helper()
-
-			invite := func(role string) func() reply {
-				return func() reply {
-					return post(t, pathInvitation, invOrgBody(t, "member", 1, world.org, role), world.platformToken)
-				}
-			}
-
-			return orgRound{
-				racers: []func() reply{orgRevokeOrgRacer(t, world), invite("member"), invite("admin")},
-				judge: func(t *testing.T, replies []reply) {
-					t.Helper()
-
-					orgOneOf(t, "the revocation", replies[0], http.StatusOK)
-
-					created := 1 // the invitation the world was built with
-
-					for i, invited := range replies[1:] {
-						orgOneOf(t, "invitation "+strconv.Itoa(i+1), invited, http.StatusCreated, http.StatusNotFound)
-
-						if invited.status == http.StatusCreated {
-							created++
-						} else if code := invited.errorCode(); code != "org_not_found" {
-							t.Errorf("a refused invitation = %q, want org_not_found", code)
-						}
-					}
-
-					expectCount(t, "invitations", strconv.Itoa(created))
-					expectCount(t, "org_offers", "0")
-					expectCount(t, "orgs WHERE id = ? AND revoked_at IS NOT NULL", "1", world.org)
-				},
-			}
-		},
-	}
-}
-
-// orgRaceRevokeAgainstPromote: the organization is revoked while a member is promoted. Whichever
-// happened first, the member is released and is no administrator of it.
-func orgRaceRevokeAgainstPromote() orgRace {
-	return orgRace{
-		name: "the organization is revoked while a member is promoted", rounds: 12,
-		build: func(t *testing.T, world orgWorld) orgRound {
-			t.Helper()
-
-			promote := func(token string) func() reply {
-				return func() reply { return patch(t, pathMember+"/"+world.member, []byte(`{"admin":true}`), token) }
-			}
-
-			return orgRound{
-				racers: []func() reply{orgRevokeOrgRacer(t, world), promote(world.secondToken), promote(world.adminToken)},
-				judge: func(t *testing.T, replies []reply) {
-					t.Helper()
-
-					orgOneOf(t, "the revocation", replies[0], http.StatusOK)
-					orgOneOf(t, "a promotion by the second administrator", replies[1],
-						http.StatusOK, http.StatusNotFound, http.StatusConflict)
-					orgOneOf(t, "a promotion by the administrator", replies[2],
-						http.StatusOK, http.StatusNotFound, http.StatusConflict)
-
-					expectCount(t, "org_admins", "0")
-					expectCount(t, "users WHERE org_id IS NOT NULL", "0")
-					expectCount(t, "orgs WHERE id = ? AND revoked_at IS NOT NULL", "1", world.org)
+					expectCount(t, "org_admins a JOIN users u ON u.id = a.user_id "+
+						"WHERE a.org_id = ? AND u.revoked_at IS NULL", "1", world.org)
 				},
 			}
 		},
@@ -1809,16 +1377,9 @@ func orgRaceSandboxAgainstAgentCreates() orgRace {
 func orgRaces() []orgRace {
 	return []orgRace{
 		orgRaceDemote(),
-		orgRaceLeave(),
-		orgRaceDemoteWhileLeaving(),
-		orgRaceDemoteAndLeave(),
-		orgRaceRevokeAgainstAccept(),
-		orgRaceWithdrawAgainstAccept(),
-		orgRaceTwoAccepts(),
-		orgRaceTwoCreates(),
-		orgRaceRevokeAgainstOffers(),
-		orgRaceRevokeAgainstInvitations(),
-		orgRaceRevokeAgainstPromote(),
+		orgRaceRevokeEachOther(),
+		orgRaceDemoteWhileRevoking(),
+		orgRaceDemoteAndRevoke(),
 		orgRaceSandboxAgainstUserCreates(),
 		orgRaceSandboxAgainstAgentCreates(),
 	}
@@ -1847,12 +1408,14 @@ func TestOrgRaces(t *testing.T) {
 }
 
 // TestOrgRevokingTheLastAdministratorsAccountIsNotRefused: the last-administrator
-// rule is only that demoting or removing the last unrevoked administrator is
-// refused. Revoking their ACCOUNT is not, because refusing it would let an
-// organization administrator shield themselves from platform revocation. The
-// organization is then left with no unrevoked administrator, which no organization
-// administrator can change, and a platform administrator's override is how it is
-// managed: they promote a member, who is then the administrator.
+// rule is that demoting the last unrevoked administrator is refused, and that an
+// organization's own administrators never revoke each other or themselves down to
+// none. A platform administrator revoking their ACCOUNT is not refused, because
+// refusing it would let an organization administrator shield themselves from
+// platform revocation. The organization is then left with no unrevoked
+// administrator, which no organization administrator can change, and a platform
+// administrator's override is how it is managed: they promote a member, who is then
+// the administrator.
 //
 //nolint:paralleltest // shares one database
 func TestOrgRevokingTheLastAdministratorsAccountIsNotRefused(t *testing.T) {
@@ -1862,18 +1425,19 @@ func TestOrgRevokingTheLastAdministratorsAccountIsNotRefused(t *testing.T) {
 	patch(t, pathMember+"/"+world.second, []byte(`{"admin":false}`), world.adminToken).
 		expect(t, "the second administrator steps down", http.StatusOK, "")
 
-	// The last one cannot be demoted or leave, which is the whole of the rule.
+	// The last one cannot be demoted, and cannot revoke themself.
 	patch(t, pathMember+"/"+world.admin, []byte(`{"admin":false}`), world.adminToken).
 		expect(t, "demoting the last administrator", http.StatusConflict, orgCodeLastAdmin)
 	del(t, pathMember+"/"+world.admin, world.adminToken).
-		expect(t, "the last administrator leaving", http.StatusConflict, orgCodeLastAdmin)
+		expect(t, "the last administrator revoking themself", http.StatusForbidden, orgCodeSelfRevoke)
 
-	// Their account may be revoked all the same.
+	// Their account may be revoked by a platform administrator all the same, by
+	// either route.
 	del(t, usrItem(world.admin), world.platformToken).
 		expect(t, "revoking the last administrator's account", http.StatusOK, "")
 
 	get(t, pathSession, world.adminToken).expect(t, "the revoked administrator's session", http.StatusUnauthorized, "")
-	expectCount(t, "orgs WHERE id = ? AND revoked_at IS NULL", "1", world.org)
+	expectCount(t, "orgs WHERE id = ?", "1", world.org)
 	expectCount(t, "org_admins a JOIN users u ON u.id = a.user_id WHERE a.org_id = ? AND u.revoked_at IS NULL", "0", world.org)
 
 	// Nobody an organization administrator can act as is left, so the members
@@ -1907,9 +1471,7 @@ func TestOrgBodyCaps(t *testing.T) {
 		{"create", http.MethodPost, pathOrg, orgBodyCap},
 		{"rename", http.MethodPatch, orgItem(world.org), orgBodyCap},
 		{"promote", http.MethodPatch, pathMember + "/" + world.member, orgSmallCap},
-		{"offer", http.MethodPost, orgItem(world.org) + "/offer", orgSmallCap},
-		{"accept", http.MethodPost, pathOffer + "/" + idMissing + "/accept", orgSmallCap},
-		{"revoke", http.MethodDelete, orgItem(idMissing), orgSmallCap},
+		{"delete", http.MethodDelete, orgItem(idMissing), orgSmallCap},
 	}
 
 	for _, rt := range routes {
@@ -1930,7 +1492,7 @@ func TestOrgBodyCaps(t *testing.T) {
 	// The largest legitimate name, 256 four-byte runes with every one escaped as
 	// a surrogate pair (12 bytes each), fits the cap of a create.
 	escaped := strings.Repeat(`\ud83d\ude00`, orgNameRunes)
-	body := []byte(`{"kind":"sandbox","name":"` + escaped + `"}`)
+	body := []byte(`{"name":"` + escaped + `"}`)
 
 	if len(body) > orgBodyCap {
 		t.Fatalf("the largest name's body is %d bytes, over the cap %d", len(body), orgBodyCap)
@@ -1957,8 +1519,7 @@ func TestOrgBodyCaps(t *testing.T) {
 func TestOrgAgentsAndKeys(t *testing.T) {
 	world := orgNewWorld(t)
 
-	allOrg := `["org:read","org:create","org:update","org:revoke","member:read","member:update","member:revoke",` +
-		`"offer:read","offer:create","offer:update","offer:revoke"]`
+	allOrg := `["org:read","sandbox:create","org:update","sandbox:revoke","member:read","member:update","member:revoke"]`
 
 	sandbox := idN(orgFamSandbox, 1)
 	orgSeedSandboxes(t, orgFamSandbox, 1, world.admin, time.Now().Unix()+3600)
@@ -1984,18 +1545,13 @@ func TestOrgAgentsAndKeys(t *testing.T) {
 	as(freeKey, http.MethodGet, pathOrg, nil).expect(t, "agent list", http.StatusOK, "")
 	as(freeKey, http.MethodGet, orgItem(world.org), nil).expect(t, "agent get", http.StatusOK, "")
 	as(freeKey, http.MethodGet, orgItem(world.org)+"/member", nil).expect(t, "agent members", http.StatusOK, "")
-	as(freeKey, http.MethodGet, orgItem(world.org)+"/offer", nil).expect(t, "agent offers", http.StatusOK, "")
-	as(freeKey, http.MethodGet, pathOffer, nil).expect(t, "agent my offers", http.StatusOK, "")
 
 	for what, got := range map[string]reply{
-		"create":  as(freeKey, http.MethodPost, pathOrg, orgCreateBody(t, "sandbox", "x")),
+		"create":  as(freeKey, http.MethodPost, pathOrg, orgCreateBody(t, "x")),
 		"rename":  as(freeKey, http.MethodPatch, orgItem(world.org), []byte(`{"name":"x"}`)),
-		"revoke":  as(freeKey, http.MethodDelete, orgItem(world.org), nil),
+		"delete":  as(freeKey, http.MethodDelete, orgItem(world.org), nil),
 		"promote": as(freeKey, http.MethodPatch, pathMember+"/"+world.member, []byte(`{"admin":true}`)),
-		"remove":  as(freeKey, http.MethodDelete, pathMember+"/"+world.member, nil),
-		"offer":   as(freeKey, http.MethodPost, orgItem(world.org)+"/offer", orgOfferBody(t, world.outsider, "member")),
-		"accept":  as(freeKey, http.MethodPost, pathOffer+"/"+idMissing+"/accept", nil),
-		"decline": as(freeKey, http.MethodDelete, pathOffer+"/"+idMissing, nil),
+		"revoke":  as(freeKey, http.MethodDelete, pathMember+"/"+world.member, nil),
 	} {
 		got.expect(t, "agent "+what, http.StatusForbidden, "")
 	}
@@ -2004,13 +1560,13 @@ func TestOrgAgentsAndKeys(t *testing.T) {
 	for what, got := range map[string]reply{
 		"list":   as(confinedKey, http.MethodGet, pathOrg, nil),
 		"get":    as(confinedKey, http.MethodGet, orgItem(sandbox), nil),
-		"create": as(confinedKey, http.MethodPost, pathOrg, orgCreateBody(t, "sandbox", "x")),
-		"revoke": as(confinedKey, http.MethodDelete, orgItem(sandbox), nil),
+		"create": as(confinedKey, http.MethodPost, pathOrg, orgCreateBody(t, "x")),
+		"delete": as(confinedKey, http.MethodDelete, orgItem(sandbox), nil),
 	} {
 		got.expect(t, "confined agent "+what, http.StatusForbidden, "")
 	}
 
-	expectCount(t, "orgs", "2")
+	expectCount(t, "orgs", "4")
 	expectCount(t, "users WHERE org_id = ?", "3", world.org)
 
 	// The user's own key with the scopes does what the user may, and nothing the
@@ -2103,7 +1659,7 @@ func TestOrgDeleteSandboxThroughTheWorker(t *testing.T) {
 		}
 
 		patch(t, orgItem(idN(famSandbox, 1)), []byte(`{"name":"x"}`), token).
-			expect(t, "rename expired", http.StatusConflict, orgCodeInactive)
+			expect(t, "rename expired", http.StatusConflict, orgCodeExpired)
 
 		del(t, orgItem(idN(famSandbox, 1)), token).expect(t, "delete expired", http.StatusOK, "")
 		orgExpectSandboxGone(t, gone, kept)
@@ -2159,7 +1715,7 @@ func orgExpectSandboxGone(t *testing.T, gone, kept []string) {
 
 	// Its administrator was released, and kept everything of their own.
 	expectCount(t, "users WHERE id = ? AND org_id = ?", "1", idUserB, idN(famOrg, 1))
-	expectCount(t, "orgs WHERE id = ? AND revoked_at IS NULL", "1", idN(famOrg, 1))
+	expectCount(t, "orgs WHERE id = ?", "1", idN(famOrg, 1))
 	expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", idN(famOrg, 1), idUserB)
 	expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", idN(famSandbox, 2), idUserB)
 	expectCount(t, "org_admins WHERE org_id = ? AND user_id = ?", "1", idN(famSandbox, 3), idUserC)

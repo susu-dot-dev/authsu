@@ -66,10 +66,6 @@ const (
 	// typeOther is a type a store row may have that is not the creatable one.
 	typeOther = "other"
 
-	// newOfferID is the id NewID hands out for the offer of a create, after the
-	// invitation's own.
-	newOfferID = "00000000-0000-7000-8000-0000000000ee"
-
 	// The operations of the fake store, as recorded in its calls.
 	opList   = "list"
 	opCreate = "create"
@@ -198,9 +194,9 @@ func (f *fakeStore) CreateInvitation(_ context.Context, in store.NewInvitation) 
 		OrgID: nil, OrgRole: nil,
 	}
 
-	// As the database stored them: the offer is the one the batch wrote.
-	if in.Offer != nil {
-		out.OrgID, out.OrgRole = new(in.Offer.OrgID.String()), new(in.Offer.Role.String())
+	// As the database stored them: the organization is the one the batch wrote.
+	if in.Org != nil {
+		out.OrgID, out.OrgRole = new(in.Org.OrgID.String()), new(in.Org.Role.String())
 	}
 
 	return out, nil
@@ -275,10 +271,6 @@ func newHarness(t *testing.T) *harness {
 		Store: harn.store, Now: harn.clock.read, Entropy: harn.entropy,
 		NewID: func() string {
 			harn.idCalls++
-
-			if harn.idCalls > 1 {
-				return newOfferID
-			}
 
 			return newInvID
 		},

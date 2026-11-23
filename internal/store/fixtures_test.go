@@ -188,6 +188,17 @@ func mustEmail(tb testing.TB, raw string) input.Email {
 	return email
 }
 
+func mustOrgName(tb testing.TB, raw string) input.OrgName {
+	tb.Helper()
+
+	name, err := input.ParseOrgName(raw)
+	if err != nil {
+		tb.Fatalf("parse organization name %q: %v", raw, err)
+	}
+
+	return name
+}
+
 func mustName(tb testing.TB, raw string) input.AccountName {
 	tb.Helper()
 

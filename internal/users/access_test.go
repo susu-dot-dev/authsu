@@ -199,7 +199,7 @@ func expectedCall(rt route, rg *rig) storeCall {
 	case opGet:
 		return readCall(opGet, targetID)
 	default:
-		return storeCall{op: opRevoke, id: targetID, role: roleAdmin, now: rg.now}
+		return storeCall{op: opRevoke, id: targetID, caller: adminID, role: roleAdmin, now: rg.now}
 	}
 }
 

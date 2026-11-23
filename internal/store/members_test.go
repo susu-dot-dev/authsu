@@ -3,6 +3,7 @@ package store_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/susu-dot-dev/authsu/internal/store"
@@ -16,8 +17,8 @@ func memberRowOf(id string, admin int64, revoked any) []any {
 
 // memberStandingOf is the standing statement's row for a member: the member's row
 // and whether the caller administers their organization.
-func memberStandingOf(id string, admin int64, revoked any, administers int64) []any {
-	return append(memberRowOf(id, admin, revoked), administers)
+func memberStandingOf(admin int64, revoked any, administers int64) []any {
+	return append(memberRowOf(targetID, admin, revoked), administers)
 }
 
 // memberKinds are the column kinds of a member row, for defectResults.
@@ -134,63 +135,77 @@ func TestSetMemberAdmin(t *testing.T) {
 
 	revoked := int64(1_700_000_100)
 
-	// batch is the outcome of the two statements: the standing and the change.
+	// batch is the outcome of the three statements: the standing, the change and
+	// the caller's standing, which is read only when the standing found no one.
 	batch := func(standing []any, changed bool) outcome {
 		changes := [][]any(nil)
 		if changed {
 			changes = [][]any{row(targetID)}
 		}
 
-		return batchOf(2, map[int][][]any{0: {standing}, 1: changes})
+		return batchOf(3, map[int][][]any{0: {standing}, 1: changes})
 	}
-	missing := batchOf(2, map[int][][]any{1: {row(targetID)}})
+	missing := batchOf(3, map[int][][]any{1: {row(targetID)}})
 
 	promote := []opCase[store.Member]{
-		{name: "promoted", out: batch(memberStandingOf(targetID, 0, nil, 1), true),
+		{name: "promoted", out: batch(memberStandingOf(0, nil, 1), true),
 			want: wantMember(targetID, true, nil)},
-		{name: "promoting an administrator succeeds", out: batch(memberStandingOf(targetID, 1, nil, 1), true),
+		{name: "promoting an administrator succeeds", out: batch(memberStandingOf(1, nil, 1), true),
 			want: wantMember(targetID, true, nil)},
-		{name: "a revoked member keeps their revocation", out: batch(memberStandingOf(targetID, 0, revoked, 1), true),
-			want: wantMember(targetID, true, &revoked)},
+		{name: "a revoked member is not promoted", out: batch(memberStandingOf(0, revoked, 1), false),
+			err: store.ErrMemberRevoked},
+		{name: "a revoked member who is already an administrator is not promoted either",
+			out: batch(memberStandingOf(1, revoked, 1), false), err: store.ErrMemberRevoked},
 		{name: "no such member", out: missing, err: store.ErrNotFound},
-		{name: "the caller does not administer", out: batch(memberStandingOf(targetID, 0, nil, 0), false),
+		{name: "no such member, and the caller is not revoked", out: callerIs(0, missing), err: store.ErrNotFound},
+		{name: "no such member, because the caller is revoked", out: callerIs(1, missing), err: store.ErrAccountRevoked},
+		{name: "the caller does not administer", out: batch(memberStandingOf(0, nil, 0), false),
 			err: store.ErrNotAdmin},
 		{name: "the caller does not administer, and the write is not read either",
-			out: batch(memberStandingOf(targetID, 0, nil, 0), true), err: store.ErrNotAdmin},
+			out: batch(memberStandingOf(0, nil, 0), true), err: store.ErrNotAdmin},
+		{name: "the caller does not administer, and is revoked: the standing says so first",
+			out: callerIs(1, batch(memberStandingOf(0, nil, 0), false)), err: store.ErrNotAdmin},
 		{name: "a promotion that matched nothing for a caller who administers is a defect",
-			out: batch(memberStandingOf(targetID, 0, nil, 1), false), defect: true},
-		{name: "the standing is not a flag", out: batch(memberStandingOf(targetID, 0, nil, 2), true), defect: true},
-		{name: "a changed row that is not an id", out: batchOf(2, map[int][][]any{
-			0: {memberStandingOf(targetID, 0, nil, 1)}, 1: {row(int64(1))},
+			out: batch(memberStandingOf(0, nil, 1), false), defect: true},
+		{name: "the standing is not a flag", out: batch(memberStandingOf(0, nil, 2), true), defect: true},
+		{name: "a changed row that is not an id", out: batchOf(3, map[int][][]any{
+			0: {memberStandingOf(0, nil, 1)}, 1: {row(int64(1))},
 		}), defect: true},
-		{name: "two changed rows", out: batchOf(2, map[int][][]any{
-			0: {memberStandingOf(targetID, 0, nil, 1)}, 1: {row(targetID), row(targetID)},
+		{name: "two changed rows", out: batchOf(3, map[int][][]any{
+			0: {memberStandingOf(0, nil, 1)}, 1: {row(targetID), row(targetID)},
 		}), defect: true},
 	}
 
-	for name, rows := range defectResults(memberStandingOf(targetID, 0, nil, 1), append(memberKinds(), "integer")...) {
+	promote = append(promote, callerDefectCases[store.Member](3)...)
+
+	for name, rows := range defectResults(memberStandingOf(0, nil, 1), append(memberKinds(), "integer")...) {
 		promote = append(promote, opCase[store.Member]{name: "a defective standing: " + name,
-			out: batchOf(2, map[int][][]any{0: rows, 1: {row(targetID)}}), defect: true})
+			out: batchOf(3, map[int][][]any{0: rows, 1: {row(targetID)}}), defect: true})
 	}
 
 	runOpCases(t, promote, store.CodeMemberUpdateRejected, setting(true))
 
-	runOpCases(t, []opCase[store.Member]{
-		{name: "demoted", out: batch(memberStandingOf(targetID, 1, nil, 1), true), want: wantMember(targetID, false, nil)},
+	demote := []opCase[store.Member]{
+		{name: "demoted", out: batch(memberStandingOf(1, nil, 1), true), want: wantMember(targetID, false, nil)},
+		{name: "a revoked administrator is demoted", out: batch(memberStandingOf(1, revoked, 1), true),
+			want: wantMember(targetID, false, &revoked)},
 		{name: "demoting a member who is not an administrator succeeds",
-			out: batch(memberStandingOf(targetID, 0, nil, 1), false), want: wantMember(targetID, false, nil)},
-		{name: "the last administrator is refused", out: batch(memberStandingOf(targetID, 1, nil, 1), false),
+			out: batch(memberStandingOf(0, nil, 1), false), want: wantMember(targetID, false, nil)},
+		{name: "the last administrator is refused", out: batch(memberStandingOf(1, nil, 1), false),
 			err: store.ErrLastOrgAdmin},
 		{name: "no such member", out: missing, err: store.ErrNotFound},
-		{name: "the caller does not administer", out: batch(memberStandingOf(targetID, 1, nil, 0), false),
+		{name: "no such member, because the caller is revoked", out: callerIs(1, missing), err: store.ErrAccountRevoked},
+		{name: "the caller does not administer", out: batch(memberStandingOf(1, nil, 0), false),
 			err: store.ErrNotAdmin},
-	}, store.CodeMemberUpdateRejected, setting(false))
+	}
+
+	runOpCases(t, append(demote, callerDefectCases[store.Member](3)...), store.CodeMemberUpdateRejected, setting(false))
 
 	t.Run("the statements", func(t *testing.T) {
 		t.Parallel()
 
 		standingFragments := append([]string{
-			"FROM users tu WHERE tu.id = ?1 AND tu.org_id IS NOT NULL AND",
+			"FROM users tu WHERE tu.id = ?1 AND",
 			"EXISTS (SELECT 1 FROM org_admins ta WHERE ta.org_id = tu.org_id AND ta.user_id = tu.id) AS is_admin",
 			"AS administers",
 		}, targetAdministersFragments...)
@@ -200,7 +215,7 @@ func TestSetMemberAdmin(t *testing.T) {
 			args:      []any{targetID, callerID, adminRole},
 		}
 
-		promoting := newFake(batch(memberStandingOf(targetID, 0, nil, 1), true))
+		promoting := newFake(batch(memberStandingOf(0, nil, 1), true))
 
 		_, err := setting(true)(promoting.store())
 		checkErr(t, err, nil)
@@ -208,16 +223,16 @@ func TestSetMemberAdmin(t *testing.T) {
 		checkNumberedStatements(t, promoting, standingStatement, wantStatement{
 			fragments: append([]string{
 				"INSERT INTO org_admins (org_id, user_id, created_at) SELECT tu.org_id, tu.id, ?4 FROM users tu",
-				// The organization must be active, and the caller administers it.
-				"AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = tu.org_id AND o.revoked_at IS NULL) AND",
+				// A revoked member is never promoted: the write itself says so.
+				"WHERE tu.id = ?1 AND tu.revoked_at IS NULL AND",
 				// Promoting an administrator matches and changes nothing, so a row
 				// is returned either way.
 				"ON CONFLICT (org_id, user_id) DO UPDATE SET created_at = org_admins.created_at RETURNING user_id",
 			}, targetAdministersFragments...),
 			args: []any{targetID, callerID, adminRole, now.Unix()},
-		})
+		}, callerStandingStatement())
 
-		demoting := newFake(batch(memberStandingOf(targetID, 1, nil, 1), true))
+		demoting := newFake(batch(memberStandingOf(1, nil, 1), true))
 
 		_, err = setting(false)(demoting.store())
 		checkErr(t, err, nil)
@@ -231,14 +246,14 @@ func TestSetMemberAdmin(t *testing.T) {
 				"RETURNING user_id",
 			}, targetAdministersFragments...),
 			args: []any{targetID, callerID, adminRole},
-		})
+		}, callerStandingStatement())
 	})
 
 	t.Run("failures", func(t *testing.T) {
 		t.Parallel()
 
 		for _, admin := range []bool{true, false} {
-			runOpFailures(t, 2, store.CodeMemberUpdateFailed, store.CodeMemberUpdateRejected,
+			runOpFailures(t, store.CodeMemberUpdateFailed, store.CodeMemberUpdateRejected,
 				func(s *store.Store) error { return lastErr(setting(admin)(s)) })
 		}
 	})
@@ -261,114 +276,81 @@ const otherAdminFragment = "(tu.revoked_at IS NOT NULL OR EXISTS (SELECT 1 FROM 
 	"JOIN users u2 ON u2.id = oa2.user_id WHERE oa2.org_id = tu.org_id AND oa2.user_id <> tu.id " +
 	"AND u2.revoked_at IS NULL))"
 
-// TestRemoveMember: the standing statement before the writes, the guarded
-// delete of the administrator row, and the release of the user say what
-// happened.
+// TestRevokeMember: the member is read off the standing statement and the account
+// statement's row, with the time of the revocation. The refusals are those of
+// RevokeUser; its statements are held by TestRevokeUserStatements.
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
-func TestRemoveMember(t *testing.T) {
+func TestRevokeMember(t *testing.T) {
 	t.Parallel()
 
-	removing := func(id string) func(*store.Store) (store.Member, error) {
+	revoking := func(id string) func(*store.Store) (store.Member, error) {
 		return func(s *store.Store) (store.Member, error) {
-			return s.RemoveMember(context.Background(), mustUserID(t, id), callerID, adminRole)
+			return s.RevokeMember(context.Background(), mustUserID(t, id), callerID, adminRole, now)
 		}
 	}
 
-	batch := func(standing []any, released bool) outcome {
-		changes := [][]any(nil)
-		if released {
-			changes = [][]any{row(targetID)}
-		}
+	justNow := now.Unix()
+	earlier := int64(1_700_000_100)
 
-		return batchOf(3, map[int][][]any{0: {standing}, 2: changes})
+	// standing is the first statement's row: the member, whether they administer
+	// the organization and are revoked, and then what the caller may do to them.
+	standing := func(admin int64, revoked any, platform, administers, may int64) []any {
+		return append(memberRowOf(targetID, admin, revoked), platform, administers, may)
 	}
 
-	revoked := int64(1_700_000_100)
-
-	// An administrator who is removed is shown as no longer one.
-	runOpCases(t, []opCase[store.Member]{
-		{name: "a member is removed", out: batch(memberStandingOf(targetID, 0, nil, 1), true),
-			want: wantMember(targetID, false, nil)},
-		{name: "an administrator is removed and is shown as no longer one",
-			out: batch(memberStandingOf(targetID, 1, nil, 1), true), want: wantMember(targetID, false, nil)},
-		{name: "a revoked member is removed", out: batch(memberStandingOf(targetID, 0, revoked, 1), true),
-			want: wantMember(targetID, false, &revoked)},
-		{name: "a member who is not an administrator of it is refused",
-			out: batch(memberStandingOf(targetID, 0, nil, 0), false), err: store.ErrNotAdmin},
-		{name: "the last administrator is refused", out: batch(memberStandingOf(targetID, 1, nil, 1), false),
-			err: store.ErrLastOrgAdmin},
-		{name: "no such member", out: batchOf(3, map[int][][]any{2: {row(targetID)}}), err: store.ErrNotFound},
-		{name: "the standing is not a flag", out: batch(memberStandingOf(targetID, 0, nil, 2), true), defect: true},
-		{name: "two released rows are not what the update says", out: batchOf(3, map[int][][]any{
-			0: {memberStandingOf(targetID, 0, nil, 1)}, 2: {row(targetID), row(targetID)},
-		}), defect: true},
-		{name: "a released row that is not an id", out: batchOf(3, map[int][][]any{
-			0: {memberStandingOf(targetID, 0, nil, 1)}, 2: {row(int64(1))},
-		}), defect: true},
-	}, store.CodeMemberRemoveRejected, removing(targetID))
-
-	// Leaving is removing oneself: refused as the last administrator, and not as
-	// a stranger, whatever the caller administers.
-	runOpCases(t, []opCase[store.Member]{
-		{name: "the user leaves", out: batch(memberStandingOf(callerID, 0, nil, 0), true),
-			want: wantMember(callerID, false, nil)},
-		{name: "the last administrator cannot leave", out: batch(memberStandingOf(callerID, 1, nil, 0), false),
-			err: store.ErrLastOrgAdmin},
-		{name: "no longer belongs to an organization", out: batchOf(3, nil), err: store.ErrNotFound},
-	}, store.CodeMemberRemoveRejected, removing(callerID))
-
-	cases := []opCase[store.Member]{}
-
-	for name, rows := range defectResults(memberStandingOf(targetID, 0, nil, 1), append(memberKinds(), "integer")...) {
-		cases = append(cases, opCase[store.Member]{name: "a defective standing: " + name,
-			out: batchOf(3, map[int][][]any{0: rows, 2: {row(targetID)}}), defect: true})
+	// done is a revocation that took effect, of a member who administers the
+	// organization or not, and whose account was revoked at the time.
+	done := func(admin int64, at int64) outcome {
+		return revokeBatch(standing(admin, nil, 0, 1, 1), userRowOf(targetID, "member", at, 1))
 	}
 
-	runOpCases(t, cases, store.CodeMemberRemoveRejected, removing(targetID))
+	refused := func(platform, administers, may int64) outcome {
+		return revokeBatch(standing(0, nil, platform, administers, may))
+	}
 
-	t.Run("the statements", func(t *testing.T) {
+	runOpCases(t, []opCase[store.Member]{
+		{name: "a member is revoked", out: done(0, justNow), want: wantMember(targetID, false, &justNow)},
+		{name: "an administrator is revoked and keeps the row that says so", out: done(1, justNow),
+			want: wantMember(targetID, true, &justNow)},
+		{name: "revoking again reports the earlier time",
+			out:  revokeBatch(standing(0, earlier, 0, 1, 1), userRowOf(targetID, "member", earlier, 1)),
+			want: wantMember(targetID, false, &earlier)},
+		{name: "no such member", out: revokeBatch(nil), err: store.ErrNotFound},
+		{name: "the caller may not see the member because they are revoked", out: callerIs(1, revokeBatch(nil)),
+			err: store.ErrAccountRevoked},
+		{name: "the caller does not administer the organization", out: refused(0, 0, 0), err: store.ErrNotAdmin},
+		{name: "a platform administrator is not revoked by an organization administrator", out: refused(1, 1, 0),
+			err: store.ErrPlatformAdminTarget},
+		{name: "the last platform administrator", out: refused(1, 1, 1), err: store.ErrLastAdmin},
+		{name: "a refusal nobody explains", out: refused(0, 1, 1), defect: true},
+		{name: "a defective account row",
+			out: revokeBatch(standing(0, nil, 0, 1, 1), with(activeUserRow(), 4, "now")), defect: true},
+	}, store.CodeMemberRevokeRejected, revoking(targetID))
+
+	t.Run("the operation is the one of its failures", func(t *testing.T) {
 		t.Parallel()
 
-		fake := newFake(batch(memberStandingOf(targetID, 0, nil, 1), true))
-
-		_, err := removing(targetID)(fake.store())
-		checkErr(t, err, nil)
-
-		// The user may remove themself, or the caller administers the organization.
-		mayRemove := "((tu.id = ?2 AND tu.revoked_at IS NULL) OR EXISTS " +
-			"(SELECT 1 FROM (SELECT tu.org_id AS org_id) subject, users actor"
-
-		checkNumberedStatements(t, fake,
-			wantStatement{
-				fragments: []string{"FROM users tu WHERE tu.id = ?1 AND tu.org_id IS NOT NULL AND", "AS administers"},
-				args:      []any{targetID, callerID, adminRole},
-			},
-			wantStatement{
-				fragments: append([]string{
-					"DELETE FROM org_admins WHERE user_id = ?1 AND EXISTS (SELECT 1 FROM users tu",
-					"WHERE tu.id = ?1 AND tu.org_id = org_admins.org_id AND " + mayRemove,
-					otherAdminFragment,
-				}, targetAdministersFragments...),
-				args: []any{targetID, callerID, adminRole},
-			},
-			wantStatement{
-				fragments: append([]string{
-					"UPDATE users AS tu SET org_id = NULL WHERE tu.id = ?1 AND tu.org_id IS NOT NULL AND " + mayRemove,
-					// Only a user who is no longer an administrator is released: the
-					// delete before it refused to remove the last one.
-					"AND NOT EXISTS (SELECT 1 FROM org_admins ta WHERE ta.org_id = tu.org_id AND ta.user_id = tu.id)",
-					"RETURNING id",
-				}, targetAdministersFragments...),
-				args: []any{targetID, callerID, adminRole},
-			},
-		)
+		runDefectFailures(t, 5, store.CodeMemberRevokeFailed, store.CodeMemberRevokeRejected, orgsDescription,
+			func(s *store.Store) error { return lastErr(revoking(targetID)(s)) })
 	})
 
-	t.Run("failures", func(t *testing.T) {
+	t.Run("the statements are those of RevokeUser", func(t *testing.T) {
 		t.Parallel()
 
-		runOpFailures(t, 3, store.CodeMemberRemoveFailed, store.CodeMemberRemoveRejected,
-			func(s *store.Store) error { return lastErr(removing(targetID)(s)) })
+		fake := newFake(done(0, justNow))
+
+		_, err := revoking(targetID)(fake.store())
+		checkErr(t, err, nil)
+
+		if len(fake.calls) != 1 || len(fake.calls[0]) != 5 {
+			t.Fatalf("calls = %v, want one batch of five statements", fake.calls)
+		}
+
+		for _, statement := range fake.calls[0][:4] {
+			if want := []any{targetID, callerID, adminRole}; !reflect.DeepEqual(statement.Args[:3], want) {
+				t.Errorf("args = %#v, want %v first", statement.Args, want)
+			}
+		}
 	})
 }

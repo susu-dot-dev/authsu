@@ -5,8 +5,9 @@ package e2e_test
 
 // orgs_schema_test.go holds the constraints of migrations/0001_schema.sql that
 // belong to the organizations design (docs/orgs_design.md): what an
-// organization, an administrator and an offer may hold, which kind of
-// organization a user and an agent may point at, and what deleting one removes.
+// organization, an administrator and the organization an invitation names may
+// hold, which kind of organization a user and an agent may point at, and what
+// deleting one removes.
 //
 // Like schema_test.go these are schema tests and not behaviour tests: no request
 // goes to the Worker. The store's unit tests can only read the migration's
@@ -18,7 +19,7 @@ package e2e_test
 // every statement, and each test starts from reset.
 //
 // REVIEW.md categories covered: permission confusion (a user is never in a
-// sandbox, an agent never in a standard organization, an offer never to a
+// sandbox, an agent never in a standard organization, an invitation never naming a
 // sandbox), type and bound confusion (the CHECKs at their bounds and one past,
 // text against BLOB, NUL), and the database half of interleaving (a delete from
 // either side leaves nothing dangling and no secret without its row).
@@ -40,7 +41,6 @@ const (
 	famOrg      = "0f80"
 	famSandbox  = "0f81"
 	famAdmin    = "0f82"
-	famOffer    = "0f83"
 	famAgent    = "0f84"
 	famKey      = "0f85"
 	famGrant    = "0f86"
@@ -60,14 +60,14 @@ func orgSchemaWorld(t *testing.T) {
 }
 
 // insertOrg is an organization's row with every column given: id, kind, name,
-// created_by, expires_at, revoked_at, created_at.
-const insertOrg = "INSERT INTO orgs (id, kind, name, created_by, expires_at, revoked_at, created_at) " +
-	"VALUES (?, ?, ?, ?, ?, ?, ?)"
+// created_by, expires_at, created_at.
+const insertOrg = "INSERT INTO orgs (id, kind, name, created_by, expires_at, created_at) " +
+	"VALUES (?, ?, ?, ?, ?, ?)"
 
 // orgArgs are the arguments of a well-formed standard organization, id
 // idN(famOrg, 1), for insertOrg, changed by mutate.
 func orgArgs(mutate func(args []any)) []any {
-	args := []any{idN(famOrg, 1), schemaKindStandard, "Acme", idUserB, nil, nil, int64(1_700_000_000)}
+	args := []any{idN(famOrg, 1), schemaKindStandard, "Acme", idUserB, nil, int64(1_700_000_000)}
 
 	mutate(args)
 
@@ -81,7 +81,7 @@ func orgArgs(mutate func(args []any)) []any {
 func sandboxArgs(mutate func(args []any)) []any {
 	now := time.Now()
 	args := []any{
-		idN(famSandbox, 1), schemaKindSandbox, "Scratch", idUserB, now.Add(7 * 24 * time.Hour).Unix(), nil, now.Unix(),
+		idN(famSandbox, 1), schemaKindSandbox, "Scratch", idUserB, now.Add(7 * 24 * time.Hour).Unix(), now.Unix(),
 	}
 
 	mutate(args)
@@ -107,8 +107,8 @@ func seedSandbox(t *testing.T, id, creator string) {
 
 // TestSchemaOrgs: the backstop CHECKs and keys of orgs against the real SQLite,
 // each at its bound and one past it. The two kinds are told apart by what they
-// must and must not hold (a sandbox expires and is never revoked, a standard
-// organization never expires), the name is bounded in bytes and refuses NUL
+// must and must not hold (a sandbox expires, a standard organization never
+// does), the name is bounded in bytes and refuses NUL
 // (length() on TEXT stops at one), and the creator is required and is a real
 // account.
 //
@@ -124,7 +124,6 @@ func TestSchemaOrgs(t *testing.T) {
 		name
 		creator
 		expires
-		revoked
 		created
 	)
 
@@ -138,13 +137,9 @@ func TestSchemaOrgs(t *testing.T) {
 	}{
 		{"a well-formed standard organization", orgArgs(func([]any) {}), false},
 		{"a well-formed sandbox", sandboxArgs(func([]any) {}), false},
-		{"a revoked standard organization", standard(revoked, int64(1_700_000_001)), false},
-		{"a standard organization revoked at the epoch", standard(revoked, int64(0)), false},
 
 		// The rules that define each kind.
 		{"a sandbox with no expiry", sandbox(expires, nil), true},
-		{"a sandbox that is revoked", sandbox(revoked, int64(1_700_000_001)), true},
-		{"a sandbox that is revoked at the epoch", sandbox(revoked, int64(0)), true},
 		{"a sandbox that has already expired", sandbox(expires, int64(1)), false},
 		{"a standard organization with an expiry", standard(expires, int64(1_700_600_000)), true},
 		{"a standard organization expiring at the epoch", standard(expires, int64(0)), true},
@@ -192,24 +187,27 @@ func TestSchemaOrgs(t *testing.T) {
 
 	t.Run("an organization's creator cannot be deleted", func(t *testing.T) {
 		// Accounts are revoked and never deleted, and what an organization's
-		// creator made stays answerable: no ON DELETE action.
+		// creator made stays answerable: no ON DELETE action. Only when the
+		// organizations it created go with it can the account be deleted.
 		if !refused(t, "DELETE FROM users WHERE id = ?", idUserB) {
 			t.Error("deleting the creator of an organization was accepted")
 		}
 
-		seed(t, "DELETE FROM orgs WHERE id = ?", idN(famOrg, 2))
-
-		if refused(t, "DELETE FROM users WHERE id = ?", idUserB) {
-			t.Error("deleting an account that created nothing was refused")
+		err := inTx(t,
+			sqlStmt("DELETE FROM orgs WHERE created_by = ?", idUserB), sqlStmt("DELETE FROM users WHERE id = ?", idUserB))
+		if err != nil {
+			t.Errorf("deleting an account with the organizations it created was refused: %v", err)
 		}
 	})
 }
 
 // TestSchemaUsersBelongOnlyToAStandardOrganization: users.org_id points at an
-// organization by its id and the kind 'standard' together, so an account can
-// belong to a standard organization and to nothing else: not a sandbox, not an
-// organization that does not exist. Whether the organization is still active is
-// not the schema's to say: it is a condition of the write that joins.
+// organization by its id and the kind 'standard' together, so an account belongs
+// to a standard organization and to nothing else: not a sandbox, not an
+// organization that does not exist, and not none, because the column is NOT NULL.
+// The key is deferred, so what the commit would refuse is read from the
+// transaction's violations (refused), and a transaction that writes an account and
+// its organization together is accepted in either order.
 //
 //nolint:paralleltest // shares one database
 func TestSchemaUsersBelongOnlyToAStandardOrganization(t *testing.T) {
@@ -217,11 +215,10 @@ func TestSchemaUsersBelongOnlyToAStandardOrganization(t *testing.T) {
 	seedOrg(t, idN(famOrg, 1))
 	seedSandbox(t, idN(famSandbox, 1), idUserB)
 
-	// A revoked organization is in the world too.
-	seedOrg(t, idN(famOrg, 3))
-	seed(t, "UPDATE orgs SET revoked_at = strftime('%s','now') WHERE id = ?", idN(famOrg, 3))
-
 	const join = "UPDATE users SET org_id = ? WHERE id = ?"
+
+	const born = "INSERT INTO users (id, user_handle, role, invitation_id, org_id, created_at) " +
+		"VALUES (?, randomblob(16), 'member', ?, ?, strftime('%s','now'))"
 
 	tests := []struct {
 		name  string
@@ -229,34 +226,25 @@ func TestSchemaUsersBelongOnlyToAStandardOrganization(t *testing.T) {
 		args  []any
 		want  bool // refused
 	}{
-		{"an account joins a standard organization", join, []any{idN(famOrg, 1), idUserC}, false},
-		{"an account leaves its organization", join, []any{nil, idUserC}, false},
+		{"an account can be set to a standard organization", join, []any{idN(famOrg, 1), idUserC}, false},
+		{"an account cannot be set to none", join, []any{nil, idUserC}, true},
 		{"an account cannot belong to a sandbox", join, []any{idN(famSandbox, 1), idUserC}, true},
 		{"an account cannot belong to a sandbox even its creator's", join, []any{idN(famSandbox, 1), idUserB}, true},
 		{"an account cannot belong to an organization that does not exist", join, []any{idMissing, idUserC}, true},
-		{"an account can belong to a revoked organization (the join's write refuses it)", join, []any{idN(famOrg, 3), idUserC}, false},
 		{"an account cannot take another kind than standard", "UPDATE users SET org_kind = ? WHERE id = ?", []any{schemaKindSandbox, idUserC}, true},
 		{"an account cannot take an empty kind", "UPDATE users SET org_kind = ? WHERE id = ?", []any{"", idUserC}, true},
 		{"an account cannot take a kind in another case", "UPDATE users SET org_kind = ? WHERE id = ?", []any{"STANDARD", idUserC}, true},
 		{"an account cannot have no kind", "UPDATE users SET org_kind = NULL WHERE id = ?", []any{idUserC}, true},
 		{"an account's kind may be restated", "UPDATE users SET org_kind = ? WHERE id = ?", []any{schemaKindStandard, idUserC}, false},
+		{"a new account may be born in a standard organization", born, []any{idN(famDeletion, 1), idInvitationA, idN(famOrg, 1)}, false},
+		{"a new account may not be born in a sandbox", born, []any{idN(famDeletion, 1), idInvitationA, idN(famSandbox, 1)}, true},
+		{"a new account may not be born in an organization that does not exist", born, []any{idN(famDeletion, 1), idInvitationA, idMissing}, true},
+		{"a new account may not be born with no organization", born, []any{idN(famDeletion, 1), idInvitationA, nil}, true},
 		{
-			"a new account may be born in a standard organization",
-			"INSERT INTO users (id, user_handle, role, invitation_id, org_id, created_at) " +
-				"VALUES (?, randomblob(16), 'member', ?, ?, strftime('%s','now'))",
-			[]any{idN(famDeletion, 1), idInvitationA, idN(famOrg, 1)}, false,
-		},
-		{
-			"a new account may not be born in a sandbox",
-			"INSERT INTO users (id, user_handle, role, invitation_id, org_id, created_at) " +
-				"VALUES (?, randomblob(16), 'member', ?, ?, strftime('%s','now'))",
-			[]any{idN(famDeletion, 1), idInvitationA, idN(famSandbox, 1)}, true,
-		},
-		{
-			"a new account born with no organization has the standard kind",
+			"a new account may not be born with no organization given",
 			"INSERT INTO users (id, user_handle, role, invitation_id, created_at) " +
 				"VALUES (?, randomblob(16), 'member', ?, strftime('%s','now'))",
-			[]any{idN(famDeletion, 1), idInvitationA}, false,
+			[]any{idN(famDeletion, 1), idInvitationA}, true,
 		},
 	}
 
@@ -272,6 +260,41 @@ func TestSchemaUsersBelongOnlyToAStandardOrganization(t *testing.T) {
 		if got := scalar(t, "SELECT org_kind FROM users WHERE id = ?", idUserC); got != schemaKindStandard {
 			t.Errorf("org_kind = %q, want %q", got, schemaKindStandard)
 		}
+	})
+
+	// An account and the organization it creates are written together, as
+	// registration writes them: the account first, because the organization's key
+	// to its creator is checked at once, and the account's key to the organization
+	// at the commit. A transaction that leaves an account without its organization
+	// is refused at the commit.
+	const personal = "INSERT INTO orgs (id, kind, name, created_by, created_at) VALUES (?, 'standard', 'Own', ?, 1)"
+
+	idNew, idOwn := idN(famDeletion, 2), idN(famOrg, 3)
+
+	t.Run("an account and its own organization are accepted in one transaction", func(t *testing.T) {
+		err := inTx(t, sqlStmt(born, idNew, idInvitationA, idOwn), sqlStmt(personal, idOwn, idNew))
+		if err != nil {
+			t.Errorf("the account and its organization were refused: %v", err)
+		}
+
+		expectCount(t, "users WHERE id = ? AND org_id = ?", "1", idNew, idOwn)
+	})
+
+	t.Run("an organization cannot be written before its creator", func(t *testing.T) {
+		err := inTx(t, sqlStmt(personal, idN(famOrg, 4), idN(famDeletion, 3)),
+			sqlStmt(born, idN(famDeletion, 3), idInvitationA, idN(famOrg, 4)))
+		if err == nil {
+			t.Error("an organization of an account that did not exist yet was accepted")
+		}
+	})
+
+	t.Run("an account whose organization is never written is refused at the commit", func(t *testing.T) {
+		err := inTx(t, sqlStmt(born, idN(famDeletion, 4), idInvitationA, idN(famOrg, 5)))
+		if err == nil {
+			t.Error("an account without its organization was committed")
+		}
+
+		expectCount(t, "users WHERE id = ?", "0", idN(famDeletion, 4))
 	})
 }
 
@@ -372,7 +395,7 @@ func TestSchemaOrgAdmins(t *testing.T) {
 		seedUser(t, idN(famDeletion, 1), roleMember)
 		seed(t, insert, idN(famOrg, 2), idN(famDeletion, 1), int64(1))
 
-		seed(t, "DELETE FROM users WHERE id = ?", idN(famDeletion, 1))
+		deleteAccount(t, idN(famDeletion, 1))
 
 		expectCount(t, "org_admins WHERE user_id = ?", "0", idN(famDeletion, 1))
 		expectCount(t, "org_admins WHERE org_id = ?", "1", idN(famOrg, 2))
@@ -388,57 +411,44 @@ func TestSchemaOrgAdmins(t *testing.T) {
 	})
 }
 
-// insertOffer is an offer's row with every column given: id, org_id, kind,
-// user_id, invitation_id, role, created_by, created_at.
-const insertOffer = "INSERT INTO org_offers (id, org_id, kind, user_id, invitation_id, role, created_by, created_at) " +
-	"VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+// insertInvitationOrg is the row of the organization an invitation names, with
+// every column given: invitation_id, org_id, kind, role, created_at.
+const insertInvitationOrg = "INSERT INTO invitation_orgs (invitation_id, org_id, kind, role, created_at) " +
+	"VALUES (?, ?, ?, ?, ?)"
 
-// offerArgs are the arguments of a well-formed offer to the account idUserC for
-// the standard organization idN(famOrg, 1), id idN(famOffer, 1), changed by
-// mutate.
-func offerArgs(mutate func(args []any)) []any {
-	args := []any{
-		idN(famOffer, 1), idN(famOrg, 1), schemaKindStandard, idUserC, nil, "member", idUserB, int64(1_700_000_000),
-	}
+// invitationOrgArgs are the arguments of a well-formed row naming the standard
+// organization idN(famOrg, 1) on the invitation idInvitationB, changed by mutate.
+func invitationOrgArgs(mutate func(args []any)) []any {
+	args := []any{idInvitationB, idN(famOrg, 1), schemaKindStandard, "member", int64(1_700_000_000)}
 
 	mutate(args)
 
 	return args
 }
 
-// TestSchemaOrgOffers: an offer is for a standard organization and addressed to
-// one account or to one invitation, never both and never neither; an account is
-// offered a place in an organization once, an invitation carries one offer, and
-// the role is a size-bounded text that Go owns.
+// TestSchemaInvitationOrgs: an invitation names at most one organization, which
+// is standard, with a role that is a size-bounded text that Go owns.
 //
 //nolint:paralleltest // shares one database
-func TestSchemaOrgOffers(t *testing.T) {
+func TestSchemaInvitationOrgs(t *testing.T) {
 	orgSchemaWorld(t)
 	seedOrg(t, idN(famOrg, 1))
 	seedOrg(t, idN(famOrg, 2))
 	seedSandbox(t, idN(famSandbox, 1), idUserB)
-	seed(t, insertOffer, offerArgs(func([]any) {})...)
+	seed(t, insertInvitationOrg, invitationOrgArgs(func([]any) {})...)
 
-	// A second offer: to an invitation, so its unique key can be collided with.
-	seed(t, insertOffer, offerArgs(func(a []any) {
-		a[0], a[3], a[4] = idN(famOffer, 2), nil, idInvitationB
-	})...)
-
-	// The positions of the columns in offerArgs.
+	// The positions of the columns in invitationOrgArgs.
 	const (
-		id = iota
+		invitation = iota
 		org
 		kind
-		user
-		invitation
 		role
-		creator
 		created
 	)
 
 	with := func(changes map[int]any) []any {
-		return offerArgs(func(a []any) {
-			a[id] = idN(famOffer, 3)
+		return invitationOrgArgs(func(a []any) {
+			a[invitation] = idInvitationA
 
 			for column, value := range changes {
 				a[column] = value
@@ -451,78 +461,63 @@ func TestSchemaOrgOffers(t *testing.T) {
 		args []any
 		want bool // refused
 	}{
-		// Addressee: one of two things.
-		{"an offer to another account", with(map[int]any{user: idUserB}), false},
-		{"an offer to the same account for another organization", with(map[int]any{org: idN(famOrg, 2)}), false},
-		{"an offer to an invitation that carries none", with(map[int]any{user: nil, invitation: idInvitationA, org: idN(famOrg, 2)}), false},
-		{"an offer to the account again", with(nil), true},
-		{"an offer to both an account and an invitation", with(map[int]any{user: idUserB, invitation: idInvitationA}), true},
-		{"an offer to neither", with(map[int]any{user: nil, invitation: nil}), true},
-		{"an offer to an account that does not exist", with(map[int]any{user: idMissing}), true},
-		{"an offer to an invitation that does not exist", with(map[int]any{user: nil, invitation: idMissing}), true},
-		{"a second offer on an invitation that carries one", with(map[int]any{user: nil, invitation: idInvitationB}), true},
-		{
-			"a second offer on that invitation for another organization",
-			with(map[int]any{user: nil, invitation: idInvitationB, org: idN(famOrg, 2)}), true,
-		},
-		// Several invitation offers for one organization are distinct: NULL is
-		// distinct in the UNIQUE on (org_id, user_id).
-		{"another invitation's offer for the same organization", with(map[int]any{user: nil, invitation: idInvitationA}), false},
+		// The invitation: one organization each.
+		{"another invitation naming the same organization", with(nil), false},
+		{"another invitation naming another organization", with(map[int]any{org: idN(famOrg, 2)}), false},
+		{"a second organization on the invitation that names one",
+			with(map[int]any{invitation: idInvitationB, org: idN(famOrg, 2)}), true},
+		{"the same organization again on the invitation that names it", with(map[int]any{invitation: idInvitationB}), true},
+		{"an invitation that does not exist", with(map[int]any{invitation: idMissing}), true},
+		{"no invitation", with(map[int]any{invitation: nil}), true},
 
 		// The organization: standard only.
-		{"an offer for an organization that does not exist", with(map[int]any{org: idMissing, user: idUserB}), true},
-		{"an offer for a sandbox", with(map[int]any{org: idN(famSandbox, 1), user: idUserB}), true},
-		{"an offer for a sandbox restating the sandbox kind", with(map[int]any{org: idN(famSandbox, 1), kind: schemaKindSandbox, user: idUserB}), true},
-		{"an offer for a standard organization claiming the sandbox kind", with(map[int]any{kind: schemaKindSandbox, user: idUserB}), true},
-		{"an offer with an empty kind", with(map[int]any{kind: "", user: idUserB}), true},
-		{"an offer with no kind", with(map[int]any{kind: nil, user: idUserB}), true},
-		{"no organization", with(map[int]any{org: nil, user: idUserB}), true},
+		{"an organization that does not exist", with(map[int]any{org: idMissing}), true},
+		{"a sandbox", with(map[int]any{org: idN(famSandbox, 1)}), true},
+		{"a sandbox restating the sandbox kind", with(map[int]any{org: idN(famSandbox, 1), kind: schemaKindSandbox}), true},
+		{"a standard organization claiming the sandbox kind", with(map[int]any{kind: schemaKindSandbox}), true},
+		{"an empty kind", with(map[int]any{kind: ""}), true},
+		{"no kind", with(map[int]any{kind: nil}), true},
+		{"no organization", with(map[int]any{org: nil}), true},
 
 		// The role: bounded text, Go's set.
-		{"a role of 64 characters", with(map[int]any{role: strings.Repeat("r", 64), user: idUserB}), false},
-		{"a role of 65 characters", with(map[int]any{role: strings.Repeat("r", 65), user: idUserB}), true},
-		{"an admin role", with(map[int]any{role: "admin", user: idUserB}), false},
-		{"a role the code does not know", with(map[int]any{role: "owner", user: idUserB}), false},
-		{"an empty role", with(map[int]any{role: "", user: idUserB}), true},
-		{"a role that is a blob", with(map[int]any{role: []byte("member"), user: idUserB}), true},
-		{"no role", with(map[int]any{role: nil, user: idUserB}), true},
+		{"a role of 64 characters", with(map[int]any{role: strings.Repeat("r", 64)}), false},
+		{"a role of 65 characters", with(map[int]any{role: strings.Repeat("r", 65)}), true},
+		{"an admin role", with(map[int]any{role: "admin"}), false},
+		{"a role the code does not know", with(map[int]any{role: "owner"}), false},
+		{"an empty role", with(map[int]any{role: ""}), true},
+		{"a role that is a blob", with(map[int]any{role: []byte("member")}), true},
+		{"no role", with(map[int]any{role: nil}), true},
 
-		// Identity and provenance.
-		{"an id of 35 characters", with(map[int]any{id: idN(famOffer, 3)[1:], user: idUserB}), true},
-		{"an id in upper case", with(map[int]any{id: strings.ToUpper(idN(famOffer, 3)), user: idUserB}), true},
-		{"an id that is already used", with(map[int]any{id: idN(famOffer, 1), user: idUserB}), true},
-		{"no creator", with(map[int]any{creator: nil, user: idUserB}), true},
-		{"a creator that is not an account", with(map[int]any{creator: idMissing, user: idUserB}), true},
-		{"no creation time", with(map[int]any{created: nil, user: idUserB}), true},
+		{"no creation time", with(map[int]any{created: nil}), true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := refused(t, insertOffer, tt.args...); got != tt.want {
+			if got := refused(t, insertInvitationOrg, tt.args...); got != tt.want {
 				t.Errorf("refused = %v, want %v", got, tt.want)
 			}
 		})
 	}
 
-	t.Run("an offer's kind is standard when it was never given", func(t *testing.T) {
-		const insertDefaulted = "INSERT INTO org_offers (id, org_id, user_id, role, created_by, created_at) " +
-			"VALUES (?, ?, ?, 'member', ?, 1)"
+	t.Run("the kind is standard when it was never given", func(t *testing.T) {
+		const insertDefaulted = "INSERT INTO invitation_orgs (invitation_id, org_id, role, created_at) " +
+			"VALUES (?, ?, 'member', 1)"
 
-		if refused(t, insertDefaulted, idN(famOffer, 3), idN(famOrg, 1), idUserB, idUserB) {
-			t.Error("an offer without a kind was refused")
+		if refused(t, insertDefaulted, idInvitationA, idN(famOrg, 1)) {
+			t.Error("a row without a kind was refused")
 		}
 
-		if !refused(t, insertDefaulted, idN(famOffer, 3), idN(famSandbox, 1), idUserB, idUserB) {
-			t.Error("an offer without a kind, for a sandbox, was accepted")
+		if !refused(t, insertDefaulted, idInvitationA, idN(famSandbox, 1)) {
+			t.Error("a row without a kind, naming a sandbox, was accepted")
 		}
 	})
 }
 
-// TestSchemaOrgDeletion: a standard organization is revoked and never deleted,
-// and the schema is what stops a delete that would strand anything: members and
-// offers hold it with no ON DELETE action. What belongs to a person or an
-// invitation dies with it (an offer to an account, an offer on an invitation),
-// and nothing an offer's removal does touches the invitation.
+// TestSchemaOrgDeletion: a standard organization is never deleted, and the
+// schema is what stops a delete that would strand anything: members and the
+// invitations that name it hold it with no ON DELETE action. What an invitation
+// names dies with the invitation, and nothing its removal does touches the
+// invitation.
 //
 //nolint:paralleltest // shares one database
 func TestSchemaOrgDeletion(t *testing.T) {
@@ -535,14 +530,10 @@ func TestSchemaOrgDeletion(t *testing.T) {
 		seed(t, "UPDATE users SET org_id = ? WHERE id = ?", idN(famOrg, 1), idUserB)
 	}
 
-	offerTo := func(t *testing.T, offer string, changes func(args []any)) {
+	names := func(t *testing.T, invitation string) {
 		t.Helper()
 
-		seed(t, insertOffer, offerArgs(func(a []any) {
-			a[0] = offer
-
-			changes(a)
-		})...)
+		seed(t, insertInvitationOrg, invitationOrgArgs(func(a []any) { a[0] = invitation })...)
 	}
 
 	t.Run("an organization with a member cannot be deleted", func(t *testing.T) {
@@ -556,115 +547,72 @@ func TestSchemaOrgDeletion(t *testing.T) {
 		expectCount(t, "users WHERE org_id = ?", "1", idN(famOrg, 1))
 	})
 
-	t.Run("an organization whose members were released can be deleted", func(t *testing.T) {
+	t.Run("an organization whose members moved out can be deleted", func(t *testing.T) {
 		world(t)
-		seed(t, "UPDATE users SET org_id = NULL WHERE org_id = ?", idN(famOrg, 1))
+		seed(t, "UPDATE users SET org_id = id WHERE org_id = ?", idN(famOrg, 1))
 
 		seed(t, "DELETE FROM orgs WHERE id = ?", idN(famOrg, 1))
 
-		expectCount(t, "orgs", "0")
+		expectCount(t, "orgs WHERE id = ?", "0", idN(famOrg, 1))
 		expectCount(t, "org_admins", "0")
 		expectCount(t, "users WHERE id = ?", "1", idUserB)
 	})
 
-	t.Run("an organization with an offer to an account cannot be deleted", func(t *testing.T) {
+	t.Run("an organization an invitation names cannot be deleted", func(t *testing.T) {
 		world(t)
-		seed(t, "UPDATE users SET org_id = NULL")
-		offerTo(t, idN(famOffer, 1), func([]any) {})
+		seed(t, "UPDATE users SET org_id = id")
+		names(t, idInvitationB)
 
 		if !refused(t, "DELETE FROM orgs WHERE id = ?", idN(famOrg, 1)) {
-			t.Error("deleting an organization with an offer was accepted")
+			t.Error("deleting an organization an invitation names was accepted")
 		}
 
-		seed(t, "DELETE FROM org_offers WHERE id = ?", idN(famOffer, 1))
-		seed(t, "DELETE FROM orgs WHERE id = ?", idN(famOrg, 1))
-		expectCount(t, "orgs", "0")
+		expectCount(t, "invitation_orgs", "1")
 	})
 
-	t.Run("an organization with an offer on an invitation cannot be deleted", func(t *testing.T) {
+	t.Run("deleting what an invitation names does not touch its invitation", func(t *testing.T) {
 		world(t)
-		seed(t, "UPDATE users SET org_id = NULL")
-		offerTo(t, idN(famOffer, 1), func(a []any) { a[3], a[4] = nil, idInvitationB })
+		names(t, idInvitationB)
 
-		if !refused(t, "DELETE FROM orgs WHERE id = ?", idN(famOrg, 1)) {
-			t.Error("deleting an organization with an invitation's offer was accepted")
-		}
-
-		expectCount(t, "org_offers", "1")
-	})
-
-	t.Run("deleting an offer does not touch its invitation", func(t *testing.T) {
-		world(t)
-		offerTo(t, idN(famOffer, 1), func(a []any) { a[3], a[4] = nil, idInvitationB })
-
-		seed(t, "DELETE FROM org_offers WHERE id = ?", idN(famOffer, 1))
+		seed(t, "DELETE FROM invitation_orgs WHERE invitation_id = ?", idInvitationB)
 
 		expectCount(t, "invitations WHERE id = ?", "1", idInvitationB)
 		expectCount(t, "secrets WHERE id = ?", "1", idInvitationB)
 	})
 
-	t.Run("deleting an invitation deletes its offer and not the organization", func(t *testing.T) {
+	t.Run("deleting an invitation deletes what it names and not the organization", func(t *testing.T) {
 		world(t)
-		offerTo(t, idN(famOffer, 1), func(a []any) { a[3], a[4] = nil, idInvitationB })
+		names(t, idInvitationB)
 
 		seed(t, "DELETE FROM invitations WHERE id = ?", idInvitationB)
 
-		expectCount(t, "org_offers", "0")
+		expectCount(t, "invitation_orgs", "0")
 		expectCount(t, "orgs WHERE id = ?", "1", idN(famOrg, 1))
 		expectCount(t, "secrets WHERE id = ?", "0", idInvitationB)
 		expectNoOrphanSecrets(t)
 	})
 
-	t.Run("deleting an invitation's secret deletes its offer too", func(t *testing.T) {
+	t.Run("deleting an invitation's secret deletes what it names too", func(t *testing.T) {
 		world(t)
-		offerTo(t, idN(famOffer, 1), func(a []any) { a[3], a[4] = nil, idInvitationB })
+		names(t, idInvitationB)
 
 		seed(t, "DELETE FROM secrets WHERE id = ?", idInvitationB)
 
 		expectCount(t, "invitations WHERE id = ?", "0", idInvitationB)
-		expectCount(t, "org_offers", "0")
+		expectCount(t, "invitation_orgs", "0")
 		expectCount(t, "orgs WHERE id = ?", "1", idN(famOrg, 1))
 		expectNoOrphanSecrets(t)
 	})
 
-	t.Run("an invitation that has accounts keeps its offer and cannot be deleted", func(t *testing.T) {
+	t.Run("an invitation that has accounts keeps what it names and cannot be deleted", func(t *testing.T) {
 		world(t)
-		offerTo(t, idN(famOffer, 1), func(a []any) { a[3], a[4] = nil, idInvitationA })
+		names(t, idInvitationA)
 
 		if !refused(t, "DELETE FROM invitations WHERE id = ?", idInvitationA) {
 			t.Error("deleting an invitation with accounts was accepted")
 		}
 
-		expectCount(t, "org_offers", "1")
-	})
-
-	t.Run("deleting an account deletes the offers to it and the organization stays", func(t *testing.T) {
-		world(t)
-		offerTo(t, idN(famOffer, 1), func([]any) {})
-
-		seed(t, "DELETE FROM users WHERE id = ?", idUserC)
-
-		expectCount(t, "org_offers", "0")
-		expectCount(t, "orgs WHERE id = ?", "1", idN(famOrg, 1))
-	})
-
-	t.Run("an account that made an offer cannot be deleted", func(t *testing.T) {
-		world(t)
-
-		// A third account that created nothing else, so that the offer is what
-		// holds it.
-		seedUser(t, idN(famDeletion, 2), roleMember)
-		offerTo(t, idN(famOffer, 1), func(a []any) { a[6] = idN(famDeletion, 2) })
-
-		if !refused(t, "DELETE FROM users WHERE id = ?", idN(famDeletion, 2)) {
-			t.Error("deleting the creator of an offer was accepted")
-		}
-
-		seed(t, "DELETE FROM org_offers WHERE id = ?", idN(famOffer, 1))
-
-		if refused(t, "DELETE FROM users WHERE id = ?", idN(famDeletion, 2)) {
-			t.Error("deleting an account that made nothing was refused")
-		}
+		expectCount(t, "invitation_orgs", "1")
 	})
 
 	t.Run("deleting a member account leaves the organization and its other administrators", func(t *testing.T) {
@@ -673,8 +621,8 @@ func TestSchemaOrgDeletion(t *testing.T) {
 		seed(t, "UPDATE users SET org_id = ? WHERE id = ?", idN(famOrg, 1), idUserC)
 
 		// idUserB created the organization and cannot be deleted: delete the
-		// member that did not.
-		seed(t, "DELETE FROM users WHERE id = ?", idUserC)
+		// member that did not, with the organization of its own that it left.
+		deleteAccount(t, idUserC)
 
 		expectCount(t, "orgs WHERE id = ?", "1", idN(famOrg, 1))
 		expectCount(t, "org_admins WHERE org_id = ?", "1", idN(famOrg, 1))
@@ -813,7 +761,7 @@ func TestSchemaDeletingASandbox(t *testing.T) {
 
 		seed(t, "DELETE FROM orgs WHERE id = ?", idN(famSandbox, 1))
 
-		expectCount(t, "orgs", "0")
+		expectCount(t, "orgs WHERE kind = ?", "0", schemaKindSandbox)
 		expectCount(t, "org_admins", "0")
 		expectCount(t, "users WHERE id = ?", "1", idUserB)
 	})
@@ -856,7 +804,7 @@ func TestSchemaDeletingASandbox(t *testing.T) {
 		seed(t, "INSERT INTO agents (id, user_id, name, scopes, sandbox_id, created_at) "+
 			"VALUES (?, ?, 'bot', '[]', ?, strftime('%s','now'))", idN(famAgent, 1), idUserC, idN(famSandbox, 1))
 
-		seed(t, "DELETE FROM users WHERE id = ?", idUserC)
+		deleteAccount(t, idUserC)
 
 		expectCount(t, "agents", "0")
 		expectCount(t, "orgs WHERE id = ?", "1", idN(famSandbox, 1))
@@ -866,7 +814,7 @@ func TestSchemaDeletingASandbox(t *testing.T) {
 
 // TestSchemaOrgIndexes: the indexes the queries of the organization design rely
 // on exist, with the shape the migration gives them: partial where most rows
-// have none of the column.
+// have none of the column (agents' sandbox).
 //
 //nolint:paralleltest // shares one database
 func TestSchemaOrgIndexes(t *testing.T) {
@@ -878,11 +826,10 @@ func TestSchemaOrgIndexes(t *testing.T) {
 		partial bool
 		unique  bool
 	}{
-		{"users_org_id", tableUsers, true, false},
+		{"users_org_id", tableUsers, false, false},
 		{"agents_sandbox_id", tableAgents, true, false},
 		{"orgs_created_by", tableOrgs, false, false},
 		{"org_admins_user_id", tableOrgAdmins, false, false},
-		{"org_offers_user_id", tableOrgOffers, true, false},
 	}
 
 	for _, tt := range tests {

@@ -1598,7 +1598,15 @@ func TestLoginRacingAStateChange(t *testing.T) {
 	}{
 		{"passkey deleted in the gap", "DELETE FROM credentials WHERE id = NEW.id;"},
 		{"account revoked in the gap", "UPDATE users SET revoked_at = strftime('%s','now') WHERE id = NEW.user_id;"},
-		{"account deleted in the gap", "DELETE FROM users WHERE id = NEW.user_id;"},
+		{
+			// The account holds its organization and the organization its creator:
+			// the organization goes first, and the account's key to it, which is
+			// deferred, is only checked when the transaction commits.
+			"account deleted in the gap",
+			"DELETE FROM org_admins WHERE user_id = NEW.user_id; " +
+				"DELETE FROM orgs WHERE created_by = NEW.user_id; " +
+				"DELETE FROM users WHERE id = NEW.user_id;",
+		},
 	}
 
 	for _, tt := range cases {

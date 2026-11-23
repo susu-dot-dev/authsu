@@ -29,14 +29,14 @@ import (
 
 // Where the values are in the statements the account batch binds (see
 // store.CreateAccount): the first-run invitation's secret and row, then the user
-// insert, then the insert of an organization's administrator, then the
-// credential insert. The user and the credential are what accountOf returns.
+// insert, the account's own organization, the insert of its administrator, then the credential insert. The user and the
+// credential are what accountOf returns.
 const (
 	userArgID      = 0
 	userArgHandle  = 1
 	userArgRole    = 2
 	userArgProfile = 3
-	userArgOrgKind = 5
+	userArgOrg     = 5
 	userArgHash    = 6
 	userArgKind    = 7
 	userArgType    = 8
@@ -159,9 +159,18 @@ func register(t *testing.T, h *harness, pk *passkey, name string, write step) (i
 }
 
 // accountBatchLen is the number of statements of the account write: the
-// first-run invitation's secret and row, the user, the administrator row of the
-// organization the invitation offers, and the passkey.
-const accountBatchLen = 5
+// first-run invitation's secret and row, the user, the organization written for
+// the account, the administrator row, and the passkey.
+const accountBatchLen = 6
+
+// The positions of the statements of the account batch that are not the user's
+// or the passkey's.
+const (
+	accountUser     = 2
+	accountOrg      = 3
+	accountOrgAdmin = 4
+	accountPasskey  = 5
+)
 
 // accepted is the answer of the account write when it took effect.
 func accepted() step {
@@ -170,7 +179,7 @@ func accepted() step {
 
 // accountOf is the user and passkey statements of an account batch, which every
 // check of what registration wrote reads, without the first-run invitation's
-// two inserts that precede them and the administrator row between them. A batch
+// two inserts that precede them and the organization statements between them. A batch
 // of any other length is returned unchanged, so a test fails on its length and
 // not on an index.
 func accountOf(batch []store.Statement) []store.Statement {
@@ -178,7 +187,7 @@ func accountOf(batch []store.Statement) []store.Statement {
 		return batch
 	}
 
-	return []store.Statement{batch[accountBatchLen-3], batch[accountBatchLen-1]}
+	return []store.Statement{batch[accountUser], batch[accountPasskey]}
 }
 
 // credentialRowOf is the row the credential lookup answers for what a
@@ -260,7 +269,7 @@ func TestRegistrationWritesWhatTheSchemaAndLoginExpect(t *testing.T) {
 		}
 	})
 
-	t.Run("the organization the invitation may offer", func(t *testing.T) {
+	t.Run("the organization the account is given", func(t *testing.T) {
 		t.Parallel()
 
 		checkOrgBinds(t, h.lastCall(), user)
@@ -292,23 +301,56 @@ func TestRegistrationWritesWhatTheSchemaAndLoginExpect(t *testing.T) {
 	})
 }
 
-// checkOrgBinds checks that the user insert and the administrator insert after
-// it bind the kind and the role the store owns, and that the administrator row
-// is for the account just inserted.
+// checkOrgBinds checks the statements about the account's organization: the
+// organization is written with the kind the store owns, a name that is the
+// account's followed by "'s org", the account as its creator and a fresh UUIDv7 that the routes
+// accept back; the user is written with, and the organization insert is
+// conditional on, that same organization; and the administrator row is for that
+// account and the role the store owns.
 func checkOrgBinds(t *testing.T, batch []store.Statement, user []any) {
 	t.Helper()
 
-	admin := batch[accountBatchLen-2].Args
+	org, admin := batch[accountOrg].Args, batch[accountOrgAdmin].Args
 
-	if user[userArgOrgKind] != store.OrgKindStandard {
-		t.Errorf("the user insert binds the organization kind %v, want %s", user[userArgOrgKind], store.OrgKindStandard)
+	if len(org) != 6 || len(admin) != 3 {
+		t.Fatalf("the organization statements bind %d and %d arguments, want 6 and 3", len(org), len(admin))
 	}
 
-	if len(admin) != 4 || admin[1] != user[userArgID] || admin[2] != store.OrgKindStandard ||
-		admin[3] != store.OfferRoleAdmin {
-		t.Errorf("the administrator insert binds %v, want the account, %s and %s",
-			admin, store.OrgKindStandard, store.OfferRoleAdmin)
+	checkOrgInsert(t, org, user)
+
+	if user[userArgOrg] != org[0] || org[5] != org[0] {
+		t.Errorf("the user is written with organization %v and the insert is conditional on %v, want %v",
+			user[userArgOrg], org[5], org[0])
 	}
+
+	if admin[0] != user[4] || admin[1] != user[userArgID] || admin[2] != store.OrgRoleAdmin {
+		t.Errorf("the administrator insert binds %v, want the creation time, the account and %s", admin, store.OrgRoleAdmin)
+	}
+}
+
+// checkOrgInsert checks the arguments of the statement that creates the
+// account's organization, and that they fit the columns they are written to.
+func checkOrgInsert(t *testing.T, org, user []any) {
+	t.Helper()
+
+	_, err := input.ParseID(asText(org[0]))
+	if !uuidV7.MatchString(asText(org[0])) || err != nil || org[0] == user[userArgID] {
+		t.Errorf("organization id = %v, want a fresh UUIDv7 that the path parser accepts back (%v)", org[0], err)
+	}
+
+	wantName := registeredName + "'s org"
+
+	if org[1] != store.OrgKindStandard || org[2] != wantName || org[3] != user[4] || org[4] != user[userArgID] {
+		t.Errorf("the organization binds %v, want %s named %q, created with the account %v at %v",
+			org[1:], store.OrgKindStandard, wantName, user[userArgID], user[4])
+	}
+
+	const nameBound = `length\(cast\(name AS BLOB\)\) BETWEEN 1 AND (\d+)\), created_by TEXT NOT NULL REFERENCES users`
+
+	checkFits(t, []fit{
+		{"organization id", `CHECK \(length\(id\) = (\d+)`, org[0], true},
+		{"organization name", nameBound, org[2], false},
+	})
 }
 
 // checkFirstRunInserts checks the two statements that open an account batch,

@@ -50,10 +50,8 @@ type Deps struct {
 type WhoAmIResponse struct {
 	UserID string `json:"userId"`
 	Role   string `json:"role"`
-	// OrgID is the standard organization the account belongs to now. It is
-	// absent, like the other optional members of the API, when the account
-	// belongs to none.
-	OrgID string `json:"orgId,omitempty"`
+	// OrgID is the standard organization the account belongs to.
+	OrgID string `json:"orgId"`
 	// ExpiresAt is when this session ends, in Unix seconds.
 	ExpiresAt int64 `json:"expiresAt"`
 }

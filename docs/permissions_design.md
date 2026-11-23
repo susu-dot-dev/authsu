@@ -20,7 +20,7 @@ The design keeps one rule throughout: **each layer can only narrow the ones abov
 
 **The user's role is the primary security gate, and a scope never grants what the role does not.** Scopes exist to restrict a credential further, never to extend it. An admin scope is usable only with the administrator role *and* the scope: the route boundary checks the role whenever a route needs an admin scope, so a route cannot be declared with an admin scope and forget the role. A member whose credential names every admin scope gets nothing from them. This is also why nothing needs to stop a user writing any scope onto their own agent: a scope the user could not use anyway is harmless.
 
-Because the role gates, it is not part of the scope intersection below. It is read live on every request ([users_design.md](users_design.md)).
+Administering an organization is likewise a gate, held as a relation to that organization and not as a scope ([orgs_design.md](orgs_design.md)). Because the role gates, it is not part of the scope intersection below. It is read live on every request ([users_design.md](users_design.md)).
 
 ## Scopes and bundles
 
@@ -36,14 +36,14 @@ A **bundle** is a named set of scopes defined in code. Bundles do not contain ot
 | Bundle | Holds | Used for |
 |---|---|---|
 | `default:session` | every scope | every session |
-| `default:user` | every scope that is not an admin scope | a user's own API keys |
+| `default:user` | every scope that is not an admin scope, except `member:revoke` | a user's own API keys |
 | `default:agent` | `agent:read` | an agent and its keys |
 
-Tests require `default:session` to hold every scope and `default:user` every non-admin one, so a new scope cannot be left out of them silently.
+Tests require `default:session` to hold every scope and `default:user` every non-admin one but `member:revoke`, so a new scope cannot be left out of them silently.
 
 A scope list can name individual scopes, bundles, or both. Bundles are **expanded when a request is checked**, not when a list is written, so adding a scope to a bundle reaches every agent and credential that names it. Listing scopes individually is how to opt out: an explicit list never changes.
 
-The default bundles are where "elevated, never a default" lives. `default:user` includes `agent:create`, because users are expected to create agents rather than hand their own keys to software. `default:agent` does not, so an agent can create agents only if that is named for it.
+The default bundles are where "elevated, never a default" lives. `default:user` includes `agent:create`, because users are expected to create agents rather than hand their own keys to software. `default:agent` does not, so an agent can create agents only if that is named for it. `default:user` leaves out `member:revoke`, which revokes other people's accounts: a session has it, and a user who wants a key with that power names it.
 
 Unknown names are refused wherever a list is written, because a typo should fail loudly rather than produce a credential that silently can do nothing. Reading is the opposite: a name the code no longer knows grants nothing, so removing a scope only ever removes access. Lists are parsed once, refused whole when invalid, bounded in length, and kept exactly as written.
 
@@ -83,7 +83,7 @@ Some requirements are about *what kind of credential* is in use, not what it is 
 
 - **A session**: the credential came from a passkey ceremony, so a person was present. Issuing keys requires this.
 - **The administrator role**, for any route that needs an admin scope, checked together with the scope.
-- **An agent is acting**: every credential an agent holds names the agent, so a route can refuse agents whatever scopes they hold. Renaming and revoking an agent do, because agents are flat under their user.
+- **An agent is acting**: every credential an agent holds names the agent, so a route can refuse agents whatever scopes they hold. Renaming and revoking an agent do, because agents are flat under their user. So do the actions that change who administers an organization or who is revoked.
 
 A route declares all of this as data, so reviewing permissions is reading a table, and leaving it out fails when the routes are built. The checks run in a fixed order, all after the credential is known to be valid: the role for an admin scope, then the scope, then session-only, then agents.
 

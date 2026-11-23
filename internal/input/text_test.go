@@ -87,6 +87,53 @@ func TestParseInvitationLabel(t *testing.T) {
 	runStringTable(t, textCases(labelSpec()), parseLabel, input.CodeInvalidLabel)
 }
 
+// TestEveryAccountNameIsAnOrgName holds that the organization created for an
+// account can always be named after it: for every account name the parser
+// accepts, of the cases of every text rule, "<name>'s org" is accepted by the
+// organization name's parser, and OrgNameOf produces exactly that.
+func TestEveryAccountNameIsAnOrgName(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range textCases(accountNameSpec()) {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			requireAccountNameIsOrgName(t, tc.in)
+		})
+	}
+}
+
+// requireAccountNameIsOrgName checks one raw value: if it is an account name it
+// is an organization name with the suffix, and the conversion adds only that.
+func requireAccountNameIsOrgName(t *testing.T, raw string) {
+	t.Helper()
+
+	name, err := input.ParseAccountName(raw)
+	if err != nil {
+		return
+	}
+
+	want := raw + "'s org"
+
+	org, err := input.ParseOrgName(want)
+	if err != nil {
+		t.Fatalf("the personal organization name %q is not an organization name: %v", want, err)
+	}
+
+	if got := input.OrgNameOf(name); got != org || got.String() != want {
+		t.Fatalf("OrgNameOf(%q) = %q, want %q", raw, got.String(), want)
+	}
+}
+
+// FuzzEveryAccountNameIsAnOrgName is the same property over arbitrary text.
+func FuzzEveryAccountNameIsAnOrgName(f *testing.F) {
+	for _, seed := range seedsOf(textCases(accountNameSpec())) {
+		f.Add(seed)
+	}
+
+	f.Fuzz(requireAccountNameIsOrgName)
+}
+
 // TestTextBoundsFitTheSchema pins the arithmetic the bound constants rely on.
 func TestTextBoundsFitTheSchema(t *testing.T) {
 	t.Parallel()

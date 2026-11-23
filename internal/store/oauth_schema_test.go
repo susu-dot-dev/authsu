@@ -139,9 +139,9 @@ func oauthSchemaBounds(t *testing.T) []bound {
 				`AND instr\(nonce, char\(0\)\) = 0 AND length\(cast\(nonce AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)\)`,
 			lowest: 1, highest: len(oauthWorstNonce(t).String()), exact: false},
 		// The client an agent is kept for is the grant's client_id, so it has that
-		// bound (migration 0002).
+		// bound.
 		{name: "agents.first_party_client bytes",
-			pattern: `ADD COLUMN first_party_client TEXT CHECK \(first_party_client IS NULL OR \(first_party = 1 ` +
+			pattern: `first_party_client TEXT CHECK \(first_party_client IS NULL OR \(first_party = 1 ` +
 				`AND typeof\(first_party_client\) = 'text' AND instr\(first_party_client, char\(0\)\) = 0 ` +
 				`AND length\(cast\(first_party_client AS BLOB\)\) BETWEEN (\d+) AND (\d+)\)\)`,
 			lowest: 1, highest: len(oauthWorstClientID(t).String()), exact: false},
@@ -314,12 +314,12 @@ func TestOAuthMigrationShape(t *testing.T) {
 			pattern: `CREATE INDEX oauth_grants_user_id ON oauth_grants \(user_id, id\);`},
 		{name: "an agent's grants are found to revoke them",
 			pattern: `CREATE INDEX oauth_grants_agent_id ON oauth_grants \(agent_id\);`},
-		// Migration 0002: what the first-party login's agent relies on. The flag is
-		// 0 for every agent that exists, and the unique index is what makes the
-		// consent write's ON CONFLICT DO NOTHING find the agent a user already has
-		// for a client, and not create a second.
+		// What the first-party login's agent relies on. The flag is 0 for an
+		// ordinary agent, and the unique index is what makes the consent write's ON
+		// CONFLICT DO NOTHING find the agent a user already has for a client, and
+		// not create a second.
 		{name: "an agent is not first-party by default",
-			pattern: `ALTER TABLE agents ADD COLUMN first_party INTEGER NOT NULL DEFAULT 0 CHECK \(first_party IN \(0, 1\)\);`},
+			pattern: `first_party INTEGER NOT NULL DEFAULT 0 CHECK \(first_party IN \(0, 1\)\),`},
 		{name: "a client is recorded only for a first-party agent",
 			pattern: `first_party_client IS NULL OR \(first_party = 1 AND`},
 		{name: "a user has one active agent for a client, among those that have one",

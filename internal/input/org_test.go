@@ -11,7 +11,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/input"
 )
 
-// The organization kind and offer role are closed sets that the parsers own:
+// The organization kind and invitation role are closed sets that the parsers own:
 // each table lists every spelling a client might try, and only the exact values
 // are accepted. A refusal is the type's one fixed text, so it cannot echo the
 // input.
@@ -53,31 +53,16 @@ func enumCases(members ...string) []parseCase {
 	return cases
 }
 
-func parseOrgKind(raw string) (string, error) {
-	return strAdapter(input.ParseOrgKind, input.OrgKind.String)(raw)
-}
-
 func parseOrgRole(raw string) (string, error) {
 	return strAdapter(input.ParseOrgRole, input.OrgRole.String)(raw)
-}
-
-func TestParseOrgKind(t *testing.T) {
-	t.Parallel()
-
-	cases := append(enumCases(input.OrgKinds()...),
-		// The other enumeration's words are not kinds.
-		parseCase{"a role is not a kind", input.OrgRoleMember, false},
-		parseCase{"the admin role is not a kind", input.OrgRoleAdmin, false},
-	)
-
-	runStringTable(t, cases, parseOrgKind, input.CodeInvalidOrgKind)
 }
 
 func TestParseOrgRole(t *testing.T) {
 	t.Parallel()
 
 	cases := append(enumCases(input.OrgRoles()...),
-		parseCase{"a kind is not a role", input.OrgKindStandard, false},
+		// A kind is not a role.
+		parseCase{"the standard kind is not a role", input.OrgKindStandard, false},
 		parseCase{"the sandbox kind is not a role", input.OrgKindSandbox, false},
 		// The platform's own role spelling is a different thing.
 		parseCase{"owner", "owner", false},
@@ -86,10 +71,10 @@ func TestParseOrgRole(t *testing.T) {
 	runStringTable(t, cases, parseOrgRole, input.CodeInvalidOrgRole)
 }
 
-// TestOrgEnumerationsAreStated holds the sets to what the constants say, so a
-// value added to one place and not the other is noticed: every listed value
-// parses, is distinct, and appears in the fixed refusal text a client reads.
-func TestOrgEnumerationsAreStated(t *testing.T) {
+// TestOrgRolesAreStated holds the set to what the constants say, so a value added
+// to one place and not the other is noticed: every listed value parses and
+// appears in the fixed refusal text a client reads.
+func TestOrgRolesAreStated(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -99,7 +84,6 @@ func TestOrgEnumerationsAreStated(t *testing.T) {
 		code   string
 		want   []string
 	}{
-		{"kind", input.OrgKinds(), parseOrgKind, input.CodeInvalidOrgKind, []string{"standard", "sandbox"}},
 		{"role", input.OrgRoles(), parseOrgRole, input.CodeInvalidOrgRole, []string{"member", "admin"}},
 	}
 
@@ -128,45 +112,34 @@ func TestOrgEnumerationsAreStated(t *testing.T) {
 	}
 }
 
-// TestOrgEnumerationsReturnCopies holds that a caller cannot change the sets.
-func TestOrgEnumerationsReturnCopies(t *testing.T) {
+// TestOrgRolesReturnCopies holds that a caller cannot change the set.
+func TestOrgRolesReturnCopies(t *testing.T) {
 	t.Parallel()
-
-	kinds := input.OrgKinds()
-	kinds[0] = "tampered"
 
 	roles := input.OrgRoles()
 	roles[0] = "tampered"
 
-	if input.OrgKinds()[0] != input.OrgKindStandard || input.OrgRoles()[0] != input.OrgRoleMember {
-		t.Error("OrgKinds or OrgRoles returned a shared slice")
+	if input.OrgRoles()[0] != input.OrgRoleMember {
+		t.Error("OrgRoles returned a shared slice")
 	}
 }
 
-// TestOrgPredicates holds Sandbox and Admin, and that the zero values are
-// neither a kind nor a role.
-func TestOrgPredicates(t *testing.T) {
+// TestOrgRoleAdmin holds Admin, and that the zero value is not a role.
+func TestOrgRoleAdmin(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		kind      string
-		role      string
-		isSandbox bool
-		isAdmin   bool
+		name    string
+		role    string
+		isAdmin bool
 	}{
-		{"standard member", input.OrgKindStandard, input.OrgRoleMember, false, false},
-		{"sandbox admin", input.OrgKindSandbox, input.OrgRoleAdmin, true, true},
+		{"member", input.OrgRoleMember, false},
+		{"admin", input.OrgRoleAdmin, true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-
-			kind, err := input.ParseOrgKind(test.kind)
-			if err != nil || kind.Sandbox() != test.isSandbox {
-				t.Errorf("kind %q: Sandbox() = %v, %v; want %v", test.kind, kind.Sandbox(), err, test.isSandbox)
-			}
 
 			role, err := input.ParseOrgRole(test.role)
 			if err != nil || role.Admin() != test.isAdmin {
@@ -175,18 +148,16 @@ func TestOrgPredicates(t *testing.T) {
 		})
 	}
 
-	var (
-		kind input.OrgKind
-		role input.OrgRole
-	)
+	var role input.OrgRole
 
-	if kind.String() != "" || kind.Sandbox() || role.String() != "" || role.Admin() {
-		t.Error("the zero OrgKind or OrgRole is a value")
+	if role.String() != "" || role.Admin() {
+		t.Error("the zero OrgRole is a value")
 	}
 }
 
 // TestOrgEnumerationsFitTheSchema holds the longest value of each set inside
-// the CHECK of the column it is stored in.
+// the CHECK of the column it is stored in. The kinds are the two constants: no
+// parser enumerates them, because a client never names one.
 func TestOrgEnumerationsFitTheSchema(t *testing.T) {
 	t.Parallel()
 
@@ -195,11 +166,11 @@ func TestOrgEnumerationsFitTheSchema(t *testing.T) {
 		values  []string
 		pattern string
 	}{
-		{"orgs.kind", input.OrgKinds(),
+		{"orgs.kind", []string{input.OrgKindStandard, input.OrgKindSandbox},
 			`CREATE TABLE orgs \(.*? kind TEXT NOT NULL CHECK \(typeof\(kind\) = 'text' ` +
 				`AND length\(kind\) BETWEEN \d+ AND (\d+)\)`},
-		{"org_offers.role", input.OrgRoles(),
-			`CREATE TABLE org_offers \(.*? role TEXT NOT NULL CHECK \(typeof\(role\) = 'text' ` +
+		{"invitation_orgs.role", input.OrgRoles(),
+			`CREATE TABLE invitation_orgs \(.*? role TEXT NOT NULL CHECK \(typeof\(role\) = 'text' ` +
 				`AND length\(role\) BETWEEN \d+ AND (\d+)\)`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -220,44 +191,39 @@ func orgSetOracle(members ...string) func(string) bool {
 	return func(s string) bool { return slices.Contains(members, s) }
 }
 
-func FuzzParseOrgKind(f *testing.F) {
-	fuzzString(f, seedsOf(enumCases(input.OrgKinds()...)), input.ParseOrgKind, input.OrgKind.String,
-		input.CodeInvalidOrgKind, orgSetOracle(input.OrgKinds()...))
-}
-
 func FuzzParseOrgRole(f *testing.F) {
 	fuzzString(f, seedsOf(enumCases(input.OrgRoles()...)), input.ParseOrgRole, input.OrgRole.String,
 		input.CodeInvalidOrgRole, orgSetOracle(input.OrgRoles()...))
 }
 
-const offerTestOrg = "00000000-0000-7000-8000-0000000000f1"
+const invitationTestOrg = "00000000-0000-7000-8000-0000000000f1"
 
-// TestParseOrgOffer holds every combination of the two optional fields: neither
-// is no offer, one without the other is refused naming the missing one (before
+// TestParseInvitationOrg holds every combination of the two optional fields: neither
+// is none, one without the other is refused naming the missing one (before
 // the value given is looked at), and a value given is parsed as its own type
 // parses it, the organization first.
-func TestParseOrgOffer(t *testing.T) {
+func TestParseInvitationOrg(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		id      *string
-		role    *string
-		offered bool
-		code    string
+		name  string
+		id    *string
+		role  *string
+		named bool
+		code  string
 	}{
 		{"neither", nil, nil, false, ""},
-		{"a member offer", new(offerTestOrg), new("member"), true, ""},
-		{"an admin offer", new(offerTestOrg), new("admin"), true, ""},
+		{"a member invitation", new(invitationTestOrg), new("member"), true, ""},
+		{"an admin invitation", new(invitationTestOrg), new("admin"), true, ""},
 		{"a role with no organization", nil, new("member"), false, input.CodeMissingOrgID},
 		{"an invalid role with no organization", nil, new("owner"), false, input.CodeMissingOrgID},
-		{"an organization with no role", new(offerTestOrg), nil, false, input.CodeMissingOrgRole},
+		{"an organization with no role", new(invitationTestOrg), nil, false, input.CodeMissingOrgRole},
 		{"an invalid organization with no role", new("nope"), nil, false, input.CodeMissingOrgRole},
-		{"an empty role is a role", new(offerTestOrg), new(""), false, input.CodeInvalidOrgRole},
+		{"an empty role is a role", new(invitationTestOrg), new(""), false, input.CodeInvalidOrgRole},
 		{"an empty organization is an organization", new(""), new("member"), false, input.CodeInvalidID},
 		{"an invalid organization", new("nope"), new("member"), false, input.CodeInvalidID},
-		{"an invalid role", new(offerTestOrg), new("owner"), false, input.CodeInvalidOrgRole},
-		{"a role in other case", new(offerTestOrg), new("Admin"), false, input.CodeInvalidOrgRole},
+		{"an invalid role", new(invitationTestOrg), new("owner"), false, input.CodeInvalidOrgRole},
+		{"a role in other case", new(invitationTestOrg), new("Admin"), false, input.CodeInvalidOrgRole},
 		{"both invalid: the organization is refused first", new("nope"), new("owner"), false, input.CodeInvalidID},
 	}
 
@@ -265,11 +231,11 @@ func TestParseOrgOffer(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			offer, err := input.ParseOrgOffer(test.id, test.role)
+			named, err := input.ParseInvitationOrg(test.id, test.role)
 
 			if test.code != "" {
 				requireRefusal(t, err, test.code)
-				requireOffer(t, offer, nil, nil, false)
+				requireInvitationOrg(t, named, nil, nil, false)
 
 				return
 			}
@@ -278,43 +244,43 @@ func TestParseOrgOffer(t *testing.T) {
 				t.Fatalf("err = %v", err)
 			}
 
-			requireOffer(t, offer, test.id, test.role, test.offered)
+			requireInvitationOrg(t, named, test.id, test.role, test.named)
 		})
 	}
 }
 
-// requireOffer checks an offer: what it reports, and that it carries the id and
+// requireInvitationOrg checks a parsed value: what it reports, and that it carries the id and
 // the role it was given, or nothing (the zero value) when it is none.
-func requireOffer(t *testing.T, offer input.OrgOffer, id, role *string, offered bool) {
+func requireInvitationOrg(t *testing.T, got input.InvitationOrg, id, role *string, want bool) {
 	t.Helper()
 
 	wantID, wantRole := "", ""
-	if offered {
+	if want {
 		wantID, wantRole = *id, *role
 	}
 
-	if offer.Offered() != offered || offer.OrgID().String() != wantID || offer.Role().String() != wantRole {
-		t.Errorf("offer = %v, %q, %q; want %v, %q, %q",
-			offer.Offered(), offer.OrgID().String(), offer.Role().String(), offered, wantID, wantRole)
+	if got.Named() != want || got.OrgID().String() != wantID || got.Role().String() != wantRole {
+		t.Errorf("parsed = %v, %q, %q; want %v, %q, %q",
+			got.Named(), got.OrgID().String(), got.Role().String(), want, wantID, wantRole)
 	}
 }
 
-// TestParseOrgOfferMissingDescriptions holds that each missing field has its own
+// TestParseInvitationOrgMissingDescriptions holds that each missing field has its own
 // fixed text, which names the field.
-func TestParseOrgOfferMissingDescriptions(t *testing.T) {
+func TestParseInvitationOrgMissingDescriptions(t *testing.T) {
 	t.Parallel()
 
-	_, err := input.ParseOrgOffer(nil, new("member"))
+	_, err := input.ParseInvitationOrg(nil, new("member"))
 	requireFixedRefusal(t, err, input.CodeMissingOrgID, "orgId is required with orgRole")
 
-	_, err = input.ParseOrgOffer(new(offerTestOrg), nil)
+	_, err = input.ParseInvitationOrg(new(invitationTestOrg), nil)
 	requireFixedRefusal(t, err, input.CodeMissingOrgRole, "orgRole is required with orgId")
 }
 
-// FuzzParseOrgOffer holds that an accepted offer is exactly what was given, and
-// that anything refused carries one of the offer's codes.
-func FuzzParseOrgOffer(f *testing.F) {
-	for _, id := range []string{"", offerTestOrg, "nope"} {
+// FuzzParseInvitationOrg holds that an accepted value is exactly what was given, and
+// that anything refused carries one of the codes of the pair.
+func FuzzParseInvitationOrg(f *testing.F) {
+	for _, id := range []string{"", invitationTestOrg, "nope"} {
 		for _, role := range input.OrgRoles() {
 			f.Add(id, role, true, true)
 		}
@@ -333,27 +299,27 @@ func FuzzParseOrgOffer(f *testing.F) {
 			rolep = &role
 		}
 
-		offer, err := input.ParseOrgOffer(idp, rolep)
+		named, err := input.ParseInvitationOrg(idp, rolep)
 		if err != nil {
-			requireOfferCode(t, err)
+			requireInvitationOrgCode(t, err)
 
 			return
 		}
 
-		requireOffer(t, offer, idp, rolep, hasID || hasRole)
+		requireInvitationOrg(t, named, idp, rolep, hasID || hasRole)
 	})
 }
 
-// requireOfferCode fails the test unless err is a refusal with one of the
-// offer's codes.
-func requireOfferCode(t *testing.T, err error) {
+// requireInvitationOrgCode fails the test unless err is a refusal with one of the
+// codes of the pair.
+func requireInvitationOrgCode(t *testing.T, err error) {
 	t.Helper()
 
 	refusal, isClient := errors.AsType[*apierr.Error](err)
 	if !isClient || !slices.Contains([]string{
 		input.CodeMissingOrgID, input.CodeMissingOrgRole, input.CodeInvalidID, input.CodeInvalidOrgRole,
 	}, refusal.Code) {
-		t.Fatalf("refused with %v, which is not one of the offer's codes", err)
+		t.Fatalf("refused with %v, which is not one of the codes of the pair", err)
 	}
 }
 

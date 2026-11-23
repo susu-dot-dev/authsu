@@ -25,23 +25,11 @@ const (
 
 	// The ids the organization tests name. The platform administrator's role is
 	// bound as an argument, and these are its test spelling.
-	orgTestID  = "01890000-0000-7000-8000-0000000000b1"
-	callerID   = "01890000-0000-7000-8000-000000000001"
-	targetID   = "01890000-0000-7000-8000-000000000002"
-	offerTestI = "01890000-0000-7000-8000-0000000000c1"
-	adminRole  = "admin"
+	orgTestID = "01890000-0000-7000-8000-0000000000b1"
+	callerID  = "01890000-0000-7000-8000-000000000001"
+	targetID  = "01890000-0000-7000-8000-000000000002"
+	adminRole = "admin"
 )
-
-func orgKindOf(tb testing.TB, raw string) input.OrgKind {
-	tb.Helper()
-
-	kind, err := input.ParseOrgKind(raw)
-	if err != nil {
-		tb.Fatalf("parse org kind %q: %v", raw, err)
-	}
-
-	return kind
-}
 
 func orgNameOf(tb testing.TB, raw string) input.OrgName {
 	tb.Helper()
@@ -52,17 +40,6 @@ func orgNameOf(tb testing.TB, raw string) input.OrgName {
 	}
 
 	return name
-}
-
-func orgRoleOf(tb testing.TB, raw string) input.OrgRole {
-	tb.Helper()
-
-	role, err := input.ParseOrgRole(raw)
-	if err != nil {
-		tb.Fatalf("parse org role %q: %v", raw, err)
-	}
-
-	return role
 }
 
 func orgCursorOf(tb testing.TB, values ...string) input.Cursor {
@@ -98,22 +75,53 @@ func batchOf(n int, rows map[int][][]any) outcome {
 	return outcome{results: results, err: nil}
 }
 
-// orgRowOf is the row of an organization: id, kind, name, created_by,
-// expires_at, revoked_at, created_at.
-func orgRowOf(id, kind string, expires, revoked any) []any {
-	return row(id, kind, "Acme", callerID, expires, revoked, int64(1_700_000_000))
+// callerIs sets the last statement of a batch, the caller's standing
+// (callerStandingQuery), to a row of one column: whether the caller is revoked.
+func callerIs(revoked int64, out outcome) outcome {
+	results := slices.Clone(out.results)
+	results[len(results)-1] = store.Result{Changes: 0, Rows: [][]any{row(revoked)}}
+
+	return outcome{results: results, err: out.err}
 }
 
-// standardRow and sandboxRow are an active organization and a sandbox that
+// callerDefectCases are the ways the caller's standing, the last of a batch of
+// n statements, can fail to be one row of one flag, when no write said why:
+// every one is a defect and never a guess at which refusal it was.
+func callerDefectCases[T any](n int) []opCase[T] {
+	return []opCase[T]{
+		{name: "the caller's standing has a column too many",
+			out: batchOf(n, map[int][][]any{n - 1: {row(int64(1), int64(1))}}), defect: true},
+		{name: "the caller's standing is not a flag", out: callerIs(2, batchOf(n, nil)), defect: true},
+		{name: "the caller's standing is text", out: batchOf(n, map[int][][]any{n - 1: {row("1")}}), defect: true},
+		{name: "two caller standing rows", out: batchOf(n, map[int][][]any{n - 1: {row(int64(1)), row(int64(1))}}),
+			defect: true},
+	}
+}
+
+// callerStandingStatement is the wanted last statement of a write that can be
+// refused: the caller's standing, with the caller's id as its one argument.
+func callerStandingStatement() wantStatement {
+	return wantStatement{
+		fragments: []string{"SELECT u.revoked_at IS NOT NULL AS revoked FROM users u WHERE u.id = ?1"},
+		args:      []any{callerID},
+	}
+}
+
+// orgRowOf is the row of an organization: id, kind, name, created_by,
+// expires_at, created_at.
+func orgRowOf(id, kind string, expires any) []any {
+	return row(id, kind, "Acme", callerID, expires, int64(1_700_000_000))
+}
+
+// standardRow and sandboxRow are a standard organization and a sandbox that
 // expires at the given time.
-func standardRow() []any                   { return orgRowOf(orgTestID, store.OrgKindStandard, nil, nil) }
-func sandboxRow(at int64) []any            { return orgRowOf(orgTestID, store.OrgKindSandbox, at, nil) }
-func revokedRow(at int64) []any            { return orgRowOf(orgTestID, store.OrgKindStandard, nil, at) }
+func standardRow() []any                   { return orgRowOf(orgTestID, store.OrgKindStandard, nil) }
+func sandboxRow(at int64) []any            { return orgRowOf(orgTestID, store.OrgKindSandbox, at) }
 func standing(of []any, admin int64) []any { return append(slices.Clip(of), admin) }
 
 // orgKinds are the column kinds of an organization row, for defectResults.
 func orgKinds() []string {
-	return []string{"text", "text", "text", "text", "optInteger", "optInteger", "integer"}
+	return []string{"text", "text", "text", "text", "optInteger", "integer"}
 }
 
 // opCase is one outcome of an operation: what the fake database answers, and
@@ -183,13 +191,17 @@ func rowDefectCases[T any](n, at int, valid []any, kinds ...string) []opCase[T] 
 	return cases
 }
 
-// runOpFailures holds how a failed or malformed batch of n statements is
-// reported. No operation here writes a constraint a client could cause, so a
-// conflict is the schema disagreeing with the code and is the "_rejected" 500.
-func runOpFailures(t *testing.T, n int, failed, rejected string, call func(*store.Store) error) {
+// orgWriteStatements is the length of the batch of every write that can be
+// refused: the write, why it was refused, and the caller's standing.
+const orgWriteStatements = 3
+
+// runOpFailures holds how a failed or malformed batch of an organization or member
+// write is reported. No operation here writes a constraint a client could cause,
+// so a conflict is the schema disagreeing with the code and is the "_rejected" 500.
+func runOpFailures(t *testing.T, failed, rejected string, call func(*store.Store) error) {
 	t.Helper()
 
-	runDefectFailures(t, n, failed, rejected, orgsDescription, call)
+	runDefectFailures(t, orgWriteStatements, failed, rejected, orgsDescription, call)
 }
 
 // longAt is an instant well after now, as a sandbox's expiry in a row.
@@ -198,135 +210,98 @@ const longAt = int64(1_900_000_456)
 // soonAt is when a sandbox created at now expires.
 func soonAt() time.Time { return now.Add(7 * 24 * time.Hour) }
 
-// createCall is CreateOrg of the kind with the largest values it can carry.
-func createCall(t *testing.T, kind string) func(*store.Store) (store.Org, error) {
+// createCall is CreateSandbox with the largest values it can carry.
+func createCall(t *testing.T) func(*store.Store) (store.Org, error) {
 	t.Helper()
 
 	return func(s *store.Store) (store.Org, error) {
-		return s.CreateOrg(context.Background(), store.NewOrg{
-			ID: orgTestID, Kind: orgKindOf(t, kind), Name: orgNameOf(t, "Acme"), Creator: callerID, ExpiresAt: soonAt(),
-			Limit: 5, CreatedAt: now,
+		return s.CreateSandbox(context.Background(), store.NewSandbox{
+			ID: orgTestID, Name: orgNameOf(t, "Acme"), Creator: callerID, ExpiresAt: soonAt(), Limit: 5, CreatedAt: now,
 		})
 	}
 }
 
-// TestCreateOrgOutcomes: the row the insert returned is the organization, and
-// otherwise the creator's standing says why: gone or revoked first, then
-// already a member (for a standard organization only), and what is left is the
-// limit.
-func TestCreateOrgOutcomes(t *testing.T) {
+// TestCreateSandboxOutcomes: the row the insert returned is the sandbox, and
+// otherwise the creator's standing says why: gone or revoked first, and what is
+// left is the limit.
+func TestCreateSandboxOutcomes(t *testing.T) {
 	t.Parallel()
 
-	stored := store.Org{
-		ID: orgTestID, Kind: store.OrgKindStandard, Name: "Acme", CreatedBy: callerID, CreatedAt: 1_700_000_000,
-	}
 	expires := longAt
-	sandbox := stored
-	sandbox.Kind, sandbox.ExpiresAt = store.OrgKindSandbox, &expires
-
-	refused := func(revoked, member int64) outcome {
-		return batchOf(4, map[int][][]any{3: {row(revoked, member)}})
+	stored := store.Org{
+		ID: orgTestID, Kind: store.OrgKindSandbox, Name: "Acme", CreatedBy: callerID, ExpiresAt: &expires,
+		CreatedAt: 1_700_000_000,
 	}
+
+	refused := func(revoked int64) outcome { return batchOf(3, map[int][][]any{2: {row(revoked)}}) }
 
 	cases := []opCase[store.Org]{
-		{name: "a standard organization was created", out: batchOf(4, map[int][][]any{0: {standardRow()}}), want: stored},
-		{name: "the standing is not read when it was", out: batchOf(4, map[int][][]any{
-			0: {standardRow()}, 3: {row(int64(1), int64(1))},
+		{name: "a sandbox was created", out: batchOf(3, map[int][][]any{0: {sandboxRow(longAt)}}), want: stored},
+		{name: "the standing is not read when it was", out: batchOf(3, map[int][][]any{
+			0: {sandboxRow(longAt)}, 2: {row(int64(1))},
 		}), want: stored},
-		{name: "the creator is gone", out: batchOf(4, nil), err: store.ErrAccountRevoked},
-		{name: "the creator is revoked", out: refused(1, 0), err: store.ErrAccountRevoked},
-		{name: "the creator is revoked and a member: revoked first", out: refused(1, 1), err: store.ErrAccountRevoked},
-		{name: "the creator belongs to an organization", out: refused(0, 1), err: store.ErrAlreadyMember},
-		{name: "the creator is at the limit", out: refused(0, 0), err: store.ErrOrgLimit},
+		{name: "the creator is gone", out: batchOf(3, nil), err: store.ErrAccountRevoked},
+		{name: "the creator is revoked", out: refused(1), err: store.ErrAccountRevoked},
+		{name: "the creator is at the limit", out: refused(0), err: store.ErrSandboxLimit},
 	}
 
-	cases = append(cases, rowDefectCases[store.Org](4, 0, standardRow(), orgKinds()...)...)
+	cases = append(cases, rowDefectCases[store.Org](3, 0, sandboxRow(longAt), orgKinds()...)...)
 	cases = append(cases,
-		opCase[store.Org]{name: "two rows for one id", out: batchOf(4, map[int][][]any{0: {standardRow(), standardRow()}}),
-			defect: true},
-		opCase[store.Org]{name: "the standing has a column too few", out: batchOf(4, map[int][][]any{3: {row(int64(0))}}),
-			defect: true},
-		opCase[store.Org]{name: "the standing is not a flag", out: batchOf(4, map[int][][]any{3: {row(int64(2), int64(0))}}),
-			defect: true},
-		opCase[store.Org]{name: "two standing rows", out: batchOf(4, map[int][][]any{
-			3: {row(int64(0), int64(0)), row(int64(0), int64(0))},
+		opCase[store.Org]{name: "two rows for one id", out: batchOf(3, map[int][][]any{
+			0: {sandboxRow(longAt), sandboxRow(longAt)},
+		}), defect: true},
+		opCase[store.Org]{name: "the standing has a column too many", out: batchOf(3, map[int][][]any{
+			2: {row(int64(0), int64(0))},
+		}), defect: true},
+		opCase[store.Org]{name: "the standing is not a flag", out: refused(2), defect: true},
+		opCase[store.Org]{name: "two standing rows", out: batchOf(3, map[int][][]any{
+			2: {row(int64(0)), row(int64(0))},
 		}), defect: true},
 	)
 
-	runOpCases(t, cases, store.CodeOrgCreateRejected, createCall(t, store.OrgKindStandard))
-
-	// A sandbox is refused for a member of an organization only by the limit:
-	// it needs no free membership.
-	runOpCases(t, []opCase[store.Org]{
-		{name: "a sandbox for a member of an organization is not refused for it", out: refused(0, 1), err: store.ErrOrgLimit},
-		{name: "a sandbox was created", out: batchOf(4, map[int][][]any{0: {sandboxRow(longAt)}}), want: sandbox},
-		{name: "a sandbox with a revoked creator", out: refused(1, 0), err: store.ErrAccountRevoked},
-	}, store.CodeOrgCreateRejected, createCall(t, store.OrgKindSandbox))
+	runOpCases(t, cases, store.CodeOrgCreateRejected, createCall(t))
 }
 
-// TestCreateOrgStatements pins the batch: the four statements in order, the
+// TestCreateSandboxStatements pins the batch: the three statements in order, the
 // guards that decide what each does, and the exact arguments in placeholder
-// order. The kinds are bound, and a sandbox's expiry is bound and a standard
-// organization's is NULL, as the schema's CHECKs require.
-func TestCreateOrgStatements(t *testing.T) {
+// order. The sandbox kind is bound, and so is the sandbox's expiry, as the
+// schema's CHECK requires.
+func TestCreateSandboxStatements(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		kind    string
-		expires any
-	}{
-		{name: "a standard organization", kind: store.OrgKindStandard, expires: nil},
-		{name: "a sandbox", kind: store.OrgKindSandbox, expires: soonAt().Unix()},
-	}
+	fake := newFake(batchOf(3, map[int][][]any{0: {sandboxRow(longAt)}}))
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
+	_, err := createCall(t)(fake.store())
+	checkErr(t, err, nil)
 
-			fake := newFake(batchOf(4, map[int][][]any{0: {standardRow()}}))
-
-			_, err := createCall(t, test.kind)(fake.store())
-			checkErr(t, err, nil)
-
-			checkNumberedStatements(t, fake,
-				wantStatement{
-					fragments: []string{
-						"INSERT INTO orgs (id, kind, name, created_by, expires_at, revoked_at, created_at)",
-						// The creator is read from users, unrevoked, and a standard
-						// organization needs one that belongs to none.
-						"FROM users u WHERE u.id = ?6 AND u.revoked_at IS NULL AND (?2 <> ?7 OR u.org_id IS NULL)",
-						// The limit is counted in the write: every standard organization
-						// ever created, and the sandboxes that have not expired.
-						"(SELECT count(*) FROM orgs g WHERE g.created_by = u.id AND g.kind = ?2 " +
-							"AND (?2 = ?7 OR g.expires_at > ?5)) < ?8",
-						"RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at",
-					},
-					args: []any{
-						orgTestID, test.kind, "Acme", test.expires, now.Unix(), callerID, store.OrgKindStandard, int64(5),
-					},
-				},
-				wantStatement{
-					fragments: []string{
-						"UPDATE users SET org_id = ?1 WHERE id = ?2 AND org_id IS NULL AND ?3 = ?4",
-						"AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = ?1 AND o.created_by = ?2)",
-					},
-					args: []any{orgTestID, callerID, test.kind, store.OrgKindStandard},
-				},
-				wantStatement{
-					fragments: []string{
-						"INSERT INTO org_admins (org_id, user_id, created_at)",
-						"SELECT o.id, o.created_by, ?2 FROM orgs o WHERE o.id = ?1",
-					},
-					args: []any{orgTestID, now.Unix()},
-				},
-				wantStatement{
-					fragments: []string{"SELECT u.revoked_at IS NOT NULL AS revoked, u.org_id IS NOT NULL AS member FROM users u"},
-					args:      []any{callerID},
-				},
-			)
-		})
-	}
+	checkNumberedStatements(t, fake,
+		wantStatement{
+			fragments: []string{
+				"INSERT INTO orgs (id, kind, name, created_by, expires_at, created_at)",
+				// The creator is read from users, unrevoked, and nothing about
+				// the organization it belongs to is asked: it keeps it.
+				"FROM users u WHERE u.id = ?7 AND u.revoked_at IS NULL",
+				// The limit is counted in the write: the sandboxes that have not
+				// expired, and no other kind.
+				"(SELECT count(*) FROM orgs g WHERE g.created_by = u.id AND g.kind = ?5 AND g.expires_at > ?4) < ?6",
+				"RETURNING id, kind, name, created_by, expires_at, created_at",
+			},
+			args: []any{
+				orgTestID, "Acme", soonAt().Unix(), now.Unix(), store.OrgKindSandbox, int64(5), callerID,
+			},
+		},
+		wantStatement{
+			fragments: []string{
+				"INSERT INTO org_admins (org_id, user_id, created_at)",
+				"SELECT o.id, o.created_by, ?2 FROM orgs o WHERE o.id = ?1",
+			},
+			args: []any{orgTestID, now.Unix()},
+		},
+		wantStatement{
+			fragments: []string{"SELECT u.revoked_at IS NOT NULL AS revoked FROM users u WHERE u.id = ?1"},
+			args:      []any{callerID},
+		},
+	)
 }
 
 // TestCreateSandboxJudgesTheLimitAtTheRequestSecond: the count of the sandboxes a
@@ -334,7 +309,7 @@ func TestCreateOrgStatements(t *testing.T) {
 // whose expiry is this very second is not counted, and the new sandbox's own
 // expiry is whole seconds too. A fraction of a second in the clock changes
 // neither. (The comparison itself runs in the end-to-end tests; the operator is
-// pinned in TestCreateOrgStatements.)
+// pinned in TestCreateSandboxStatements.)
 func TestCreateSandboxJudgesTheLimitAtTheRequestSecond(t *testing.T) {
 	t.Parallel()
 
@@ -343,36 +318,36 @@ func TestCreateSandboxJudgesTheLimitAtTheRequestSecond(t *testing.T) {
 			t.Parallel()
 
 			at := now.Add(fraction)
-			fake := newFake(batchOf(4, map[int][][]any{0: {sandboxRow(longAt)}}))
+			fake := newFake(batchOf(3, map[int][][]any{0: {sandboxRow(longAt)}}))
 
-			_, err := fake.store().CreateOrg(context.Background(), store.NewOrg{
-				ID: orgTestID, Kind: orgKindOf(t, store.OrgKindSandbox), Name: orgNameOf(t, "Acme"), Creator: callerID,
+			_, err := fake.store().CreateSandbox(context.Background(), store.NewSandbox{
+				ID: orgTestID, Name: orgNameOf(t, "Acme"), Creator: callerID,
 				ExpiresAt: at.Add(7 * 24 * time.Hour), Limit: 25, CreatedAt: at,
 			})
 			checkErr(t, err, nil)
 
 			insert := fake.calls[0][0]
-			if !strings.Contains(squash(insert.Query), "g.expires_at > ?5") {
-				t.Errorf("the count does not compare with ?5 strictly:\n%s", insert.Query)
+			if !strings.Contains(squash(insert.Query), "g.expires_at > ?4") {
+				t.Errorf("the count does not compare with ?4 strictly:\n%s", insert.Query)
 			}
 
-			if insert.Args[3] != now.Add(7*24*time.Hour).Unix() || insert.Args[4] != now.Unix() {
+			if insert.Args[2] != now.Add(7*24*time.Hour).Unix() || insert.Args[3] != now.Unix() {
 				t.Errorf("expiry and creation time = %v and %v, want whole seconds %d and %d",
-					insert.Args[3], insert.Args[4], now.Add(7*24*time.Hour).Unix(), now.Unix())
+					insert.Args[2], insert.Args[3], now.Add(7*24*time.Hour).Unix(), now.Unix())
 			}
 		})
 	}
 }
 
-// TestCreateOrgFailures holds how a failed or malformed batch is reported.
-func TestCreateOrgFailures(t *testing.T) {
+// TestCreateSandboxFailures holds how a failed or malformed batch is reported.
+func TestCreateSandboxFailures(t *testing.T) {
 	t.Parallel()
 
-	runOpFailures(t, 4, store.CodeOrgCreateFailed, store.CodeOrgCreateRejected,
-		func(s *store.Store) error { return lastErr(createCall(t, store.OrgKindStandard)(s)) })
+	runOpFailures(t, store.CodeOrgCreateFailed, store.CodeOrgCreateRejected,
+		func(s *store.Store) error { return lastErr(createCall(t)(s)) })
 }
 
-// TestOrgActive: an organization works unless it is revoked or its expiry has
+// TestOrgActive: an organization works unless it is a sandbox whose expiry has
 // come, and an expiry of this very second is over.
 func TestOrgActive(t *testing.T) {
 	t.Parallel()
@@ -386,7 +361,6 @@ func TestOrgActive(t *testing.T) {
 		want bool
 	}{
 		{name: "a standard organization", org: store.Org{}, want: true},
-		{name: "a revoked one", org: store.Org{RevokedAt: &at}, want: false},
 		{name: "a sandbox before its expiry", org: store.Org{ExpiresAt: &after}, want: true},
 		{name: "a sandbox at its expiry", org: store.Org{ExpiresAt: &at}, want: false},
 		{name: "a sandbox past its expiry", org: store.Org{ExpiresAt: &before}, want: false},
@@ -452,7 +426,7 @@ func TestGetOrg(t *testing.T) {
 // visible to the caller: the account is unrevoked, and is a platform
 // administrator, belongs to the organization, or administers it. Every statement
 // that asks it, for whatever the organization is called there (?1, a user's
-// organization, an offer's), has this text with its own expression for org, and
+// organization), has this text with its own expression for org, and
 // it is written out here on purpose: changing who may see an organization is a
 // change to security behaviour, and must change these lines with it.
 func seesOf(org string) []string {
@@ -498,8 +472,8 @@ func TestListOrgs(t *testing.T) {
 		}
 	}
 
-	second := orgRowOf("01890000-0000-7000-8000-0000000000b0", store.OrgKindStandard, nil, nil)
-	third := orgRowOf("01890000-0000-7000-8000-0000000000af", store.OrgKindStandard, nil, nil)
+	second := orgRowOf("01890000-0000-7000-8000-0000000000b0", store.OrgKindStandard, nil)
+	third := orgRowOf("01890000-0000-7000-8000-0000000000af", store.OrgKindStandard, nil)
 
 	wantOrg := func(id string) store.Org {
 		return store.Org{ID: id, Kind: store.OrgKindStandard, Name: "Acme", CreatedBy: callerID, CreatedAt: 1_700_000_000}
@@ -635,30 +609,36 @@ func TestRenameOrg(t *testing.T) {
 		ID: orgTestID, Kind: store.OrgKindStandard, Name: "Acme", CreatedBy: callerID, CreatedAt: 1_700_000_000,
 	}
 
-	refused := func(of []any, admin int64) outcome { return batchOf(2, map[int][][]any{1: {standing(of, admin)}}) }
+	refused := func(of []any, admin int64) outcome { return batchOf(3, map[int][][]any{1: {standing(of, admin)}}) }
 
 	cases := []opCase[store.Org]{
-		{name: "renamed", out: batchOf(2, map[int][][]any{0: {standardRow()}}), want: renamed},
-		{name: "the caller may not see it", out: batchOf(2, nil), err: store.ErrNotFound},
+		{name: "renamed", out: batchOf(3, map[int][][]any{0: {standardRow()}}), want: renamed},
+		{name: "renamed: the caller's standing is not read", out: callerIs(1, batchOf(3, map[int][][]any{
+			0: {standardRow()},
+		})), want: renamed},
+		{name: "the caller may not see it", out: batchOf(3, nil), err: store.ErrNotFound},
+		{name: "the caller may not see it, and is not revoked", out: callerIs(0, batchOf(3, nil)), err: store.ErrNotFound},
+		{name: "the caller may not see it, because they are revoked", out: callerIs(1, batchOf(3, nil)),
+			err: store.ErrAccountRevoked},
 		{name: "the caller sees it and does not administer it", out: refused(standardRow(), 0), err: store.ErrNotAdmin},
-		{name: "the organization is revoked", out: refused(revokedRow(expired), 1), err: store.ErrInactive},
-		{name: "the sandbox has expired", out: refused(sandboxRow(expired), 1), err: store.ErrInactive},
-		{name: "the sandbox expires this very second", out: refused(sandboxRow(now.Unix()), 1), err: store.ErrInactive},
+		{name: "the sandbox has expired", out: refused(sandboxRow(expired), 1), err: store.ErrExpired},
+		{name: "the sandbox expires this very second", out: refused(sandboxRow(now.Unix()), 1), err: store.ErrExpired},
 		{name: "an active organization the write did not rename is a defect",
 			out: refused(standardRow(), 1), defect: true},
 		{name: "an active sandbox the write did not rename is a defect", out: refused(sandboxRow(live), 1), defect: true},
 		{name: "the standing is not a flag", out: refused(standardRow(), 2), defect: true},
 	}
 
-	cases = append(cases, rowDefectCases[store.Org](2, 0, standardRow(), orgKinds()...)...)
-	cases = append(cases, rowDefectCases[store.Org](2, 1, standing(standardRow(), 1), append(orgKinds(), "integer")...)...)
+	cases = append(cases, callerDefectCases[store.Org](3)...)
+	cases = append(cases, rowDefectCases[store.Org](3, 0, standardRow(), orgKinds()...)...)
+	cases = append(cases, rowDefectCases[store.Org](3, 1, standing(standardRow(), 1), append(orgKinds(), "integer")...)...)
 
 	runOpCases(t, cases, store.CodeOrgUpdateRejected, call)
 
 	t.Run("the statements", func(t *testing.T) {
 		t.Parallel()
 
-		fake := newFake(batchOf(2, map[int][][]any{0: {standardRow()}}))
+		fake := newFake(batchOf(3, map[int][][]any{0: {standardRow()}}))
 
 		_, err := call(fake.store())
 		checkErr(t, err, nil)
@@ -667,114 +647,94 @@ func TestRenameOrg(t *testing.T) {
 			wantStatement{
 				fragments: append([]string{
 					"UPDATE orgs SET name = ?4 WHERE id = ?1",
-					// A revoked organization and an expired sandbox are final.
-					"AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?5) AND",
-					"RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at",
+					// An expired sandbox is final.
+					"AND (expires_at IS NULL OR expires_at > ?5) AND",
+					"RETURNING id, kind, name, created_by, expires_at, created_at",
 				}, administersFragments...),
 				args: []any{orgTestID, callerID, adminRole, "New", now.Unix()},
 			},
 			wantStatement{
 				fragments: append([]string{
-					"o.revoked_at AS revoked_at, o.created_at AS created_at, " +
+					"o.created_at AS created_at, " +
 						"EXISTS (SELECT 1 FROM (SELECT ?1 AS org_id) subject, users actor",
 					"AS administers FROM orgs o WHERE o.id = ?1 AND",
 				}, seesFragments...),
 				args: []any{orgTestID, callerID, adminRole},
 			},
+			callerStandingStatement(),
 		)
 	})
 
 	t.Run("failures", func(t *testing.T) {
 		t.Parallel()
 
-		runOpFailures(t, 2, store.CodeOrgUpdateFailed, store.CodeOrgUpdateRejected,
+		runOpFailures(t, store.CodeOrgUpdateFailed, store.CodeOrgUpdateRejected,
 			func(s *store.Store) error { return lastErr(call(s)) })
 	})
 }
 
-// TestRevokeOrg: a returned row from the revoking update is a revoked standard
-// organization, one from the sandbox delete is a deleted sandbox, and otherwise
-// the standing statement says why neither happened.
+// TestDeleteSandbox: a returned row from the delete is the deleted sandbox, and
+// otherwise the standing statement says why nothing was deleted.
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
-func TestRevokeOrg(t *testing.T) {
+func TestDeleteSandbox(t *testing.T) {
 	t.Parallel()
 
-	call := func(s *store.Store) (store.OrgEnd, error) {
-		return s.RevokeOrg(context.Background(), mustUserID(t, orgTestID), callerID, adminRole, now)
+	call := func(s *store.Store) (store.Org, error) {
+		return s.DeleteSandbox(context.Background(), mustUserID(t, orgTestID), callerID, adminRole)
 	}
 
-	at := now.Unix()
 	expires := longAt
 
-	refused := func(of []any, admin int64) outcome { return batchOf(6, map[int][][]any{5: {standing(of, admin)}}) }
+	refused := func(of []any, admin int64) outcome { return batchOf(3, map[int][][]any{1: {standing(of, admin)}}) }
 
-	cases := []opCase[store.OrgEnd]{
-		{name: "a standard organization was revoked", out: batchOf(6, map[int][][]any{0: {revokedRow(at)}}),
-			want: store.OrgEnd{Org: store.Org{
-				ID: orgTestID, Kind: store.OrgKindStandard, Name: "Acme", CreatedBy: callerID, RevokedAt: &at,
-				CreatedAt: 1_700_000_000,
-			}}},
-		{name: "a sandbox was deleted", out: batchOf(6, map[int][][]any{4: {sandboxRow(longAt)}}),
-			want: store.OrgEnd{Deleted: true, Org: store.Org{
+	cases := []opCase[store.Org]{
+		{name: "a sandbox was deleted", out: batchOf(3, map[int][][]any{0: {sandboxRow(longAt)}}),
+			want: store.Org{
 				ID: orgTestID, Kind: store.OrgKindSandbox, Name: "Acme", CreatedBy: callerID, ExpiresAt: &expires,
 				CreatedAt: 1_700_000_000,
-			}}},
-		{name: "the caller may not see it", out: batchOf(6, nil), err: store.ErrNotFound},
-		{name: "the caller sees it and does not administer it", out: refused(standardRow(), 0), err: store.ErrNotAdmin},
-		{name: "an organization the caller administers that nothing matched is a defect",
-			out: refused(standardRow(), 1), defect: true},
-		{name: "a revoked organization the caller administers is inactive", out: refused(revokedRow(at-1), 1),
-			err: store.ErrInactive},
+			}},
+		{name: "the caller may not see it", out: batchOf(3, nil), err: store.ErrNotFound},
+		{name: "the caller may not see it, and is not revoked", out: callerIs(0, batchOf(3, nil)), err: store.ErrNotFound},
+		{name: "the caller may not see it, because they are revoked", out: callerIs(1, batchOf(3, nil)),
+			err: store.ErrAccountRevoked},
+		{name: "a revoked caller's standing is not read when the write said why", out: callerIs(1, refused(standardRow(), 0)),
+			err: store.ErrNotAdmin},
+		{name: "the caller sees a sandbox and does not administer it", out: refused(sandboxRow(longAt), 0),
+			err: store.ErrNotAdmin},
+		{name: "the caller sees a standard organization and does not administer it", out: refused(standardRow(), 0),
+			err: store.ErrNotAdmin},
+		{name: "the caller administers a standard organization", out: refused(standardRow(), 1),
+			err: store.ErrNotSandbox},
+		{name: "a sandbox the caller administers that nothing matched is a defect",
+			out: refused(sandboxRow(longAt), 1), defect: true},
+		{name: "an expired sandbox the caller administers that nothing matched is a defect",
+			out: refused(sandboxRow(now.Unix()-1), 1), defect: true},
+		{name: "the standing is not a flag", out: refused(standardRow(), 2), defect: true},
 	}
 
-	cases = append(cases, rowDefectCases[store.OrgEnd](6, 0, revokedRow(at), orgKinds()...)...)
-	cases = append(cases, rowDefectCases[store.OrgEnd](6, 4, sandboxRow(longAt), orgKinds()...)...)
-	cases = append(cases, rowDefectCases[store.OrgEnd](6, 5, standing(standardRow(), 1),
+	cases = append(cases, callerDefectCases[store.Org](3)...)
+	cases = append(cases, rowDefectCases[store.Org](3, 0, sandboxRow(longAt), orgKinds()...)...)
+	cases = append(cases, rowDefectCases[store.Org](3, 1, standing(standardRow(), 1),
 		append(orgKinds(), "integer")...)...)
 
-	runOpCases(t, cases, store.CodeOrgRevokeRejected, call)
+	runOpCases(t, cases, store.CodeOrgDeleteRejected, call)
 
 	t.Run("the statements", func(t *testing.T) {
 		t.Parallel()
 
-		fake := newFake(batchOf(6, map[int][][]any{0: {revokedRow(at)}}))
+		fake := newFake(batchOf(3, map[int][][]any{0: {sandboxRow(longAt)}}))
 
 		_, err := call(fake.store())
 		checkErr(t, err, nil)
 
-		// The statements that follow the revocation apply only to a revoked
-		// standard organization, and are written with the same standing as the
-		// revocation, so a caller who may not revoke changes nothing at all.
-		revokedOrg := "AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = ?1 AND o.kind = ?4 AND o.revoked_at IS NOT NULL)"
-
+		// The delete names the sandbox kind and no expiry: an expired sandbox is
+		// deleted too, and a standard organization never is.
 		checkNumberedStatements(t, fake,
 			wantStatement{
 				fragments: append([]string{
-					"UPDATE orgs SET revoked_at = COALESCE(revoked_at, ?4) WHERE id = ?1 AND kind = ?5 AND",
-					"RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at",
-				}, administersFragments...),
-				args: []any{orgTestID, callerID, adminRole, at, store.OrgKindStandard},
-			},
-			wantStatement{
-				fragments: append([]string{"UPDATE users SET org_id = NULL WHERE org_id = ?1 AND", revokedOrg},
-					administersFragments...),
-				args: []any{orgTestID, callerID, adminRole, store.OrgKindStandard},
-			},
-			wantStatement{
-				fragments: append([]string{"DELETE FROM org_offers WHERE org_id = ?1 AND", revokedOrg},
-					administersFragments...),
-				args: []any{orgTestID, callerID, adminRole, store.OrgKindStandard},
-			},
-			wantStatement{
-				fragments: append([]string{"DELETE FROM org_admins WHERE org_id = ?1 AND", revokedOrg},
-					administersFragments...),
-				args: []any{orgTestID, callerID, adminRole, store.OrgKindStandard},
-			},
-			wantStatement{
-				fragments: append([]string{
 					"DELETE FROM orgs WHERE id = ?1 AND kind = ?4 AND",
-					"RETURNING id, kind, name, created_by, expires_at, revoked_at, created_at",
+					"RETURNING id, kind, name, created_by, expires_at, created_at",
 				}, administersFragments...),
 				args: []any{orgTestID, callerID, adminRole, store.OrgKindSandbox},
 			},
@@ -782,24 +742,18 @@ func TestRevokeOrg(t *testing.T) {
 				fragments: []string{"AS administers FROM orgs o WHERE o.id = ?1 AND"},
 				args:      []any{orgTestID, callerID, adminRole},
 			},
+			callerStandingStatement(),
 		)
 
-		// The order matters: the administrator rows go last, because the caller's
-		// own standing may be one of them and the other statements need it.
-		order := []string{
-			"UPDATE orgs", "UPDATE users", "DELETE FROM org_offers", "DELETE FROM org_admins", "DELETE FROM orgs",
-		}
-		for i, prefix := range order {
-			if query := squash(fake.calls[0][i].Query); !strings.HasPrefix(query, prefix) {
-				t.Errorf("statement %d = %q, want it to start with %q", i, query, prefix)
-			}
+		if query := squash(fake.calls[0][0].Query); strings.Contains(query, "expires_at >") {
+			t.Errorf("the delete is conditioned on the expiry: %q", query)
 		}
 	})
 
 	t.Run("failures", func(t *testing.T) {
 		t.Parallel()
 
-		runOpFailures(t, 6, store.CodeOrgRevokeFailed, store.CodeOrgRevokeRejected,
+		runOpFailures(t, store.CodeOrgDeleteFailed, store.CodeOrgDeleteRejected,
 			func(s *store.Store) error { return lastErr(call(s)) })
 	})
 }
@@ -817,22 +771,14 @@ func TestOrgCodes(t *testing.T) {
 		{store.CodeOrgLookupRejected, "org_lookup_rejected"},
 		{store.CodeOrgUpdateFailed, "org_update_failed"},
 		{store.CodeOrgUpdateRejected, "org_update_rejected"},
-		{store.CodeOrgRevokeFailed, "org_revoke_failed"},
-		{store.CodeOrgRevokeRejected, "org_revoke_rejected"},
+		{store.CodeOrgDeleteFailed, "org_delete_failed"},
+		{store.CodeOrgDeleteRejected, "org_delete_rejected"},
 		{store.CodeMemberListFailed, "member_list_failed"},
 		{store.CodeMemberListRejected, "member_list_rejected"},
 		{store.CodeMemberUpdateFailed, "member_update_failed"},
 		{store.CodeMemberUpdateRejected, "member_update_rejected"},
-		{store.CodeMemberRemoveFailed, "member_remove_failed"},
-		{store.CodeMemberRemoveRejected, "member_remove_rejected"},
-		{store.CodeOfferCreateFailed, "offer_create_failed"},
-		{store.CodeOfferCreateRejected, "offer_create_rejected"},
-		{store.CodeOfferListFailed, "offer_list_failed"},
-		{store.CodeOfferListRejected, "offer_list_rejected"},
-		{store.CodeOfferAcceptFailed, "offer_accept_failed"},
-		{store.CodeOfferAcceptRejected, "offer_accept_rejected"},
-		{store.CodeOfferRevokeFailed, "offer_revoke_failed"},
-		{store.CodeOfferRevokeRejected, "offer_revoke_rejected"},
+		{store.CodeMemberRevokeFailed, "member_revoke_failed"},
+		{store.CodeMemberRevokeRejected, "member_revoke_rejected"},
 	}
 
 	for _, test := range tests {

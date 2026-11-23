@@ -2,7 +2,6 @@ package orgs
 
 import (
 	"errors"
-	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
@@ -12,60 +11,34 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
-// createBody is the body of POST /api/org.
+// createBody is the body of POST /api/org: a sandbox is the only thing a client
+// can create, so it names only what to call it.
 type createBody struct {
-	// Kind is "standard" or "sandbox".
-	Kind string `json:"kind"`
-
-	// Name is what the organization is called.
+	// Name is what the sandbox is called.
 	Name string `json:"name"`
 }
 
-// creation is a create request that has been parsed.
-type creation struct {
-	kind input.OrgKind
-	name input.OrgName
-}
-
-// parseCreate parses the kind and the name, the kind first.
-func parseCreate(body createBody) result.Result[creation] {
-	return result.Of(input.ParseOrgKind(body.Kind)).
-		Map(func(kind input.OrgKind) creation { return creation{kind: kind} }).
-		Then(func(c creation) (creation, error) {
-			return result.Of(input.ParseOrgName(body.Name)).
-				Map(func(name input.OrgName) creation { c.name = name; return c }).
-				Get()
-		})
-}
-
-// createOrg answers POST /api/org. The limit of the kind and the expiry of a
-// sandbox are the server's, never the request's.
-func (d Deps) createOrg(call *auth.Call) result.Result[httpapi.Response] {
+// createSandbox answers POST /api/org. The limit and the expiry are the
+// server's, never the request's.
+func (d Deps) createSandbox(call *auth.Call) result.Result[httpapi.Response] {
 	now := d.Now()
 
 	return httpapi.Decode[createBody](call.Request).
-		Then(func(body createBody) (creation, error) { return parseCreate(body).Get() }).
-		Then(func(c creation) (store.Org, error) { return d.write(call, c, now).Get() }).
+		Then(func(body createBody) (input.OrgName, error) { return input.ParseOrgName(body.Name) }).
+		Then(func(name input.OrgName) (store.Org, error) {
+			return d.Store.CreateSandbox(call.Request.Context, store.NewSandbox{
+				ID: d.NewID(), Name: name, Creator: call.Principal.UserID,
+				ExpiresAt: now.Add(SandboxLifetime), Limit: MaxSandboxesPerUser, CreatedAt: now,
+			})
+		}).
+		MapErr(func(err error) error {
+			if errors.Is(err, store.ErrSandboxLimit) {
+				return refuse(apierr.Conflict, CodeSandboxLimit, "a user may hold a limited number of sandboxes", err)
+			}
+
+			return asOrg(err)
+		}).
 		Map(func(stored store.Org) httpapi.Response { return created(presentOrg(stored, now)) })
-}
-
-// write creates what was asked for, with the limit that applies to its kind.
-func (d Deps) write(call *auth.Call, c creation, now time.Time) result.Result[store.Org] {
-	limit, code, description := MaxStandardOrgsPerUser, CodeOrgLimit, "a user may create a limited number of organizations"
-	if c.kind.Sandbox() {
-		limit, code, description = MaxSandboxesPerUser, CodeSandboxLimit, "a user may hold a limited number of sandboxes"
-	}
-
-	return result.Of(d.Store.CreateOrg(call.Request.Context, store.NewOrg{
-		ID: d.NewID(), Kind: c.kind, Name: c.name, Creator: call.Principal.UserID,
-		ExpiresAt: now.Add(SandboxLifetime), Limit: limit, CreatedAt: now,
-	})).MapErr(func(err error) error {
-		if errors.Is(err, store.ErrOrgLimit) {
-			return refuse(apierr.Conflict, code, description, err)
-		}
-
-		return asOrg(err)
-	})
 }
 
 // ListResponse is the body of GET /api/org: one page, newest first.
@@ -124,24 +97,17 @@ func (d Deps) renameOrg(call *auth.Call) result.Result[httpapi.Response] {
 		Map(func(stored store.Org) httpapi.Response { return ok(presentOrg(stored, now)) })
 }
 
-// revokeOrg answers DELETE /api/org/{id}: a standard organization is revoked, and
-// a sandbox is deleted, with what it holds. The response is the organization as
-// it is left (revoked), or as it was (a sandbox, shown as deleted).
-func (d Deps) revokeOrg(call *auth.Call) result.Result[httpapi.Response] {
+// deleteSandbox answers DELETE /api/org/{id}: a sandbox is deleted, with what
+// it holds. The response is the sandbox as it was, shown as deleted.
+func (d Deps) deleteSandbox(call *auth.Call) result.Result[httpapi.Response] {
 	now := d.Now()
 
-	return result.Of(d.Store.RevokeOrg(call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin, now)).
+	return result.Of(d.Store.DeleteSandbox(call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin)).
 		MapErr(asOrg).
-		Map(func(end store.OrgEnd) httpapi.Response { return ok(presentEnd(end, now)) })
-}
+		Map(func(stored store.Org) httpapi.Response {
+			deleted := presentOrg(stored, now)
+			deleted.Status = StatusDeleted
 
-// presentEnd is the client's view of an organization that was just ended.
-func presentEnd(end store.OrgEnd, now time.Time) Org {
-	out := presentOrg(end.Org, now)
-
-	if end.Deleted {
-		out.Status = StatusDeleted
-	}
-
-	return out
+			return ok(deleted)
+		})
 }

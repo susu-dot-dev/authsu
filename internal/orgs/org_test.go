@@ -72,7 +72,7 @@ func runCases(t *testing.T, cases []routeCase) {
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 // orgJSON is the exact JSON of an organization.
-func orgJSON(id, kind, name string, expires, revoked *int64, status string) string {
+func orgJSON(id, kind, name string, expires *int64, status string) string {
 	out := `{"id":"` + id + `","kind":"` + kind + `","name":"` + name + `","createdBy":"` + userID +
 		`","createdAt":1700000000`
 
@@ -80,16 +80,12 @@ func orgJSON(id, kind, name string, expires, revoked *int64, status string) stri
 		out += `,"expiresAt":` + itoa(*expires)
 	}
 
-	if revoked != nil {
-		out += `,"revokedAt":` + itoa(*revoked)
-	}
-
 	return out + `,"status":"` + status + `"}`
 }
 
 // activeOrgJSON is the JSON of storedOrg(id): an active standard organization.
 func activeOrgJSON(id string) string {
-	return orgJSON(id, "standard", "Acme", nil, nil, "active")
+	return orgJSON(id, "standard", "Acme", nil, "active")
 }
 
 // line is a response body: one JSON document and the newline the writer adds.
@@ -99,16 +95,10 @@ func line(document string) string { return document + "\n" }
 // outcomes to.
 const (
 	bodyNotAdmin = `{"error":{"code":"org_admin_required","message":"administering the organization is required"}}` + "\n"
-	bodyInactive = `{"error":{"code":"org_inactive","message":"the organization is revoked or has expired"}}` + "\n"
-	bodyNotStd   = `{"error":{"code":"org_not_standard",` +
-		`"message":"a sandbox has no members and receives no offers"}}` + "\n"
-	bodyAlready = `{"error":{"code":"org_already_member","message":"the user already belongs to an organization"}}` + "\n"
-	bodyLastOrg = `{"error":{"code":"org_last_admin","message":"an organization must keep an administrator"}}` + "\n"
-	bodyExists  = `{"error":{"code":"offer_exists",` +
-		`"message":"the user already has an offer from the organization"}}` + "\n"
-	bodyNoUser   = `{"error":{"code":"offer_user_not_found","message":"no such user"}}` + "\n"
-	bodyOrgLimit = `{"error":{"code":"org_limit_reached",` +
-		`"message":"a user may create a limited number of organizations"}}` + "\n"
+	bodyExpired  = `{"error":{"code":"sandbox_expired","message":"the sandbox has expired"}}` + "\n"
+	bodyNotStd   = `{"error":{"code":"org_not_standard","message":"a sandbox has no members"}}` + "\n"
+	bodyNotSbx   = `{"error":{"code":"org_not_sandbox","message":"only a sandbox can be deleted"}}` + "\n"
+	bodyLastOrg  = `{"error":{"code":"org_last_admin","message":"an organization must keep an administrator"}}` + "\n"
 	bodySbxLimit = `{"error":{"code":"sandbox_limit_reached",` +
 		`"message":"a user may hold a limited number of sandboxes"}}` + "\n"
 )
@@ -154,73 +144,55 @@ func addFailures(
 	return cases
 }
 
-// TestCreateOrg: the kind and the name are parsed, the limit and the expiry are
-// the server's, and every outcome of the store is its own answer.
-//
-//nolint:funlen // the case table is the test; splitting it would only scatter the cases
-func TestCreateOrg(t *testing.T) {
+// TestCreateSandbox: POST /api/org creates a sandbox and nothing else. The name is
+// parsed, the limit and the expiry are the server's, and every outcome of the
+// store is its own answer. A kind is not a field of the request: no body can ask
+// for a standard organization.
+func TestCreateSandbox(t *testing.T) {
 	t.Parallel()
 
 	const target = "/api/org"
 
-	standardCall := fmt.Sprintf("CreateOrg id=%s kind=standard name=Acme creator=%s expires=%d limit=5 at=%d",
+	call := fmt.Sprintf("CreateSandbox id=%s name=Scratch creator=%s expires=%d limit=25 at=%d",
 		newID, userID, inAWeek, now)
-	sandboxCall := fmt.Sprintf("CreateOrg id=%s kind=sandbox name=Scratch creator=%s expires=%d limit=25 at=%d",
-		newID, userID, inAWeek, now)
-
-	sandbox := storedSandbox(newID, inAWeek)
 
 	cases := []routeCase{
-		{name: "a standard organization", method: http.MethodPost, target: target,
-			body:    `{"kind":"standard","name":"Acme"}`,
-			program: func(s *fakeStore) { s.create = reply[store.Org]{value: storedOrg(newID)} },
-			status:  http.StatusCreated, want: line(activeOrgJSON(newID)), calls: []string{standardCall}},
-		{name: "a sandbox", method: http.MethodPost, target: target,
-			body:    `{"kind":"sandbox","name":"Scratch"}`,
-			program: func(s *fakeStore) { s.create = reply[store.Org]{value: sandbox} },
+		{name: "a sandbox", method: http.MethodPost, target: target, body: `{"name":"Scratch"}`,
+			program: func(s *fakeStore) { s.create = reply[store.Org]{value: storedSandbox(newID, inAWeek)} },
 			status:  http.StatusCreated,
-			want:    line(orgJSON(newID, "sandbox", "Scratch", new(inAWeek), nil, "active")),
-			calls:   []string{sandboxCall}},
+			want:    line(orgJSON(newID, "sandbox", "Scratch", new(inAWeek), "active")), calls: []string{call}},
 		{name: "a platform administrator creates like anyone", method: http.MethodPost, target: target,
-			role:    roleAdmin,
-			body:    `{"kind":"standard","name":"Acme"}`,
-			program: func(s *fakeStore) { s.create = reply[store.Org]{value: storedOrg(newID)} },
-			status:  http.StatusCreated, want: line(activeOrgJSON(newID)), calls: []string{standardCall}},
-		{name: "the standard limit", method: http.MethodPost, target: target, body: `{"kind":"standard","name":"Acme"}`,
-			program: func(s *fakeStore) { s.create.err = store.ErrOrgLimit },
-			status:  http.StatusConflict, want: bodyOrgLimit, logged: "org_limit_reached", calls: []string{standardCall}},
-		{name: "the sandbox limit", method: http.MethodPost, target: target, body: `{"kind":"sandbox","name":"Scratch"}`,
-			program: func(s *fakeStore) { s.create.err = store.ErrOrgLimit },
-			status:  http.StatusConflict, want: bodySbxLimit, logged: "sandbox_limit_reached", calls: []string{sandboxCall}},
-		{name: "already a member", method: http.MethodPost, target: target, body: `{"kind":"standard","name":"Acme"}`,
-			program: func(s *fakeStore) { s.create.err = store.ErrAlreadyMember },
-			status:  http.StatusConflict, want: bodyAlready, logged: "org_already_member", calls: []string{standardCall}},
+			role: roleAdmin, body: `{"name":"Scratch"}`,
+			program: func(s *fakeStore) { s.create = reply[store.Org]{value: storedSandbox(newID, inAWeek)} },
+			status:  http.StatusCreated,
+			want:    line(orgJSON(newID, "sandbox", "Scratch", new(inAWeek), "active")), calls: []string{call}},
+		{name: "the sandbox limit", method: http.MethodPost, target: target, body: `{"name":"Scratch"}`,
+			program: func(s *fakeStore) { s.create.err = store.ErrSandboxLimit },
+			status:  http.StatusConflict, want: bodySbxLimit, logged: "sandbox_limit_reached", calls: []string{call}},
 		{name: "the account was revoked meanwhile", method: http.MethodPost, target: target,
-			body:    `{"kind":"standard","name":"Acme"}`,
+			body:    `{"name":"Scratch"}`,
 			program: func(s *fakeStore) { s.create.err = store.ErrAccountRevoked },
 			status:  http.StatusUnauthorized, want: bodyUnauthenticated, logged: "unauthenticated",
-			calls: []string{standardCall}},
+			calls: []string{call}},
 	}
 
-	cases = addFailures(cases, http.MethodPost, target, `{"kind":"standard","name":"Acme"}`, store.CodeOrgCreateFailed,
-		[]string{standardCall}, func(s *fakeStore, err error) { s.create.err = err })
+	cases = addFailures(cases, http.MethodPost, target, `{"name":"Scratch"}`, store.CodeOrgCreateFailed,
+		[]string{call}, func(s *fakeStore, err error) { s.create.err = err })
 
 	cases = append(cases, bodyFailures(http.MethodPost, target, []badBody{
-		{name: "no kind", body: `{"name":"Acme"}`, code: input.CodeInvalidOrgKind},
-		{name: "an unknown kind", body: `{"kind":"enterprise","name":"Acme"}`, code: input.CodeInvalidOrgKind},
-		{name: "a kind in the wrong case", body: `{"kind":"Standard","name":"Acme"}`, code: input.CodeInvalidOrgKind},
-		{name: "a kind that is not text", body: `{"kind":1,"name":"Acme"}`, code: "invalid_field_type"},
-		{name: "no name", body: `{"kind":"standard"}`, code: input.CodeInvalidOrgName},
-		{name: "an empty name", body: `{"kind":"standard","name":""}`, code: input.CodeInvalidOrgName},
-		{name: "a name with a control character", body: `{"kind":"standard","name":"a\u0000b"}`,
+		{name: "a kind of standard", body: `{"kind":"standard","name":"Acme"}`, code: "unknown_field"},
+		{name: "a kind of sandbox", body: `{"kind":"sandbox","name":"Scratch"}`, code: "unknown_field"},
+		{name: "no name", body: `{}`, code: input.CodeInvalidOrgName},
+		{name: "an empty name", body: `{"name":""}`, code: input.CodeInvalidOrgName},
+		{name: "a name with a control character", body: `{"name":"a\u0000b"}`, code: input.CodeInvalidOrgName},
+		{name: "a name of 257 characters", body: `{"name":"` + strings.Repeat("x", 257) + `"}`,
 			code: input.CodeInvalidOrgName},
-		{name: "a name of 257 characters", body: `{"kind":"standard","name":"` + strings.Repeat("x", 257) + `"}`,
-			code: input.CodeInvalidOrgName},
-		{name: "an unknown field", body: `{"kind":"standard","name":"Acme","expiresAt":1}`, code: "unknown_field"},
-		{name: "a repeated field", body: `{"kind":"standard","kind":"sandbox","name":"Acme"}`, code: "duplicate_field"},
+		{name: "a name that is not text", body: `{"name":1}`, code: "invalid_field_type"},
+		{name: "an unknown field", body: `{"name":"Acme","expiresAt":1}`, code: "unknown_field"},
+		{name: "a repeated field", body: `{"name":"Acme","name":"Acme"}`, code: "duplicate_field"},
 		{name: "an empty body", body: ``, code: "empty_body"},
 		{name: "not JSON", body: `{`, code: "invalid_json"},
-		{name: "trailing data", body: `{"kind":"standard","name":"Acme"} {}`, code: "trailing_data"},
+		{name: "trailing data", body: `{"name":"Acme"} {}`, code: "trailing_data"},
 	})...)
 
 	runCases(t, cases)
@@ -262,14 +234,14 @@ func TestRenameOrg(t *testing.T) {
 	cases := []routeCase{
 		{name: "renamed", method: http.MethodPatch, target: target, body: `{"name":"New"}`,
 			program: func(s *fakeStore) { s.rename.value = renamed }, status: http.StatusOK,
-			want: line(orgJSON(orgID, "standard", "New", nil, nil, "active")), calls: []string{call}},
+			want: line(orgJSON(orgID, "standard", "New", nil, "active")), calls: []string{call}},
 		{name: "a sandbox that has expired is shown as expired", method: http.MethodPatch, target: target,
 			body: `{"name":"New"}`,
 			program: func(s *fakeStore) {
 				s.rename.value = storedSandbox(orgID, past)
 			},
 			status: http.StatusOK,
-			want:   line(orgJSON(orgID, "sandbox", "Scratch", new(past), nil, "expired")),
+			want:   line(orgJSON(orgID, "sandbox", "Scratch", new(past), "expired")),
 			calls:  []string{call}},
 		{name: "not found", method: http.MethodPatch, target: target, body: `{"name":"New"}`,
 			program: func(s *fakeStore) { s.rename.err = store.ErrNotFound }, status: http.StatusNotFound,
@@ -277,9 +249,17 @@ func TestRenameOrg(t *testing.T) {
 		{name: "the caller is not an administrator", method: http.MethodPatch, target: target, body: `{"name":"New"}`,
 			program: func(s *fakeStore) { s.rename.err = store.ErrNotAdmin }, status: http.StatusForbidden,
 			want: bodyNotAdmin, logged: "org_admin_required", calls: []string{call}},
-		{name: "revoked or expired", method: http.MethodPatch, target: target, body: `{"name":"New"}`,
-			program: func(s *fakeStore) { s.rename.err = store.ErrInactive }, status: http.StatusConflict,
-			want: bodyInactive, logged: "org_inactive", calls: []string{call}},
+		{name: "the sandbox has expired", method: http.MethodPatch, target: target, body: `{"name":"New"}`,
+			program: func(s *fakeStore) { s.rename.err = store.ErrExpired }, status: http.StatusConflict,
+			want: bodyExpired, logged: "sandbox_expired", calls: []string{call}},
+		{name: "the account was revoked meanwhile", method: http.MethodPatch, target: target, body: `{"name":"New"}`,
+			program: func(s *fakeStore) { s.rename.err = store.ErrAccountRevoked }, status: http.StatusUnauthorized,
+			want: bodyUnauthenticated, logged: "unauthenticated", calls: []string{call}},
+		{name: "the account was revoked meanwhile, however the store wraps it", method: http.MethodPatch, target: target,
+			body:    `{"name":"New"}`,
+			program: func(s *fakeStore) { s.rename.err = fmt.Errorf("rename: %w", store.ErrAccountRevoked) },
+			status:  http.StatusUnauthorized, want: bodyUnauthenticated, logged: "unauthenticated",
+			calls: []string{call}},
 	}
 
 	cases = addFailures(cases, http.MethodPatch, target, `{"name":"New"}`, store.CodeOrgUpdateFailed, []string{call},
@@ -298,40 +278,47 @@ func TestRenameOrg(t *testing.T) {
 	runCases(t, cases)
 }
 
-// TestRevokeOrg: a standard organization is revoked and a sandbox is deleted,
-// and the response says which.
-func TestRevokeOrg(t *testing.T) {
+// TestDeleteSandbox: a sandbox is deleted and shown as deleted, and a standard
+// organization is refused, to a caller who can see it.
+func TestDeleteSandbox(t *testing.T) {
 	t.Parallel()
 
 	target := "/api/org/" + orgID
-	call := fmt.Sprintf("RevokeOrg id=%s caller=%s role=%s at=%d", orgID, userID, auth.RoleAdmin, now)
-
-	revoked := storedOrg(orgID)
-	revoked.RevokedAt = new(exactlyNow)
+	call := fmt.Sprintf("DeleteSandbox id=%s caller=%s role=%s", orgID, userID, auth.RoleAdmin)
 
 	cases := []routeCase{
-		{name: "a standard organization is revoked", method: http.MethodDelete, target: target,
-			program: func(s *fakeStore) { s.revoke.value = store.OrgEnd{Org: revoked, Deleted: false} },
-			status:  http.StatusOK,
-			want:    line(orgJSON(orgID, "standard", "Acme", nil, new(exactlyNow), "revoked")),
-			calls:   []string{call}},
 		{name: "a sandbox is deleted", method: http.MethodDelete, target: target,
-			program: func(s *fakeStore) {
-				s.revoke.value = store.OrgEnd{Org: storedSandbox(orgID, future), Deleted: true}
-			},
-			status: http.StatusOK,
-			want:   line(orgJSON(orgID, "sandbox", "Scratch", new(future), nil, "deleted")),
-			calls:  []string{call}},
+			program: func(s *fakeStore) { s.remove.value = storedSandbox(orgID, future) },
+			status:  http.StatusOK,
+			want:    line(orgJSON(orgID, "sandbox", "Scratch", new(future), "deleted")),
+			calls:   []string{call}},
+		{name: "an expired sandbox is deleted, and shown as deleted", method: http.MethodDelete, target: target,
+			program: func(s *fakeStore) { s.remove.value = storedSandbox(orgID, past) },
+			status:  http.StatusOK,
+			want:    line(orgJSON(orgID, "sandbox", "Scratch", new(past), "deleted")),
+			calls:   []string{call}},
+		{name: "a platform administrator deletes like an administrator", method: http.MethodDelete, target: target,
+			role:    roleAdmin,
+			program: func(s *fakeStore) { s.remove.value = storedSandbox(orgID, future) },
+			status:  http.StatusOK,
+			want:    line(orgJSON(orgID, "sandbox", "Scratch", new(future), "deleted")),
+			calls:   []string{call}},
 		{name: "not found", method: http.MethodDelete, target: target,
-			program: func(s *fakeStore) { s.revoke.err = store.ErrNotFound }, status: http.StatusNotFound,
+			program: func(s *fakeStore) { s.remove.err = store.ErrNotFound }, status: http.StatusNotFound,
 			want: bodyOrgNotFound, logged: "org_not_found", calls: []string{call}},
 		{name: "the caller is not an administrator", method: http.MethodDelete, target: target,
-			program: func(s *fakeStore) { s.revoke.err = store.ErrNotAdmin }, status: http.StatusForbidden,
+			program: func(s *fakeStore) { s.remove.err = store.ErrNotAdmin }, status: http.StatusForbidden,
 			want: bodyNotAdmin, logged: "org_admin_required", calls: []string{call}},
+		{name: "a standard organization is never deleted", method: http.MethodDelete, target: target,
+			program: func(s *fakeStore) { s.remove.err = store.ErrNotSandbox }, status: http.StatusConflict,
+			want: bodyNotSbx, logged: "org_not_sandbox", calls: []string{call}},
+		{name: "the account was revoked meanwhile", method: http.MethodDelete, target: target,
+			program: func(s *fakeStore) { s.remove.err = store.ErrAccountRevoked }, status: http.StatusUnauthorized,
+			want: bodyUnauthenticated, logged: "unauthenticated", calls: []string{call}},
 	}
 
-	cases = addFailures(cases, http.MethodDelete, target, "", store.CodeOrgRevokeFailed, []string{call},
-		func(s *fakeStore, err error) { s.revoke.err = err })
+	cases = addFailures(cases, http.MethodDelete, target, "", store.CodeOrgDeleteFailed, []string{call},
+		func(s *fakeStore, err error) { s.remove.err = err })
 
 	cases = append(cases, bodyFailures(http.MethodDelete, "/api/org/"+strings.ToUpper(orgID), []badBody{
 		{name: "an id in upper case", body: "", code: input.CodeInvalidID},
@@ -348,28 +335,21 @@ func TestGetOrg(t *testing.T) {
 	target := "/api/org/" + orgID
 	call := fmt.Sprintf("GetOrg id=%s caller=%s role=%s", orgID, userID, auth.RoleAdmin)
 
-	revoked := storedOrg(orgID)
-	revoked.RevokedAt = new(past)
-
 	cases := []routeCase{
-		{name: "an active standard organization", method: http.MethodGet, target: target,
+		{name: "a standard organization", method: http.MethodGet, target: target,
 			program: func(s *fakeStore) { s.get.value = storedOrg(orgID) }, status: http.StatusOK,
 			want: line(activeOrgJSON(orgID)), calls: []string{call}},
-		{name: "a revoked organization", method: http.MethodGet, target: target,
-			program: func(s *fakeStore) { s.get.value = revoked }, status: http.StatusOK,
-			want:  line(orgJSON(orgID, "standard", "Acme", nil, new(past), "revoked")),
-			calls: []string{call}},
 		{name: "a sandbox that has not expired", method: http.MethodGet, target: target,
 			program: func(s *fakeStore) { s.get.value = storedSandbox(orgID, future) }, status: http.StatusOK,
-			want:  line(orgJSON(orgID, "sandbox", "Scratch", new(future), nil, "active")),
+			want:  line(orgJSON(orgID, "sandbox", "Scratch", new(future), "active")),
 			calls: []string{call}},
 		{name: "a sandbox that expires this very second is expired", method: http.MethodGet, target: target,
 			program: func(s *fakeStore) { s.get.value = storedSandbox(orgID, exactlyNow) }, status: http.StatusOK,
-			want:  line(orgJSON(orgID, "sandbox", "Scratch", new(exactlyNow), nil, "expired")),
+			want:  line(orgJSON(orgID, "sandbox", "Scratch", new(exactlyNow), "expired")),
 			calls: []string{call}},
 		{name: "a sandbox that has expired", method: http.MethodGet, target: target,
 			program: func(s *fakeStore) { s.get.value = storedSandbox(orgID, past) }, status: http.StatusOK,
-			want:  line(orgJSON(orgID, "sandbox", "Scratch", new(past), nil, "expired")),
+			want:  line(orgJSON(orgID, "sandbox", "Scratch", new(past), "expired")),
 			calls: []string{call}},
 		{name: "not found", method: http.MethodGet, target: target,
 			program: func(s *fakeStore) { s.get.err = store.ErrNotFound }, status: http.StatusNotFound,
@@ -396,7 +376,7 @@ func TestListOrgs(t *testing.T) {
 		{name: "the first page, with a next", method: http.MethodGet, target: "/api/org",
 			program: func(s *fakeStore) { s.list.value = page }, status: http.StatusOK,
 			want: line(`{"orgs":[` + activeOrgJSON(orgID) + `,` +
-				orgJSON(sandboxID, "sandbox", "Scratch", new(future), nil, "active") +
+				orgJSON(sandboxID, "sandbox", "Scratch", new(future), "active") +
 				`],"next":"` + sandboxID + `"}`),
 			calls: []string{call("-", input.DefaultPageLimit)}},
 		{name: "the last page has no next", method: http.MethodGet, target: "/api/org?limit=100&cursor=" + cursorID,

@@ -10,7 +10,8 @@ import (
 )
 
 // TestRevoke is DELETE /api/user/{id}: every outcome of the store's revocation,
-// and that it is called once with the admin role and the injected time.
+// and that it is called once with the signed-in administrator as the caller, the
+// admin role and the injected time.
 //
 //nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestRevoke(t *testing.T) {
@@ -63,6 +64,16 @@ func TestRevoke(t *testing.T) {
 			name:    "no such account, however the store wraps the outcome",
 			program: func(f *fakeStore) { f.revokeErr = fmt.Errorf("revoke: %w", store.ErrNotFound) },
 			status:  http.StatusNotFound, body: bodyNotFound, logged: "user_not_found", calls: calls,
+		},
+		{
+			name:    "the caller was revoked while the request ran",
+			program: func(f *fakeStore) { f.revokeErr = store.ErrAccountRevoked },
+			status:  http.StatusUnauthorized, body: bodyUnauthenticated, logged: "unauthenticated", calls: calls,
+		},
+		{
+			name:    "the caller was revoked, however the store wraps the outcome",
+			program: func(f *fakeStore) { f.revokeErr = fmt.Errorf("revoke: %w", store.ErrAccountRevoked) },
+			status:  http.StatusUnauthorized, body: bodyUnauthenticated, logged: "unauthenticated", calls: calls,
 		},
 		{
 			name:    "the database is unavailable",
@@ -146,8 +157,8 @@ func TestRevokeReadsTheClockOncePerRequest(t *testing.T) {
 	rg.as(cookie, http.MethodGet, itemPrefix+targetID)
 
 	want := []storeCall{
-		{op: opRevoke, id: targetID, role: roleAdmin, now: first},
-		{op: opRevoke, id: targetID, role: roleAdmin, now: second},
+		{op: opRevoke, id: targetID, caller: adminID, role: roleAdmin, now: first},
+		{op: opRevoke, id: targetID, caller: adminID, role: roleAdmin, now: second},
 		readCall(opGet, targetID),
 	}
 

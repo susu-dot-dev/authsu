@@ -1,4 +1,4 @@
-// Package users is the admin API for accounts described in
+// Package users is the platform administrators' API for accounts described in
 // docs/users_design.md: list them, read one, and revoke one.
 //
 //	GET    /api/user        list every account, revoked ones included
@@ -13,11 +13,18 @@
 // credential (store.ResolveSession, store.ResolveAPIKey), so revoking an admin
 // takes effect at once.
 //
-// Revoking is final and never deletes: the row stays, the account cannot log
-// in, and none of its sessions or API keys verify. The last active admin cannot
-// be revoked, because the only recovery from having none is wiping the
-// database. An admin may revoke themselves, as long as another active admin
-// remains.
+// Revoking is final and never deletes: the row stays, in its organization, the
+// account cannot log in, and none of its sessions, API keys or agents work. The
+// last active admin cannot be revoked, because the only recovery from having none
+// is wiping the database. An admin may revoke themselves, as long as another
+// active admin remains.
+//
+// These routes are the platform administrators' only. An organization's own
+// administrators revoke the accounts of their organization through
+// DELETE /api/member/{id} (package orgs), which is the same write with the same
+// rules: whoever may revoke an account is decided in that write, from the
+// caller's standing, and not by the route. Here the caller is always a platform
+// administrator, who may revoke any account.
 //
 // A stored profile that is not a JSON object is logged and served as an empty
 // object: one corrupt row must not hide every other account from the admin who
@@ -58,10 +65,12 @@ type Store interface {
 	ListUsers(ctx context.Context) ([]store.User, error)
 	// GetUser returns the account id, or store.ErrNotFound.
 	GetUser(ctx context.Context, id input.ID) (store.User, error)
-	// RevokeUser revokes the account id and returns it as the write left it:
-	// store.ErrNotFound for no such account, store.ErrLastAdmin when the
-	// account is the last active holder of adminRole.
-	RevokeUser(ctx context.Context, id input.ID, adminRole string, now time.Time) (store.User, error)
+	// RevokeUser revokes the account id on behalf of the caller and returns it
+	// as the write left it: store.ErrNotFound for no such account (or a caller
+	// who may not see it), store.ErrLastAdmin when the account is the last
+	// active holder of adminRole. A caller who is a platform administrator is
+	// refused nothing else.
+	RevokeUser(ctx context.Context, id input.ID, caller, adminRole string, now time.Time) (store.User, error)
 }
 
 // Deps are the collaborators of Routes. All are required.
@@ -105,7 +114,7 @@ func Routes(deps Deps) []auth.Route {
 		},
 		{
 			Method: http.MethodDelete, Path: itemPath, MaxBody: maxBody,
-			Credential: auth.Authenticated, Access: auth.Needs(scope.UserRevoke), Handle: api.revoke,
+			Credential: auth.Authenticated, Access: auth.Needs(scope.UserRevoke).WithoutAgents(), Handle: api.revoke,
 		},
 	}
 }

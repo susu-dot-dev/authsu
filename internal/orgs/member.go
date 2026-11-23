@@ -59,11 +59,13 @@ func (d Deps) setMemberAdmin(call *auth.Call) result.Result[httpapi.Response] {
 		Map(func(stored store.Member) httpapi.Response { return ok(presentMember(stored)) })
 }
 
-// removeMember answers DELETE /api/member/{id}: {id} is the user's id. The user
-// may remove themself, which is leaving; otherwise the caller administers their
-// organization or is a platform administrator.
-func (d Deps) removeMember(call *auth.Call) result.Result[httpapi.Response] {
-	return result.Of(d.Store.RemoveMember(call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin)).
+// revokeMember answers DELETE /api/member/{id}: {id} is the user's id. It revokes
+// the member's account, and the response is the member as revoked. The caller
+// is a platform administrator, or administers the member's organization and
+// does not revoke a platform administrator or themself: the store decides.
+func (d Deps) revokeMember(call *auth.Call) result.Result[httpapi.Response] {
+	return result.Of(d.Store.RevokeMember(
+		call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin, d.Now())).
 		MapErr(asMember).
 		Map(func(stored store.Member) httpapi.Response { return ok(presentMember(stored)) })
 }

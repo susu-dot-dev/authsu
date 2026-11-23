@@ -127,6 +127,22 @@ func ParseOrgName(raw string) (OrgName, error) {
 // String returns the name exactly as it was parsed.
 func (n OrgName) String() string { return n.v }
 
+// personalOrgSuffix follows the account's name in the name of the organization
+// created for it, so an account called "Ann" administers "Ann's org" and not an
+// organization that reads as the person.
+const personalOrgSuffix = "'s org"
+
+// OrgNameOf is the name of the organization that is created for an account: the
+// account's own name followed by personalOrgSuffix ("<name>'s org"). It is a
+// conversion and not a parse because every AccountName with the suffix is an
+// OrgName (the account name's rules are the stricter, the suffix is plain
+// ASCII, and the account name's bound of 128 bytes plus the suffix is far
+// inside the organization's 256 characters), which
+// TestEveryAccountNameIsAnOrgName holds for every value the account name
+// parser accepts. Registration therefore never fails because of the
+// organization's name.
+func OrgNameOf(n AccountName) OrgName { return OrgName{v: n.v + personalOrgSuffix} }
+
 // InvitationLabel is the note an administrator attaches to an invitation. It
 // may be empty.
 type InvitationLabel struct{ v string }

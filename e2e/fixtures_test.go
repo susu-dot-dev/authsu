@@ -1019,7 +1019,7 @@ func seedUsers(t *testing.T, invitation string, n int) {
 	t.Helper()
 
 	for i := range n {
-		seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
+		seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, created_at) "+
 			"VALUES (?, randomblob(16), 'e2e_none', ?, strftime('%s','now'))", idN("0b00", i+1), invitation)
 	}
 }
@@ -1029,9 +1029,46 @@ func seedUsers(t *testing.T, invitation string, n int) {
 func seedUser(t *testing.T, id, role string) {
 	t.Helper()
 
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
 		"VALUES (?, randomblob(16), ?, (SELECT id FROM invitations LIMIT 1), '{\"name\":\"seeded\"}', strftime('%s','now'))",
 		id, role)
+}
+
+// seedUserOwn is seedUser for an account whose own organization has the id org,
+// not the account's: a test of what a route does with an id of the wrong kind
+// needs a user id that is no organization's, and an organization id that is no
+// user's.
+func seedUserOwn(t *testing.T, id, role, org string) {
+	t.Helper()
+
+	seedAccountIn(t, org, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+		"VALUES (?, randomblob(16), ?, (SELECT id FROM invitations LIMIT 1), '{\"name\":\"seeded\"}', strftime('%s','now'))",
+		id, role)
+}
+
+// insertUserIn is an account of role that belongs to the organization org, with
+// the profile {"name":"seeded"}, redeemed from any existing invitation.
+const insertUserIn = "INSERT INTO users (id, user_handle, role, invitation_id, profile, org_id, created_at) " +
+	"VALUES (?, randomblob(16), ?, (SELECT id FROM invitations LIMIT 1), '{\"name\":\"seeded\"}', ?, strftime('%s','now'))"
+
+// seedUserIn inserts an account that belongs to org, which must exist.
+func seedUserIn(t *testing.T, id, role, org string) {
+	t.Helper()
+
+	seed(t, insertUserIn, id, role, org)
+}
+
+// seedUserWithOrg inserts an account and the standard organization org that it
+// created and belongs to, named name, in one transaction: the organization's key
+// to its creator is checked at once, and the account's key to it when the
+// transaction commits.
+func seedUserWithOrg(t *testing.T, id, role, org, name string) {
+	t.Helper()
+
+	seedAll(t,
+		sqlStmt(insertUserIn, id, role, org),
+		sqlStmt("INSERT INTO orgs (id, kind, name, created_by, created_at) VALUES (?, 'standard', ?, ?, 1700000000)",
+			org, name, id))
 }
 
 // seedAgent inserts an agent for owner with no key.

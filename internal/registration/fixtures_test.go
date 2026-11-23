@@ -733,6 +733,17 @@ func classified(kind apierr.Kind, code string) error {
 }
 
 // mustName parses an account name the test knows is valid.
+func mustOrgName(t *testing.T, raw string) input.OrgName {
+	t.Helper()
+
+	name, err := input.ParseOrgName(raw)
+	if err != nil {
+		t.Fatalf("organization name: %v", err)
+	}
+
+	return name
+}
+
 func mustName(t *testing.T, raw string) input.AccountName {
 	t.Helper()
 

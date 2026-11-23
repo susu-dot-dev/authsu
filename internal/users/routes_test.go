@@ -24,10 +24,13 @@ func TestRouteDeclarations(t *testing.T) {
 		method string
 		path   string
 		scope  scope.Scope
+		// noAgents is whether an agent is refused whatever scopes it holds:
+		// revoking an account is for a person.
+		noAgents bool
 	}{
 		{name: opList, method: http.MethodGet, path: "/api/user", scope: scope.UserRead},
 		{name: "get", method: http.MethodGet, path: "/api/user/{id}", scope: scope.UserRead},
-		{name: "revoke", method: http.MethodDelete, path: "/api/user/{id}", scope: scope.UserRevoke},
+		{name: "revoke", method: http.MethodDelete, path: "/api/user/{id}", scope: scope.UserRevoke, noAgents: true},
 	}
 
 	declared := users.Routes(users.Deps{Store: &fakeStore{}, Now: time.Now, Log: noLog})
@@ -40,23 +43,29 @@ func TestRouteDeclarations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			checkDeclared(t, declared[i], tc.method, tc.path, tc.scope)
+			checkDeclared(t, declared[i], tc.method, tc.path, tc.scope, tc.noAgents)
 		})
 	}
 }
 
 // checkDeclared checks one route: where it is, that it needs a credential, that
 // its access is exactly its own admin scope (so the boundary requires the
-// administrator role as well), and that it reads no body.
-func checkDeclared(t *testing.T, got auth.Route, method, path string, needs scope.Scope) {
+// administrator role as well) and refuses agents when noAgents, and that it
+// reads no body.
+func checkDeclared(t *testing.T, got auth.Route, method, path string, needs scope.Scope, noAgents bool) {
 	t.Helper()
 
 	if got.Method != method || got.Path != path {
 		t.Errorf("route = %s %s, want %s %s", got.Method, got.Path, method, path)
 	}
 
-	if got.Credential != auth.Authenticated || got.Access != auth.Needs(needs) {
-		t.Errorf("Credential = %v, Access = %+v, want Authenticated and %+v", got.Credential, got.Access, auth.Needs(needs))
+	want := auth.Needs(needs)
+	if noAgents {
+		want = want.WithoutAgents()
+	}
+
+	if got.Credential != auth.Authenticated || got.Access != want {
+		t.Errorf("Credential = %v, Access = %+v, want Authenticated and %+v", got.Credential, got.Access, want)
 	}
 
 	if !scope.IsAdmin(needs) {

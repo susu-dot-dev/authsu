@@ -2426,7 +2426,7 @@ func TestRegistrationBatchConstraints(t *testing.T) {
 	user := scalar(t, "SELECT id FROM users")
 	otherUser := "00000000-0000-7000-8000-00000000e301"
 
-	seed(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+	seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
 		"VALUES (?, randomblob(32), 'e2e_none', (SELECT id FROM invitations), '{}', 0)", otherUser)
 
 	existingID := scalar(t, "SELECT hex(credential_id) FROM credentials")
@@ -2458,21 +2458,21 @@ func TestRegistrationBatchConstraints(t *testing.T) {
 			[]any{idN("0c00", 8), randomBytes(32), otherUser, randomBytes(1025)}, true},
 		{"a credential id stored as TEXT", insertCredential,
 			[]any{idN("0c00", 9), "text-credential-id", otherUser, randomBytes(77)}, true},
-		{"a user handle shared with another account", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
-			"VALUES (?, (SELECT user_handle FROM users LIMIT 1), 'e2e_none', (SELECT id FROM invitations), '{}', 0)",
+		{"a user handle shared with another account", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) " +
+			"VALUES (?, (SELECT user_handle FROM users LIMIT 1), 'e2e_none', (SELECT id FROM invitations), '{}', 0, (SELECT id FROM orgs LIMIT 1))",
 			[]any{idN("0c00", 10)}, true},
-		{"a user handle of 65 bytes", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
-			"VALUES (?, randomblob(65), 'e2e_none', (SELECT id FROM invitations), '{}', 0)", []any{idN("0c00", 11)}, true},
-		{"a profile of 1025 bytes", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
-			"VALUES (?, randomblob(32), 'e2e_none', (SELECT id FROM invitations), '{\"name\":\"" + strings.Repeat("a", 1025-10) + "\"}', 0)",
+		{"a user handle of 65 bytes", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) " +
+			"VALUES (?, randomblob(65), 'e2e_none', (SELECT id FROM invitations), '{}', 0, (SELECT id FROM orgs LIMIT 1))", []any{idN("0c00", 11)}, true},
+		{"a profile of 1025 bytes", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) " +
+			"VALUES (?, randomblob(32), 'e2e_none', (SELECT id FROM invitations), '{\"name\":\"" + strings.Repeat("a", 1025-10) + "\"}', 0, (SELECT id FROM orgs LIMIT 1))",
 			[]any{idN("0c00", 12)}, true},
-		{"a profile of 1024 bytes", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
-			"VALUES (?, randomblob(32), 'e2e_none', (SELECT id FROM invitations), '{\"name\":\"" + strings.Repeat("a", 1024-11) + "\"}', 0)",
+		{"a profile of 1024 bytes", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) " +
+			"VALUES (?, randomblob(32), 'e2e_none', (SELECT id FROM invitations), '{\"name\":\"" + strings.Repeat("a", 1024-11) + "\"}', 0, (SELECT id FROM orgs LIMIT 1))",
 			[]any{idN("0c00", 13)}, false},
-		{"a user for no invitation", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
-			"VALUES (?, randomblob(32), 'e2e_none', NULL, '{}', 0)", []any{idN("0c00", 14)}, true},
-		{"a user for an unknown invitation", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) " +
-			"VALUES (?, randomblob(32), 'e2e_none', '" + idMissing + "', '{}', 0)", []any{idN("0c00", 15)}, true},
+		{"a user for no invitation", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) " +
+			"VALUES (?, randomblob(32), 'e2e_none', NULL, '{}', 0, (SELECT id FROM orgs LIMIT 1))", []any{idN("0c00", 14)}, true},
+		{"a user for an unknown invitation", "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at, org_id) " +
+			"VALUES (?, randomblob(32), 'e2e_none', '" + idMissing + "', '{}', 0, (SELECT id FROM orgs LIMIT 1))", []any{idN("0c00", 15)}, true},
 	}
 
 	for _, tt := range tests {

@@ -3,6 +3,8 @@ package orgs_test
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -38,32 +40,22 @@ const (
 // catalog is every route the package declares, in the order Routes returns them.
 func catalog() []catalogRoute {
 	return []catalogRoute{
-		{name: "create org", method: http.MethodPost, path: "/api/org", target: "/api/org",
-			body: `{"kind":"standard","name":"Acme"}`, scope: scope.OrgCreate, reads: false, limit: bodyCap},
+		{name: "create sandbox", method: http.MethodPost, path: "/api/org", target: "/api/org",
+			body: `{"name":"Scratch"}`, scope: scope.SandboxCreate, reads: false, limit: bodyCap},
 		{name: "list orgs", method: http.MethodGet, path: "/api/org", target: "/api/org",
 			scope: scope.OrgRead, reads: true, limit: smallCap},
 		{name: "get org", method: http.MethodGet, path: "/api/org/{id}", target: "/api/org/" + orgID,
 			scope: scope.OrgRead, reads: true, limit: smallCap},
 		{name: "rename org", method: http.MethodPatch, path: "/api/org/{id}", target: "/api/org/" + orgID,
 			body: `{"name":"New"}`, scope: scope.OrgUpdate, reads: false, limit: bodyCap},
-		{name: "revoke org", method: http.MethodDelete, path: "/api/org/{id}", target: "/api/org/" + orgID,
-			scope: scope.OrgRevoke, reads: false, limit: smallCap},
+		{name: "delete sandbox", method: http.MethodDelete, path: "/api/org/{id}", target: "/api/org/" + orgID,
+			scope: scope.SandboxRevoke, reads: false, limit: smallCap},
 		{name: "list members", method: http.MethodGet, path: "/api/org/{id}/member", target: "/api/org/" + orgID + "/member",
 			scope: scope.MemberRead, reads: true, limit: smallCap},
 		{name: "set member admin", method: http.MethodPatch, path: "/api/member/{id}", target: "/api/member/" + otherID,
 			body: `{"admin":true}`, scope: scope.MemberUpdate, reads: false, limit: smallCap},
-		{name: "remove member", method: http.MethodDelete, path: "/api/member/{id}", target: "/api/member/" + otherID,
+		{name: "revoke member", method: http.MethodDelete, path: "/api/member/{id}", target: "/api/member/" + otherID,
 			scope: scope.MemberRevoke, reads: false, limit: smallCap},
-		{name: "create offer", method: http.MethodPost, path: "/api/org/{id}/offer", target: "/api/org/" + orgID + "/offer",
-			body: `{"userId":"` + otherID + `","role":"member"}`, scope: scope.OfferCreate, reads: false, limit: smallCap},
-		{name: "list org offers", method: http.MethodGet, path: "/api/org/{id}/offer", target: "/api/org/" + orgID + "/offer",
-			scope: scope.OfferRead, reads: true, limit: smallCap},
-		{name: "list my offers", method: http.MethodGet, path: "/api/offer", target: "/api/offer",
-			scope: scope.OfferRead, reads: true, limit: smallCap},
-		{name: "accept offer", method: http.MethodPost, path: "/api/offer/{id}/accept",
-			target: "/api/offer/" + offerID + "/accept", scope: scope.OfferUpdate, reads: false, limit: smallCap},
-		{name: "revoke offer", method: http.MethodDelete, path: "/api/offer/{id}", target: "/api/offer/" + offerID,
-			scope: scope.OfferRevoke, reads: false, limit: smallCap},
 	}
 }
 
@@ -343,4 +335,87 @@ func TestBoundaryRefusalsBeforeTheStore(t *testing.T) {
 			})
 		}
 	}
+}
+
+// bundleCaller is a credential of the bundle matrix: the lists it carries, and the
+// scopes of the catalog it effectively holds, written out by hand.
+type bundleCaller struct {
+	name string
+	// agent is whether an agent acts, with agentList as its list.
+	agent     bool
+	agentList scope.List
+	keyList   scope.List
+	holds     []scope.Scope
+}
+
+// TestBundlesAtTheCatalog is the bundle half of the credential matrix: a user's
+// default key has every route's scope but member:revoke, which it has only when
+// it names it; a key with the session bundle has all; and an agent, whatever it
+// holds, is refused (forbidden) on every route that changes something it holds,
+// and lacks the scope (insufficient scope) on one it does not.
+func TestBundlesAtTheCatalog(t *testing.T) {
+	t.Parallel()
+
+	every := make([]scope.Scope, 0, len(catalog()))
+
+	for _, route := range catalog() {
+		every = append(every, route.scope)
+	}
+
+	withoutRevoke := slices.DeleteFunc(slices.Clone(every), func(s scope.Scope) bool { return s == scope.MemberRevoke })
+
+	callers := []bundleCaller{
+		{name: "a default:user key", keyList: scopes(scope.DefaultUser), holds: withoutRevoke},
+		{name: "a default:user key that names member:revoke", keyList: scopes(scope.DefaultUser, scope.MemberRevoke),
+			holds: every},
+		{name: "a key naming only member:revoke", keyList: scopes(scope.MemberRevoke),
+			holds: []scope.Scope{scope.MemberRevoke}},
+		{name: "a default:session key", keyList: scopes(scope.DefaultSession), holds: every},
+		{name: "an agent holding everything", agent: true, keyList: scopes(scope.DefaultSession),
+			agentList: scopes(scope.DefaultSession), holds: every},
+		{name: "an agent of the default:user bundle", agent: true, keyList: scopes(scope.DefaultSession),
+			agentList: scopes(scope.DefaultUser), holds: withoutRevoke},
+		{name: "an agent holding the revoking scopes", agent: true, keyList: scopes(scope.DefaultSession),
+			agentList: scopes(scope.UserRevoke, scope.MemberRevoke, scope.InvitationCreate),
+			holds:     []scope.Scope{scope.MemberRevoke}},
+		{name: "an agent of the default:agent bundle", agent: true, keyList: scopes(scope.DefaultAgent),
+			agentList: scopes(scope.DefaultAgent), holds: nil},
+	}
+
+	for _, route := range catalog() {
+		for _, caller := range callers {
+			t.Run(route.name+"/"+caller.name, func(t *testing.T) {
+				t.Parallel()
+
+				spec := keySpec{scope: caller.keyList, agent: "", agentScopes: nil, sandbox: ""}
+				if caller.agent {
+					spec.agent, spec.agentScopes = "agent-1", caller.agentList
+				}
+
+				rg := newRig(t)
+				rec := rg.serve(keyed(rg, route, spec))
+
+				switch {
+				case !slices.Contains(caller.holds, route.scope):
+					wantRefused(t, rg, rec, auth.CodeInsufficientScope)
+				case caller.agent && !route.reads:
+					wantRefused(t, rg, rec, auth.CodeForbidden)
+				case len(rg.store.calls) != 1:
+					t.Errorf("= %d, store calls = %q, want the route to run once", rec.Code, rg.store.calls)
+				}
+			})
+		}
+	}
+}
+
+// wantRefused checks a 403 of the boundary with code, logged once, and that the
+// store was never called.
+func wantRefused(t *testing.T, rg *rig, rec *httptest.ResponseRecorder, code string) {
+	t.Helper()
+
+	if rec.Code != http.StatusForbidden || len(rg.logged) != 1 || rg.logged[0].Code != code {
+		t.Errorf("= %d, logged %v; want 403 %q", rec.Code, rg.logged, code)
+	}
+
+	wantCalls(t, rg.store.calls, nil)
 }

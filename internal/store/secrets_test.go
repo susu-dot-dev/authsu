@@ -119,7 +119,7 @@ func TestResolveSessionStatement(t *testing.T) {
 			"AND " + activeFragment,
 			"AND u.revoked_at IS NULL",
 			"u.role AS role",
-			"COALESCE(u.org_id, '') AS org_id",
+			"u.org_id AS org_id",
 		},
 		args: []any{token.Hash(), store.KindSession, now.Unix(), now.Unix()},
 	})
@@ -247,7 +247,7 @@ func TestResolveAPIKeyStatement(t *testing.T) {
 			"COALESCE(a.scopes, '') AS agent_scopes",
 			"COALESCE(k.agent_id, '') AS agent_id",
 			"AND (k.agent_id IS NULL OR (a.id IS NOT NULL AND a.revoked_at IS NULL))",
-			"COALESCE(u.org_id, '') AS org_id",
+			"u.org_id AS org_id",
 			"COALESCE(a.sandbox_id, '') AS sandbox_id",
 			// A key of an agent in a sandbox needs the sandbox to stand, unexpired as of now,
 			// of the kind the agent's own foreign key names.

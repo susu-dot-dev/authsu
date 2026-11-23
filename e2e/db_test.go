@@ -104,6 +104,134 @@ func seed(t *testing.T, query string, args ...any) {
 	}
 }
 
+// statement is a statement of a transaction, with its arguments.
+type statement struct {
+	query string
+	args  []any
+}
+
+// sqlStmt returns a statement of a transaction.
+func sqlStmt(query string, args ...any) statement { return statement{query: query, args: args} }
+
+// seedAll runs the statements in one transaction, as a D1 batch is one. An
+// account and its organization point at each other, and the key from the account
+// to its organization is deferred: it is checked when the transaction commits,
+// so rows that hold each other are written or deleted together here and in no
+// other way.
+func seedAll(t *testing.T, statements ...statement) {
+	t.Helper()
+
+	err := inTx(t, statements...)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+}
+
+// inTx runs the statements in one transaction and returns the error of the first
+// one that fails or of the commit, where a deferred foreign key is checked. A
+// failed transaction is rolled back.
+func inTx(t *testing.T, statements ...statement) error {
+	t.Helper()
+
+	tx, err := database(t).BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	defer func() { _ = tx.Rollback() }()
+
+	for _, s := range statements {
+		_, err = tx.ExecContext(t.Context(), s.query, s.args...)
+		if err != nil {
+			return fmt.Errorf("exec %q: %w", s.query, err)
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	return nil
+}
+
+// deleteAccount deletes an account, with the organization it created and that
+// only it belongs to: an account created its own organization, which holds it
+// and which it holds (orgs.created_by has no ON DELETE action), so they go
+// together. Whatever else points at the account must already be gone.
+func deleteAccount(t *testing.T, id string) {
+	t.Helper()
+
+	seedAll(t,
+		sqlStmt("DELETE FROM invitation_orgs WHERE org_id IN (SELECT id FROM orgs WHERE created_by = ?)", id),
+		sqlStmt("DELETE FROM org_admins WHERE org_id IN (SELECT id FROM orgs WHERE created_by = ?)", id),
+		sqlStmt("DELETE FROM orgs WHERE created_by = ?", id),
+		sqlStmt("DELETE FROM users WHERE id = ?", id))
+}
+
+// seedAccount inserts an account and the standard organization it belongs to,
+// its own, in one transaction (the account's key to its organization is deferred
+// to the commit, and the organization's key to its creator is not, so the
+// account is written first). query is an INSERT INTO users statement and args
+// its arguments, the first of which is the account's id. The account's
+// organization has the account's id, is named "seeded" and is created by the
+// account, as registration creates one for an account whose invitation names
+// none. Unlike registration it gives the account no administrator row: a test
+// that needs one adds it.
+//
+// An organization whose id is the account's hides a route that takes the one
+// where it wants the other, so a test of the routes' ids uses seedAccountIn.
+func seedAccount(t *testing.T, query string, args ...any) {
+	t.Helper()
+
+	if len(args) == 0 {
+		t.Fatalf("seedAccount wants an INSERT INTO users (...) VALUES (...) with its id first: %q", query)
+	}
+
+	seedAccountIn(t, fmt.Sprint(args[0]), query, args...)
+}
+
+// seedAccountIn is seedAccount with the id of the account's own organization of
+// the caller's choosing, so that it differs from the account's id.
+func seedAccountIn(t *testing.T, org, query string, args ...any) {
+	t.Helper()
+
+	const prefix, values = "INSERT INTO users (", ") VALUES ("
+
+	if !strings.HasPrefix(query, prefix) || strings.Count(query, values) != 1 || len(args) == 0 {
+		t.Fatalf("seedAccount wants an INSERT INTO users (...) VALUES (...) with its id first: %q", query)
+	}
+
+	// The organization's id is bound as the first value.
+	query = prefix + "org_id, " + strings.TrimPrefix(query, prefix)
+	query = strings.Replace(query, values, values+"?, ", 1)
+	args = append([]any{org}, args...)
+
+	tx, err := database(t).BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(t.Context(), query, args...)
+	if err != nil {
+		t.Fatalf("seed %q: %v", query, err)
+	}
+
+	_, err = tx.ExecContext(t.Context(),
+		"INSERT INTO orgs (id, kind, name, created_by, created_at) VALUES (?, 'standard', 'seeded', ?, strftime('%s','now'))",
+		org, args[1])
+	if err != nil {
+		t.Fatalf("seed the organization of %v: %v", args[1], err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		t.Fatalf("seed %q: commit: %v", query, err)
+	}
+}
+
 // scalar returns the first column of the first row as text, or "" when there is
 // no row (or the value is NULL).
 func scalar(t *testing.T, query string, args ...any) string {
@@ -137,7 +265,11 @@ func expectCount(t *testing.T, from, want string, args ...any) {
 
 // refused reports whether the database refuses the statement: the way a test
 // asserts that a schema constraint holds. The statement is run in a transaction
-// that is always rolled back, so an accepted one leaves nothing behind.
+// that is always rolled back, so an accepted one leaves nothing behind. A
+// deferred foreign key (the key from an account to its organization) is only
+// checked when a transaction commits, so before the rollback the transaction's
+// violations are read, and a statement that leaves one is refused too: it is
+// what the commit would refuse.
 func refused(t *testing.T, query string, args ...any) bool {
 	t.Helper()
 
@@ -149,8 +281,25 @@ func refused(t *testing.T, query string, args ...any) bool {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(t.Context(), query, args...)
+	if err != nil {
+		return true
+	}
 
-	return err != nil
+	violations, err := tx.QueryContext(t.Context(), "PRAGMA foreign_key_check")
+	if err != nil {
+		t.Fatalf("foreign_key_check: %v", err)
+	}
+
+	defer func() { _ = violations.Close() }()
+
+	found := violations.Next()
+
+	err = violations.Err()
+	if err != nil {
+		t.Fatalf("foreign_key_check: %v", err)
+	}
+
+	return found
 }
 
 // Tables the tests name. Several are counted by many tests.
@@ -169,7 +318,7 @@ const (
 
 	tableOrgs      = "orgs"
 	tableOrgAdmins = "org_admins"
-	tableOrgOffers = "org_offers"
+	tableInvOrgs   = "invitation_orgs"
 )
 
 // tables are every table a test may leave rows in, in the order that empties
@@ -180,31 +329,47 @@ const (
 // ON DELETE action. Deleting a session or a key also deletes its secret (a
 // trigger), so by the time secrets is emptied it only removes strays.
 //
-// The organizations sit between the two: offers first (they point at users,
-// invitations and organizations with no ON DELETE action that would clear
-// them), then administrators, then the organizations, which agents (already
-// gone) and users point at. users and orgs point at each other (users.org_id,
-// orgs.created_by), so reset releases every member before it deletes either.
+// The organizations sit between the two: the organizations invitations name
+// first (they point at invitations and organizations, and the key to an
+// organization has no ON DELETE action that would clear them), then
+// administrators, then the organizations, which agents (already gone) and users
+// point at. users and orgs point at each other (users.org_id,
+// orgs.created_by), so reset deletes the organizations and then the users in one
+// transaction.
 func tables() []string {
 	return []string{
 		tableOAuthAccess, tableOAuthGrants, tableKeys, tableLabels, tableAgents, tableSessions, tableCredentials,
-		tableOrgOffers, tableOrgAdmins, tableOrgs, tableUsers, tableInvitations, tableSecrets,
+		tableInvOrgs, tableOrgAdmins, tableOrgs, tableUsers, tableInvitations, tableSecrets,
 	}
 }
 
 // reset empties every table, so a test starts from a fresh deployment whatever
-// ran before it. This is what makes tests independent of source order.
+// ran before it. This is what makes tests independent of source order. It is one
+// transaction: an account holds its organization with no ON DELETE action and
+// the organization holds its creator the same way, so the key from the account
+// is only satisfied again at the commit, when neither is left.
 func reset(t *testing.T) {
 	t.Helper()
 
-	// A member holds its organization with no ON DELETE action, and the
-	// organization holds its creator the same way: release the members first,
-	// or neither table can be emptied before the other.
-	seed(t, "UPDATE users SET org_id = NULL")
+	statements := make([]statement, 0, len(tables()))
 
 	for _, table := range tables() {
-		seed(t, "DELETE FROM "+table)
+		statements = append(statements, sqlStmt("DELETE FROM "+table))
 	}
+
+	seedAll(t, statements...)
+}
+
+// deleteAccounts deletes every account with the organizations that hold them,
+// and what names an organization with them. An account and its organization hold
+// each other (users.org_id, and orgs.created_by with no ON DELETE action), so
+// they go in one transaction. Credentials and sessions of the accounts must
+// already be gone.
+func deleteAccounts(t *testing.T) {
+	t.Helper()
+
+	seedAll(t, sqlStmt("DELETE FROM invitation_orgs"), sqlStmt("DELETE FROM org_admins"), sqlStmt("DELETE FROM orgs"),
+		sqlStmt("DELETE FROM users"))
 }
 
 // firstRow returns the columns of the first row as text, and whether there was a

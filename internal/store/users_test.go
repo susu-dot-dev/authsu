@@ -1,4 +1,4 @@
-//nolint:goconst // table-driven tests repeat case names and inputs on purpose; a constant per row would hide the table
+//nolint:goconst,prealloc // table-driven tests repeat case names and inputs, and append defect tables to their cases
 package store_test
 
 import (
@@ -367,172 +367,217 @@ func memberUser(revokedAt *int64) store.User {
 		RevokedAt: revokedAt, CreatedAt: 1_699_999_000}
 }
 
-// revokeBatch is the outcome of RevokeUser's three-statement batch: the account
-// statement returned rows and the secrets and agent statements changed the given
-// number of rows each.
-func revokeBatch(keys, agents int64, rows ...[]any) outcome {
-	return outcome{err: nil, results: []store.Result{
-		{Changes: 0, Rows: rows},
-		{Changes: keys, Rows: nil},
-		{Changes: agents, Rows: nil},
-	}}
+// standingOf is the first statement's row of a revocation: the member's columns
+// (the organization of the tests, administrator or not, revoked or not), then
+// whether the account is a platform administrator, whether the caller
+// administers its organization, and whether the caller may revoke it.
+func standingOf(id string, revoked any, platform, administers, may int64) []any {
+	return append(memberRowOf(id, 0, revoked), platform, administers, may)
 }
 
-// TestRevokeUserOutcomes holds how the row the account statement returned
-// becomes the operation's result: revoked_at set is a revocation, NULL is the
-// last-admin guard refusing, and no row is no such account.
+// revokeBatch is the outcome of the five statements of a revocation: the standing
+// of the account first, the secrets and agents statements, the account statement,
+// which returned the given rows, and the caller's standing last, which is not read
+// unless the standing found no account.
+func revokeBatch(standing []any, rows ...[]any) outcome {
+	results := map[int][][]any{3: rows}
+	if standing != nil {
+		results[0] = [][]any{standing}
+	}
+
+	return batchOf(5, results)
+}
+
+// revokeStandingKinds are the column kinds of a revocation's standing row.
+func revokeStandingKinds() []string {
+	return append(memberKinds(), "integer", "integer", "integer")
+}
+
+// TestRevokeUserOutcomes holds how the standing row and the row the account
+// statement returned become the operation's result: a row returned is a
+// revocation (the earlier time of one that was already revoked), and no row is
+// why the standing says: no standing is no such account (or one the caller may
+// not see), and otherwise the caller's refusal.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestRevokeUserOutcomes(t *testing.T) {
 	t.Parallel()
 
 	justNow := now.Unix()
 	earlier := int64(1_700_000_050)
 
-	tests := []struct {
-		name    string
-		outcome outcome
-		want    store.User
-		err     error
-		defect  bool
-	}{
-		{name: "this call revoked an admin who is not the last",
-			outcome: revokeBatch(0, 0, userRowOf(userID1, userAdminRole, justNow, 1_700_000_000)),
-			want: store.User{ID: userID1, Role: userAdminRole, InvitationID: "inv-1", Profile: `{"name":"Ada"}`,
+	revoking := func(id, caller string) func(*store.Store) (store.User, error) {
+		return func(s *store.Store) (store.User, error) {
+			return s.RevokeUser(context.Background(), mustUserID(t, id), caller, userAdminRole, now)
+		}
+	}
+
+	// The caller is another account.
+	runOpCases(t, []opCase[store.User]{
+		{name: "this call revoked an account",
+			out:  revokeBatch(standingOf(userID2, nil, 0, 1, 1), userRowOf(userID2, "member", justNow, 1_699_999_000)),
+			want: memberUser(&justNow)},
+		{name: "this call revoked an administrator who is not the last",
+			out: revokeBatch(standingOf(userID2, nil, 1, 1, 1), userRowOf(userID2, userAdminRole, justNow, 1_700_000_000)),
+			want: store.User{ID: userID2, Role: userAdminRole, InvitationID: "inv-1", Profile: `{"name":"Ada"}`,
 				RevokedAt: &justNow, CreatedAt: 1_700_000_000}},
-		{name: "this call revoked a member with keys and agents",
-			outcome: revokeBatch(3, 2, userRowOf(userID2, "member", justNow, 1_699_999_000)),
-			want:    memberUser(&justNow)},
 		{name: "already revoked keeps the earlier time",
-			outcome: revokeBatch(0, 0, revokedUserRow()), want: memberUser(&earlier)},
-		{name: "the last active admin is refused", outcome: revokeBatch(0, 0, activeUserRow()),
-			err: store.ErrLastAdmin},
-		{name: "no such account", outcome: revokeBatch(0, 0), err: store.ErrNotFound},
-		{name: "two rows for one primary key", outcome: revokeBatch(0, 0, revokedUserRow(), revokedUserRow()),
-			defect: true},
-		{name: "two rows, the first refused", outcome: revokeBatch(0, 0, activeUserRow(), revokedUserRow()),
-			defect: true},
+			out:  revokeBatch(standingOf(userID2, earlier, 0, 1, 1), revokedUserRow()),
+			want: memberUser(&earlier)},
+		{name: "no such account, or one the caller may not see", out: revokeBatch(nil), err: store.ErrNotFound},
+		{name: "no such account, and the caller is not revoked", out: callerIs(0, revokeBatch(nil)),
+			err: store.ErrNotFound},
+		{name: "the caller may not see the account because they are revoked", out: callerIs(1, revokeBatch(nil)),
+			err: store.ErrAccountRevoked},
+		{name: "a revoked caller's standing is not read when the account was seen",
+			out: callerIs(1, revokeBatch(standingOf(userID2, nil, 0, 0, 0))), err: store.ErrNotAdmin},
+		{name: "a caller who does not administer the organization",
+			out: revokeBatch(standingOf(userID2, nil, 0, 0, 0)), err: store.ErrNotAdmin},
+		{name: "a member of the organization who does not administer it",
+			out: revokeBatch(standingOf(userID2, earlier, 0, 0, 0)), err: store.ErrNotAdmin},
+		{name: "an organization administrator and a platform administrator",
+			out: revokeBatch(standingOf(userID2, nil, 1, 1, 0)), err: store.ErrPlatformAdminTarget},
+		{name: "an organization administrator and a revoked platform administrator",
+			out: revokeBatch(standingOf(userID2, earlier, 1, 1, 0)), err: store.ErrPlatformAdminTarget},
+		{name: "the last active platform administrator",
+			out: revokeBatch(standingOf(userID2, nil, 1, 1, 1)), err: store.ErrLastAdmin},
+		{name: "nothing matched for a caller who may revoke an ordinary account",
+			out: revokeBatch(standingOf(userID2, nil, 0, 1, 1)), defect: true},
+		{name: "nothing matched for an organization administrator who may not, and not for a reason",
+			out: revokeBatch(standingOf(userID2, nil, 0, 1, 0)), defect: true},
+		{name: "two rows for one primary key", out: revokeBatch(standingOf(userID2, nil, 0, 1, 1),
+			revokedUserRow(), revokedUserRow()), defect: true},
+		{name: "a row returned without a standing", out: revokeBatch(nil, revokedUserRow()), err: store.ErrNotFound},
+	}, store.CodeUserRevokeRejected, revoking(userID2, userID1))
+
+	// The caller is the account: refused as themself, when they may not.
+	runOpCases(t, []opCase[store.User]{
+		{name: "an organization administrator revoking themself",
+			out: revokeBatch(standingOf(userID1, nil, 0, 1, 0)), err: store.ErrSelfRevoke},
+		{name: "a platform administrator revoking themself, another remaining",
+			out: revokeBatch(standingOf(userID1, nil, 1, 1, 1), userRowOf(userID1, userAdminRole, justNow, 1)),
+			want: store.User{ID: userID1, Role: userAdminRole, InvitationID: "inv-1", Profile: `{"name":"Ada"}`,
+				RevokedAt: &justNow, CreatedAt: 1},
+		},
+		{name: "the sole platform administrator revoking themself",
+			out: revokeBatch(standingOf(userID1, nil, 1, 1, 1)), err: store.ErrLastAdmin},
+	}, store.CodeUserRevokeRejected, revoking(userID1, userID1))
+
+	cases := []opCase[store.User]{}
+
+	for name, rows := range defectResults(standingOf(userID2, nil, 0, 1, 1), revokeStandingKinds()...) {
+		cases = append(cases, opCase[store.User]{name: "a defective standing: " + name,
+			out: batchOf(5, map[int][][]any{0: rows, 3: {revokedUserRow()}}), defect: true})
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			fake := newFake(test.outcome)
-
-			got, err := fake.store().RevokeUser(context.Background(), mustUserID(t, userID1), userAdminRole, now)
-
-			switch {
-			case test.defect:
-				checkErr(t, err, defectOf(store.CodeUserRevokeRejected))
-			case test.err != nil:
-				if !errors.Is(err, test.err) {
-					t.Fatalf("error = %v, want %v", err, test.err)
-				}
-
-				if _, isAPI := errors.AsType[*apierr.Error](err); isAPI {
-					t.Errorf("outcome %v is classified; the feature must decide that", err)
-				}
-			default:
-				checkErr(t, err, nil)
-			}
-
-			if !reflect.DeepEqual(got, test.want) {
-				t.Errorf("user = %#v, want %#v", got, test.want)
-			}
-		})
-	}
-}
-
-// TestRevokeUserDefects holds that a returned row that is not an account is a
-// defect, and never a revocation, a refusal or a missing account.
-func TestRevokeUserDefects(t *testing.T) {
-	t.Parallel()
 
 	for _, defect := range userDefects() {
-		t.Run(defect.name, func(t *testing.T) {
-			t.Parallel()
-
-			fake := newFake(revokeBatch(0, 0, defect.row))
-
-			got, err := fake.store().RevokeUser(context.Background(), mustUserID(t, userID1), userAdminRole, now)
-
-			checkErr(t, err, defectOf(store.CodeUserRevokeRejected))
-
-			if !reflect.DeepEqual(got, store.User{}) {
-				t.Errorf("a defective row returned %#v", got)
-			}
-		})
+		cases = append(cases, opCase[store.User]{name: "a defective account row: " + defect.name,
+			out: revokeBatch(standingOf(userID2, nil, 0, 1, 1), defect.row), defect: true})
 	}
+
+	cases = append(cases, callerDefectCases[store.User](5)...)
+
+	runOpCases(t, cases, store.CodeUserRevokeRejected, revoking(userID2, userID1))
 }
 
-// TestRevokeUserStatements pins the batch: the three statements in order, the
-// guards that decide what each does, and the exact arguments in placeholder
+// The statements of a revocation, as fragments of their squashed text. The caller
+// may revoke the account when they administer its organization (or are a platform
+// administrator) and the account is neither a platform administrator nor the
+// caller, unless the caller is a platform administrator themself; the last active
+// platform administrator is never revoked. Every statement of the batch carries
+// the same conditions, so a refusal changes nothing.
+//
+//nolint:gochecknoglobals // fixed lists shared by the table tests
+var (
+	revokeMayFragment = "AND ((tu.role <> ?3 AND tu.id <> ?2) OR EXISTS (SELECT 1 FROM users pa " +
+		"WHERE pa.id = ?2 AND pa.revoked_at IS NULL AND pa.role = ?3))"
+	revokeRemainsFragment = "AND (tu.revoked_at IS NOT NULL OR tu.role <> ?3 OR EXISTS (SELECT 1 FROM users other " +
+		"WHERE other.id <> tu.id AND other.role = ?3 AND other.revoked_at IS NULL))"
+)
+
+// revokeAllowedFragments is every fragment a statement carrying revokeAllowed has.
+func revokeAllowedFragments() []string {
+	return append(slices.Clone(targetAdministersFragments), revokeMayFragment, revokeRemainsFragment)
+}
+
+// TestRevokeUserStatements pins the batch: the five statements in order, the
+// conditions that decide what each does, and the exact arguments in placeholder
 // order. The role is bound, and not written in the SQL.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestRevokeUserStatements(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		id   string
-		role string
-		at   int64
+		name   string
+		id     string
+		caller string
+		role   string
+		at     int64
 	}{
-		{name: "an admin role and an account", id: userID1, role: userAdminRole, at: now.Unix()},
-		{name: "another role and another account", id: userID2, role: "owner", at: 1_700_000_999},
+		{name: "an admin role and an account", id: userID2, caller: userID1, role: userAdminRole, at: now.Unix()},
+		{name: "another role, account and caller", id: userID1, caller: callerID, role: "owner", at: 1_700_000_999},
 	}
-
-	// The account must be revoked, as the statement left it, for the secrets and
-	// agents statements to apply: this is the condition that lets a refused
-	// revocation change nothing else.
-	followsRevocation := "AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND revoked_at IS NOT NULL)"
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			fake := newFake(revokeBatch(0, 0, userRowOf(test.id, "member", test.at, 1)))
+			fake := newFake(revokeBatch(standingOf(test.id, nil, 0, 1, 1), userRowOf(test.id, "member", test.at, 1)))
 
-			_, err := fake.store().RevokeUser(context.Background(), mustUserID(t, test.id), test.role, time.Unix(test.at, 0))
+			_, err := fake.store().RevokeUser(
+				context.Background(), mustUserID(t, test.id), test.caller, test.role, time.Unix(test.at, 0))
 			checkErr(t, err, nil)
+
+			exists := "EXISTS (SELECT 1 FROM users tu WHERE tu.id = ?1 AND "
 
 			checkNumberedStatements(t, fake,
 				wantStatement{
-					fragments: []string{
-						// The account: keeps an earlier time, refuses to leave
-						// no active admin, matches by id alone, and returns the
-						// row as it was left.
-						"UPDATE users SET revoked_at = COALESCE(revoked_at, CASE",
-						"WHEN role <> ?3",
-						"OR EXISTS (SELECT 1 FROM users other WHERE other.id <> users.id " +
-							"AND other.role = ?3 AND other.revoked_at IS NULL)",
-						"THEN ?1 END)",
-						"WHERE id = ?2",
-						"RETURNING " + userColumns,
-					},
-					args: []any{test.at, test.id, test.role},
+					fragments: append([]string{
+						// The standing: the account as the caller may see it, and
+						// what the caller may do to it, as the write sees it.
+						"FROM users tu WHERE tu.id = ?1 AND",
+						"tu.org_id AS org_id",
+						"tu.role = ?3 AS platform_admin",
+						"AS administers", "AS may_revoke",
+					}, append(slices.Clone(targetSeesFragments), revokeMayFragment)...),
+					args: []any{test.id, test.caller, test.role},
 				},
 				wantStatement{
-					fragments: []string{
+					fragments: append([]string{
 						// The user's sessions, keys and OAuth grants with their access
 						// tokens, those of its agents included: a due time is kept.
-						"UPDATE secrets SET revoked_at = ?1",
-						"WHERE id IN (SELECT id FROM sessions WHERE user_id = ?2 UNION ALL SELECT id FROM api_keys " +
-							"WHERE user_id = ?2 UNION ALL SELECT id FROM oauth_grants WHERE user_id = ?2 " +
+						"UPDATE secrets SET revoked_at = ?4",
+						"WHERE id IN (SELECT id FROM sessions WHERE user_id = ?1 UNION ALL SELECT id FROM api_keys " +
+							"WHERE user_id = ?1 UNION ALL SELECT id FROM oauth_grants WHERE user_id = ?1 " +
 							"UNION ALL SELECT t.id FROM oauth_access_tokens t JOIN oauth_grants g ON g.id = t.grant_id " +
-							"WHERE g.user_id = ?2)",
-						"AND (revoked_at IS NULL OR revoked_at > ?1)",
-						followsRevocation,
-					},
-					args: []any{test.at, test.id},
+							"WHERE g.user_id = ?1)",
+						"AND (revoked_at IS NULL OR revoked_at > ?4)",
+						exists,
+					}, revokeAllowedFragments()...),
+					args: []any{test.id, test.caller, test.role, test.at},
 				},
 				wantStatement{
-					fragments: []string{
+					fragments: append([]string{
 						// The agents: one already revoked keeps its time.
-						"UPDATE agents SET revoked_at = ?1",
-						"WHERE user_id = ?2",
-						"AND revoked_at IS NULL",
-						followsRevocation,
-					},
-					args: []any{test.at, test.id},
+						"UPDATE agents SET revoked_at = ?4",
+						"WHERE user_id = ?1 AND revoked_at IS NULL",
+						exists,
+					}, revokeAllowedFragments()...),
+					args: []any{test.id, test.caller, test.role, test.at},
+				},
+				wantStatement{
+					fragments: append([]string{
+						// The account: keeps an earlier time, matches by id, and
+						// returns the row as it was left.
+						"UPDATE users AS tu SET revoked_at = COALESCE(tu.revoked_at, ?4) WHERE tu.id = ?1 AND",
+						"RETURNING " + userColumns,
+					}, revokeAllowedFragments()...),
+					args: []any{test.id, test.caller, test.role, test.at},
+				},
+				wantStatement{
+					fragments: callerStandingStatement().fragments,
+					args:      []any{test.caller},
 				},
 			)
 		})
@@ -544,19 +589,23 @@ func TestRevokeUserStatements(t *testing.T) {
 func TestRevokeUserGuardIsNotABareLiteral(t *testing.T) {
 	t.Parallel()
 
-	fake := newFake(revokeBatch(0, 0, revokedUserRow()))
+	fake := newFake(revokeBatch(standingOf(userID2, nil, 0, 1, 1), revokedUserRow()))
 
-	_, err := fake.store().RevokeUser(context.Background(), mustUserID(t, userID2), "customrole", now)
+	_, err := fake.store().RevokeUser(context.Background(), mustUserID(t, userID2), userID1, "customrole", now)
 	checkErr(t, err, nil)
 
 	for i, statement := range fake.calls[0] {
-		if query := squash(statement.Query); strings.Contains(query, "admin") || strings.Contains(query, "customrole") {
+		query := squash(statement.Query)
+
+		if strings.Contains(query, "'admin'") || strings.Contains(query, "'customrole'") {
 			t.Errorf("statement %d writes a role into the SQL:\n%s", i, query)
 		}
-	}
 
-	if args := fake.calls[0][0].Args; !slices.Contains(args, any("customrole")) {
-		t.Errorf("role is not bound: args = %#v", args)
+		// Every statement that judges the caller's authority binds the role; the
+		// caller's standing, which does not, has the caller's id alone.
+		if strings.Contains(query, "?3") != slices.Contains(statement.Args, any("customrole")) {
+			t.Errorf("statement %d binds the role only if it uses it: args = %#v", i, statement.Args)
+		}
 	}
 }
 
@@ -568,30 +617,10 @@ func TestRevokeUserGuardIsNotABareLiteral(t *testing.T) {
 func TestRevokeUserFailures(t *testing.T) {
 	t.Parallel()
 
-	for _, f := range infraFailures(3, store.CodeUserRevokeFailed, store.CodeUserRevokeRejected, usersDescription) {
-		if f.conflict {
-			f.conflict = false
-			f.want = *defectOf(store.CodeUserRevokeRejected)
-		}
-
-		t.Run(f.name, func(t *testing.T) {
-			t.Parallel()
-
-			fake := newFake(f.outcome)
-
-			got, err := fake.store().RevokeUser(context.Background(), mustUserID(t, userID1), userAdminRole, now)
-
-			checkFailure(t, err, f)
-
-			if !reflect.DeepEqual(got, store.User{}) {
-				t.Errorf("a failed revoke returned %#v", got)
-			}
-
-			if len(fake.calls) != 1 {
-				t.Errorf("exec called %d times, want 1", len(fake.calls))
-			}
+	runDefectFailures(t, 5, store.CodeUserRevokeFailed, store.CodeUserRevokeRejected, usersDescription,
+		func(s *store.Store) error {
+			return lastErr(s.RevokeUser(context.Background(), mustUserID(t, userID1), userID1, userAdminRole, now))
 		})
-	}
 }
 
 // TestUserCodes pins the wire codes the operations report. Clients and

@@ -21,52 +21,45 @@ const (
 	// CodeOrgNotFound is an organization the caller may not see: one that does
 	// not exist, and one that exists and is not theirs.
 	CodeOrgNotFound = "org_not_found"
-	// CodeMemberNotFound is a user who belongs to no organization, or to one the
+	// CodeMemberNotFound is a user who does not exist, or whose organization the
 	// caller may not see.
 	CodeMemberNotFound = "member_not_found"
-	// CodeOfferNotFound is an offer that does not exist, that is not the
-	// caller's to decline or withdraw, or that is of an organization that is
-	// revoked.
-	CodeOfferNotFound = "offer_not_found"
-	// CodeOfferUserNotFound is the user an offer is addressed to not existing, or
-	// being revoked.
-	CodeOfferUserNotFound = "offer_user_not_found"
 	// CodeNotAdmin is a caller who can see the organization and does not
 	// administer it.
 	CodeNotAdmin = "org_admin_required"
-	// CodeInactive is a change to an organization that is revoked, or a sandbox
-	// that has expired.
-	CodeInactive = "org_inactive"
-	// CodeNotStandard is a member or offer route that named a sandbox.
+	// CodeSandboxExpired is a change to a sandbox that has expired.
+	CodeSandboxExpired = "sandbox_expired"
+	// CodeNotStandard is a member route that named a sandbox.
 	CodeNotStandard = "org_not_standard"
-	// CodeAlreadyMember is a user who belongs to an organization already, and so
-	// cannot create or join one.
-	CodeAlreadyMember = "org_already_member"
-	// CodeOrgLimit is a create of a standard organization refused because the
-	// user has created MaxStandardOrgsPerUser.
-	CodeOrgLimit = "org_limit_reached"
-	// CodeSandboxLimit is a create of a sandbox refused because the user holds
-	// MaxSandboxesPerUser that have not expired.
+	// CodeNotSandbox is a delete that named a standard organization, which is
+	// never deleted.
+	CodeNotSandbox = "org_not_sandbox"
+	// CodeSandboxLimit is a create refused because the user holds
+	// MaxSandboxesPerUser sandboxes that have not expired.
 	CodeSandboxLimit = "sandbox_limit_reached"
-	// CodeLastAdmin is a change that would leave a standard organization without
-	// an unrevoked administrator.
+	// CodeLastAdmin is a demotion that would leave a standard organization
+	// without an unrevoked administrator.
 	CodeLastAdmin = "org_last_admin"
-	// CodeOfferExists is an offer to a user who already has one from the
-	// organization.
-	CodeOfferExists = "offer_exists"
+	// CodeMemberRevoked is a promotion of a member whose account is revoked.
+	CodeMemberRevoked = "member_revoked"
+	// CodeLastPlatformAdmin is a revocation of the last active platform
+	// administrator. It is the code the account routes use for the same refusal
+	// (docs/users_design.md).
+	CodeLastPlatformAdmin = "user_last_admin"
+	// CodePlatformAdminProtected is an organization administrator's revocation of
+	// a platform administrator, who only a platform administrator may revoke.
+	CodePlatformAdminProtected = "platform_admin_protected"
+	// CodeSelfRevoke is an organization administrator's revocation of themself.
+	CodeSelfRevoke = "self_revoke_refused"
 )
 
 // Paths. A collection takes the verbs of the whole set; a member of one takes the
 // verbs of its own.
 const (
-	orgCollectionPath   = "/api/org"
-	orgItemPath         = "/api/org/{id}"
-	orgMemberPath       = "/api/org/{id}/member"
-	orgOfferPath        = "/api/org/{id}/offer"
-	memberItemPath      = "/api/member/{id}"
-	offerCollectionPath = "/api/offer"
-	offerItemPath       = "/api/offer/{id}"
-	offerAcceptPath     = "/api/offer/{id}/accept"
+	orgCollectionPath = "/api/org"
+	orgItemPath       = "/api/org/{id}"
+	orgMemberPath     = "/api/org/{id}/member"
+	memberItemPath    = "/api/member/{id}"
 )
 
 // maxBody is the largest request body any route reads, in bytes. The biggest
@@ -86,7 +79,7 @@ const maxSmallBody = 1 << 10
 // Each needs its own scope and no role: whether the caller may act on an
 // organization is the store's to decide, in the write. Every route that changes
 // something refuses agents, whatever their scopes (an agent is not the one to
-// reorganise its user's membership), and none opts in to a sandbox.
+// reorganise its user's organization), and none opts in to a sandbox.
 func Routes(deps Deps) []auth.Route {
 	for name, missing := range map[string]bool{
 		"Store": deps.Store == nil, "Now": deps.Now == nil, "NewID": deps.NewID == nil,
@@ -97,23 +90,18 @@ func Routes(deps Deps) []auth.Route {
 	}
 
 	return []auth.Route{
-		declare(http.MethodPost, orgCollectionPath, maxBody, auth.Needs(scope.OrgCreate).WithoutAgents(), deps.createOrg),
+		declare(http.MethodPost, orgCollectionPath, maxBody,
+			auth.Needs(scope.SandboxCreate).WithoutAgents(), deps.createSandbox),
 		declare(http.MethodGet, orgCollectionPath, maxSmallBody, auth.Needs(scope.OrgRead), deps.listOrgs),
 		declare(http.MethodGet, orgItemPath, maxSmallBody, auth.Needs(scope.OrgRead), deps.getOrg),
 		declare(http.MethodPatch, orgItemPath, maxBody, auth.Needs(scope.OrgUpdate).WithoutAgents(), deps.renameOrg),
-		declare(http.MethodDelete, orgItemPath, maxSmallBody, auth.Needs(scope.OrgRevoke).WithoutAgents(), deps.revokeOrg),
+		declare(http.MethodDelete, orgItemPath, maxSmallBody,
+			auth.Needs(scope.SandboxRevoke).WithoutAgents(), deps.deleteSandbox),
 		declare(http.MethodGet, orgMemberPath, maxSmallBody, auth.Needs(scope.MemberRead), deps.listMembers),
 		declare(http.MethodPatch, memberItemPath, maxSmallBody,
 			auth.Needs(scope.MemberUpdate).WithoutAgents(), deps.setMemberAdmin),
 		declare(http.MethodDelete, memberItemPath, maxSmallBody,
-			auth.Needs(scope.MemberRevoke).WithoutAgents(), deps.removeMember),
-		declare(http.MethodPost, orgOfferPath, maxSmallBody, auth.Needs(scope.OfferCreate).WithoutAgents(), deps.createOffer),
-		declare(http.MethodGet, orgOfferPath, maxSmallBody, auth.Needs(scope.OfferRead), deps.listOrgOffers),
-		declare(http.MethodGet, offerCollectionPath, maxSmallBody, auth.Needs(scope.OfferRead), deps.listMyOffers),
-		declare(http.MethodPost, offerAcceptPath, maxSmallBody,
-			auth.Needs(scope.OfferUpdate).WithoutAgents(), deps.acceptOffer),
-		declare(http.MethodDelete, offerItemPath, maxSmallBody,
-			auth.Needs(scope.OfferRevoke).WithoutAgents(), deps.revokeOffer),
+			auth.Needs(scope.MemberRevoke).WithoutAgents(), deps.revokeMember),
 	}
 }
 
@@ -134,8 +122,6 @@ type Status string
 const (
 	// StatusActive means the organization works.
 	StatusActive Status = "active"
-	// StatusRevoked means a standard organization was revoked.
-	StatusRevoked Status = "revoked"
 	// StatusExpired means a sandbox is past its expiry. It still exists, and is
 	// inert, until it is deleted.
 	StatusExpired Status = "expired"
@@ -162,27 +148,19 @@ type Org struct {
 	// organization.
 	ExpiresAt *int64 `json:"expiresAt,omitempty"`
 
-	// RevokedAt is when a standard organization was revoked, and is absent
-	// until then.
-	RevokedAt *int64 `json:"revokedAt,omitempty"`
-
 	Status Status `json:"status"`
 }
 
 // presentOrg is the client's view of a stored organization at now.
 func presentOrg(stored store.Org, now time.Time) Org {
 	status := StatusActive
-
-	switch {
-	case stored.RevokedAt != nil:
-		status = StatusRevoked
-	case !stored.Active(now):
+	if !stored.Active(now) {
 		status = StatusExpired
 	}
 
 	return Org{
 		ID: stored.ID, Kind: stored.Kind, Name: stored.Name, CreatedBy: stored.CreatedBy, CreatedAt: stored.CreatedAt,
-		ExpiresAt: stored.ExpiresAt, RevokedAt: stored.RevokedAt, Status: status,
+		ExpiresAt: stored.ExpiresAt, Status: status,
 	}
 }
 
@@ -194,12 +172,12 @@ type Member struct {
 	// OrgID is the organization they belong to.
 	OrgID string `json:"orgId"`
 
-	// Admin is whether they administer it.
+	// Admin is whether they administer it. A revoked member never does, whatever
+	// they administered when they were revoked.
 	Admin bool `json:"admin"`
 
 	// Status is "active", or "revoked" for a member whose account was revoked: they
-	// stay in the organization until removed, and do not count as an
-	// administrator.
+	// stay in the organization as a record.
 	Status string `json:"status"`
 
 	// CreatedAt is when the account was created, in Unix seconds.
@@ -223,40 +201,9 @@ func presentMember(stored store.Member) Member {
 	}
 
 	return Member{
-		ID: stored.ID, OrgID: stored.OrgID, Admin: stored.Admin, Status: status, CreatedAt: stored.CreatedAt,
+		ID: stored.ID, OrgID: stored.OrgID, Admin: stored.Admin && stored.RevokedAt == nil, Status: status,
+		CreatedAt: stored.CreatedAt,
 		RevokedAt: stored.RevokedAt,
-	}
-}
-
-// Offer is an offer of a place in a standard organization.
-type Offer struct {
-	ID string `json:"id"`
-
-	// OrgID and OrgName are the organization offered.
-	OrgID   string `json:"orgId"`
-	OrgName string `json:"orgName"`
-
-	// UserID is who it is addressed to, and is absent for an offer that rides on
-	// an invitation.
-	UserID *string `json:"userId,omitempty"`
-
-	// InvitationID is the invitation the offer rides on, and is absent for an
-	// offer to an existing user.
-	InvitationID *string `json:"invitationId,omitempty"`
-
-	// Role is "member" or "admin": what the person becomes on joining.
-	Role string `json:"role"`
-
-	// CreatedBy is who made the offer, and CreatedAt is in Unix seconds.
-	CreatedBy string `json:"createdBy"`
-	CreatedAt int64  `json:"createdAt"`
-}
-
-// presentOffer is the client's view of a stored offer.
-func presentOffer(stored store.Offer) Offer {
-	return Offer{
-		ID: stored.ID, OrgID: stored.OrgID, OrgName: stored.OrgName, UserID: stored.UserID,
-		InvitationID: stored.InvitationID, Role: stored.Role, CreatedBy: stored.CreatedBy, CreatedAt: stored.CreatedAt,
 	}
 }
 
@@ -294,12 +241,24 @@ func outcome(err error, notFound func(error) *apierr.Error) error {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return notFound(err)
-	case errors.Is(err, store.ErrNotAdmin):
-		return refuse(apierr.Forbidden, CodeNotAdmin, "administering the organization is required", err)
-	case errors.Is(err, store.ErrTargetNotFound):
-		return refuse(apierr.NotFound, CodeOfferUserNotFound, "no such user", err)
 	case errors.Is(err, store.ErrAccountRevoked):
 		return auth.Unauthenticated(err) //nolint:wrapcheck // the boundary's own classified 401, with err as its cause
+	default:
+		return forbidden(err)
+	}
+}
+
+// forbidden maps the outcomes of a caller who can see what they asked about and
+// may not do it. Anything else is for conflict.
+func forbidden(err error) error {
+	switch {
+	case errors.Is(err, store.ErrNotAdmin):
+		return refuse(apierr.Forbidden, CodeNotAdmin, "administering the organization is required", err)
+	case errors.Is(err, store.ErrPlatformAdminTarget):
+		return refuse(apierr.Forbidden, CodePlatformAdminProtected,
+			"only a platform administrator may revoke a platform administrator", err)
+	case errors.Is(err, store.ErrSelfRevoke):
+		return refuse(apierr.Forbidden, CodeSelfRevoke, "an organization administrator may not revoke themself", err)
 	default:
 		return conflict(err)
 	}
@@ -310,16 +269,18 @@ func outcome(err error, notFound func(error) *apierr.Error) error {
 // is.
 func conflict(err error) error {
 	switch {
-	case errors.Is(err, store.ErrInactive):
-		return refuse(apierr.Conflict, CodeInactive, "the organization is revoked or has expired", err)
+	case errors.Is(err, store.ErrExpired):
+		return refuse(apierr.Conflict, CodeSandboxExpired, "the sandbox has expired", err)
 	case errors.Is(err, store.ErrNotStandard):
-		return refuse(apierr.Conflict, CodeNotStandard, "a sandbox has no members and receives no offers", err)
-	case errors.Is(err, store.ErrAlreadyMember):
-		return refuse(apierr.Conflict, CodeAlreadyMember, "the user already belongs to an organization", err)
+		return refuse(apierr.Conflict, CodeNotStandard, "a sandbox has no members", err)
+	case errors.Is(err, store.ErrNotSandbox):
+		return refuse(apierr.Conflict, CodeNotSandbox, "only a sandbox can be deleted", err)
+	case errors.Is(err, store.ErrMemberRevoked):
+		return refuse(apierr.Conflict, CodeMemberRevoked, "a revoked member cannot be made an administrator", err)
 	case errors.Is(err, store.ErrLastOrgAdmin):
 		return refuse(apierr.Conflict, CodeLastAdmin, "an organization must keep an administrator", err)
-	case errors.Is(err, store.ErrOfferExists):
-		return refuse(apierr.Conflict, CodeOfferExists, "the user already has an offer from the organization", err)
+	case errors.Is(err, store.ErrLastAdmin):
+		return refuse(apierr.Conflict, CodeLastPlatformAdmin, "the last active administrator cannot be revoked", err)
 	default:
 		return err
 	}
@@ -330,9 +291,6 @@ func asOrg(err error) error { return outcome(err, noSuchOrg) }
 
 // asMember is outcome for a route about a member.
 func asMember(err error) error { return outcome(err, noSuchMember) }
-
-// asOffer is outcome for a route about an offer.
-func asOffer(err error) error { return outcome(err, noSuchOffer) }
 
 // refuse is the classified error for a store outcome, with cause kept for the
 // log.
@@ -349,10 +307,4 @@ func noSuchOrg(cause error) *apierr.Error {
 // caller may see.
 func noSuchMember(cause error) *apierr.Error {
 	return refuse(apierr.NotFound, CodeMemberNotFound, "no such member", cause)
-}
-
-// noSuchOffer is the client's 404 for an offer that does not exist or is not the
-// caller's.
-func noSuchOffer(cause error) *apierr.Error {
-	return refuse(apierr.NotFound, CodeOfferNotFound, "no such offer", cause)
 }

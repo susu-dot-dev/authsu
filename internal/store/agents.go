@@ -58,8 +58,7 @@ type Agent struct {
 	SandboxID *string
 
 	// FirstParty is whether authsu created the agent for a trusted app's sign-in
-	// (migration 0002) and not the user. It says nothing about what the agent may
-	// do.
+	// and not the user. It says nothing about what the agent may do.
 	FirstParty bool
 }
 

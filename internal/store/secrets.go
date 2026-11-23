@@ -90,12 +90,12 @@ func insertSecret(id, kind string, hash []byte, expiresAt, createdAt int64) Stat
 // A hash that belongs to another kind of secret therefore resolves to nothing.
 //
 // The account's organization is read from the account in the same statement, as
-// its role is: "" when it belongs to none.
+// its role is.
 //
 // Arguments, in order: hash, kind, now, now (unix seconds).
 const resolveSessionQuery = `
 SELECT s.id AS id, x.user_id AS user_id, u.role AS role, s.expires_at AS expires_at,
-       COALESCE(u.org_id, '') AS org_id
+       u.org_id AS org_id
 FROM secrets s
 JOIN sessions x ON x.id = s.id AND x.kind = s.kind
 JOIN users u ON u.id = x.user_id
@@ -119,7 +119,7 @@ type ActiveSession struct {
 	// ExpiresAt is when the session stops being active.
 	ExpiresAt time.Time
 
-	// OrgID is the standard organization the account belongs to now, or "".
+	// OrgID is the standard organization the account belongs to.
 	OrgID string
 }
 
@@ -173,7 +173,7 @@ func (s *Store) ResolveSession(
 const resolveAPIKeyQuery = `
 SELECT s.id AS id, k.user_id AS user_id, u.role AS role, s.expires_at AS expires_at,
        COALESCE(k.agent_id, '') AS agent_id, COALESCE(a.scopes, '') AS agent_scopes, k.scope AS scope,
-       COALESCE(u.org_id, '') AS org_id, COALESCE(a.sandbox_id, '') AS sandbox_id
+       u.org_id AS org_id, COALESCE(a.sandbox_id, '') AS sandbox_id
 FROM secrets s
 JOIN api_keys k ON k.id = s.id AND k.kind = s.kind
 JOIN users u ON u.id = k.user_id
@@ -212,7 +212,7 @@ type ActiveAPIKey struct {
 	// Scope is the key's own scope list as stored.
 	Scope string
 
-	// OrgID is the standard organization the account belongs to now, or "".
+	// OrgID is the standard organization the account belongs to.
 	OrgID string
 
 	// SandboxID is the sandbox the key's agent is confined to, or "" for a

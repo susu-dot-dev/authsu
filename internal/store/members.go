@@ -16,8 +16,8 @@ const (
 	CodeMemberListRejected   = "member_list_rejected"
 	CodeMemberUpdateFailed   = "member_update_failed"
 	CodeMemberUpdateRejected = "member_update_rejected"
-	CodeMemberRemoveFailed   = "member_remove_failed"
-	CodeMemberRemoveRejected = "member_remove_rejected"
+	CodeMemberRevokeFailed   = "member_revoke_failed"
+	CodeMemberRevokeRejected = "member_revoke_rejected"
 )
 
 // Member is a user of a standard organization as it is shown to those who may
@@ -33,7 +33,7 @@ type Member struct {
 	Admin bool
 
 	// RevokedAt is when the user's account was revoked, in Unix seconds, or nil.
-	// A revoked member keeps belonging to the organization until removed, and
+	// A revoked member stays in the organization as a record, for life, and
 	// does not count as an administrator.
 	RevokedAt *int64
 
@@ -78,10 +78,6 @@ const (
 	// belongs to it, administers it, or is a platform administrator. The user
 	// themself is among those who belong to it.
 	callerSeesTargetOrg = orgSubjectFrom + `tu.org_id` + callerSeesOrgTo
-
-	// callerMayRemoveTarget holds when the caller may take the user out of their
-	// organization: the user themself (leaving), or one who administers it.
-	callerMayRemoveTarget = `((tu.id = ?2 AND tu.revoked_at IS NULL) OR ` + callerAdministersTargetOrg + `)`
 
 	// otherAdminRemains holds when the user's organization would still have an
 	// unrevoked administrator other than the user, or when the user is revoked
@@ -149,8 +145,8 @@ func (s *Store) ListMembers(
 	)
 }
 
-// standardOrg is the guard of what only a standard organization has (members,
-// offers): a sandbox has none.
+// standardOrg is the guard of what only a standard organization has (members): a
+// sandbox has none.
 func standardOrg(org Org) error {
 	if org.Kind != OrgKindStandard {
 		return ErrNotStandard
@@ -162,8 +158,8 @@ func standardOrg(org Org) error {
 // memberStandingQuery reads a user who belongs to an organization, with whether
 // they administer it and whether the caller does, as the first statement of a
 // write to a member: the write's conditions are the same text over the same
-// batch, so it reads the state the write saw. No row is a user who belongs to no
-// organization or one the caller may not see, which is the same answer for both.
+// batch, so it reads the state the write saw. No row is a user who does not exist
+// or one the caller may not see, which is the same answer for both.
 //
 // Arguments, by number: ?1 user id, ?2 caller id, ?3 the platform
 // administrator role.
@@ -173,13 +169,17 @@ SELECT tu.id AS id, tu.org_id AS org_id,
        tu.revoked_at AS revoked_at, tu.created_at AS created_at,
        ` + callerAdministersTargetOrg + ` AS administers
 FROM users tu
-WHERE tu.id = ?1 AND tu.org_id IS NOT NULL AND ` + callerSeesTargetOrg
+WHERE tu.id = ?1 AND ` + callerSeesTargetOrg
 
-// promoteMemberQuery makes a member of an active standard organization an
+// promoteMemberQuery makes a member of a standard organization an
 // administrator of it, if the caller administers it. A member who already is one
 // is matched too and left as they are (the upsert changes nothing), so promoting
 // twice succeeds, and RETURNING gives a row either way, which is how the caller
 // learns that the write took effect.
+//
+// A revoked member is not promoted: a revoked account never administers
+// anything, so the row would mean nothing, and the member's standing statement
+// tells the caller why nothing was written (ErrMemberRevoked).
 //
 // Arguments, by number: ?1 user id, ?2 caller id, ?3 the platform
 // administrator role, ?4 created_at.
@@ -187,8 +187,8 @@ const promoteMemberQuery = `
 INSERT INTO org_admins (org_id, user_id, created_at)
 SELECT tu.org_id, tu.id, ?4
 FROM users tu
-WHERE tu.id = ?1 AND tu.org_id IS NOT NULL
-  AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = tu.org_id AND o.revoked_at IS NULL)
+WHERE tu.id = ?1
+  AND tu.revoked_at IS NULL
   AND ` + callerAdministersTargetOrg + `
 ON CONFLICT (org_id, user_id) DO UPDATE SET created_at = org_admins.created_at
 RETURNING user_id`
@@ -215,47 +215,17 @@ WHERE user_id = ?1
                 AND ` + otherAdminRemains + `)
 RETURNING user_id`
 
-// removeMemberAdminQuery deletes the administrator row of a user who is leaving
-// their organization or being removed from it, if the caller may remove them and
-// the organization keeps an unrevoked administrator (otherAdminRemains). It is
-// the first of the two writes of RemoveMember, so that the second sees whether
-// the user is still an administrator: it removes the user only when they are not,
-// which is the last-administrator guard without stating it twice.
-//
-// Arguments, by number: ?1 user id, ?2 caller id, ?3 the platform
-// administrator role.
-const removeMemberAdminQuery = `
-DELETE FROM org_admins
-WHERE user_id = ?1
-  AND EXISTS (SELECT 1 FROM users tu
-              WHERE tu.id = ?1 AND tu.org_id = org_admins.org_id
-                AND ` + callerMayRemoveTarget + `
-                AND ` + otherAdminRemains + `)`
-
-// removeMemberQuery takes a user out of their organization, if the caller may
-// remove them and they no longer administer it (removeMemberAdminQuery has run
-// before it and refused to remove the last administrator). RETURNING gives a row
-// when the user was released.
-//
-// Arguments, by number: ?1 user id, ?2 caller id, ?3 the platform
-// administrator role.
-const removeMemberQuery = `
-UPDATE users AS tu SET org_id = NULL
-WHERE tu.id = ?1 AND tu.org_id IS NOT NULL
-  AND ` + callerMayRemoveTarget + `
-  AND NOT EXISTS (SELECT 1 FROM org_admins ta WHERE ta.org_id = tu.org_id AND ta.user_id = tu.id)
-RETURNING id`
-
 // SetMemberAdmin makes a member of a standard organization an administrator of it,
 // or stops them being one, as one batch, and returns the member as the write left
 // them. The caller must administer the member's organization, or be a platform
 // administrator. Promoting an administrator and demoting a member who is not one
 // succeed and change nothing.
 //
-// It returns ErrNotFound when the user belongs to no organization or the caller
-// may not see it, ErrNotAdmin when the caller can see it but does not administer
-// it, and ErrLastOrgAdmin when demoting would leave the organization without an
-// unrevoked administrator.
+// It returns ErrNotFound when the user does not exist or the caller may not see
+// their organization, ErrAccountRevoked when the caller was revoked, ErrNotAdmin
+// when the caller can see it but does not administer it, ErrMemberRevoked when
+// asked to promote a revoked member, and ErrLastOrgAdmin when demoting would
+// leave the organization without an unrevoked administrator.
 func (s *Store) SetMemberAdmin(
 	ctx context.Context, id input.ID, admin bool, caller, adminRole string, now time.Time,
 ) (Member, error) {
@@ -268,9 +238,11 @@ func (s *Store) SetMemberAdmin(
 		change = Statement{Query: promoteMemberQuery, Args: []any{id.String(), caller, adminRole, now.Unix()}}
 	}
 
-	return outcome(s.runChecked(ctx, o, Statement{Query: memberStandingQuery, Args: args}, change).
+	return outcome(s.runChecked(ctx, o,
+		Statement{Query: memberStandingQuery, Args: args}, change, Statement{Query: callerStandingQuery, Args: []any{caller}},
+	).
 		Then(func(results []Result) (Member, error) {
-			return memberBefore(o, results[0].Rows).
+			return memberBefore(o, results[0].Rows, results[2].Rows).
 				Check(callerAdministers).
 				Then(func(before memberStanding) (Member, error) {
 					return applied(o, results[1].Rows).
@@ -286,7 +258,8 @@ func (s *Store) SetMemberAdmin(
 // the member as the batch left them, or why the change was refused. took is
 // whether the change's statement returned its row. A demotion of a member who
 // was not an administrator succeeds with nothing to do, and one that matched
-// nothing for an administrator is the guard refusing to take the last one.
+// nothing for an administrator is the guard refusing to take the last one. A
+// promotion that matched nothing is for a revoked member, who is never promoted.
 func memberChanged(o op, member Member, admin, took bool) (Member, error) {
 	was := member.Admin
 	member.Admin = admin
@@ -296,6 +269,8 @@ func memberChanged(o op, member Member, admin, took bool) (Member, error) {
 		return member, nil
 	case !admin:
 		return Member{}, ErrLastOrgAdmin
+	case member.RevokedAt != nil:
+		return Member{}, ErrMemberRevoked
 	default:
 		return Member{}, o.defect(fmt.Errorf("%w: a promotion matched nothing for a caller who administers", errChanges))
 	}
@@ -309,10 +284,18 @@ func applied(o op, rows [][]any) result.Result[bool] {
 		Map(func(wrote found[string]) bool { return wrote.ok })
 }
 
-// memberBefore reads the standing statement of a write to a member, which is
-// ErrNotFound when it has no row.
-func memberBefore(o op, rows [][]any) result.Result[memberStanding] {
-	return lookup(rows, o, readMemberStanding).Then(found[memberStanding].orNotFound)
+// memberBefore reads the standing statement of a write to a member. When it has
+// no row the caller cannot see the member, which is ErrAccountRevoked for a caller
+// who was revoked (callerRows) and ErrNotFound for anyone else.
+func memberBefore(o op, rows, callerRows [][]any) result.Result[memberStanding] {
+	return lookup(rows, o, readMemberStanding).
+		Then(func(standing found[memberStanding]) (memberStanding, error) {
+			if !standing.ok {
+				return memberStanding{}, unseen(o, callerRows)
+			}
+
+			return standing.value, nil
+		})
 }
 
 // callerAdministers is the guard of a write to a member that only an
@@ -325,51 +308,34 @@ func callerAdministers(before memberStanding) error {
 	return nil
 }
 
-// RemoveMember takes a user out of the organization they belong to, and out of
-// its administrators if they are one, as one batch, and returns the member as
-// they were, no longer an administrator. The user themself may leave; otherwise
-// the caller must administer the organization or be a platform administrator.
+// RevokeMember revokes the account of a member of an organization, with its
+// secrets and its agents, as one batch, and returns the member as the write left
+// them: revoked, at the time of the first revocation. A revoked member stays in
+// the organization as a record and keeps the administrator relation they had,
+// which does not count (docs/orgs_design.md, principle 3). A platform
+// administrator may revoke any member, and an administrator of the organization
+// may revoke a member of it, but never a platform administrator and never
+// themself. Revoking a revoked member succeeds and keeps the earlier time.
 //
-// It returns ErrNotFound when the user belongs to no organization or the caller
-// may not see it, ErrNotAdmin when the caller can see it but is neither the user
-// nor an administrator, and ErrLastOrgAdmin when the user is the organization's
-// last unrevoked administrator, in which case nothing changed.
-func (s *Store) RemoveMember(ctx context.Context, id input.ID, caller, adminRole string) (Member, error) {
-	o := op{failed: CodeMemberRemoveFailed, rejected: CodeMemberRemoveRejected, description: orgsDescription}
+// It returns ErrNotFound when the user does not exist or the caller may not see
+// their organization, ErrNotAdmin when the caller can see it but does not
+// administer it, ErrPlatformAdminTarget and ErrSelfRevoke for an administrator of
+// the organization who tried to revoke a platform administrator or themself, and
+// ErrLastAdmin when the member is the last active platform administrator. A
+// refused call changed nothing. There is no refusal for the last unrevoked
+// administrator of an organization: the administrator who revokes is another
+// one, so an organization administrator can never leave it without one, and a
+// platform administrator may (see callerMayRevokeTarget).
+func (s *Store) RevokeMember(
+	ctx context.Context, id input.ID, caller, adminRole string, now time.Time,
+) (Member, error) {
+	o := op{failed: CodeMemberRevokeFailed, rejected: CodeMemberRevokeRejected, description: orgsDescription}
 
-	args := []any{id.String(), caller, adminRole}
+	return outcome(result.Of(s.revoke(ctx, o, id, caller, adminRole, now)).
+		Map(func(done revocation) Member {
+			member := done.member
+			member.RevokedAt = done.user.RevokedAt
 
-	return outcome(s.runChecked(ctx, o,
-		Statement{Query: memberStandingQuery, Args: args},
-		Statement{Query: removeMemberAdminQuery, Args: args},
-		Statement{Query: removeMemberQuery, Args: args},
-	).
-		Then(func(results []Result) (Member, error) {
-			return memberBefore(o, results[0].Rows).
-				Then(func(before memberStanding) (Member, error) {
-					return applied(o, results[2].Rows).
-						Then(func(took bool) (Member, error) { return memberRemoved(before, took, id.String() == caller) }).
-						Get()
-				}).
-				Get()
-		}),
-	)
-}
-
-// memberRemoved is the outcome of taking a user out of their organization: the
-// member as they were, no longer an administrator, or why they stayed. self is
-// whether the user was removing themself, who is refused only by the last
-// administrator guard and never for not administering.
-func memberRemoved(before memberStanding, took, self bool) (Member, error) {
-	member := before.member
-	member.Admin = false
-
-	switch {
-	case took:
-		return member, nil
-	case !before.administer && !self:
-		return Member{}, ErrNotAdmin
-	default:
-		return Member{}, ErrLastOrgAdmin
-	}
+			return member
+		}))
 }
