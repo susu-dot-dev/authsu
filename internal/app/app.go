@@ -32,6 +32,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/registration"
 	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/seal"
 	"github.com/susu-dot-dev/authsu/internal/session"
 	"github.com/susu-dot-dev/authsu/internal/store"
 	"github.com/susu-dot-dev/authsu/internal/users"
@@ -85,11 +86,12 @@ func NewHandler(platform Platform) http.Handler {
 		session.Routes(session.Deps{Store: db, Now: time.Now}),
 		agents.Routes(agents.Deps{
 			Store: db, Now: time.Now, NewID: newID, Entropy: rand.Reader, IssueAPIKey: auth.IssueAPIKey,
+			Seal: seal.Seal,
 		}),
 		keys.Routes(keys.Deps{
 			Store: db, Now: time.Now, NewID: newID, Entropy: rand.Reader, IssueUserAPIKey: auth.IssueUserAPIKey,
 		}),
-		invitations.Routes(invitations.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID}),
+		invitations.Routes(invitations.Deps{Store: db, Now: time.Now, Entropy: rand.Reader, NewID: newID, Seal: seal.Seal}),
 		users.Routes(users.Deps{Store: db, Now: time.Now, Log: platform.Log}),
 		orgs.Routes(orgs.Deps{Store: db, Now: time.Now, NewID: newID}),
 		oauth.Routes(oauth.Deps{

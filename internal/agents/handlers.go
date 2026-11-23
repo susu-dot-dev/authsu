@@ -87,6 +87,7 @@ func Routes(deps Deps) []auth.Route {
 	for name, missing := range map[string]bool{
 		"Store": deps.Store == nil, "Now": deps.Now == nil, "NewID": deps.NewID == nil, "Entropy": deps.Entropy == nil,
 		"IssueAPIKey": deps.IssueAPIKey == nil,
+		"Seal":        deps.Seal == nil,
 	} {
 		if missing {
 			panic("agents: Deps." + name + " is required")
@@ -229,6 +230,12 @@ type createBody struct {
 	// not have expired. An agent may not choose: its new agent is in its own
 	// sandbox, so it may only omit this or repeat its own.
 	SandboxID *string `json:"sandboxId"`
+
+	// PublicKey is the key the first key's token is sealed to: the base64url of
+	// the suite byte and an X25519 public key (input.PublicKey). A session may
+	// omit it and be sent the token as it is; any other credential must send
+	// it (auth.Recipient).
+	PublicKey *string `json:"publicKey"`
 }
 
 // CreateResponse is the body of a created agent. Key is the only time the
@@ -244,8 +251,13 @@ type Key struct {
 	ID string `json:"id"`
 
 	// Token is the bearer token ("susu_key_..."). Only its hash is stored, so
-	// it cannot be shown again.
-	Token string `json:"token"`
+	// it cannot be shown again. It is absent when the request carried a public
+	// key, and Sealed is present instead.
+	Token string `json:"token,omitempty"`
+
+	// Sealed is the token sealed to the request's public key (internal/seal).
+	// It is absent when Token is present.
+	Sealed string `json:"sealed,omitempty"`
 
 	// Scopes is the key's scope list as stored, as written.
 	Scopes []string `json:"scopes"`
@@ -263,6 +275,9 @@ type request struct {
 	scopes    scope.List
 	keyScopes scope.List
 	sandbox   input.SandboxID
+	// recipient is the key the first key's token is sealed to, the zero value
+	// when the caller is to be sent it as it is.
+	recipient input.PublicKey
 }
 
 // parseCreate parses the new agent's name, labels and scope lists. A scope list
@@ -321,11 +336,13 @@ func parseOptionalScopes(raw *[]string) result.Result[scope.List] {
 }
 
 // creation is a create request that has been planned: the agent, its key and its
-// labels exactly as they will be written, and the key's token. Once written it
-// also holds the agent's scopes as the write stored them.
+// labels exactly as they will be written, and the key's token, as the response
+// shows it: plain in token, or sealed in sealed. Once written it also holds the
+// agent's scopes as the write stored them.
 type creation struct {
-	agent store.NewAgent
-	token string
+	agent  store.NewAgent
+	token  string
+	sealed string
 	// keyScopes is what the response reports for the key: the list stored on
 	// the key's row.
 	keyScopes scope.List
@@ -340,7 +357,7 @@ type creation struct {
 
 func (d Deps) create(call *auth.Call) result.Result[httpapi.Response] {
 	return httpapi.Decode[createBody](call.Request).
-		Then(func(body createBody) (request, error) { return parseCreate(body).Get() }).
+		Then(func(body createBody) (request, error) { return d.parseRequest(call, body).Get() }).
 		Then(func(req request) (request, error) { return resolveScopes(call.Principal, req).Get() }).
 		Then(func(req request) (request, error) { return resolveSandbox(call.Principal, req).Get() }).
 		Then(func(req request) (creation, error) { return d.plan(call, req).Get() }).
@@ -348,6 +365,19 @@ func (d Deps) create(call *auth.Call) result.Result[httpapi.Response] {
 		MapErr(createRefused).
 		Map(respondCreated).
 		Map(func(out CreateResponse) httpapi.Response { return httpapi.JSON(http.StatusCreated, out) })
+}
+
+// parseRequest parses the body of a create and decides who the first key's
+// token is sealed to. The recipient is decided here, before anything is issued
+// or written, so a credential that must send one and did not is refused with
+// nothing created.
+func (d Deps) parseRequest(call *auth.Call, body createBody) result.Result[request] {
+	return parseCreate(body).
+		Then(func(req request) (request, error) {
+			return auth.Recipient(call.Principal, body.PublicKey).
+				Map(func(to input.PublicKey) request { req.recipient = to; return req }).
+				Get()
+		})
 }
 
 // write stores the plan and records the scopes and the sandbox the write
@@ -509,13 +539,26 @@ func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
 		return result.Fail[creation](apierr.Wrap(err, apierr.Internal, CodeKeyFailed, "internal error"))
 	}
 
+	// Sealing is the last thing that can fail, and it is before the write, so a
+	// key that cannot be sealed to creates nothing.
+	sealed, err := auth.SealTo(d.Seal, req.recipient, issued.Token).Get()
+	if err != nil {
+		return result.Fail[creation](err)
+	}
+
+	token := issued.Token
+	if sealed != "" {
+		token = ""
+	}
+
 	return result.Ok(creation{
 		agent: store.NewAgent{
 			ID: id, Owner: owner, Name: req.name, Scopes: req.scopes.JSON(), KeyScope: req.keyScopes.JSON(),
 			Labels: req.labels, CreatedBy: call.Principal.AgentID, Sandbox: req.sandbox, MaxActive: MaxAgentsPerUser,
 			KeyID: issued.ID, KeyHash: issued.Hash, KeyExpiresAt: issued.ExpiresAt, CreatedAt: now,
 		},
-		token:     issued.Token,
+		token:     token,
+		sealed:    sealed,
 		keyScopes: req.keyScopes,
 	})
 }
@@ -537,7 +580,10 @@ func respondCreated(plan creation) CreateResponse {
 			ID: agent.ID, Name: agent.Name.String(), Scopes: plan.scopes.Claim(), Status: StatusActive,
 			RevokedAt: nil, CreatedAt: agent.CreatedAt.Unix(), Labels: sortedLabels(agent.Labels), SandboxID: sandbox,
 		},
-		Key: Key{ID: agent.KeyID, Token: plan.token, Scopes: plan.keyScopes.Claim(), ExpiresAt: agent.KeyExpiresAt.Unix()},
+		Key: Key{
+			ID: agent.KeyID, Token: plan.token, Sealed: plan.sealed, Scopes: plan.keyScopes.Claim(),
+			ExpiresAt: agent.KeyExpiresAt.Unix(),
+		},
 	}
 }
 

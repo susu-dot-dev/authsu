@@ -20,6 +20,8 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/invitations"
+	"github.com/susu-dot-dev/authsu/internal/scope"
+	"github.com/susu-dot-dev/authsu/internal/seal"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -224,6 +226,8 @@ func (f *fakeStore) RevokeInvitation(_ context.Context, id input.ID, now time.Ti
 // from, keyed by the session token.
 type fakeCredentials struct {
 	sessions map[string]store.ActiveSession
+	// keys are the active API keys, by the hash of the token.
+	keys map[string]store.ActiveAPIKey
 }
 
 func (f *fakeCredentials) ResolveSession(
@@ -235,9 +239,11 @@ func (f *fakeCredentials) ResolveSession(
 }
 
 func (f *fakeCredentials) ResolveAPIKey(
-	context.Context, input.APIKeyToken, time.Time,
+	_ context.Context, token input.APIKeyToken, _ time.Time,
 ) (store.ActiveAPIKey, bool, error) {
-	return store.ActiveAPIKey{}, false, nil
+	row, found := f.keys[string(token.Hash())]
+
+	return row, found, nil
 }
 
 // harness is one deployment under test: the real auth boundary over the routes,
@@ -255,6 +261,11 @@ type harness struct {
 	entropy *countingReader
 	idCalls int
 
+	// sealCalls records every secret the routes sealed, and sealErr, when set,
+	// makes sealing fail without calling seal.Seal.
+	sealCalls []sealCall
+	sealErr   error
+
 	handler http.Handler
 }
 
@@ -262,7 +273,8 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 
 	harn := &harness{
-		t: t, store: &fakeStore{}, creds: &fakeCredentials{sessions: map[string]store.ActiveSession{}},
+		t: t, store: &fakeStore{},
+		creds:   &fakeCredentials{sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}},
 		clock:   &clock{now: fixedNow()},
 		entropy: &countingReader{reader: bytes.NewReader(sequence(0, 8*secret.BodyBytes))},
 	}
@@ -274,9 +286,48 @@ func newHarness(t *testing.T) *harness {
 
 			return newInvID
 		},
+		Seal: harn.seal,
 	}
 
 	return harn
+}
+
+// sealCall is one call to the Seal the routes were given.
+type sealCall struct {
+	recipient []byte
+	plaintext string
+}
+
+// seal is the routes' Seal: seal.Seal, recorded, unless a test programmed a
+// failure, which is returned without calling it.
+func (h *harness) seal(recipient []byte, plaintext string) (string, error) {
+	h.sealCalls = append(h.sealCalls, sealCall{recipient: recipient, plaintext: plaintext})
+
+	if h.sealErr != nil {
+		return "", h.sealErr
+	}
+
+	return seal.Seal(recipient, plaintext) //nolint:wrapcheck // a test double passes the real sealer's answer through
+}
+
+// adminKey issues an API key of an admin that holds scopes, registers it with
+// the fake credential store as active, and returns the Authorization header a
+// client sends.
+func (h *harness) adminKey(scopes scope.List) string {
+	h.t.Helper()
+
+	issued, err := auth.IssueAPIKey(bytes.NewReader(sequence(100, 8*secret.BodyBytes)), func() string { return adminID },
+		time.Now(), time.Hour)
+	if err != nil {
+		h.t.Fatalf("IssueAPIKey: %v", err)
+	}
+
+	h.creds.keys[string(issued.Hash)] = store.ActiveAPIKey{
+		ID: issued.ID, UserID: adminID, Role: auth.RoleAdmin, ExpiresAt: issued.ExpiresAt,
+		Scope: scopes.JSON(),
+	}
+
+	return "Bearer " + issued.Token
 }
 
 // build constructs the handler over the current deps.
@@ -325,6 +376,8 @@ func (h *harness) member() *http.Cookie { return h.session(memberID, roleMember)
 type request struct {
 	method, target, body string
 	cookie               *http.Cookie
+	// authorization is sent as the Authorization header when set.
+	authorization string
 	// contentType defaults to application/json.
 	contentType string
 }
@@ -352,6 +405,10 @@ func (h *harness) do(req request) *httptest.ResponseRecorder {
 
 	if req.cookie != nil {
 		httpReq.AddCookie(req.cookie)
+	}
+
+	if req.authorization != "" {
+		httpReq.Header.Set("Authorization", req.authorization)
 	}
 
 	rec := httptest.NewRecorder()
@@ -398,7 +455,8 @@ type wireInvitation struct {
 type wireCreated struct {
 	wireInvitation
 
-	Code string `json:"code"`
+	Code   string `json:"code"`
+	Sealed string `json:"sealed"`
 }
 
 // wireList is the body of the list.
