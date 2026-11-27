@@ -62,10 +62,7 @@ func TestTablesAreWellFormed(t *testing.T) {
 	// "resource:action": lower-case ASCII words, underscores between words.
 	grammar := regexp.MustCompile(`^[a-z]+(_[a-z]+)*:[a-z]+(_[a-z]+)*$`)
 
-	for name, table := range map[string]resource.Table{
-		"production":  resource.Select(originProd),
-		"development": resource.Select(originLocalPort),
-	} {
+	for name, table := range bothTables() {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -140,9 +137,93 @@ func TestTheTwoResources(t *testing.T) {
 	}
 
 	login := entries[1]
-	if !login.FirstParty || !slices.Equal(login.Scopes, []string{resource.ScopeProfile}) ||
+	if !login.FirstParty || !slices.Equal(login.Scopes, wantLoginScopes()) ||
 		!slices.Equal(login.Defaults, []string{resource.ScopeProfile}) || login.HasScope(scopeRead) {
 		t.Errorf("the login resource = %+v", login)
+	}
+}
+
+// TestLoginScopes: the login resource defines profile and exactly the fixed
+// authsu scopes, and defaults to profile alone so that asking for nothing never
+// widens.
+func TestLoginScopes(t *testing.T) {
+	t.Parallel()
+
+	for name, table := range bothTables() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			login, found := table.Login()
+			if !found || !login.FirstParty || !slices.Equal(login.Scopes, wantLoginScopes()) {
+				t.Fatalf("Login = %+v, %v", login, found)
+			}
+
+			if !slices.Equal(login.Defaults, []string{resource.ScopeProfile}) {
+				t.Errorf("defaults = %v, want profile alone", login.Defaults)
+			}
+
+			for _, authsu := range wantLoginScopes()[1:] {
+				if !login.HasScope(authsu) {
+					t.Errorf("the login resource does not define %q", authsu)
+				}
+			}
+		})
+	}
+}
+
+// TestOnlyTheLoginResourceDefinesAuthsuScopes: no other resource defines any of
+// authsu's scopes, and AuthsuScopes is empty and not nil for it.
+func TestOnlyTheLoginResourceDefinesAuthsuScopes(t *testing.T) {
+	t.Parallel()
+
+	for name, table := range bothTables() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, other := range table.Entries() {
+				if other.FirstParty {
+					continue
+				}
+
+				if got := other.AuthsuScopes(); len(got) != 0 || got == nil {
+					t.Errorf("%s: AuthsuScopes = %#v, want none and not nil", other.URL, got)
+				}
+
+				for _, authsu := range wantLoginScopes()[1:] {
+					if other.HasScope(authsu) {
+						t.Errorf("%s defines the authsu scope %q", other.URL, authsu)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestLoginIsACopyAndTheZeroTableHasNone: what Login returns is a copy, and a
+// table with no entries has no login resource, so nothing is allowlisted.
+func TestLoginIsACopyAndTheZeroTableHasNone(t *testing.T) {
+	t.Parallel()
+
+	table := resource.Select(originProd)
+
+	login, _ := table.Login()
+	login.Scopes[0] = scopeEvil
+	login.Scopes = append(login.Scopes[:1], scopeEvil)
+
+	again, _ := table.Login()
+	if !slices.Equal(again.Scopes, wantLoginScopes()) {
+		t.Errorf("the table was changed through a copy: %v", again.Scopes)
+	}
+
+	changed := resource.LoginAuthsuScopes()
+	changed[0] = scopeEvil
+
+	if resource.LoginAuthsuScopes()[0] == scopeEvil {
+		t.Error("LoginAuthsuScopes returns the table's own slice")
+	}
+
+	if got, found := (resource.Table{}).Login(); found || got.URL != "" {
+		t.Errorf("the zero table's Login = %+v, %v", got, found)
 	}
 }
 

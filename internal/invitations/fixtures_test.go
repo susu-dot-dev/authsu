@@ -20,6 +20,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/invitations"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/seal"
 	"github.com/susu-dot-dev/authsu/internal/secret"
@@ -255,6 +256,14 @@ func (f *fakeCredentials) ResolveAPIKey(
 	return row, found, nil
 }
 
+// ResolveGrant finds no grant: these routes are exercised through sessions and
+// keys, and an access token presented to them is unknown.
+func (f *fakeCredentials) ResolveGrant(
+	context.Context, input.AccessToken, input.ResourceID, time.Time,
+) (store.ActiveGrant, bool, error) {
+	return store.ActiveGrant{}, false, nil
+}
+
 // harness is one deployment under test: the real auth boundary over the routes,
 // with a fake store, fake keys and a fixed clock.
 type harness struct {
@@ -349,6 +358,7 @@ func (h *harness) build() http.Handler {
 
 	return auth.Handler(invitations.Routes(h.deps), auth.Deps{
 		Credentials: h.creds,
+		Resources:   resource.Select,
 		Now:         time.Now,
 		Getenv:      func(name string) string { return env[name] },
 		Log:         func(_ httpapi.Request, failure *apierr.Error) { h.logged = append(h.logged, failure) },

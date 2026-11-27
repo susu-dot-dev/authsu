@@ -28,6 +28,9 @@ type catalogRoute struct {
 	// reads is true for a route an agent may use when its scopes allow, and false
 	// for one that refuses every agent.
 	reads bool
+	// grant is true for a route an OAuth grant may use. A grant has an agent, so
+	// on a route that refuses agents it is let through only by GrantsAsUser.
+	grant bool
 	// limit is the body cap the route must declare.
 	limit int64
 }
@@ -41,29 +44,32 @@ const (
 func catalog() []catalogRoute {
 	return []catalogRoute{
 		{name: "create sandbox", method: http.MethodPost, path: "/api/org", target: "/api/org",
-			body: `{"name":"Scratch"}`, scope: scope.SandboxCreate, reads: false, limit: bodyCap},
+			body: `{"name":"Scratch"}`, scope: scope.SandboxCreate, reads: false, grant: true, limit: bodyCap},
 		{name: "list orgs", method: http.MethodGet, path: "/api/org", target: "/api/org",
-			scope: scope.OrgRead, reads: true, limit: smallCap},
+			scope: scope.OrgRead, reads: true, grant: true, limit: smallCap},
 		{name: "get org", method: http.MethodGet, path: "/api/org/{id}", target: "/api/org/" + orgID,
-			scope: scope.OrgRead, reads: true, limit: smallCap},
+			scope: scope.OrgRead, reads: true, grant: true, limit: smallCap},
 		{name: "rename org", method: http.MethodPatch, path: "/api/org/{id}", target: "/api/org/" + orgID,
-			body: `{"name":"New"}`, scope: scope.OrgUpdate, reads: false, limit: bodyCap},
+			body: `{"name":"New"}`, scope: scope.OrgUpdate, reads: false, grant: false, limit: bodyCap},
 		{name: "delete sandbox", method: http.MethodDelete, path: "/api/org/{id}", target: "/api/org/" + orgID,
-			scope: scope.SandboxRevoke, reads: false, limit: smallCap},
+			scope: scope.SandboxRevoke, reads: false, grant: true, limit: smallCap},
 		{name: "list members", method: http.MethodGet, path: "/api/org/{id}/member", target: "/api/org/" + orgID + "/member",
-			scope: scope.MemberRead, reads: true, limit: smallCap},
+			scope: scope.MemberRead, reads: true, grant: false, limit: smallCap},
 		{name: "set member admin", method: http.MethodPatch, path: "/api/member/{id}", target: "/api/member/" + otherID,
-			body: `{"admin":true}`, scope: scope.MemberUpdate, reads: false, limit: smallCap},
+			body: `{"admin":true}`, scope: scope.MemberUpdate, reads: false, grant: false, limit: smallCap},
 		{name: "revoke member", method: http.MethodDelete, path: "/api/member/{id}", target: "/api/member/" + otherID,
-			scope: scope.MemberRevoke, reads: false, limit: smallCap},
+			scope: scope.MemberRevoke, reads: false, grant: false, limit: smallCap},
 	}
 }
 
 // TestRouteDeclarations is the permission-confusion test: each route is the
 // method and path that is documented, needs a credential and exactly its own
 // scope, refuses agents unless it only reads, and never opts in to a sandbox.
-// None is an admin scope: who looks after an organization is decided by the
-// store, so a member's credential is never turned away by the role gate.
+// Exactly four take an OAuth grant: the two reads, and creating and deleting a
+// sandbox, which are the writes that say GrantsAsUser so a grant (which has an
+// agent) passes the refusal of agents, and an agent's API key does not. None is
+// an admin scope: who looks after an organization is decided by the store, so a
+// member's credential is never turned away by the role gate.
 func TestRouteDeclarations(t *testing.T) {
 	t.Parallel()
 
@@ -83,6 +89,24 @@ func TestRouteDeclarations(t *testing.T) {
 	}
 }
 
+// wantAccess is the access a catalog entry must declare.
+func wantAccess(tc catalogRoute) auth.Access {
+	want := auth.Needs(tc.scope)
+	if !tc.reads {
+		want = want.WithoutAgents()
+	}
+
+	if tc.grant {
+		want = want.FromGrants()
+	}
+
+	if tc.grant && !tc.reads {
+		want = want.GrantsAsUser()
+	}
+
+	return want
+}
+
 // checkDeclared checks one declared route against its catalog entry.
 func checkDeclared(t *testing.T, got auth.Route, tc catalogRoute) {
 	t.Helper()
@@ -91,21 +115,14 @@ func checkDeclared(t *testing.T, got auth.Route, tc catalogRoute) {
 		t.Errorf("route = %s %s, want %s %s", got.Method, got.Path, tc.method, tc.path)
 	}
 
-	want := auth.Needs(tc.scope)
-	if !tc.reads {
-		want = want.WithoutAgents()
-	}
-
+	want := wantAccess(tc)
 	if got.Credential != auth.Authenticated || got.Access != want {
 		t.Errorf("Credential = %v, Access = %+v, want Authenticated and %+v", got.Credential, got.Access, want)
 	}
 
-	if got.Access.SandboxOK {
-		t.Error("the route opts in to a sandbox, which no organization route may")
-	}
-
-	if scope.IsAdmin(tc.scope) {
-		t.Errorf("%s is an admin scope: who administers an organization is the store's to decide", tc.scope)
+	if got.Access.SandboxOK || scope.IsAdmin(tc.scope) {
+		t.Errorf("%s: opts in to a sandbox (%t) or needs an admin scope (%t), which no organization route may",
+			tc.scope, got.Access.SandboxOK, scope.IsAdmin(tc.scope))
 	}
 
 	if got.Handle == nil || got.MaxBody != tc.limit {

@@ -132,7 +132,7 @@ func TestFirstPartyLogin(t *testing.T) {
 
 	if got := scalar(t, "SELECT name || '|' || first_party || '|' || first_party_client || '|' || scopes FROM agents WHERE id = ?",
 		agentID); got != "Pages|1|"+trustedClientID+"|[]" {
-		t.Errorf("the agent = %q, want one named for the client, flagged, kept for it and with no scopes", got)
+		t.Errorf("the agent = %q, want one named for the client, flagged, kept for it and with no authsu scopes (the request named none)", got)
 	}
 
 	if got := scalar(t, "SELECT resource || '|' || scope FROM oauth_grants WHERE id = ?", grantID); got != loginResource+"|openid profile" {
@@ -560,4 +560,158 @@ func TestFirstPartyDiscovery(t *testing.T) {
 
 	// oaPublicKey checks kid, use sig, alg RS256 and the exponent.
 	oaPublicKey(t)
+}
+
+// agentListOf is the stored scope list of the agent a user's first-party login
+// keeps, as the text the column holds.
+func agentListOf(t *testing.T, userID string) string {
+	t.Helper()
+
+	return scalar(t, "SELECT scopes FROM agents WHERE user_id = ? AND first_party = 1 AND revoked_at IS NULL", userID)
+}
+
+// signInAsking runs one first-party login of the user asking for scope.
+func signInAsking(t *testing.T, client *oauthClient, session, scope string) {
+	t.Helper()
+
+	query := loginQuery(client, newPKCE())
+	query.Set("scope", scope)
+
+	pending := loginPage(t, authorize(t, query))
+	consent(t, session, pending, true, nil).expect(t, "a login asking for "+scope, http.StatusOK, "")
+}
+
+// TestFirstPartyAgentScopes runs the real statement that sets a first-party
+// login's agent's list, in the real database: the first sign-in creates the agent
+// with the names asked for, a later one unions, a smaller one keeps the earlier
+// names, a stale or foreign name is pruned to the allowlist, and the list is in
+// the allowlist's order, each name once. A name that is not authsu's is never
+// written. The row is the stored text, so what is held is the JSON as written.
+//
+//nolint:paralleltest // shares one database
+func TestFirstPartyAgentScopes(t *testing.T) {
+	client := firstPartyClient(t)
+
+	type step struct {
+		// stale, when set, is written into the agent's row before the sign-in.
+		stale string
+		ask   string
+		want  string
+	}
+
+	tests := []struct {
+		name  string
+		steps []step
+	}{
+		{name: "the profile alone", steps: []step{{ask: "openid profile", want: `[]`}}},
+		{name: "the first sign-in creates the list", steps: []step{
+			{ask: "openid profile agent:read org:read", want: `["org:read","agent:read"]`},
+		}},
+		{name: "a later sign-in unions, in the allowlist's order", steps: []step{
+			{ask: "profile agent:read", want: `["agent:read"]`},
+			{ask: "profile sandbox:create org:read", want: `["sandbox:create","org:read","agent:read"]`},
+		}},
+		{name: "a later sign-in asking for less keeps the earlier names", steps: []step{
+			{ask: "profile agent:read org:read", want: `["org:read","agent:read"]`},
+			{ask: "profile agent:read", want: `["org:read","agent:read"]`},
+			{ask: "openid profile", want: `["org:read","agent:read"]`},
+		}},
+		{name: "a name removed from the allowlist is pruned", steps: []step{
+			{ask: "profile org:read", want: `["org:read"]`},
+			{stale: `["org:read","removed:scope","default:agent","user:read"]`, ask: "profile", want: `["org:read"]`},
+		}},
+		{name: "a damaged list is repaired and never fails the sign-in", steps: []step{
+			{ask: "profile org:read", want: `["org:read"]`},
+			{stale: `not json`, ask: "profile agent:read", want: `["agent:read"]`},
+			{stale: `{"org:read":1}`, ask: "profile", want: `[]`},
+			{stale: `[1,null,"org:read",["x"]]`, ask: "profile", want: `["org:read"]`},
+			{stale: `"org:read"`, ask: "profile", want: `[]`},
+		}},
+		{name: "every name fits the column", steps: []step{
+			{ask: "profile sandbox:create sandbox:revoke org:read agent:create agent:read",
+				want: `["sandbox:create","sandbox:revoke","org:read","agent:create","agent:read"]`},
+			{stale: `["a","b"]`, ask: "profile agent:read", want: `["agent:read"]`},
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			holder := newOAuthHolder(t)
+
+			for i, one := range test.steps {
+				if one.stale != "" {
+					seed(t, "UPDATE agents SET scopes = ? WHERE user_id = ? AND first_party = 1", one.stale, holder.userID)
+				}
+
+				signInAsking(t, client, holder.session, one.ask)
+
+				if got := agentListOf(t, holder.userID); got != one.want {
+					t.Errorf("step %d (%s): the agent's list = %s, want %s", i, one.ask, got, one.want)
+				}
+			}
+
+			expectNoOrphanSecrets(t)
+		})
+	}
+}
+
+// TestFirstPartyAgentScopesNeverReachOtherAgents: the update of a login's agent
+// list writes only the agent authsu keeps for the client. A user's own agent, a
+// revoked first-party agent, a first-party agent of another user and a sandboxed
+// agent keep their lists through a sign-in that asks for every scope, and a user
+// agent the user attaches to a third-party grant is not widened by it.
+//
+//nolint:paralleltest // shares one database
+func TestFirstPartyAgentScopesNeverReachOtherAgents(t *testing.T) {
+	holder := newOAuthHolder(t)
+	other, _ := secondUser(t)
+	client := firstPartyClient(t)
+
+	const own, revoked, foreign = "d300", "d301", "d302"
+
+	seedAgent(t, idN(own, 1), holder.userID, "mine")
+	seed(t, "UPDATE agents SET scopes = ? WHERE id = ?", `["org:read"]`, idN(own, 1))
+
+	seed(t, "INSERT INTO agents (id, user_id, name, scopes, created_at, first_party, first_party_client, revoked_at) "+
+		"VALUES (?, ?, 'old', ?, 1, 1, ?, 2)", idN(revoked, 1), holder.userID, `["agent:create"]`, trustedClientID)
+	seed(t, "INSERT INTO agents (id, user_id, name, scopes, created_at, first_party, first_party_client) "+
+		"VALUES (?, ?, 'theirs', ?, 1, 1, ?)", idN(foreign, 1), other, `["agent:create"]`, trustedClientID)
+
+	signInAsking(t, client, holder.session, "profile sandbox:create sandbox:revoke org:read agent:create agent:read")
+
+	for id, want := range map[string]string{
+		idN(own, 1): `["org:read"]`, idN(revoked, 1): `["agent:create"]`, idN(foreign, 1): `["agent:create"]`,
+	} {
+		if got := scalar(t, "SELECT scopes FROM agents WHERE id = ?", id); got != want {
+			t.Errorf("agent %s holds %s, want %s untouched", id, got, want)
+		}
+	}
+
+	// The login's own agent is the fresh one, holding what was asked.
+	if got := agentListOf(t, holder.userID); got != `["sandbox:create","sandbox:revoke","org:read","agent:create","agent:read"]` {
+		t.Errorf("the login's agent holds %s", got)
+	}
+
+	// An agent the user attaches to a third-party grant is never written.
+	approveWith(t, newOAuthClient(t), holder.session, agentChoiceID(idN(own, 1)), nil)
+
+	if got := scalar(t, "SELECT scopes FROM agents WHERE id = ?", idN(own, 1)); got != `["org:read"]` {
+		t.Errorf("an attached agent holds %s, want it untouched", got)
+	}
+}
+
+// TestThirdPartyConsentAgentHoldsNoAuthsuScopes: the agent a person creates at the
+// consent of a third-party client has the empty list, whatever MCP scopes were
+// approved, because none of them is an authsu name.
+//
+//nolint:paralleltest // shares one database
+func TestThirdPartyConsentAgentHoldsNoAuthsuScopes(t *testing.T) {
+	holder := newOAuthHolder(t)
+
+	approved := approve(t, newOAuthClient(t), holder.session, newAgentChoice("tool"))
+	agent := scalar(t, "SELECT agent_id FROM oauth_grants WHERE id = ?", idOfToken(t, approved.code))
+
+	if got := scalar(t, "SELECT scopes FROM agents WHERE id = ? AND first_party = 0", agent); got != "[]" {
+		t.Errorf("the new agent holds %s, want the empty list", got)
+	}
 }

@@ -25,11 +25,13 @@
 // development resource is a separate local server beside the API.
 //
 // The second is the first-party login resource: the origin of the Pages app
-// (https://app.susu.dev, development http://localhost:9894), with the one scope
-// "profile". It is not a server that holds data: it is the audience of the
-// sign-in a first-party app asks authsu for, so a token for it is bound to that
-// app as every token is bound to its resource. It is marked FirstParty, which
-// means only a trusted client may ask for it (below).
+// (https://app.susu.dev, development http://localhost:9894), with the scope
+// "profile" and the authsu scopes in LoginAuthsuScopes. It is the audience of
+// the sign-in a first-party app asks authsu for, so a token for it is bound to
+// that app as every token is bound to its resource, and it is also the one
+// resource whose access tokens authsu's own API accepts (internal/auth): its
+// scope list is the allowlist of what such a grant can ever do there. It is
+// marked FirstParty, which means only a trusted client may ask for it (below).
 //
 // # Trusted clients
 //
@@ -50,9 +52,16 @@
 //
 // A resource's scopes are written "resource:action" in the same shape as
 // authsu's own (internal/scope), such as "mcp:read". They are the vocabulary of
-// the OAuth "scope" parameter for that resource and are a separate namespace
-// from authsu's: a grant carries none of authsu's scopes, and an authsu scope
-// is never a resource scope.
+// the OAuth "scope" parameter for that resource. A third-party resource's
+// scopes are a separate namespace from authsu's, and an authsu scope is never
+// one of them: what a grant may do there is the grant's scopes alone.
+//
+// The first-party login resource is the one exception, and only for the fixed
+// names in LoginAuthsuScopes: concrete authsu scope names, never a bundle and
+// never an admin scope. They are what a grant for it can be asked to hold, and
+// authsu's own API narrows them by the grant's agent like any credential's list
+// (internal/auth). The list is an allowlist read at every request, so removing a
+// name from it cuts the live grants that hold it.
 //
 // # Development also allows localhost clients
 //
@@ -67,7 +76,22 @@ import (
 	"slices"
 
 	"github.com/susu-dot-dev/authsu/internal/config"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 )
+
+// LoginAuthsuScopes are the authsu scopes the first-party login resource
+// defines, beside ScopeProfile: exactly what a grant for it can be asked to
+// hold and what authsu's own API will honour from one. Each is a concrete scope
+// name (internal/scope), never a bundle, so what a grant holds is spelled out
+// and cannot grow when a bundle does, and none is an admin scope. Adding a name
+// is a reviewed change here, and it must still fit what a grant stores
+// (input.MaxOAuthScopeBytes), which a test holds.
+func LoginAuthsuScopes() []string {
+	return []string{
+		string(scope.SandboxCreate), string(scope.SandboxRevoke), string(scope.OrgRead),
+		string(scope.AgentCreate), string(scope.AgentRead),
+	}
+}
 
 // The one resource, in each table.
 const (
@@ -91,7 +115,8 @@ const (
 	// resource in each table: the origin of the Pages app, with no path.
 	ProductionLoginURL  = "https://app.susu.dev"
 	DevelopmentLoginURL = "http://localhost:9894"
-	// ScopeProfile is the one scope of the first-party login resource.
+	// ScopeProfile is the scope of the first-party login resource that is not
+	// one of authsu's: it asks for the user's name and email in the ID token.
 	ScopeProfile = "profile"
 
 	// ProductionClientID and DevelopmentClientID are the trusted client of each
@@ -157,16 +182,43 @@ func entry(resourceURL string) Entry {
 	}
 }
 
-// login is the first-party login resource at a URL: it defines "profile", which
-// is also its default, and only a trusted client may ask for it.
+// login is the first-party login resource at a URL: it defines "profile" and the
+// authsu scopes of LoginAuthsuScopes, defaults to "profile" alone (a client asks
+// for an authsu scope explicitly, and leaving the scope out never widens), and
+// only a trusted client may ask for it.
 func login(resourceURL string) Entry {
 	return Entry{
 		Name:       LoginName,
 		URL:        resourceURL,
-		Scopes:     []string{ScopeProfile},
+		Scopes:     append([]string{ScopeProfile}, LoginAuthsuScopes()...),
 		Defaults:   []string{ScopeProfile},
 		FirstParty: true,
 	}
+}
+
+// Login returns the first-party login resource of the table, and reports false
+// for a table that has none (the zero table). It is the only resource whose
+// tokens authsu's own API accepts, and its Scopes are the allowlist of what
+// they may do there. It is a copy.
+func (t Table) Login() (Entry, bool) {
+	for _, e := range t.entries {
+		if e.FirstParty {
+			return e.clone(), true
+		}
+	}
+
+	return Entry{}, false
+}
+
+// AuthsuScopes returns the names of the entry that are authsu's own scopes: its
+// scopes without ScopeProfile, in the order they are listed, for the first-party
+// login resource, and none for any other entry. It is a copy.
+func (e Entry) AuthsuScopes() []string {
+	if !e.FirstParty {
+		return []string{}
+	}
+
+	return slices.DeleteFunc(slices.Clone(e.Scopes), func(name string) bool { return name == ScopeProfile })
 }
 
 // Trusted reports whether clientID is one of the table's trusted clients, by

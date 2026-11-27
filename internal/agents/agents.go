@@ -44,6 +44,13 @@
 // while a user reaches all of their own, whichever sandbox they are in. These
 // are the only routes a sandboxed agent may use at all (auth.Access.InSandbox).
 //
+// An OAuth grant of a first-party app (docs/oauth_design.md) reaches the list, the
+// read and the create, for managing the user's sandboxes: it reads only the agents
+// that are in a sandbox the user administers, and creates only inside one the user
+// administers, with lists that are entries of both its access token's list and its
+// agent's list, as written (the agent's is the primary permission set and the
+// token's only narrows it).
+//
 // A create may give the new agent labels, whoever is creating. They are written
 // in the same batch as the agent and its key, so a create gives the agent all of
 // them or creates nothing, and the agent is never seen without them. Labels are

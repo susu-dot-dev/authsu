@@ -42,6 +42,8 @@ So a sandbox is a boundary, and the only one. An agent of a sandbox reaches a re
 
 A sandbox is an organization and not a tag on an agent because a tag is bookkeeping that nothing enforces, so an agent could never be proven contained. It has exactly one administrator, the user who made it, who keeps their own organization. It has no members, and an agent of a sandbox cannot create one, so there is no nesting. As with accounts, there is no getting out: an agent of a sandbox stays in it until it is deleted with it.
 
+A first-party app may manage a user's sandboxes for them, through the OAuth grant of the user's sign-in to it ([oauth_design.md](oauth_design.md#which-routes-take-a-grant-and-why)): create and delete them, and create agents in them. It is the user acting as the sandbox's administrator, so the administrator of a sandbox is still the user and nothing else about a sandbox changes. The grant does not carry the platform administrator's override, even when its user is one: it manages only the sandboxes its user administers, and another user's are not found (`auth.Principal.PlatformRole`).
+
 A sandbox expires. The service does no scheduled work, and does not need to for the boundary to hold: whether a sandbox still stands is read when a credential is used, so an expired one is inert on the next request. Cleaning up what was inside belongs to whatever owns those resources.
 
 ### 5. Ending a sandbox must not lose who did what

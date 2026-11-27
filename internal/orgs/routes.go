@@ -80,6 +80,14 @@ const maxSmallBody = 1 << 10
 // organization is the store's to decide, in the write. Every route that changes
 // something refuses agents, whatever their scopes (an agent is not the one to
 // reorganise its user's organization), and none opts in to a sandbox.
+//
+// Four routes also take an OAuth grant (FromGrants), the one a first-party app
+// holds after its user signs in: the two reads, and creating and deleting a
+// sandbox, which is what the app does for the user's sandboxes
+// (docs/oauth_design.md). A grant has an agent, so the two writes that refuse
+// agents say GrantsAsUser as well, which relaxes that refusal for a grant and for
+// nothing else: an agent's API key is still refused there. Renaming, deleting a
+// member and every member route stay unreachable by a grant.
 func Routes(deps Deps) []auth.Route {
 	for name, missing := range map[string]bool{
 		"Store": deps.Store == nil, "Now": deps.Now == nil, "NewID": deps.NewID == nil,
@@ -91,12 +99,12 @@ func Routes(deps Deps) []auth.Route {
 
 	return []auth.Route{
 		declare(http.MethodPost, orgCollectionPath, maxBody,
-			auth.Needs(scope.SandboxCreate).WithoutAgents(), deps.createSandbox),
-		declare(http.MethodGet, orgCollectionPath, maxSmallBody, auth.Needs(scope.OrgRead), deps.listOrgs),
-		declare(http.MethodGet, orgItemPath, maxSmallBody, auth.Needs(scope.OrgRead), deps.getOrg),
+			auth.Needs(scope.SandboxCreate).WithoutAgents().FromGrants().GrantsAsUser(), deps.createSandbox),
+		declare(http.MethodGet, orgCollectionPath, maxSmallBody, auth.Needs(scope.OrgRead).FromGrants(), deps.listOrgs),
+		declare(http.MethodGet, orgItemPath, maxSmallBody, auth.Needs(scope.OrgRead).FromGrants(), deps.getOrg),
 		declare(http.MethodPatch, orgItemPath, maxBody, auth.Needs(scope.OrgUpdate).WithoutAgents(), deps.renameOrg),
 		declare(http.MethodDelete, orgItemPath, maxSmallBody,
-			auth.Needs(scope.SandboxRevoke).WithoutAgents(), deps.deleteSandbox),
+			auth.Needs(scope.SandboxRevoke).WithoutAgents().FromGrants().GrantsAsUser(), deps.deleteSandbox),
 		declare(http.MethodGet, orgMemberPath, maxSmallBody, auth.Needs(scope.MemberRead), deps.listMembers),
 		declare(http.MethodPatch, memberItemPath, maxSmallBody,
 			auth.Needs(scope.MemberUpdate).WithoutAgents(), deps.setMemberAdmin),

@@ -63,19 +63,37 @@ type Agent struct {
 }
 
 // AgentReach is which of a user's agents a request may reach. Every agent read
-// is scoped to one owner, and to one more thing: whether the caller is confined
-// to a sandbox. It is built only by OwnAgents and SandboxAgents, so a caller
-// states which it is; the zero value has no owner and reaches nothing.
+// is scoped to one owner, and to one more thing: how far the caller reaches among
+// them. It is built only by OwnAgents, SandboxAgents and AdministeredSandboxAgents,
+// so a caller states which it is; the zero value has no owner and reaches
+// nothing.
 type AgentReach struct {
-	owner    string
-	confined bool
-	sandbox  string
+	owner string
+	mode  reachMode
+	// sandbox is the sandbox a reach of reachConfined is limited to.
+	sandbox string
 }
+
+// reachMode is the rule of an AgentReach, as agentListQuery and agentGetQuery
+// number it in their SQL: the values are the statements' own, and the zero value
+// is the widest, which only OwnAgents sets (an AgentReach of no owner matches no
+// agent whatever its mode).
+type reachMode int64
+
+const (
+	// reachAll is every agent of the owner.
+	reachAll reachMode = 0
+	// reachConfined is the agents of one sandbox, or the ordinary ones.
+	reachConfined reachMode = 1
+	// reachAdministered is the agents that are in a sandbox the owner
+	// administers, and no other: never an ordinary agent.
+	reachAdministered reachMode = 2
+)
 
 // OwnAgents is the reach of the user themselves, a session or one of their own
 // keys: every agent they own, ordinary or in a sandbox.
 func OwnAgents(owner string) AgentReach {
-	return AgentReach{owner: owner, confined: false, sandbox: ""}
+	return AgentReach{owner: owner, mode: reachAll, sandbox: ""}
 }
 
 // SandboxAgents is the reach of an agent: the owner's agents that are in the
@@ -85,7 +103,19 @@ func OwnAgents(owner string) AgentReach {
 // (IS, not =), so an ordinary agent cannot see a sandbox's agents any more than
 // a sandbox's agent can see ordinary ones.
 func SandboxAgents(owner, sandbox string) AgentReach {
-	return AgentReach{owner: owner, confined: true, sandbox: sandbox}
+	return AgentReach{owner: owner, mode: reachConfined, sandbox: sandbox}
+}
+
+// AdministeredSandboxAgents is the reach of an OAuth grant, which manages the
+// user's sandboxes and not the user's whole inventory: the owner's agents that
+// are in a sandbox the owner administers (an unexpired one or not, as for the
+// sandbox itself) and nothing else. An ordinary agent, whose list and labels are
+// the user's own business, is never reached, and neither is an agent of a
+// sandbox the owner does not administer. Whether the owner administers it is read
+// in the same statement as the agent (org_admins), so it is the state the read
+// saw.
+func AdministeredSandboxAgents(owner string) AgentReach {
+	return AgentReach{owner: owner, mode: reachAdministered, sandbox: ""}
 }
 
 // Owner is the user whose agents are reached.
@@ -93,25 +123,25 @@ func (r AgentReach) Owner() string { return r.owner }
 
 // Confined reports whether the reach is that of an agent (SandboxAgents), which
 // is limited to one sandbox, and not that of the user (OwnAgents).
-func (r AgentReach) Confined() bool { return r.confined }
+func (r AgentReach) Confined() bool { return r.mode == reachConfined }
+
+// Administered reports whether the reach is that of a grant
+// (AdministeredSandboxAgents): the agents of the sandboxes the owner administers.
+func (r AgentReach) Administered() bool { return r.mode == reachAdministered }
 
 // Sandbox is the sandbox a confined reach is limited to, and "" when it is
 // limited to the agents of none, or is not confined at all.
 func (r AgentReach) Sandbox() string { return r.sandbox }
 
 // args are the reach's arguments, in the order agentReachPredicate numbers
-// them: the owner, the confinement flag and the sandbox (NULL for none).
+// them: the owner, the mode and the sandbox (NULL for none).
 func (r AgentReach) args() (string, int64, any) {
 	var sandbox any
 	if r.sandbox != "" {
 		sandbox = r.sandbox
 	}
 
-	if r.confined {
-		return r.owner, 1, sandbox
-	}
-
-	return r.owner, 0, sandbox
+	return r.owner, int64(r.mode), sandbox
 }
 
 // readAgent reads one agent row, in the column order every agent statement
@@ -139,6 +169,31 @@ func readAgent(r *row) Agent {
 	return agent
 }
 
+// The reach's part of the match of the two statements that read agents for a
+// caller, over the table agents. Each statement numbers its own arguments (the
+// reach's mode, the confining sandbox with NULL for none, and the kind of a
+// sandbox), so the condition is written once for each, and a test holds the two
+// to the same text with the numbers taken out (TestAgentReachIsOneRule), so a list
+// and a read cannot disagree about what a reach is:
+//
+//   - mode 0: every agent of the owner;
+//   - mode 1: only agents whose sandbox_id IS the sandbox, which for NULL is the
+//     ordinary agents;
+//   - mode 2: only agents in a sandbox the owner administers, an org_admins row
+//     for the sandbox's own row, read in this statement. An ordinary agent has no
+//     sandbox and so matches no row.
+//
+// Any other mode matches nothing, so a mode that is added without its predicate
+// reaches no agent and never all.
+const (
+	agentListReach = `(?5 = 0 OR (?5 = 1 AND agents.sandbox_id IS ?6)
+         OR (?5 = 2 AND EXISTS (SELECT 1 FROM orgs rg JOIN org_admins ra ON ra.org_id = rg.id
+                                WHERE rg.id = agents.sandbox_id AND rg.kind = ?8 AND ra.user_id = agents.user_id)))`
+	agentGetReach = `(?3 = 0 OR (?3 = 1 AND agents.sandbox_id IS ?4)
+         OR (?3 = 2 AND EXISTS (SELECT 1 FROM orgs rg JOIN org_admins ra ON ra.org_id = rg.id
+                                WHERE rg.id = agents.sandbox_id AND rg.kind = ?5 AND ra.user_id = agents.user_id)))`
+)
+
 // agentListQuery reads one page of a user's agents, revoked ones included,
 // newest first. The id is a UUIDv7, so it is in creation order and is both the
 // sort key and the cursor: the page is the agents with an id below the cursor,
@@ -155,18 +210,19 @@ func readAgent(r *row) Agent {
 // an agent with the label is one row however many labels it has. The labels
 // column still lists ALL of the agent's labels, not only the one filtered by.
 //
-// The reach is part of the match too. ?5 says whether the caller is confined to
-// a sandbox (an agent is) and ?6 is that sandbox, NULL for none: a confined
-// caller matches only agents whose sandbox_id IS ?6, which for NULL is the
-// ordinary agents, so an agent reaches nothing outside the sandbox it is in.
-// An unconfined caller (the user themselves) matches all of their agents. ?7 is
-// the sandbox to filter by, or NULL for no filter; it narrows further and
-// cannot widen what the reach allows.
+// The reach is part of the match too, as agentListReach states it: ?5 is
+// the reach's mode (reachAll, reachConfined or reachAdministered), ?6 the
+// sandbox a confined caller is limited to, NULL for none (so an agent reaches
+// nothing outside the sandbox it is in, and an ordinary agent only ordinary
+// ones), and ?8 the kind of a sandbox, for the mode that is limited to the
+// sandboxes the owner administers (an OAuth grant). ?7 is the sandbox to filter
+// by, or NULL for no filter; it narrows further and cannot widen what the reach
+// allows.
 //
 // Arguments, by number: ?1 user id, ?2 cursor (the id to start below;
 // agentsFirstPage for the first page), ?3 rows wanted, ?4 the label or NULL, ?5
-// confined (1 or 0), ?6 the confining sandbox or NULL, ?7 the sandbox filter or
-// NULL.
+// the reach's mode (0, 1 or 2), ?6 the confining sandbox or NULL, ?7 the sandbox
+// filter or NULL, ?8 the kind of a sandbox.
 const agentListQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
@@ -175,7 +231,7 @@ SELECT id, name, scopes, revoked_at, created_at,
 FROM agents
 WHERE user_id = ?1 AND id < ?2
   AND (?4 IS NULL OR EXISTS (SELECT 1 FROM agent_labels f WHERE f.agent_id = agents.id AND f.label = ?4))
-  AND (?5 = 0 OR sandbox_id IS ?6)
+  AND ` + agentListReach + `
   AND (?7 IS NULL OR sandbox_id = ?7)
 ORDER BY id DESC
 LIMIT ?3`
@@ -229,10 +285,12 @@ func (s *Store) ListAgents(
 		sandbox = filtered.String()
 	}
 
-	owner, confined, confinedTo := reach.args()
+	owner, mode, confinedTo := reach.args()
 
 	agents, err := queryAll(ctx, s, o,
-		Statement{Query: agentListQuery, Args: []any{owner, before, int64(wanted), label, confined, confinedTo, sandbox}},
+		Statement{Query: agentListQuery, Args: []any{
+			owner, before, int64(wanted), label, mode, confinedTo, sandbox, OrgKindSandbox,
+		}},
 		readAgent)
 	if err != nil {
 		return AgentPage{}, err
@@ -254,18 +312,18 @@ func (s *Store) ListAgents(
 
 // agentGetQuery reads one agent of a user, within a reach. The owner is part of
 // the match, so another user's agent is not found, and so is an agent outside
-// the reach (see agentListQuery): which is what the caller is told for an id
-// that does not exist at all.
+// the reach (agentGetReach, the rule of agentListReach): which is what the caller
+// is told for an id that does not exist at all.
 //
-// Arguments: ?1 id, ?2 user id, ?3 confined (1 or 0), ?4 the confining sandbox
-// or NULL.
+// Arguments: ?1 id, ?2 user id, ?3 the reach's mode, ?4 the confining sandbox or
+// NULL, ?5 the kind of a sandbox.
 const agentGetQuery = `
 SELECT id, name, scopes, revoked_at, created_at,
   (SELECT json_group_array(label)
    FROM (SELECT label FROM agent_labels WHERE agent_id = agents.id ORDER BY label)) AS labels,
   sandbox_id, first_party
 FROM agents
-WHERE id = ?1 AND user_id = ?2 AND (?3 = 0 OR sandbox_id IS ?4)`
+WHERE id = ?1 AND user_id = ?2 AND ` + agentGetReach
 
 // GetAgent returns one of the agents the reach allows. It returns ErrNotFound
 // when the user has none with this id, which includes an id that belongs to
@@ -273,10 +331,10 @@ WHERE id = ?1 AND user_id = ?2 AND (?3 = 0 OR sandbox_id IS ?4)`
 func (s *Store) GetAgent(ctx context.Context, reach AgentReach, id input.ID) (Agent, error) {
 	o := op{failed: CodeAgentLookupFailed, rejected: CodeAgentLookupRejected, description: agentsDescription}
 
-	owner, confined, confinedTo := reach.args()
+	owner, mode, confinedTo := reach.args()
 
 	return queryOne(ctx, s, o,
-		Statement{Query: agentGetQuery, Args: []any{id.String(), owner, confined, confinedTo}}, readAgent)
+		Statement{Query: agentGetQuery, Args: []any{id.String(), owner, mode, confinedTo, OrgKindSandbox}}, readAgent)
 }
 
 // ownerHasRoomForAgent holds when the owner u of a new agent has fewer than ?6

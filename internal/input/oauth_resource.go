@@ -160,23 +160,28 @@ func ParseOAuthScopes(raw string, present bool, entry resource.Entry) (OAuthScop
 //     it would be there;
 //   - the name offline_access is dropped, because it asks for what is always
 //     given;
-//   - the name email is read as the entry's profile scope, so it is neither
+//   - the name email is read as resource.ScopeProfile, named explicitly and not
+//     found by position, because the login resource also defines authsu scopes
+//     and the first of its scopes is not what email stands for. It is neither
 //     stored nor repeated: a list that names both email and profile names profile
 //     once, and the stored list is only names the entry defines, plus openid;
 //   - what is stored is the stored form of the result, so a grant never holds
 //     either name and the schema's bounds are those of ParseOAuthScopes.
 //
 // An absent scope is the entry's defaults, as for ParseOAuthScopes. The caller
-// refuses a list with no name of the entry in it. The first-party scope is a
-// property of the entry and not of the name "profile": the entry's first scope is
-// what email stands for.
+// refuses a list with no name of the entry in it. An entry that does not define
+// the profile scope has nothing for email to stand for, and a list is refused.
+//
+// The names an entry defines are concrete scope names, never bundles: a
+// bundle name ("default:user") is not one the entry defines, so it is refused
+// here as any unknown name is, and a bundle can never be requested for a grant.
 func ParseFirstPartyScopes(raw string, present bool, entry resource.Entry) (OAuthScopes, error) {
 	if !present {
 		return scopesOf(entry.Defaults), nil
 	}
 
 	names, ok := scopeNames(raw, entry, EmailScope, OfflineAccessScope)
-	if !ok || len(entry.Scopes) == 0 {
+	if !ok || !entry.HasScope(resource.ScopeProfile) {
 		return OAuthScopes{}, refuse(CodeInvalidOAuthScope, descInvalidOAuthScope)
 	}
 
@@ -186,7 +191,7 @@ func ParseFirstPartyScopes(raw string, present bool, entry resource.Entry) (OAut
 		switch name {
 		case OfflineAccessScope:
 		case EmailScope:
-			kept = appendOnce(kept, entry.Scopes[0])
+			kept = appendOnce(kept, resource.ScopeProfile)
 		default:
 			kept = appendOnce(kept, name)
 		}

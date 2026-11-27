@@ -17,6 +17,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/mcp"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
@@ -93,6 +94,14 @@ func (f *fakeCredentials) ResolveAPIKey(
 	return row, found, nil
 }
 
+// ResolveGrant finds no grant: these routes are exercised through sessions and
+// keys, and an access token presented to them is unknown.
+func (f *fakeCredentials) ResolveGrant(
+	context.Context, input.AccessToken, input.ResourceID, time.Time,
+) (store.ActiveGrant, bool, error) {
+	return store.ActiveGrant{}, false, nil
+}
+
 // harness is the route under test behind the real auth boundary.
 type harness struct {
 	t      *testing.T
@@ -114,8 +123,9 @@ func newHarness(t *testing.T) *harness {
 	env := map[string]string{config.SecretHMAC: testKey, config.VarAPIOrigin: apiOrigin, config.VarUIOrigin: uiOrigin}
 
 	harn.handler = auth.Handler(mcp.Routes(mcp.Deps{Do: harn.rest.do}), auth.Deps{
-		Credentials: harn.creds, Now: time.Now, Getenv: func(name string) string { return env[name] },
-		Log: func(_ httpapi.Request, failure *apierr.Error) { harn.logged = append(harn.logged, failure) },
+		Credentials: harn.creds, Resources: resource.Select, Now: time.Now,
+		Getenv: func(name string) string { return env[name] },
+		Log:    func(_ httpapi.Request, failure *apierr.Error) { harn.logged = append(harn.logged, failure) },
 	})
 
 	return harn

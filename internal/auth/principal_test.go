@@ -41,7 +41,7 @@ func checkPrincipal(t *testing.T, got auth.Principal, want principalWant) {
 	checkList(t, "Scope", got.Scope, want.scope)
 	checkList(t, "AgentScope", got.AgentScope, want.agentScope)
 
-	if effective := got.Effective.Sorted(); !slices.Equal(effective, want.effective) {
+	if effective := got.Authority().Effective().Sorted(); !slices.Equal(effective, want.effective) {
 		t.Errorf("Effective = %v, want %v", effective, want.effective)
 	}
 }
@@ -55,7 +55,7 @@ func checkList(t *testing.T, name string, got scope.List, want []string) {
 	}
 }
 
-// sorted is the scopes of the lists, as Effective.Sorted returns them.
+// sorted is the scopes of the lists, as Authority.Effective().Sorted returns them.
 func sorted(names ...string) []scope.Scope {
 	return list(names...).Expand().Sorted()
 }
@@ -347,7 +347,7 @@ func TestNoneRoutesNeverTouchTheCredential(t *testing.T) {
 	}
 
 	got := r.handled[0].Principal
-	if got.UserID != "" || got.SecretID != "" || got.Effective.Len() != 0 || got.Scope != nil {
+	if got.UserID != "" || got.SecretID != "" || got.Authority().Effective().Len() != 0 || got.Scope != nil {
 		t.Errorf("principal = %+v, want none", got)
 	}
 }
@@ -377,6 +377,40 @@ func TestUnauthenticatedIsTheOneAnswer(t *testing.T) {
 
 			if in != nil && !errors.Is(failure, in) {
 				t.Error("the cause is not kept for the log")
+			}
+		})
+	}
+}
+
+// TestPlatformRole: the role a store call compares the caller's own with, to give
+// the platform administrator's override, is the platform role for every credential
+// but an OAuth grant, whose user's role (even an administrator's) never carries the
+// override: the grant is asked as the empty role, which no account has.
+func TestPlatformRole(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		kind string
+		role string
+		want string
+	}{
+		{"a session of an administrator", auth.KindSession, auth.RoleAdmin, auth.RoleAdmin},
+		{"a session of a member", auth.KindSession, roleMember, auth.RoleAdmin},
+		{"an API key of an administrator", auth.KindAPIKey, auth.RoleAdmin, auth.RoleAdmin},
+		{"an API key of a member", auth.KindAPIKey, roleMember, auth.RoleAdmin},
+		{"a grant of an administrator", auth.KindGrant, auth.RoleAdmin, ""},
+		{"a grant of a member", auth.KindGrant, roleMember, ""},
+		{"a grant of no role", auth.KindGrant, "", ""},
+		{"no kind", "", auth.RoleAdmin, auth.RoleAdmin},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := (auth.Principal{Kind: test.kind, Role: test.role}).PlatformRole(); got != test.want {
+				t.Errorf("PlatformRole() = %q, want %q", got, test.want)
 			}
 		})
 	}

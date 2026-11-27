@@ -26,7 +26,8 @@
 //   - A platform administrator (an account whose role is auth.RoleAdmin) has the
 //     full override: whatever an organization's administrator may do, on any
 //     organization, and every organization is listed to them. They alone may
-//     revoke a platform administrator, or themself as an administrator.
+//     revoke a platform administrator, or themself as an administrator. The
+//     override belongs to a session and an API key; an OAuth grant never has it.
 //   - Anyone else is told an organization is not found, whether it exists or
 //     not. A caller who can see an organization but may not do what they asked
 //     is told so (403 org_admin_required).
@@ -35,6 +36,17 @@
 // agent cannot reorganise its user's organization; the reads may be used by one.
 // No route opts in to a sandbox (auth.Access.InSandbox): an agent that is
 // confined to a sandbox reaches none of this.
+//
+// An OAuth grant of the first-party login (docs/oauth_design.md) reaches four
+// routes: the two reads, creating a sandbox and deleting one. The two writes
+// refuse agents and a grant has an agent, so they declare that a grant is the
+// exception (auth.Access.GrantsAsUser); an agent's API key is still refused.
+// Whose sandbox a grant may delete is the same as for the user as the sandbox's
+// administrator: one they administer, decided in the write. The grant has no
+// platform administrator's override, even for a user who is one: the routes ask
+// the store with no platform role for a grant (auth.Principal.PlatformRole), so
+// the lists show only the organizations the user belongs to or administers, and
+// another user's sandbox is not found.
 //
 // # Organizations
 //
@@ -138,7 +150,8 @@ const (
 // Store is the part of the database the routes use: one interface for each of
 // the two things they are about. Every method takes the caller, whose standing
 // to the organization is decided in the write, and the role that makes a caller
-// a platform administrator. *store.Store satisfies it. A failure must come back
+// a platform administrator, which is empty for a credential that has no such
+// override (an OAuth grant): no account has the empty role. *store.Store satisfies it. A failure must come back
 // classified (the store does), because it is sent as is.
 type Store interface {
 	OrgStore

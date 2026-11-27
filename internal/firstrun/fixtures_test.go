@@ -15,6 +15,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/firstrun"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -148,6 +149,14 @@ func (c *deadCredentials) ResolveAPIKey(
 	return store.ActiveAPIKey{}, false, errCredsRead
 }
 
+func (c *deadCredentials) ResolveGrant(
+	context.Context, input.AccessToken, input.ResourceID, time.Time,
+) (store.ActiveGrant, bool, error) {
+	c.calls++
+
+	return store.ActiveGrant{}, false, errCredsRead
+}
+
 // rig is one deployment under test: the real boundary and the real route over a
 // fake store.
 type rig struct {
@@ -185,6 +194,7 @@ func (r *rig) routes() []auth.Route {
 func (r *rig) handler() http.Handler {
 	return auth.Handler(r.routes(), auth.Deps{
 		Credentials: r.creds,
+		Resources:   resource.Select,
 		Now:         func() time.Time { return r.now },
 		Getenv: func(name string) string {
 			r.reads[name]++

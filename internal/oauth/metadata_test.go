@@ -86,7 +86,14 @@ func decodeObject(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 func TestDiscoveryDocuments(t *testing.T) {
 	t.Parallel()
 
-	scopes := []string{"openid", "mcp:read", "mcp:write", "profile", "email", "offline_access"}
+	// The login resource's scopes are profile and the authsu scopes a grant for
+	// it may hold (resource.LoginAuthsuScopes), then the two names a standard
+	// OpenID Connect client sends.
+	scopes := []string{
+		"openid", "mcp:read", "mcp:write", "profile",
+		"sandbox:create", "sandbox:revoke", "org:read", "agent:create", "agent:read",
+		"email", "offline_access",
+	}
 
 	tests := map[string]struct {
 		env    map[string]string

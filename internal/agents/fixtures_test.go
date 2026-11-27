@@ -24,6 +24,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/seal"
 	"github.com/susu-dot-dev/authsu/internal/store"
@@ -236,26 +237,11 @@ func (f *fakeStore) GetAgent(_ context.Context, reach store.AgentReach, id input
 	}
 
 	at, ok := f.find(reach.Owner(), id.String())
-	if !ok || !reaches(reach, f.rows[at].agent) {
+	if !ok || !f.reaches(reach, f.rows[at].agent) {
 		return store.Agent{}, store.ErrNotFound
 	}
 
 	return normalised(f.rows[at].agent), nil
-}
-
-// reaches is the reach's rule: a confined reach allows only agents whose
-// sandbox is exactly its own (none equals none), and an unconfined one allows
-// every agent of the owner.
-func reaches(reach store.AgentReach, agent store.Agent) bool {
-	if !reach.Confined() {
-		return true
-	}
-
-	if agent.SandboxID == nil {
-		return reach.Sandbox() == ""
-	}
-
-	return *agent.SandboxID == reach.Sandbox()
 }
 
 // normalised returns agent with a non-nil, sorted label list, as the store
@@ -378,6 +364,26 @@ func (f *fakeStore) RevokeAgent(_ context.Context, owner string, id input.ID, no
 	return normalised(f.rows[at].agent), nil
 }
 
+// reaches is the reach's rule: a confined reach allows only agents whose
+// sandbox is exactly its own (none equals none), an administered one only agents
+// in a sandbox the owner administers, and an unconfined one allows every agent of
+// the owner.
+func (f *fakeStore) reaches(reach store.AgentReach, agent store.Agent) bool {
+	if reach.Administered() {
+		return agent.SandboxID != nil && f.sandboxes[*agent.SandboxID].admin == reach.Owner()
+	}
+
+	if !reach.Confined() {
+		return true
+	}
+
+	if agent.SandboxID == nil {
+		return reach.Sandbox() == ""
+	}
+
+	return *agent.SandboxID == reach.Sandbox()
+}
+
 // inherited is the scopes and the sandbox a create writes. For an agent's create
 // they are the creating agent's, read from its row, and the list and sandbox
 // the caller offered are not used; a creating agent that is not the owner's, or
@@ -425,7 +431,7 @@ func (f *fakeStore) matching(reach store.AgentReach, before, label, sandbox stri
 	var mine []store.Agent
 
 	for _, row := range f.rows {
-		if row.owner == reach.Owner() && reaches(reach, row.agent) && listed(row.agent, before, label, sandbox) {
+		if row.owner == reach.Owner() && f.reaches(reach, row.agent) && listed(row.agent, before, label, sandbox) {
 			mine = append(mine, normalised(row.agent))
 		}
 	}
@@ -493,6 +499,9 @@ func sameAgent(a, b store.Agent) bool {
 type fakeCredentials struct {
 	sessions map[string]store.ActiveSession
 	keys     map[string]store.ActiveAPIKey
+	// grants are the active OAuth access tokens of the login resource, by the
+	// token's text.
+	grants map[string]store.ActiveGrant
 }
 
 // ResolveSession answers for an active session.
@@ -509,6 +518,16 @@ func (f *fakeCredentials) ResolveAPIKey(
 	_ context.Context, token input.APIKeyToken, _ time.Time,
 ) (store.ActiveAPIKey, bool, error) {
 	row, found := f.keys[string(token.Hash())]
+
+	return row, found, nil
+}
+
+// ResolveGrant answers for an active access token. The fake holds only tokens of
+// the login resource, which is the only resource the boundary asks for.
+func (f *fakeCredentials) ResolveGrant(
+	_ context.Context, token input.AccessToken, _ input.ResourceID, _ time.Time,
+) (store.ActiveGrant, bool, error) {
+	row, found := f.grants[token.String()]
 
 	return row, found, nil
 }
@@ -575,7 +594,10 @@ func newRig(t *testing.T) *rig {
 	rg := &rig{
 		t:     t,
 		store: &fakeStore{rows: nil, sandboxes: map[string]fakeSandbox{}, failures: map[string]error{}, calls: nil},
-		creds: &fakeCredentials{sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}},
+		creds: &fakeCredentials{
+			sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{},
+			grants: map[string]store.ActiveGrant{},
+		},
 		// A fixed instant, in whole seconds: the response carries Unix seconds.
 		now:     time.Date(2030, time.March, 4, 5, 6, 7, 0, time.UTC),
 		entropy: &sequence{reads: 1 << 32},
@@ -584,6 +606,7 @@ func newRig(t *testing.T) *rig {
 
 	rg.handler = auth.Handler(agents.Routes(rg.deps()), auth.Deps{
 		Credentials: rg.creds,
+		Resources:   resource.Select,
 		Now:         func() time.Time { return rg.now },
 		Getenv:      func(string) string { return "" },
 		Log:         func(_ httpapi.Request, failure *apierr.Error) { rg.logged = append(rg.logged, failure) },
@@ -978,4 +1001,38 @@ func (f *fakeStore) sandboxOf(id string) string {
 	}
 
 	return ""
+}
+
+// grantSpec describes an OAuth grant's access token of user A, held by an agent:
+// the token's own scope text, as stored, and the agent's list (JSON), read now.
+type grantSpec struct {
+	// scope is the access token's scope text, space-delimited.
+	scope string
+	// agentScopes is the first-party agent's stored list (JSON).
+	agentScopes string
+	// role is the account's, defaulting to a member.
+	role string
+}
+
+// signInGrant issues an access token as spec describes, stores its row as active
+// for the login resource and returns the Authorization header value.
+func (r *rig) signInGrant(spec grantSpec) string {
+	r.t.Helper()
+
+	issued, err := auth.IssueAccessToken(r.signer, r.signID, r.now)
+	if err != nil {
+		r.t.Fatalf("IssueAccessToken: %v", err)
+	}
+
+	role := spec.role
+	if role == "" {
+		role = roleMember
+	}
+
+	r.creds.grants[issued.Token] = store.ActiveGrant{
+		ID: issued.ID, UserID: userA, Role: role, ExpiresAt: issued.ExpiresAt, OrgID: "",
+		AgentID: agentA1, AgentScopes: spec.agentScopes, Scope: spec.scope,
+	}
+
+	return "Bearer " + issued.Token
 }

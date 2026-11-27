@@ -56,7 +56,7 @@ func (d Deps) listOrgs(call *auth.Call) result.Result[httpapi.Response] {
 
 	return parsePage(call.Request.Query).
 		Then(func(p page) (store.OrgPage, error) {
-			return d.Store.ListOrgs(call.Request.Context, call.Principal.UserID, auth.RoleAdmin, p.cursor, p.limit)
+			return d.Store.ListOrgs(call.Request.Context, call.Principal.UserID, platformRole(call), p.cursor, p.limit)
 		}).
 		Map(func(stored store.OrgPage) ListResponse {
 			out := ListResponse{Orgs: make([]Org, 0, len(stored.Orgs)), Next: stored.Next}
@@ -74,7 +74,7 @@ func (d Deps) listOrgs(call *auth.Call) result.Result[httpapi.Response] {
 func (d Deps) getOrg(call *auth.Call) result.Result[httpapi.Response] {
 	now := d.Now()
 
-	return result.Of(d.Store.GetOrg(call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin)).
+	return result.Of(d.Store.GetOrg(call.Request.Context, call.ID(), call.Principal.UserID, platformRole(call))).
 		MapErr(asOrg).
 		Map(func(stored store.Org) httpapi.Response { return ok(presentOrg(stored, now)) })
 }
@@ -91,7 +91,7 @@ func (d Deps) renameOrg(call *auth.Call) result.Result[httpapi.Response] {
 	return httpapi.Decode[renameBody](call.Request).
 		Then(func(body renameBody) (input.OrgName, error) { return input.ParseOrgName(body.Name) }).
 		Then(func(name input.OrgName) (store.Org, error) {
-			return d.Store.RenameOrg(call.Request.Context, call.ID(), name, call.Principal.UserID, auth.RoleAdmin, now)
+			return d.Store.RenameOrg(call.Request.Context, call.ID(), name, call.Principal.UserID, platformRole(call), now)
 		}).
 		MapErr(asOrg).
 		Map(func(stored store.Org) httpapi.Response { return ok(presentOrg(stored, now)) })
@@ -102,7 +102,7 @@ func (d Deps) renameOrg(call *auth.Call) result.Result[httpapi.Response] {
 func (d Deps) deleteSandbox(call *auth.Call) result.Result[httpapi.Response] {
 	now := d.Now()
 
-	return result.Of(d.Store.DeleteSandbox(call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin)).
+	return result.Of(d.Store.DeleteSandbox(call.Request.Context, call.ID(), call.Principal.UserID, platformRole(call))).
 		MapErr(asOrg).
 		Map(func(stored store.Org) httpapi.Response {
 			deleted := presentOrg(stored, now)
@@ -111,3 +111,9 @@ func (d Deps) deleteSandbox(call *auth.Call) result.Result[httpapi.Response] {
 			return ok(deleted)
 		})
 }
+
+// platformRole is the role the store compares the caller's own with to give the
+// platform administrator's override: the caller's principal decides it
+// (auth.Principal.PlatformRole), so an OAuth grant never has the override, and
+// every store call of this package takes its role from here.
+func platformRole(call *auth.Call) string { return call.Principal.PlatformRole() }

@@ -165,8 +165,10 @@ func (t RefreshToken) String() string { return t.v }
 func (t RefreshToken) Hash() []byte { return hashOf(t.v) }
 
 // AccessToken is the secret a client presents to a resource server, and a
-// resource server presents to introspection. authsu's own API never accepts it:
-// ParseAPIKeyToken refuses its prefix.
+// resource server presents to introspection. authsu's own API accepts it as a
+// bearer token only where the boundary tells it from an API key by its prefix
+// (ParseAPIKeyToken refuses it), and then only for the first-party login
+// resource.
 type AccessToken struct{ v string }
 
 // ParseAccessToken accepts exactly "susu_at_" followed by a canonical

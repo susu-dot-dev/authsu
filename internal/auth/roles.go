@@ -55,3 +55,26 @@ func CreatableInvitationType(invitationType string) bool {
 
 	return known && invitationType != store.InvitationFirstRun
 }
+
+// PlatformRole is the role a request is asked to hold to be a platform
+// administrator, which the store compares the caller's own role with to give the
+// platform administrator's override (docs/orgs_design.md): RoleAdmin for a user,
+// whatever they present, and for an agent's key. For an OAuth grant it is the
+// empty role, which no account has (the column's CHECK requires one), so the
+// override never applies to it.
+//
+// A grant is a credential an outside service holds, bounded to what its user
+// does through that product: it manages the sandboxes the user administers, and
+// is not the user's whole standing as the platform's administrator, which is
+// a power of a person's session. Deciding it here, from the credential's kind,
+// and passing the result as the role every store call compares with, is what
+// makes it impossible for a handler to give a grant the override by forgetting a
+// check: the handler has no other role to pass, and the store's write states the
+// override as requiring a non-empty role (store.platformOverride).
+func (p Principal) PlatformRole() string {
+	if p.Kind == KindGrant {
+		return ""
+	}
+
+	return RoleAdmin
+}

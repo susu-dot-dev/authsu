@@ -13,24 +13,30 @@
 //     Errors format.
 //  2. For an Authenticated route: reads the credential, which is either the
 //     one __Host-session cookie (a session) or an "Authorization: Bearer"
-//     token (an API key) and never both. Each carrier accepts exactly one kind
-//     of token, so a token of the other kind, or anything that is not a token,
-//     is refused here, before the store is read. A token that parses is resolved
-//     in the store (store.ResolveSession, store.ResolveAPIKey), which reads
-//     the secret, its account and, for an agent's key, the agent in one
-//     statement and finds it only while every part is active (an agent's
-//     sandbox, when it has one, included: a key of an expired or deleted
-//     sandbox is not active). Every verdict on
-//     the credential is one answer, 401 unauthenticated (see Unauthenticated); a
-//     failure of the store is 503 session_verify_failed. Verifying a credential
-//     needs no configuration: a token carries nothing to check.
+//     token (an API key, or an OAuth grant's access token, told apart by the
+//     token's tag) and never both. The cookie accepts only a session token; the
+//     header accepts only the two kinds, so a token of any other kind, or
+//     anything that is not a token, is refused here, before the store is read.
+//     A token that parses is resolved in the store (store.ResolveSession,
+//     store.ResolveAPIKey, store.ResolveGrant), which reads the secret, its
+//     account and, for an agent's credential, the agent in one statement and
+//     finds it only while every part is active (an agent's sandbox, when it has
+//     one, included: a key of an expired or deleted sandbox is not active, and
+//     a grant of an agent in a sandbox never resolves). Every verdict on the
+//     credential is one answer, 401 unauthenticated (see Unauthenticated); a
+//     failure of the store is 503 session_verify_failed. Verifying a session or
+//     a key needs no configuration: a token carries nothing to check. A grant
+//     reads API_ORIGIN, for the login resource it must be for.
 //  3. Works out the effective scopes: the credential's scope list (a session's
-//     is SessionScope, a key's is the one stored with it), narrowed by the
-//     agent's scopes when an agent is acting (docs/permissions_design.md).
-//  4. Applies the route's Access (403): a sandboxed agent on a route that has
-//     not opted in with InSandbox (sandbox_confined), then the administrator
-//     role for an admin scope, then the scope, then session-only, then
-//     no-agents.
+//     is SessionScope, a key's is the one stored with it, a grant's is the
+//     authsu names of its access token's scope, within the login resource's
+//     allowlist now), narrowed by the agent's scopes when an agent is acting
+//     (docs/permissions_design.md).
+//  4. Applies the route's Access (403): an OAuth grant on a route that has not
+//     opted in with FromGrants (grant_not_accepted), a sandboxed agent on a
+//     route that has not opted in with InSandbox (sandbox_confined), then the
+//     administrator role for an admin scope, then the scope, then session-only,
+//     then no-agents.
 //  5. Parses the route's {id} wildcard, if it has one, as an input.ID (400
 //     invalid_id). This is after the credential, so a caller who may not use
 //     the route learns nothing about what a valid id looks like or whether the
@@ -65,6 +71,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/scope"
 )
@@ -87,10 +94,12 @@ const (
 //
 // There are two answers, not one per kind of credential: an Authenticated
 // route accepts whichever valid credential the request carries (a session in
-// the cookie, an API key as a bearer token), and Access decides which kinds and
-// which callers may use the route. Adding a kind of credential is local to this
-// package: a constant in issue.go, the place the request is read, and the
-// resolver of its token. No route and no feature changes.
+// the cookie, an API key or an OAuth access token as a bearer token), and Access
+// decides which kinds and which callers may use the route. Adding a kind of
+// credential is local to this package: a constant in issue.go, the place the
+// request is read, and the resolver of its token. No route and no feature
+// changes, and a route accepts the new kind only if its Access says so when the
+// kind is one an outside service holds (Access.FromGrants).
 type Credential uint8
 
 const (
@@ -104,7 +113,8 @@ const (
 	None
 
 	// Authenticated is a route that needs a valid credential: a login session in the
-	// __Host-session cookie, or an API key as a bearer token.
+	// __Host-session cookie, or an API key or an OAuth access token as a bearer
+	// token.
 	Authenticated
 )
 
@@ -117,10 +127,11 @@ type Principal struct {
 	UserID string
 	// Role is the account's role now, not at the credential's issue.
 	Role string
-	// SecretID is the id of the session or API key presented: the identifier
-	// it is listed and revoked by.
+	// SecretID is the id of the session, API key or access token presented: the
+	// identifier it is listed and revoked by.
 	SecretID string
-	// Kind is the kind of credential presented (KindSession or KindAPIKey).
+	// Kind is the kind of credential presented (KindSession, KindAPIKey or
+	// KindGrant).
 	Kind string
 	// ExpiresAt is when the credential stops being active.
 	ExpiresAt time.Time
@@ -136,17 +147,19 @@ type Principal struct {
 	// Access.InSandbox, and a route that does must confine what it reads and
 	// writes to this sandbox.
 	SandboxID string
-	// Scope is the credential's own scope list exactly as stored: SessionScope
-	// for a session, the key row's list for an API key. A list that is damaged
-	// reads as empty.
+	// Scope is the credential's own scope list: SessionScope for a session, the
+	// key row's list exactly as stored for an API key, and for a grant the authsu
+	// names of its access token's scope that the login resource allows now. A
+	// list that is damaged reads as empty.
 	Scope scope.List
 	// AgentScope is the acting agent's scope list exactly as stored, read now,
 	// or empty when no agent is acting.
+	//
+	// Scope, AgentScope, AgentID and Role are the inputs of what the request
+	// may do, and Authority is the one place they are combined: nothing reads
+	// them to decide that on its own, so no second, narrower or wider rule can
+	// drift from it.
 	AgentScope scope.List
-	// Effective is what the request may do: the credential's scopes narrowed by
-	// the agent's, when one is acting. The role is not part of it: it gates
-	// admin scopes separately (Access).
-	Effective scope.Set
 }
 
 // Route is one method of one path, with everything the boundary enforces for
@@ -263,6 +276,12 @@ type Deps struct {
 	// it. A failure must come back classified (store does), because it is sent
 	// as is.
 	Credentials CredentialReader
+	// Resources selects the table of resource servers for an API_ORIGIN
+	// (resource.Select in production). It is a function because the
+	// configuration is read per request. Only an OAuth access token's
+	// resolution asks it, for the first-party login resource, the one resource
+	// whose tokens authsu's own API accepts.
+	Resources func(apiOrigin string) resource.Table
 	// Now is the clock, used to decide whether a stored credential is still
 	// active.
 	Now func() time.Time
@@ -304,7 +323,7 @@ func Handler(routes []Route, deps Deps) http.Handler {
 	checkDeps(deps)
 
 	paths := groupRoutes(routes)
-	router := &router{creds: deps.Credentials, now: deps.Now, getenv: deps.Getenv}
+	router := &router{creds: deps.Credentials, resources: deps.Resources, now: deps.Now, getenv: deps.Getenv}
 	mux := http.NewServeMux()
 
 	for _, path := range slices.Sorted(maps.Keys(paths)) {
@@ -330,7 +349,8 @@ func Handler(routes []Route, deps Deps) http.Handler {
 // checkDeps panics when a dependency is missing.
 func checkDeps(deps Deps) {
 	for name, missing := range map[string]bool{
-		"Credentials": deps.Credentials == nil, "Now": deps.Now == nil, "Getenv": deps.Getenv == nil, "Log": deps.Log == nil,
+		"Credentials": deps.Credentials == nil, "Resources": deps.Resources == nil, "Now": deps.Now == nil,
+		"Getenv": deps.Getenv == nil, "Log": deps.Log == nil,
 	} {
 		if missing {
 			panic("auth: Deps." + name + " is required")
@@ -426,6 +446,8 @@ func accessProblem(route Route) string {
 		return "Access must be declared: use auth.Open() or auth.Needs(scope)"
 	case route.Access.Scope != "" && !slices.Contains(scope.Scopes(), route.Access.Scope):
 		return "Access names a scope that does not exist"
+	case route.Access.GrantAsUserOK && (!route.Access.GrantOK || !route.Access.NoAgents):
+		return "GrantsAsUser relaxes WithoutAgents for a grant, so it needs FromGrants and WithoutAgents"
 	}
 
 	return ""
@@ -466,9 +488,10 @@ func wildcardNames(path string) ([]string, string) {
 
 // router carries what every route's pipeline needs.
 type router struct {
-	creds  CredentialReader
-	now    func() time.Time
-	getenv func(string) string
+	creds     CredentialReader
+	resources func(apiOrigin string) resource.Table
+	now       func() time.Time
+	getenv    func(string) string
 }
 
 // handler returns the httpapi handler for route: it authenticates, applies the

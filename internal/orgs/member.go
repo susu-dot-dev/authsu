@@ -24,7 +24,7 @@ func (d Deps) listMembers(call *auth.Call) result.Result[httpapi.Response] {
 	return parsePage(call.Request.Query).
 		Then(func(p page) (store.MemberPage, error) {
 			return d.Store.ListMembers(
-				call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin, p.cursor, p.limit)
+				call.Request.Context, call.ID(), call.Principal.UserID, platformRole(call), p.cursor, p.limit)
 		}).
 		MapErr(asOrg).
 		Map(func(stored store.MemberPage) MemberListResponse {
@@ -53,7 +53,7 @@ func (d Deps) setMemberAdmin(call *auth.Call) result.Result[httpapi.Response] {
 		Then(func(body setAdminBody) (input.OrgAdmin, error) { return input.ParseOrgAdmin(body.Admin) }).
 		Then(func(admin input.OrgAdmin) (store.Member, error) {
 			return d.Store.SetMemberAdmin(
-				call.Request.Context, call.ID(), admin.Admin(), call.Principal.UserID, auth.RoleAdmin, d.Now())
+				call.Request.Context, call.ID(), admin.Admin(), call.Principal.UserID, platformRole(call), d.Now())
 		}).
 		MapErr(asMember).
 		Map(func(stored store.Member) httpapi.Response { return ok(presentMember(stored)) })
@@ -65,7 +65,7 @@ func (d Deps) setMemberAdmin(call *auth.Call) result.Result[httpapi.Response] {
 // does not revoke a platform administrator or themself: the store decides.
 func (d Deps) revokeMember(call *auth.Call) result.Result[httpapi.Response] {
 	return result.Of(d.Store.RevokeMember(
-		call.Request.Context, call.ID(), call.Principal.UserID, auth.RoleAdmin, d.Now())).
+		call.Request.Context, call.ID(), call.Principal.UserID, platformRole(call), d.Now())).
 		MapErr(asMember).
 		Map(func(stored store.Member) httpapi.Response { return ok(presentMember(stored)) })
 }

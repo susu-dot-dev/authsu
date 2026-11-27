@@ -92,7 +92,10 @@ func TestOAuthDiscovery(t *testing.T) {
 			"token_endpoint_auth_methods_supported":         {"none"},
 			"revocation_endpoint_auth_methods_supported":    {"none"},
 			"introspection_endpoint_auth_methods_supported": {"none"},
-			"scopes_supported":                              {"openid", "mcp:read", "mcp:write", "profile", "email", "offline_access"},
+			"scopes_supported": {
+				"openid", "mcp:read", "mcp:write", "profile", "sandbox:create", "sandbox:revoke", "org:read",
+				"agent:create", "agent:read", "email", "offline_access",
+			},
 		}
 
 		for name, wantList := range lists {

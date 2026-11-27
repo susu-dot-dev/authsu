@@ -99,6 +99,8 @@ const (
 	saysErrors  = "Errors must be"
 	saysForm    = "no CSRF defence"
 	saysNoBody  = "has no body"
+
+	saysGrantsAsUser = "GrantsAsUser relaxes WithoutAgents"
 )
 
 // routeProblems are the mistakes in one route's declaration.
@@ -119,6 +121,17 @@ func routeProblems() map[string]struct {
 		"Access not declared":    {spoiled(func(r *auth.Route) { r.Access = auth.Access{} }), "Access must be declared"},
 		"Access names no such scope": {
 			spoiled(func(r *auth.Route) { r.Access = auth.Needs("nope:read") }), "scope that does not exist",
+		},
+		"GrantsAsUser alone": {
+			spoiled(func(r *auth.Route) { r.Access = auth.Needs(scope.UserRead).GrantsAsUser() }), saysGrantsAsUser,
+		},
+		"GrantsAsUser without FromGrants": {
+			spoiled(func(r *auth.Route) { r.Access = auth.Needs(scope.UserRead).WithoutAgents().GrantsAsUser() }),
+			saysGrantsAsUser,
+		},
+		"GrantsAsUser without WithoutAgents": {
+			spoiled(func(r *auth.Route) { r.Access = auth.Needs(scope.UserRead).FromGrants().GrantsAsUser() }),
+			saysGrantsAsUser,
 		},
 		"Media not known":             {withMedia(2), saysMedia},
 		"Errors not known":            {withErrors(2), saysErrors},
@@ -274,8 +287,11 @@ func TestHandlerAcceptsEveryValidDeclaration(t *testing.T) {
 		"a form PATCH that is None":     {withForm(auth.None, http.MethodPatch)[0]},
 		"a form DELETE that is None":    {withForm(auth.None, http.MethodDelete)[0]},
 		"OAuth errors, Authenticated":   withErrors(httpapi.ErrorsOAuth),
-		"JSON media said out loud":      withMedia(httpapi.MediaJSON),
-		"API errors said out loud":      withErrors(httpapi.ErrorsAPI),
+		"a grant let through the refusal of agents": spoiled(func(r *auth.Route) {
+			r.Access = auth.Needs(scope.UserRead).WithoutAgents().FromGrants().GrantsAsUser()
+		}),
+		"JSON media said out loud": withMedia(httpapi.MediaJSON),
+		"API errors said out loud": withErrors(httpapi.ErrorsAPI),
 		"every method": {
 			route("GET", "/m", none, 0), route("HEAD", "/m", none, 0), route("POST", "/m", none, 0),
 			route("PUT", "/m", none, 0), route("PATCH", "/m", none, 0), route("DELETE", "/m", none, 0),

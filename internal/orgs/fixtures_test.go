@@ -18,6 +18,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/orgs"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -42,6 +43,9 @@ var (
 const (
 	roleMember = auth.RoleMember
 	roleAdmin  = auth.RoleAdmin
+
+	// firstPartyAgent is the id of the agent a grant of the fixtures is held by.
+	firstPartyAgent = "agent-1"
 
 	// userID signs in. otherID is another user. orgID, sandboxID and newID are the ids of the things acted on.
 	userID    = "01890000-0000-7000-8000-000000000001"
@@ -200,6 +204,9 @@ func (f *fakeStore) recordf(format string, args ...any) {
 type fakeCredentials struct {
 	sessions map[string]store.ActiveSession
 	keys     map[string]store.ActiveAPIKey
+	// grants are the active OAuth access tokens of the login resource, by the
+	// token's text.
+	grants map[string]store.ActiveGrant
 }
 
 func (f *fakeCredentials) ResolveSession(
@@ -214,6 +221,16 @@ func (f *fakeCredentials) ResolveAPIKey(
 	_ context.Context, token input.APIKeyToken, _ time.Time,
 ) (store.ActiveAPIKey, bool, error) {
 	row, found := f.keys[string(token.Hash())]
+
+	return row, found, nil
+}
+
+// ResolveGrant answers for an active access token. The fake holds only tokens of
+// the login resource, which is the only resource the boundary asks for.
+func (f *fakeCredentials) ResolveGrant(
+	_ context.Context, token input.AccessToken, _ input.ResourceID, _ time.Time,
+) (store.ActiveGrant, bool, error) {
+	row, found := f.grants[token.String()]
 
 	return row, found, nil
 }
@@ -248,9 +265,12 @@ func newRig(t *testing.T) *rig {
 	t.Helper()
 
 	rg := &rig{
-		t:      t,
-		store:  &fakeStore{},
-		creds:  &fakeCredentials{sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}},
+		t:     t,
+		store: &fakeStore{},
+		creds: &fakeCredentials{
+			sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{},
+			grants: map[string]store.ActiveGrant{},
+		},
 		signer: &sequence{},
 	}
 
@@ -258,6 +278,7 @@ func newRig(t *testing.T) *rig {
 		Store: rg.store, Now: func() time.Time { return clockAt }, NewID: func() string { return newID },
 	}), auth.Deps{
 		Credentials: rg.creds,
+		Resources:   resource.Select,
 		Now:         func() time.Time { return clockAt },
 		Getenv:      func(string) string { return "" },
 		Log:         func(_ httpapi.Request, failure *apierr.Error) { rg.logged = append(rg.logged, failure) },
@@ -461,4 +482,39 @@ func wantRefusal(t *testing.T, r *rig, rec *httptest.ResponseRecorder, status in
 	}
 
 	wantLogged(t, r, code)
+}
+
+// grantSpec describes an OAuth grant's access token of the account userID, held
+// by an agent: the token's own scope text as stored, and the agent's list read
+// now.
+type grantSpec struct {
+	// scope is the access token's scope text, space-delimited.
+	scope string
+	// agentScopes is the agent's stored list.
+	agentScopes scope.List
+	// role is the account's, defaulting to a member.
+	role string
+}
+
+// signInGrant issues an access token as spec describes, stores its row as active
+// for the login resource and returns the Authorization header value.
+func (r *rig) signInGrant(spec grantSpec) string {
+	r.t.Helper()
+
+	issued, err := auth.IssueAccessToken(r.signer, r.signID, clockAt)
+	if err != nil {
+		r.t.Fatalf("IssueAccessToken: %v", err)
+	}
+
+	role := spec.role
+	if role == "" {
+		role = roleMember
+	}
+
+	r.creds.grants[issued.Token] = store.ActiveGrant{
+		ID: issued.ID, UserID: userID, Role: role, ExpiresAt: issued.ExpiresAt, OrgID: "",
+		AgentID: firstPartyAgent, AgentScopes: spec.agentScopes.JSON(), Scope: spec.scope,
+	}
+
+	return "Bearer " + issued.Token
 }

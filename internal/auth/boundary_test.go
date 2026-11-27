@@ -47,6 +47,14 @@ func (o outcome) viaKey() outcome {
 	return o
 }
 
+// viaGrant is the outcome for a request whose credential is an OAuth access
+// token.
+func (o outcome) viaGrant() outcome {
+	o.kind = auth.KindGrant
+
+	return o
+}
+
 // carried is what a request presents: Authorization header values and cookies.
 type carried struct {
 	headers []string
@@ -504,6 +512,19 @@ func shapeCases() []boundaryCase {
 			unauthenticated(0, input.CodeInvalidAPIKey).viaKey()))
 	}
 
+	for name, value := range shapes(secret.TagOAuthAccess) {
+		// A value that is not a key's shape is refused by the key's parser, unless it
+		// is a malformed access token, which the access token's parser refuses. Both
+		// are the one 401 and cost no read.
+		code := input.CodeInvalidAPIKey
+		if strings.HasPrefix(value, secret.Prefix(secret.TagOAuthAccess)) {
+			code = input.CodeInvalidAccessToken
+		}
+
+		cases = append(cases, rowOf("shape: bearer access token, "+name, pathMe, literalHeader("Bearer "+value),
+			unauthenticated(0, code).viaKey()))
+	}
+
 	return cases
 }
 
@@ -544,13 +565,16 @@ func kindCases() []boundaryCase {
 			}), unauthenticated(1, logNotActive)),
 	}
 
-	// An OAuth code, refresh token or access token is a bearer secret for the
-	// OAuth endpoints only. Presented to authsu's own API, as a bearer or in the
-	// cookie, it is refused by its shape before the store is read, so a grant
-	// carries no authsu scopes and cannot call the management API.
-	oauthTags := []secret.Tag{secret.TagOAuthCode, secret.TagOAuthRefresh, secret.TagOAuthAccess}
-	cases := make([]boundaryCase, 0, len(base)+2*len(oauthTags))
+	// An OAuth code or refresh token is a bearer secret for the OAuth endpoints
+	// only. Presented to authsu's own API, as a bearer or in the cookie, it is
+	// refused by its shape before the store is read. An access token is the one
+	// OAuth secret the API accepts, and only as a bearer: in the session cookie it
+	// is a wrong kind like any other (grantCases covers it as a bearer).
+	oauthTags := []secret.Tag{secret.TagOAuthCode, secret.TagOAuthRefresh}
+	cases := make([]boundaryCase, 0, len(base)+2*len(oauthTags)+1)
 	cases = append(cases, base...)
+	cases = append(cases, row("kind: an OAuth at token in the session cookie", pathMe,
+		inCookie(func(r *rig) string { return r.foreign(secret.TagOAuthAccess) }), wrongForCookie))
 
 	for _, tag := range oauthTags {
 		oauthToken := func(r *rig) string { return r.foreign(tag) }

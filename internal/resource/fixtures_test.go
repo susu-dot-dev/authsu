@@ -4,6 +4,7 @@ package resource_test
 import (
 	"net/url"
 	"regexp"
+	"slices"
 	"testing"
 
 	"github.com/susu-dot-dev/authsu/internal/resource"
@@ -21,6 +22,13 @@ const (
 	scopeWrite    = "mcp:write"
 	scopeEvil     = "evil:all"
 )
+
+// bothTables are the production and the development table, by name.
+func bothTables() map[string]resource.Table {
+	return map[string]resource.Table{
+		"production": resource.Select(originProd), "development": resource.Select(originLocalPort),
+	}
+}
 
 // selectCases are the API_ORIGIN values Select is tried with.
 func selectCases() map[string]struct {
@@ -157,8 +165,9 @@ func checkURL(t *testing.T, e resource.Entry) {
 	}
 }
 
-// checkScopes fails unless the entry's scopes are unique, follow the grammar,
-// and are not authsu's own.
+// checkScopes fails unless the entry's scopes are unique and follow the grammar,
+// and, for a resource that is not the first-party login, are not authsu's own.
+// The login resource is held to its own rule (checkLoginScopes).
 func checkScopes(t *testing.T, e resource.Entry, grammar *regexp.Regexp) {
 	t.Helper()
 
@@ -170,7 +179,7 @@ func checkScopes(t *testing.T, e resource.Entry, grammar *regexp.Regexp) {
 
 	for _, name := range e.Scopes {
 		if !scopeNameOK(e, name, grammar) {
-			t.Errorf("scope %q is not a resource:action name (or, for a first-party resource, not only %q)",
+			t.Errorf("scope %q is not a resource:action name (or, for a first-party resource, %q)",
 				name, resource.ScopeProfile)
 		}
 
@@ -180,9 +189,10 @@ func checkScopes(t *testing.T, e resource.Entry, grammar *regexp.Regexp) {
 
 		seen[name] = true
 
-		// A resource scope is never one of authsu's own, nor a bundle: a client
-		// asking for one must not be mistaken for asking for authority at authsu.
-		if scope.Known(name) {
+		// A third-party resource's scope is never one of authsu's own, nor a
+		// bundle: a client asking for one must not be mistaken for asking for
+		// authority at authsu. The login resource is checked as a whole below.
+		if !e.FirstParty && scope.Known(name) {
 			t.Errorf("scope %q is also an authsu scope or bundle", name)
 		}
 
@@ -190,17 +200,61 @@ func checkScopes(t *testing.T, e resource.Entry, grammar *regexp.Regexp) {
 			t.Errorf("HasScope(%q) = false for a listed scope", name)
 		}
 	}
+
+	if e.FirstParty {
+		checkLoginScopes(t, e)
+	}
 }
 
 // scopeNameOK reports whether a scope's name is acceptable for its entry: a
-// resource:action name, except for the first-party login resource, whose one
-// scope is the OpenID Connect name "profile".
+// resource:action name, except that the first-party login resource also has the
+// OpenID Connect name "profile".
 func scopeNameOK(e resource.Entry, name string, grammar *regexp.Regexp) bool {
-	if e.FirstParty {
-		return name == resource.ScopeProfile && len(e.Scopes) == 1
+	if e.FirstParty && name == resource.ScopeProfile {
+		return true
 	}
 
 	return grammar.MatchString(name) && len(name) <= scope.MaxNameBytes
+}
+
+// wantLoginScopes is the scope list of the first-party login resource, spelled
+// out: the profile scope, then the authsu scopes a grant for it may hold. It is
+// written here and not derived from resource.LoginAuthsuScopes, so changing the
+// allowlist is a change to this test too.
+func wantLoginScopes() []string {
+	return []string{
+		resource.ScopeProfile, "sandbox:create", "sandbox:revoke", "org:read", "agent:create", "agent:read",
+	}
+}
+
+// checkLoginScopes fails unless the first-party login resource's scopes are
+// exactly profile and the fixed authsu list, each of the authsu names a known
+// concrete scope: never a bundle and never an admin scope, because a grant can
+// never gain an admin scope and the allowlist must not suggest otherwise.
+func checkLoginScopes(t *testing.T, e resource.Entry) {
+	t.Helper()
+
+	if !slices.Equal(e.Scopes, wantLoginScopes()) {
+		t.Errorf("the login resource's scopes = %v, want %v", e.Scopes, wantLoginScopes())
+	}
+
+	authsu := resource.LoginAuthsuScopes()
+	if !slices.Equal(e.Scopes[1:], authsu) || !slices.Equal(e.AuthsuScopes(), authsu) {
+		t.Errorf("AuthsuScopes = %v, LoginAuthsuScopes = %v, want both %v", e.AuthsuScopes(), authsu, e.Scopes[1:])
+	}
+
+	for _, name := range e.AuthsuScopes() {
+		_, isBundle := scope.Bundle(name)
+
+		switch {
+		case !scope.Known(name):
+			t.Errorf("login scope %q is not an authsu scope", name)
+		case isBundle:
+			t.Errorf("login scope %q is a bundle", name)
+		case scope.IsAdmin(scope.Scope(name)):
+			t.Errorf("login scope %q is an admin scope", name)
+		}
+	}
 }
 
 // checkDefaults fails unless the entry's defaults are a non-empty, unique subset
