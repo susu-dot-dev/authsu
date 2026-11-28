@@ -4,6 +4,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"regexp"
 	"slices"
@@ -150,33 +151,51 @@ func checkNumbering(t *testing.T, at int, query string, args int) {
 // The WebAuthn user handle is not in it: nothing returns it.
 const userColumns = "id, role, invitation_id, profile, revoked_at, created_at"
 
-// TestListUsersDecoding holds how the rows of the list become accounts, in the
-// order the database returned them.
+// listUsers runs ListUsers for the first page of the given size.
+func listUsers(t *testing.T, s *store.Store, limit string) (store.UserPage, error) {
+	t.Helper()
+
+	page, err := s.ListUsers(context.Background(), orgCursorOf(t), orgLimitOf(t, limit))
+	if err != nil {
+		return store.UserPage{}, fmt.Errorf("list users: %w", err)
+	}
+
+	return page, nil
+}
+
+// TestListUsersDecoding holds how the rows of a page become accounts, in the
+// order the database returned them, and how the extra row that a page asks for
+// becomes the cursor of the next one and is not itself returned.
 func TestListUsersDecoding(t *testing.T) {
 	t.Parallel()
 
 	revokedAt := int64(1_700_000_050)
 
+	active := store.User{
+		ID: userID1, Role: userAdminRole, InvitationID: "inv-1", Profile: `{"name":"Ada"}`, RevokedAt: nil,
+		CreatedAt: 1_700_000_000,
+	}
+	revoked := store.User{
+		ID: userID2, Role: "member", InvitationID: "inv-1", Profile: `{"name":"Ada"}`, RevokedAt: &revokedAt,
+		CreatedAt: 1_699_999_000,
+	}
+
 	tests := []struct {
-		name string
-		rows [][]any
-		want []store.User
+		name  string
+		limit string
+		rows  [][]any
+		want  store.UserPage
 	}{
-		{name: "no accounts is an empty list, not nil", rows: nil, want: []store.User{}},
-		{name: "an active account", rows: [][]any{activeUserRow()}, want: []store.User{
-			{ID: userID1, Role: userAdminRole, InvitationID: "inv-1", Profile: `{"name":"Ada"}`, RevokedAt: nil,
-				CreatedAt: 1_700_000_000},
-		}},
-		{name: "a revoked account", rows: [][]any{revokedUserRow()}, want: []store.User{
-			{ID: userID2, Role: "member", InvitationID: "inv-1", Profile: `{"name":"Ada"}`, RevokedAt: &revokedAt,
-				CreatedAt: 1_699_999_000},
-		}},
-		{name: "the order is the database's", rows: [][]any{revokedUserRow(), activeUserRow()}, want: []store.User{
-			{ID: userID2, Role: "member", InvitationID: "inv-1", Profile: `{"name":"Ada"}`, RevokedAt: &revokedAt,
-				CreatedAt: 1_699_999_000},
-			{ID: userID1, Role: userAdminRole, InvitationID: "inv-1", Profile: `{"name":"Ada"}`, RevokedAt: nil,
-				CreatedAt: 1_700_000_000},
-		}},
+		{name: "no accounts is an empty page, not nil", limit: "2", rows: nil, want: store.UserPage{Users: []store.User{}}},
+		{name: "an active account", limit: "2", rows: [][]any{activeUserRow()},
+			want: store.UserPage{Users: []store.User{active}}},
+		{name: "a revoked account", limit: "2", rows: [][]any{revokedUserRow()},
+			want: store.UserPage{Users: []store.User{revoked}}},
+		{name: "the order is the database's", limit: "2", rows: [][]any{revokedUserRow(), activeUserRow()},
+			want: store.UserPage{Users: []store.User{revoked, active}}},
+		{name: "one more than the limit has a next page, which is the last row kept", limit: "1",
+			rows: [][]any{revokedUserRow(), activeUserRow()},
+			want: store.UserPage{Users: []store.User{revoked}, Next: userID2}},
 	}
 
 	for _, test := range tests {
@@ -185,20 +204,20 @@ func TestListUsersDecoding(t *testing.T) {
 
 			fake := newFake(returning(test.rows...))
 
-			got, err := fake.store().ListUsers(context.Background())
+			got, err := listUsers(t, fake.store(), test.limit)
 
 			checkErr(t, err, nil)
 
-			if got == nil || !reflect.DeepEqual(got, test.want) {
-				t.Errorf("users = %#v, want %#v", got, test.want)
+			if got.Users == nil || !reflect.DeepEqual(got, test.want) {
+				t.Errorf("page = %#v, want %#v", got, test.want)
 			}
 		})
 	}
 }
 
-// TestListUsersDefects holds that a list with a row that is not an account is a
+// TestListUsersDefects holds that a page with a row that is not an account is a
 // defect as a whole: a broken row is not skipped, and nothing partial is
-// returned.
+// returned. So is a page with more rows than the query asked for.
 func TestListUsersDefects(t *testing.T) {
 	t.Parallel()
 
@@ -208,38 +227,77 @@ func TestListUsersDefects(t *testing.T) {
 
 			fake := newFake(returning(activeUserRow(), defect.row))
 
-			got, err := fake.store().ListUsers(context.Background())
+			got, err := listUsers(t, fake.store(), "5")
 
 			checkErr(t, err, defectOf(store.CodeUserListRejected))
 
-			if got != nil {
-				t.Errorf("a defective list returned %#v", got)
+			if got.Users != nil || got.Next != "" {
+				t.Errorf("a defective page returned %#v", got)
 			}
 		})
 	}
+
+	t.Run("more rows than were asked for", func(t *testing.T) {
+		t.Parallel()
+
+		fake := newFake(returning(activeUserRow(), revokedUserRow(), activeUserRow()))
+
+		got, err := listUsers(t, fake.store(), "1")
+
+		checkErr(t, err, defectOf(store.CodeUserListRejected))
+
+		if got.Users != nil || got.Next != "" {
+			t.Errorf("a defective page returned %#v", got)
+		}
+	})
 }
 
-// TestListUsersStatement pins the list: every account, revoked ones included,
-// newest first with the id breaking ties, and without the user handle.
+// TestListUsersStatement pins the page: every account, revoked ones included,
+// newest first, below the cursor and one row more than the limit, and without
+// the user handle.
 func TestListUsersStatement(t *testing.T) {
 	t.Parallel()
 
-	fake := newFake(returning())
+	tests := []struct {
+		name   string
+		limit  string
+		cursor []string
+		before string
+		wanted int64
+	}{
+		{name: "the first page", limit: "2", before: "g", wanted: 3},
+		{name: "after a cursor", limit: "1", cursor: []string{userID1}, before: userID1, wanted: 2},
+		{name: "the default limit", limit: "", before: "g", wanted: input.DefaultPageLimit + 1},
+	}
 
-	_, err := fake.store().ListUsers(context.Background())
-	checkErr(t, err, nil)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 
-	checkStatements(t, fake, wantStatement{
-		fragments: []string{
-			"SELECT " + userColumns + " FROM users ORDER BY created_at DESC, id DESC",
-		},
-		args: nil,
-	})
+			fake := newFake(returning())
 
-	// No filter: a revoked account is listed too.
-	query := squash(fake.calls[0][0].Query)
-	if strings.Contains(query, "WHERE") || strings.Contains(query, "user_handle") {
-		t.Errorf("list is filtered or selects the user handle:\n%s", query)
+			limit := []string{}
+			if test.limit != "" {
+				limit = []string{test.limit}
+			}
+
+			_, err := fake.store().ListUsers(
+				context.Background(), orgCursorOf(t, test.cursor...), orgLimitOf(t, limit...))
+			checkErr(t, err, nil)
+
+			checkStatements(t, fake, wantStatement{
+				fragments: []string{
+					"SELECT " + userColumns + " FROM users WHERE id < ?1 ORDER BY id DESC LIMIT ?2",
+				},
+				args: []any{test.before, test.wanted},
+			})
+
+			// No filter beyond the cursor: a revoked account is listed too.
+			query := squash(fake.calls[0][0].Query)
+			if strings.Contains(query, "revoked_at IS") || strings.Contains(query, "user_handle") {
+				t.Errorf("list is filtered or selects the user handle:\n%s", query)
+			}
+		})
 	}
 }
 
@@ -248,7 +306,7 @@ func TestListUsersFailures(t *testing.T) {
 	t.Parallel()
 
 	runFailures(t, 1, store.CodeUserListFailed, store.CodeUserListRejected, usersDescription,
-		func(s *store.Store) error { return lastErr(s.ListUsers(context.Background())) })
+		func(s *store.Store) error { return lastErr(listUsers(t, s, "5")) })
 }
 
 // TestGetUserOutcomes holds the outcomes of a lookup: the account, or

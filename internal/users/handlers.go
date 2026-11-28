@@ -12,6 +12,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/apierr"
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -67,9 +68,32 @@ type User struct {
 	CreatedAt int64 `json:"createdAt"`
 }
 
-// ListResponse is the body of GET /api/user.
+// ListResponse is the body of GET /api/user: one page, newest first.
 type ListResponse struct {
 	Users []User `json:"users"`
+
+	// Next is the cursor of the following page, to send as the cursor query
+	// parameter. It is absent on the last page.
+	Next string `json:"next,omitempty"`
+}
+
+// page is a parsed list request.
+type page struct {
+	cursor input.Cursor
+	limit  input.PageLimit
+}
+
+// parsePage reads the limit and cursor from the query. Each may appear at most
+// once: a repeated parameter is ambiguous, and which value wins differs between
+// layers, so it is refused rather than guessed.
+func parsePage(query map[string][]string) result.Result[page] {
+	return result.Of(input.ParsePageLimit(query["limit"])).
+		Map(func(limit input.PageLimit) page { return page{limit: limit} }).
+		Then(func(p page) (page, error) {
+			return result.Of(input.ParseCursor(query["cursor"])).
+				Map(func(cursor input.Cursor) page { p.cursor = cursor; return p }).
+				Get()
+		})
 }
 
 // handlers are the route bodies, with what they depend on.
@@ -81,8 +105,25 @@ type handlers struct {
 
 // list answers GET /api/user.
 func (h handlers) list(call *auth.Call) result.Result[httpapi.Response] {
-	return result.Of(h.store.ListUsers(call.Request.Context)).
-		Map(func(users []store.User) ListResponse { return h.presentAll(call.Request, users) }).
+	return parsePage(call.Request.Query).
+		Then(func(p page) (store.UserPage, error) {
+			return h.store.ListUsers(call.Request.Context, p.cursor, p.limit)
+		}).
+		Map(func(stored store.UserPage) ListResponse { return h.presentAll(call.Request, stored) }).
+		Map(ok)
+}
+
+// self answers GET /api/user/me: the caller's own account, which the boundary
+// has just resolved, read again with the same store call as any other so it is
+// shown exactly as an administrator sees an account, whatever has changed
+// since. The caller is an account the boundary found active, so an account that
+// is not found is one that was removed in between, and is told the same as for
+// any other.
+func (h handlers) self(call *auth.Call) result.Result[httpapi.Response] {
+	return result.Of(input.ParseID(call.Principal.UserID)).
+		Then(func(id input.ID) (store.User, error) { return h.store.GetUser(call.Request.Context, id) }).
+		MapErr(outcome).
+		Map(func(stored store.User) User { return h.present(call.Request, stored) }).
 		Map(ok)
 }
 
@@ -131,13 +172,13 @@ func refuse(kind apierr.Kind, code, description string, cause error) *apierr.Err
 	return apierr.New(kind, code, description).WithCause(cause)
 }
 
-// presentAll is the client's view of every account. The list is an empty array,
-// never null, when there are none.
-func (h handlers) presentAll(req httpapi.Request, users []store.User) ListResponse {
-	out := ListResponse{Users: make([]User, 0, len(users))}
+// presentAll is the client's view of a page of accounts. The list is an empty
+// array, never null, when there are none.
+func (h handlers) presentAll(req httpapi.Request, stored store.UserPage) ListResponse {
+	out := ListResponse{Users: make([]User, 0, len(stored.Users)), Next: stored.Next}
 
-	for _, stored := range users {
-		out.Users = append(out.Users, h.present(req, stored))
+	for _, user := range stored.Users {
+		out.Users = append(out.Users, h.present(req, user))
 	}
 
 	return out

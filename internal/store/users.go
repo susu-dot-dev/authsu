@@ -61,20 +61,43 @@ func readUser(r *row) User {
 	}
 }
 
-// listUsersQuery reads every account, revoked ones included, newest first. The
-// id is a UUIDv7, so it breaks ties between accounts created in the same second
-// in creation order. The user handle is not selected: nothing returns it.
+// listUsersQuery reads one page of the accounts, revoked ones included, newest
+// first. The id is a UUIDv7, so it is the sort key and the cursor, as for
+// organizations and members: the page is the accounts with an id below the
+// cursor, and a page asks for one row more than it returns so the caller can
+// tell whether there is a next page. The user handle is not selected: nothing
+// returns it.
+//
+// Arguments, by number: ?1 cursor (orgsFirstPage for the first page), ?2 rows
+// wanted.
 const listUsersQuery = `
 SELECT id, role, invitation_id, profile, revoked_at, created_at
 FROM users
-ORDER BY created_at DESC, id DESC`
+WHERE id < ?1
+ORDER BY id DESC
+LIMIT ?2`
 
-// ListUsers returns every account, revoked ones included, newest first. There
-// is no paging: it returns the whole table.
-func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
+// UserPage is one page of accounts, newest first.
+type UserPage struct {
+	Users []User
+
+	// Next is the cursor of the following page: the id of the last account of
+	// this one. It is empty on the last page.
+	Next string
+}
+
+// ListUsers returns up to limit accounts with an id below the cursor, revoked
+// ones included, newest first. An empty cursor starts at the newest.
+func (s *Store) ListUsers(ctx context.Context, cursor input.Cursor, limit input.PageLimit) (UserPage, error) {
 	o := op{failed: CodeUserListFailed, rejected: CodeUserListRejected, description: usersDescription}
 
-	return queryAll(ctx, s, o, Statement{Query: listUsersQuery, Args: nil}, readUser)
+	before, size := pageWindow(cursor, limit)
+
+	return pageOf(o,
+		result.Of(queryAll(ctx, s, o,
+			Statement{Query: listUsersQuery, Args: []any{before, int64(size + 1)}}, readUser)),
+		size, func(user User) string { return user.ID },
+		func(users []User, next string) UserPage { return UserPage{Users: users, Next: next} })
 }
 
 // getUserQuery reads one account. Arguments: id.

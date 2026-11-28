@@ -123,6 +123,16 @@ func TestToolsAreListed(t *testing.T) {
 		{"get_invitation", true, false, true, []any{"id"}},
 		{"create_invitation", false, false, false, []any{"type", "numInvites", "publicKey"}},
 		{"revoke_invitation", false, true, true, []any{"id"}},
+		{"list_users", true, false, true, nil},
+		{"get_user", true, false, true, []any{"id"}},
+		{"revoke_user", false, true, true, []any{"id"}},
+		{"list_orgs", true, false, true, nil},
+		{"get_org", true, false, true, []any{"id"}},
+		{"rename_org", false, false, true, []any{"id", "name"}},
+		{"delete_sandbox", false, true, false, []any{"id"}},
+		{"list_org_members", true, false, true, []any{"id"}},
+		{"set_member_admin", false, false, true, []any{"id", "admin"}},
+		{"revoke_member", false, true, true, []any{"id"}},
 	}
 
 	if len(got.Result.Tools) != len(want) {
@@ -138,6 +148,8 @@ func TestToolsAreListed(t *testing.T) {
 // the method, path and body of the route's request, and the caller's own
 // Authorization header is what goes with it. This table is the record of which
 // route each tool reaches.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestToolCallsBecomeTheRoutesRequest(t *testing.T) {
 	t.Parallel()
 
@@ -159,6 +171,43 @@ func TestToolCallsBecomeTheRoutesRequest(t *testing.T) {
 		{"create with no arguments sends an empty object so the route says what is missing",
 			toolCall("create_invitation", ""), http.MethodPost, "/api/invitation", `{}`},
 		{"revoke", toolCall("revoke_invitation", `{"id":"`+itemID+`"}`), http.MethodDelete, "/api/invitation/" + itemID, ""},
+
+		{"list users", toolCall("list_users", ""), http.MethodGet, "/api/user", ""},
+		{"list users with empty arguments", toolCall("list_users", "{}"), http.MethodGet, "/api/user", ""},
+		{"list users with a limit", toolCall("list_users", `{"limit":5}`), http.MethodGet, "/api/user?limit=5", ""},
+		{"list users with a cursor", toolCall("list_users", `{"cursor":"`+itemID+`"}`), http.MethodGet,
+			"/api/user?cursor=" + itemID, ""},
+		{"list users with both", toolCall("list_users", `{"limit":100,"cursor":"`+itemID+`"}`), http.MethodGet,
+			"/api/user?cursor=" + itemID + "&limit=100", ""},
+		{"get a user", toolCall("get_user", `{"id":"`+itemID+`"}`), http.MethodGet, "/api/user/" + itemID, ""},
+		{"get the caller's own user", toolCall("get_user", `{"id":"me"}`), http.MethodGet, "/api/user/me", ""},
+		{"revoke a user", toolCall("revoke_user", `{"id":"`+itemID+`"}`), http.MethodDelete, "/api/user/" + itemID, ""},
+
+		{"list orgs", toolCall("list_orgs", ""), http.MethodGet, "/api/org", ""},
+		{"list orgs with a limit", toolCall("list_orgs", `{"limit":1}`), http.MethodGet, "/api/org?limit=1", ""},
+		{"get an org", toolCall("get_org", `{"id":"`+itemID+`"}`), http.MethodGet, "/api/org/" + itemID, ""},
+		{"rename an org", toolCall("rename_org", `{"id":"`+itemID+`","name":"Acme"}`), http.MethodPatch,
+			"/api/org/" + itemID, `{"name":"Acme"}`},
+		{"rename sends the name as it came, spelling and all",
+			toolCall("rename_org", `{ "name" : " A\u00e9 ","id":"`+itemID+`"}`), http.MethodPatch,
+			"/api/org/" + itemID, `{"name":" A\u00e9 "}`},
+		{"rename with no name sends an empty body so the route says what is missing",
+			toolCall("rename_org", `{"id":"`+itemID+`"}`), http.MethodPatch, "/api/org/" + itemID, `{}`},
+		{"delete a sandbox", toolCall("delete_sandbox", `{"id":"`+itemID+`"}`), http.MethodDelete,
+			"/api/org/" + itemID, ""},
+		{"list the members of an org", toolCall("list_org_members", `{"id":"`+itemID+`"}`), http.MethodGet,
+			"/api/org/" + itemID + "/member", ""},
+		{"list the members with a page", toolCall("list_org_members", `{"id":"`+itemID+`","limit":2,"cursor":"`+itemID+`"}`),
+			http.MethodGet, "/api/org/" + itemID + "/member?cursor=" + itemID + "&limit=2", ""},
+		{"make a member an administrator", toolCall("set_member_admin", `{"id":"`+itemID+`","admin":true}`),
+			http.MethodPatch, "/api/member/" + itemID, `{"admin":true}`},
+		{"stop a member administering", toolCall("set_member_admin", `{"admin":false,"id":"`+itemID+`"}`),
+			http.MethodPatch, "/api/member/" + itemID, `{"admin":false}`},
+		{"a null admin is sent as null, for the route to refuse",
+			toolCall("set_member_admin", `{"id":"`+itemID+`","admin":null}`),
+			http.MethodPatch, "/api/member/" + itemID, `{"admin":null}`},
+		{"revoke a member", toolCall("revoke_member", `{"id":"`+itemID+`"}`), http.MethodDelete,
+			"/api/member/" + itemID, ""},
 	}
 
 	for _, tt := range tests {
@@ -256,6 +305,8 @@ func TestAToolResultIsWhatTheRouteAnswered(t *testing.T) {
 // TestArgumentsTheToolDoesNotTakeAreRefusedAsAToolError: the model can read the
 // refusal and correct the call, and the route is never reached. The text is the
 // REST error's shape, with the parser's own code.
+//
+//nolint:funlen // the case table is the test; splitting it would only scatter the cases
 func TestArgumentsTheToolDoesNotTakeAreRefusedAsAToolError(t *testing.T) {
 	t.Parallel()
 
@@ -274,6 +325,36 @@ func TestArgumentsTheToolDoesNotTakeAreRefusedAsAToolError(t *testing.T) {
 		{"another argument beside the id", toolCall("get_invitation", `{"id":"`+itemID+`","x":1}`), "unknown_field"},
 		{"arguments that are not an object", toolCall("revoke_invitation", `[]`), "invalid_field_type"},
 		{"arguments for a tool that takes none", toolCall("list_invitations", `{"id":"`+itemID+`"}`), "unknown_field"},
+
+		{"me is only ever the exact word", toolCall("get_user", `{"id":"ME"}`), "invalid_id"},
+		{"me with a space", toolCall("get_user", `{"id":"me "}`), "invalid_id"},
+		{"a user lookup with another argument", toolCall("get_user", `{"id":"me","x":1}`), "unknown_field"},
+		{"a user lookup whose arguments are not an object", toolCall("get_user", `[]`), "invalid_field_type"},
+		{"me for a tool that does not take it", toolCall("revoke_user", `{"id":"me"}`), "invalid_id"},
+		{"me for an org", toolCall("get_org", `{"id":"me"}`), "invalid_id"},
+		{"a path for a user", toolCall("get_user", `{"id":"me/../x"}`), "invalid_id"},
+		{"a limit of zero", toolCall("list_users", `{"limit":0}`), "invalid_limit"},
+		{"a limit over the maximum", toolCall("list_orgs", `{"limit":101}`), "invalid_limit"},
+		{"a negative limit", toolCall("list_users", `{"limit":-1}`), "invalid_limit"},
+		{"a limit beyond an int64", toolCall("list_users", `{"limit":99999999999999999999}`), "invalid_field_type"},
+		{"a limit that is not a number", toolCall("list_users", `{"limit":"5"}`), "invalid_field_type"},
+		{"a fractional limit", toolCall("list_users", `{"limit":1.5}`), "invalid_field_type"},
+		{"a cursor that is not an id", toolCall("list_users", `{"cursor":"abc"}`), "invalid_cursor"},
+		{"an empty cursor", toolCall("list_orgs", `{"cursor":""}`), "invalid_cursor"},
+		{"a cursor with a query in it", toolCall("list_users", `{"cursor":"`+itemID+`&limit=1"}`), "invalid_cursor"},
+		{"a cursor that is a number", toolCall("list_users", `{"cursor":1}`), "invalid_field_type"},
+		{"another argument beside the page", toolCall("list_users", `{"limit":1,"x":1}`), "unknown_field"},
+		{"a members list with no id", toolCall("list_org_members", `{"limit":1}`), "invalid_id"},
+		{"a members list with a bad id", toolCall("list_org_members", `{"id":"x"}`), "invalid_id"},
+		{"a members list with another argument", toolCall("list_org_members", `{"id":"`+itemID+`","x":1}`), "unknown_field"},
+		{"a rename with a bad id", toolCall("rename_org", `{"id":"x","name":"A"}`), "invalid_id"},
+		{"a rename with no id", toolCall("rename_org", `{"name":"A"}`), "invalid_id"},
+		{"a rename with an id that is a number", toolCall("rename_org", `{"id":1,"name":"A"}`), "invalid_field_type"},
+		{"a rename with another argument", toolCall("rename_org", `{"id":"`+itemID+`","name":"A","x":1}`), "unknown_field"},
+		{"a rename that names admin", toolCall("rename_org", `{"id":"`+itemID+`","admin":true}`), "unknown_field"},
+		{"a rename whose arguments are not an object", toolCall("rename_org", `[]`), "invalid_field_type"},
+		{"an admin change with a bad id", toolCall("set_member_admin", `{"id":"x","admin":true}`), "invalid_id"},
+		{"an admin change that names name", toolCall("set_member_admin", `{"id":"`+itemID+`","name":"A"}`), "unknown_field"},
 	}
 
 	for _, tt := range tests {
@@ -294,6 +375,30 @@ func TestArgumentsTheToolDoesNotTakeAreRefusedAsAToolError(t *testing.T) {
 				t.Errorf("reached the routes: %+v", harn.rest.calls)
 			}
 		})
+	}
+}
+
+// TestRepeatedArgumentsAreRefusedBeforeTheTool: a member given twice anywhere in
+// the message is refused as an invalid request by the endpoint's strict reader,
+// so no tool ever sees two spellings of one argument.
+func TestRepeatedArgumentsAreRefusedBeforeTheTool(t *testing.T) {
+	t.Parallel()
+
+	calls := []string{
+		toolCall("list_users", `{"limit":1,"limit":2}`),
+		toolCall("rename_org", `{"id":"`+itemID+`","name":"A","name":"B"}`),
+		toolCall("rename_org", `{"id":"`+itemID+`","id":"`+itemID+`","name":"A"}`),
+		toolCall("set_member_admin", `{"id":"`+itemID+`","admin":true,"admin":false}`),
+	}
+
+	for _, call := range calls {
+		harn := newHarness(t)
+		rec := harn.post(call)
+
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":-32600`) ||
+			len(harn.rest.calls) != 0 {
+			t.Errorf("%s: response = %d %s, routes got %+v", call, rec.Code, rec.Body.String(), harn.rest.calls)
+		}
 	}
 }
 

@@ -29,6 +29,7 @@ func TestRouteDeclarations(t *testing.T) {
 		noAgents bool
 	}{
 		{name: opList, method: http.MethodGet, path: "/api/user", scope: scope.UserRead},
+		{name: opSelf, method: http.MethodGet, path: "/api/user/me", scope: scope.UserRead},
 		{name: "get", method: http.MethodGet, path: "/api/user/{id}", scope: scope.UserRead},
 		{name: "revoke", method: http.MethodDelete, path: "/api/user/{id}", scope: scope.UserRevoke, noAgents: true},
 	}

@@ -808,8 +808,10 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 			_, _, _ = s.UpdateNumInvites(ctx, invID(t), invNum(t, input.MaxNumInvites), farthest)
 		},
 		"RevokeInvitation": func(s *store.Store) { _, _ = s.RevokeInvitation(ctx, invID(t), farthest) },
-		"ListUsers":        func(s *store.Store) { _, _ = s.ListUsers(ctx) },
-		"GetUser":          func(s *store.Store) { _, _ = s.GetUser(ctx, mustUserID(t, userID1)) },
+		"ListUsers": func(s *store.Store) {
+			_, _ = s.ListUsers(ctx, orgCursorOf(t, userID1), orgLimitOf(t, "100"))
+		},
+		"GetUser": func(s *store.Store) { _, _ = s.GetUser(ctx, mustUserID(t, userID1)) },
 		"RevokeUser": func(s *store.Store) {
 			_, _ = s.RevokeUser(ctx, mustUserID(t, userID1), userID2, userAdminRole, farthest)
 		},

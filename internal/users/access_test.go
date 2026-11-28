@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
 
@@ -195,9 +196,11 @@ func TestMalformedSessionTokensAreNotLookedUp(t *testing.T) {
 func expectedCall(rt route, rg *rig) storeCall {
 	switch rt.op {
 	case opList:
-		return readCall(opList, "")
+		return listCall("", input.DefaultPageLimit)
+	case opSelf:
+		return getCall(adminID)
 	case opGet:
-		return readCall(opGet, targetID)
+		return getCall(targetID)
 	default:
 		return storeCall{op: opRevoke, id: targetID, caller: adminID, role: roleAdmin, now: rg.now}
 	}
@@ -227,7 +230,7 @@ func TestRoleIsReadOnEveryRequest(t *testing.T) {
 		t.Errorf("after losing the role = %d, want 403", got)
 	}
 
-	wantCalls(t, rg.store.calls, []storeCall{readCall(opList, "")})
+	wantCalls(t, rg.store.calls, []storeCall{listCall("", input.DefaultPageLimit)})
 }
 
 // TestInvalidIDs: an id that is not a canonical lower-case UUID is refused
@@ -311,7 +314,7 @@ func TestIDReachesTheStoreAsSent(t *testing.T) {
 	}
 
 	for _, id := range ids {
-		for _, rt := range routes()[1:] {
+		for _, rt := range routes()[2:] {
 			t.Run(id+"/"+rt.name, func(t *testing.T) {
 				t.Parallel()
 
@@ -346,6 +349,8 @@ func TestMethods(t *testing.T) {
 		{name: "PUT on the collection", method: http.MethodPut, target: collection, allow: "GET"},
 		{name: "PATCH on the collection", method: http.MethodPatch, target: collection, allow: "GET"},
 		{name: "DELETE on the collection", method: http.MethodDelete, target: collection, allow: "GET"},
+		{name: "POST on the caller's own account", method: http.MethodPost, target: selfTarget, allow: "GET"},
+		{name: "DELETE on the caller's own account", method: http.MethodDelete, target: selfTarget, allow: "GET"},
 		{name: "POST on an account", method: http.MethodPost, target: itemPrefix + targetID, allow: "DELETE, GET"},
 		{name: "PUT on an account", method: http.MethodPut, target: itemPrefix + targetID, allow: "DELETE, GET"},
 		{name: "PATCH on an account", method: http.MethodPatch, target: itemPrefix + targetID, allow: "DELETE, GET"},
@@ -395,14 +400,14 @@ func TestRequestShape(t *testing.T) {
 		reached bool
 	}{
 		{
-			name: "DELETE without a content type", route: 2,
+			name: "DELETE without a content type", route: 3,
 			req:    request{contentType: "-"},
 			status: http.StatusUnsupportedMediaType,
 			body:   errorBody("unsupported_media_type", "request Content-Type must be application/json"),
 			logged: "unsupported_media_type",
 		},
 		{
-			name: "DELETE as a form", route: 2,
+			name: "DELETE as a form", route: 3,
 			req:    request{contentType: "application/x-www-form-urlencoded"},
 			status: http.StatusUnsupportedMediaType,
 			body:   errorBody("unsupported_media_type", "request Content-Type must be application/json"),
@@ -424,17 +429,22 @@ func TestRequestShape(t *testing.T) {
 			status: http.StatusRequestEntityTooLarge, body: bodyTooLarge, logged: "body_too_large",
 		},
 		{
-			name: "a body one byte over the cap, on a read", route: 1,
+			name: "a body one byte over the cap, on the caller's own account", route: 1,
 			req:    request{body: strings.Repeat("a", bodyCap+1)},
 			status: http.StatusRequestEntityTooLarge, body: bodyTooLarge, logged: "body_too_large",
 		},
 		{
-			name: "a body one byte over the cap, on a revocation", route: 2,
+			name: "a body one byte over the cap, on a read", route: 2,
 			req:    request{body: strings.Repeat("a", bodyCap+1)},
 			status: http.StatusRequestEntityTooLarge, body: bodyTooLarge, logged: "body_too_large",
 		},
 		{
-			name: "a body at the cap, on a revocation", route: 2,
+			name: "a body one byte over the cap, on a revocation", route: 3,
+			req:    request{body: strings.Repeat("a", bodyCap+1)},
+			status: http.StatusRequestEntityTooLarge, body: bodyTooLarge, logged: "body_too_large",
+		},
+		{
+			name: "a body at the cap, on a revocation", route: 3,
 			req:    request{body: strings.Repeat("a", bodyCap)},
 			status: http.StatusOK, body: "", logged: "", reached: true,
 		},
@@ -478,6 +488,8 @@ func TestUnroutedPaths(t *testing.T) {
 		"an account with a further segment":                           itemPrefix + targetID + "/keys",
 		"a plural collection":                                         collection + "s",
 		"the parent":                                                  "/api",
+		"the caller's own account with a trailing slash":              selfTarget + "/",
+		"the caller's own account with a further segment":             selfTarget + "/keys",
 	}
 
 	for name, target := range targets {

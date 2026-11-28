@@ -1,17 +1,29 @@
 // Package users is the platform administrators' API for accounts described in
-// docs/users_design.md: list them, read one, and revoke one.
+// docs/users_design.md: list them, read one, read their own, and revoke one.
 //
-//	GET    /api/user        list every account, revoked ones included
+//	GET    /api/user        one page of the accounts, revoked ones included
+//	GET    /api/user/me     the caller's own account
 //	GET    /api/user/{id}   one account
 //	DELETE /api/user/{id}   revoke it
 //
-// Every route is Authenticated and needs an admin scope (scope.UserRead or
-// scope.UserRevoke), so the boundary refuses a request without a valid
-// credential (401) and one from a caller who is not an administrator, or whose
-// scopes fall short (403), before any handler here runs. The role is the one
-// stored on the account, read on every request in the lookup that verifies the
-// credential (store.ResolveSession, store.ResolveAPIKey), so revoking an admin
-// takes effect at once.
+// Every route but /api/user/me is Authenticated and needs an admin scope
+// (scope.UserRead or scope.UserRevoke), so the boundary refuses a request
+// without a valid credential (401) and one from a caller who is not an
+// administrator, or whose scopes fall short (403), before any handler here
+// runs. The role is the one stored on the account, read on every request in the
+// lookup that verifies the credential (store.ResolveSession,
+// store.ResolveAPIKey), so revoking an admin takes effect at once.
+//
+// The list is paged, newest first, with the limit and cursor query parameters
+// of the organization list (input.ParsePageLimit, input.ParseCursor): the
+// response's next member, when present, is the cursor of the following page.
+//
+// /api/user/me is the caller's own account, in the same view an administrator
+// has of any account, and needs the same user:read scope as reading another: it
+// is the same data, and a key that may read accounts may read its own. It is for
+// administrators, like the rest, since the whole of this package is. A
+// signed-in member who wants their own standing has GET /api/session. The
+// literal path wins over /api/user/{id}, so "me" is never parsed as an id.
 //
 // Revoking is final and never deletes: the row stays, in its organization, the
 // account cannot log in, and none of its sessions, API keys or agents work. The
@@ -50,6 +62,7 @@ import (
 // Paths of the routes.
 const (
 	collectionPath = "/api/user"
+	selfPath       = "/api/user/me"
 	itemPath       = "/api/user/{id}"
 )
 
@@ -61,8 +74,9 @@ const maxBody = 1024
 // satisfies it. Failures of the database must come back classified, as the
 // store does, because they are sent to the client as they are.
 type Store interface {
-	// ListUsers returns every account, revoked ones included, newest first.
-	ListUsers(ctx context.Context) ([]store.User, error)
+	// ListUsers returns a page of the accounts, revoked ones included, newest
+	// first.
+	ListUsers(ctx context.Context, cursor input.Cursor, limit input.PageLimit) (store.UserPage, error)
 	// GetUser returns the account id, or store.ErrNotFound.
 	GetUser(ctx context.Context, id input.ID) (store.User, error)
 	// RevokeUser revokes the account id on behalf of the caller and returns it
@@ -107,6 +121,10 @@ func Routes(deps Deps) []auth.Route {
 		{
 			Method: http.MethodGet, Path: collectionPath, MaxBody: maxBody,
 			Credential: auth.Authenticated, Access: auth.Needs(scope.UserRead), Handle: api.list,
+		},
+		{
+			Method: http.MethodGet, Path: selfPath, MaxBody: maxBody,
+			Credential: auth.Authenticated, Access: auth.Needs(scope.UserRead), Handle: api.self,
 		},
 		{
 			Method: http.MethodGet, Path: itemPath, MaxBody: maxBody,

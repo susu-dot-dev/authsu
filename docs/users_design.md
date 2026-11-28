@@ -4,7 +4,7 @@
 
 Related: [permissions_design.md](permissions_design.md), [invitations_design.md](invitations_design.md), [secrets_design.md](secrets_design.md), [first_run_design.md](first_run_design.md)
 
-Platform administrators list accounts, read one, and revoke one. Organization administrators see the members of their own organization ([orgs_design.md](orgs_design.md)) and may revoke them. The route boundary refuses everyone else before any handler runs, so a signed-out caller and an ordinary member learn nothing about the accounts or what a valid id looks like. An account is shown with its role, the invitation it came from, its profile and whether it is active. The WebAuthn user handle is never shown.
+Platform administrators list accounts, read one, read their own, and revoke one. Organization administrators see the members of their own organization ([orgs_design.md](orgs_design.md)) and may revoke them. The route boundary refuses everyone else before any handler runs, so a signed-out caller and an ordinary member learn nothing about the accounts or what a valid id looks like. An account is shown with its role, the invitation it came from, its profile and whether it is active. The WebAuthn user handle is never shown.
 
 ## The role is read live
 
@@ -36,6 +36,10 @@ The check is part of the write, not a read before it. D1 has no interactive tran
 
 An organization's own administrators cannot revoke each other down to none, but the platform can always step in, so an organization whose administrators were all revoked can still be managed.
 
+## Reading your own account
+
+`GET /api/user/me` answers with the caller's own account, in the view an administrator has of any account. It is a route of its own and not an alias of the item route, so "me" is never an id, and it is found from the credential and not from anything in the request. It needs the same scope as reading another account and is for administrators, like everything here: a member who wants their standing has the session route ([login_design.md](login_design.md)).
+
 ## Stored data is checked on the way out
 
 A profile is stored as text the database does not constrain, so before it is sent it is checked. A profile that is not what registration writes is logged, naming the account, and the account is served with an empty profile. The request does not fail: one corrupt row must not hide every other account from the admin who has to find and revoke it, and a revocation that was applied must not be reported as failed.
@@ -43,5 +47,5 @@ A profile is stored as text the database does not constrain, so before it is sen
 ## What is not here
 
 - **No changes to the platform role.** When there are, they need the same last-administrator guard, and no credential invalidation, because the role is read live.
-- **No paging or filtering of the list.** Add them when there are enough accounts to need them.
+- **No filtering of the list.** It is paged, newest first, by the account's id (a UUIDv7, so its order is creation order and it is its own cursor), as organizations and members are. Add filters when there are enough accounts to need them.
 - **No per-session management.** Ending one user's sessions without revoking the account, and users listing their own sessions, are open questions in [login_design.md](login_design.md).

@@ -15,7 +15,7 @@ import (
 func TestGet(t *testing.T) {
 	t.Parallel()
 
-	calls := []storeCall{readCall(opGet, targetID)}
+	calls := []storeCall{getCall(targetID)}
 
 	revoked := userRow(targetID)
 	revoked.RevokedAt = new(int64(1_700_000_050))
@@ -81,7 +81,98 @@ func TestGet(t *testing.T) {
 		},
 	}
 
-	runOutcomes(t, routes()[1], cases)
+	runOutcomes(t, routeNamed(opGet), cases)
+}
+
+// TestSelf is GET /api/user/me: the caller's own account, read by the id the
+// credential resolved to, and shown as any other. The store is asked for the
+// signed-in administrator and nobody else.
+func TestSelf(t *testing.T) {
+	t.Parallel()
+
+	calls := []storeCall{getCall(adminID)}
+
+	admin := userRow(adminID)
+	admin.Role = roleAdmin
+
+	badProfile := admin
+	badProfile.Profile = "not json"
+
+	cases := []outcomeCase{
+		{
+			name:    "the caller's own account",
+			program: func(f *fakeStore) { f.got = admin },
+			status:  http.StatusOK, body: userJSON(adminID, roleAdmin, profileAda, "active", nil, "1700000000") + "\n",
+			logged: "", calls: calls,
+		},
+		{
+			name:    "an account that is gone by the time it is read",
+			program: func(f *fakeStore) { f.getErr = store.ErrNotFound },
+			status:  http.StatusNotFound, body: bodyNotFound, logged: "user_not_found", calls: calls,
+		},
+		{
+			name:    "the database is unavailable",
+			program: func(f *fakeStore) { f.getErr = unavailable(store.CodeUserLookupFailed) },
+			status:  http.StatusServiceUnavailable, body: bodyUnavailable(store.CodeUserLookupFailed),
+			logged: store.CodeUserLookupFailed, calls: calls,
+		},
+		{
+			name:    "an unclassified failure is a bare 500",
+			program: func(f *fakeStore) { f.getErr = errIO },
+			status:  http.StatusInternalServerError, body: internalBody, logged: "internal", calls: calls,
+		},
+		{
+			name:    "a malformed profile is logged and served as an empty object",
+			program: func(f *fakeStore) { f.got = badProfile },
+			status:  http.StatusOK, body: userJSON(adminID, roleAdmin, `{}`, "active", nil, "1700000000") + "\n",
+			logged: "user_profile_invalid", calls: calls,
+		},
+	}
+
+	runOutcomes(t, routeNamed(opSelf), cases)
+}
+
+// TestSelfIsNotAnotherAccount: "me" is a route of its own and is never read as
+// an id, and the account asked for is the caller's whoever the caller is: there
+// is nothing in the request that names another.
+func TestSelfIsNotAnotherAccount(t *testing.T) {
+	t.Parallel()
+
+	for _, caller := range []string{adminID, targetID} {
+		t.Run(caller, func(t *testing.T) {
+			t.Parallel()
+
+			rg := newRig(t)
+			cookie := rg.signIn(caller, roleAdmin)
+			rg.store.got = userRow(caller)
+
+			rec := rg.do(request{
+				method: http.MethodGet, target: selfTarget + "?id=" + otherID, body: "", contentType: "",
+				cookies: []*http.Cookie{cookie},
+			})
+
+			wantCalls(t, rg.store.calls, []storeCall{getCall(caller)})
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("response = %d %q", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestSelfWithAnIDThatIsNotOne: a credential whose user id is not an id (the
+// schema forbids it, so this is a defect of the stored data) is a failure that
+// never reaches the store, and is not a 404 that would read as a real account.
+func TestSelfWithAnIDThatIsNotOne(t *testing.T) {
+	t.Parallel()
+
+	rg := newRig(t)
+	cookie := rg.signIn("not-an-id", roleAdmin)
+
+	rec := rg.as(cookie, http.MethodGet, selfTarget)
+
+	wantResponse(t, rg, rec, http.StatusBadRequest, bodyInvalidID, "invalid_id")
+	wantCalls(t, rg.store.calls, nil)
 }
 
 // TestProfile is every shape a stored profile can have, on the routes that show
@@ -138,7 +229,7 @@ func TestProfile(t *testing.T) {
 
 					stored := userRow(targetID)
 					stored.Profile = tc.profile
-					rg.store.users, rg.store.got, rg.store.revoked = []store.User{stored}, stored, stored
+					rg.store.users, rg.store.got, rg.store.revoked = store.UserPage{Users: []store.User{stored}}, stored, stored
 					rg.store.revoked.RevokedAt = new(int64(1_700_000_050))
 
 					rec := rg.as(cookie, rt.method, rt.target)

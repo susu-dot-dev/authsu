@@ -48,6 +48,8 @@ const (
 	// adminID is the account that signs in. targetID is the account acted on.
 	adminID  = "01890000-0000-7000-8000-000000000001"
 	targetID = "01890000-0000-7000-8000-0000000000aa"
+	// otherID is an account that no request here names as the caller.
+	otherID = "01890000-0000-7000-8000-0000000000cc"
 	// invitationID is the invitation every account came from.
 	invitationID = "01890000-0000-7000-8000-0000000000bb"
 
@@ -59,6 +61,7 @@ const (
 
 	collection = "/api/user"
 	itemPrefix = "/api/user/"
+	selfTarget = "/api/user/me"
 
 	jsonType = "application/json"
 
@@ -91,6 +94,7 @@ const (
 	opList   = "list"
 	opGet    = "get"
 	opRevoke = "revoke"
+	opSelf   = "self"
 )
 
 // unavailable is the failure the store reports for a database that is down: 503
@@ -115,12 +119,16 @@ type storeCall struct {
 	caller string
 	role   string
 	now    time.Time
+	// cursor and limit are the page window of a list: the cursor is "" for the
+	// first page and the limit is the page size.
+	cursor string
+	limit  int
 }
 
 // fakeStore is the account store with a programmable outcome per operation. It
 // records every call.
 type fakeStore struct {
-	users   []store.User
+	users   store.UserPage
 	listErr error
 
 	got    store.User
@@ -132,14 +140,17 @@ type fakeStore struct {
 	calls []storeCall
 }
 
-func (f *fakeStore) ListUsers(context.Context) ([]store.User, error) {
-	f.calls = append(f.calls, storeCall{op: opList, id: "", caller: "", role: "", now: time.Time{}})
+func (f *fakeStore) ListUsers(_ context.Context, cursor input.Cursor, limit input.PageLimit) (store.UserPage, error) {
+	after, _ := cursor.ID()
+	f.calls = append(f.calls, storeCall{
+		op: opList, id: "", caller: "", role: "", now: time.Time{}, cursor: after.String(), limit: limit.Int(),
+	})
 
 	return f.users, f.listErr
 }
 
 func (f *fakeStore) GetUser(_ context.Context, id input.ID) (store.User, error) {
-	f.calls = append(f.calls, storeCall{op: opGet, id: id.String(), caller: "", role: "", now: time.Time{}})
+	f.calls = append(f.calls, getCall(id.String()))
 
 	return f.got, f.getErr
 }
@@ -147,7 +158,9 @@ func (f *fakeStore) GetUser(_ context.Context, id input.ID) (store.User, error) 
 func (f *fakeStore) RevokeUser(
 	_ context.Context, id input.ID, caller, adminRole string, now time.Time,
 ) (store.User, error) {
-	f.calls = append(f.calls, storeCall{op: opRevoke, id: id.String(), caller: caller, role: adminRole, now: now})
+	f.calls = append(f.calls, storeCall{
+		op: opRevoke, id: id.String(), caller: caller, role: adminRole, now: now, cursor: "", limit: 0,
+	})
 
 	return f.revoked, f.revokeErr
 }
@@ -338,7 +351,7 @@ func (r *rig) do(req request) *httptest.ResponseRecorder {
 	return rec
 }
 
-// route is one of the three routes, as a client calls it.
+// route is one of the routes, as a client calls it.
 type route struct {
 	name   string
 	method string
@@ -348,13 +361,26 @@ type route struct {
 	op string
 }
 
-// routes are the three routes, called for targetID.
+// routes are the routes in the order Routes declares them, called for targetID.
+// The caller's own account is asked for by name, so it has no id.
 func routes() []route {
 	return []route{
-		{name: opList, method: http.MethodGet, target: collection, op: "list"},
+		{name: opList, method: http.MethodGet, target: collection, op: opList},
+		{name: opSelf, method: http.MethodGet, target: selfTarget, op: opSelf},
 		{name: "get", method: http.MethodGet, target: itemPrefix + targetID, op: opGet},
 		{name: "revoke", method: http.MethodDelete, target: itemPrefix + targetID, op: opRevoke},
 	}
+}
+
+// routeNamed returns the route called name.
+func routeNamed(name string) route {
+	for _, rt := range routes() {
+		if rt.name == name {
+			return rt
+		}
+	}
+
+	panic("no route named " + name)
 }
 
 // userRow is the stored account id, as an active member with a profile.
@@ -375,6 +401,17 @@ func userJSON(id, role, profile, status string, revoked *int64, created string) 
 	}
 
 	return out + `,"createdAt":` + created + `}`
+}
+
+// userPageJSON is the exact JSON of a page of accounts, with a next cursor when
+// next is not empty.
+func userPageJSON(next string, users ...string) string {
+	out := `{"users":[` + strings.Join(users, ",") + `]`
+	if next != "" {
+		out += `,"next":"` + next + `"`
+	}
+
+	return out + `}`
 }
 
 // itoa formats an integer the way JSON writes it.
@@ -400,11 +437,23 @@ func wantCalls(t *testing.T, got, want []storeCall) {
 	}
 
 	for i := range want {
-		if got[i].op != want[i].op || got[i].id != want[i].id || got[i].role != want[i].role ||
-			!got[i].now.Equal(want[i].now) {
+		if !got[i].equal(want[i]) {
 			t.Errorf("store call %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
+}
+
+// equal reports whether two calls are the same, comparing the times as instants.
+func (c storeCall) equal(other storeCall) bool {
+	return c.now.Equal(other.now) && c.withoutTime() == other.withoutTime()
+}
+
+// withoutTime is the call with its time zeroed, so the rest can be compared as
+// a value.
+func (c storeCall) withoutTime() storeCall {
+	c.now = time.Time{}
+
+	return c
 }
 
 // wantResponse checks the status, the exact body and the headers every
@@ -460,29 +509,48 @@ func wantNoHandle(t *testing.T, body string) {
 		t.Fatalf("body is not JSON: %v", err)
 	}
 
-	views := []json.RawMessage{json.RawMessage(body)}
+	list, isList := decoded["users"]
+	if !isList {
+		wantViewMembers(t, json.RawMessage(body))
 
-	if list, isList := decoded["users"]; isList {
-		err = json.Unmarshal(list, &views)
-		if err != nil {
-			t.Fatalf("users is not a list: %v", err)
+		return
+	}
+
+	for name := range decoded {
+		if name != "users" && name != "next" {
+			t.Errorf("list has an unexpected member %q: %s", name, body)
 		}
 	}
 
-	allowed := []string{"id", "role", "invitationId", "profile", "status", "revokedAt", "createdAt"}
+	var views []json.RawMessage
+
+	err = json.Unmarshal(list, &views)
+	if err != nil {
+		t.Fatalf("users is not a list: %v", err)
+	}
 
 	for _, view := range views {
-		var members map[string]json.RawMessage
+		wantViewMembers(t, view)
+	}
+}
 
-		err = json.Unmarshal(view, &members)
-		if err != nil {
-			t.Fatalf("view is not an object: %v", err)
-		}
+// wantViewMembers fails when an account's view has a member beyond the ones an
+// administrator is shown.
+func wantViewMembers(t *testing.T, view json.RawMessage) {
+	t.Helper()
 
-		for name := range members {
-			if !slices.Contains(allowed, name) {
-				t.Errorf("view has an unexpected member %q: %s", name, view)
-			}
+	allowed := []string{"id", "role", "invitationId", "profile", "status", "revokedAt", "createdAt"}
+
+	var members map[string]json.RawMessage
+
+	err := json.Unmarshal(view, &members)
+	if err != nil {
+		t.Fatalf("view is not an object: %v", err)
+	}
+
+	for name := range members {
+		if !slices.Contains(allowed, name) {
+			t.Errorf("view has an unexpected member %q: %s", name, view)
 		}
 	}
 }
@@ -493,20 +561,27 @@ func wantNoHandle(t *testing.T, body string) {
 //nolint:gochecknoglobals // a fixed clock shared by the table tests
 var clockAt = time.Date(2026, time.November, 17, 12, 30, 45, 123_456_789, time.FixedZone("test", 5*60*60))
 
-// readCall is the call of a read: it has no role and no time.
-func readCall(op, id string) storeCall {
-	return storeCall{op: op, id: id, caller: "", role: "", now: time.Time{}}
+// getCall is the call of a read of one account: it has no role and no time.
+func getCall(id string) storeCall {
+	return storeCall{op: opGet, id: id, caller: "", role: "", now: time.Time{}, cursor: "", limit: 0}
+}
+
+// listCall is the call of a list for a page window.
+func listCall(cursor string, limit int) storeCall {
+	return storeCall{op: opList, id: "", caller: "", role: "", now: time.Time{}, cursor: cursor, limit: limit}
 }
 
 // revokeCall is the call a revocation of id makes at clockAt.
 func revokeCall(id string) storeCall {
-	return storeCall{op: opRevoke, id: id, caller: adminID, role: auth.RoleAdmin, now: clockAt}
+	return storeCall{op: opRevoke, id: id, caller: adminID, role: auth.RoleAdmin, now: clockAt, cursor: "", limit: 0}
 }
 
 // outcomeCase is one request to a route, with the store programmed to answer it
 // and what the client and the store must see.
 type outcomeCase struct {
 	name string
+	// target overrides the route's request target, for a query string.
+	target string
 	// program sets the store's outcomes; the clock is clockAt.
 	program func(*fakeStore)
 	status  int
@@ -533,7 +608,12 @@ func runOutcomes(t *testing.T, rt route, cases []outcomeCase) {
 
 			tc.program(rg.store)
 
-			rec := rg.as(cookie, rt.method, rt.target)
+			target := rt.target
+			if tc.target != "" {
+				target = tc.target
+			}
+
+			rec := rg.as(cookie, rt.method, target)
 
 			wantResponse(t, rg, rec, tc.status, tc.body, tc.logged)
 			wantCalls(t, rg.store.calls, tc.calls)
