@@ -447,7 +447,7 @@ func text(raw json.RawMessage) *string {
 // the token is issued without the claims and the sign-in is not failed for it.
 func profileOf(target input.ResourceID, scopes input.OAuthScopes, grant store.Exchanged) *profileClaims {
 	entry := target.Entry()
-	if !entry.FirstParty || !slices.Contains(scopes.Resource(), entry.Scopes[0]) {
+	if !entry.FirstParty || !slices.Contains(scopes.Resource(), resource.ScopeProfile) {
 		return nil
 	}
 

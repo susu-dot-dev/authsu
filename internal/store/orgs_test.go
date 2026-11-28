@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -433,7 +434,7 @@ func seesOf(org string) []string {
 	return []string{
 		"EXISTS (SELECT 1 FROM (SELECT " + org + " AS org_id) subject, users actor " +
 			"WHERE actor.id = ?2 AND actor.revoked_at IS NULL",
-		"AND (actor.role = ?3 OR actor.org_id = subject.org_id OR EXISTS (SELECT 1 FROM org_admins oa " +
+		"AND ((?3 <> '' AND actor.role = ?3) OR actor.org_id = subject.org_id OR EXISTS (SELECT 1 FROM org_admins oa " +
 			"WHERE oa.org_id = subject.org_id AND oa.user_id = actor.id)))",
 	}
 }
@@ -445,7 +446,7 @@ func administersOf(org string) []string {
 	return []string{
 		"EXISTS (SELECT 1 FROM (SELECT " + org + " AS org_id) subject, users actor " +
 			"WHERE actor.id = ?2 AND actor.revoked_at IS NULL",
-		"AND (actor.role = ?3 OR EXISTS (SELECT 1 FROM org_admins oa " +
+		"AND ((?3 <> '' AND actor.role = ?3) OR EXISTS (SELECT 1 FROM org_admins oa " +
 			"WHERE oa.org_id = subject.org_id AND oa.user_id = actor.id)))",
 	}
 }
@@ -571,7 +572,7 @@ func TestListOrgs(t *testing.T) {
 					// one they belong to. Each source starts after the cursor.
 					"FROM orgs o WHERE o.id IN (",
 					"SELECT id FROM (SELECT g.id AS id FROM orgs g WHERE g.id < ?2 AND EXISTS (SELECT 1 FROM users a " +
-						"WHERE a.id = ?1 AND a.revoked_at IS NULL AND a.role = ?4) ORDER BY g.id DESC LIMIT ?3)",
+						"WHERE a.id = ?1 AND a.revoked_at IS NULL AND ?4 <> '' AND a.role = ?4) ORDER BY g.id DESC LIMIT ?3)",
 					"UNION SELECT id FROM (SELECT oa.org_id AS id FROM org_admins oa WHERE oa.user_id = ?1 " +
 						"AND oa.org_id < ?2 AND EXISTS (SELECT 1 FROM users a WHERE a.id = ?1 AND a.revoked_at IS NULL) " +
 						"ORDER BY oa.org_id DESC LIMIT ?3)",
@@ -785,5 +786,63 @@ func TestOrgCodes(t *testing.T) {
 		if test.got != test.want {
 			t.Errorf("code %q, want %q", test.got, test.want)
 		}
+	}
+}
+
+// TestThePlatformOverrideNeverAppliesToTheEmptyRole holds that every comparison
+// of the caller's role with the platform role in an organization statement is
+// behind the guard that makes the empty role no role: an OAuth grant is asked
+// with the empty role (auth.Principal.PlatformRole), and the write itself, not a
+// check before it, keeps it from being a platform administrator. Each operation
+// is run with an empty role, and its statement must bind it unchanged and name
+// the role only behind the guard (and name it at least once, so the test cannot
+// pass by finding nothing).
+func TestThePlatformOverrideNeverAppliesToTheEmptyRole(t *testing.T) {
+	t.Parallel()
+
+	id := mustUserID(t, orgTestID)
+	ctx := context.Background()
+
+	operations := map[string]struct {
+		call  func(s *store.Store)
+		guard string
+	}{
+		"GetOrg": {func(s *store.Store) { _, _ = s.GetOrg(ctx, id, callerID, "") }, "?3"},
+		"ListOrgs": {func(s *store.Store) {
+			_, _ = s.ListOrgs(ctx, callerID, "", input.Cursor{}, input.PageLimit{})
+		}, "?4"},
+		"RenameOrg": {func(s *store.Store) {
+			_, _ = s.RenameOrg(ctx, id, orgNameOf(t, "New"), callerID, "", now)
+		}, "?3"},
+		"DeleteSandbox": {func(s *store.Store) { _, _ = s.DeleteSandbox(ctx, id, callerID, "") }, "?3"},
+	}
+
+	for name, test := range operations {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := newFake(failing(errStopRecording))
+			test.call(fake.store())
+
+			if len(fake.calls) != 1 {
+				t.Fatalf("exec called %d times, want one batch", len(fake.calls))
+			}
+
+			statement := fake.calls[0][0]
+			text := squash(statement.Query)
+
+			// The comparison is "<alias>.role = ?n", and it must be preceded by "?n <> '' AND (" or
+			// "?n <> '' AND " in every place it appears.
+			comparisons := regexp.MustCompile(`\w+\.role = \`+test.guard).FindAllString(text, -1)
+			guarded := strings.Count(text, test.guard+" <> '' AND ")
+
+			if len(comparisons) == 0 || len(comparisons) != guarded {
+				t.Errorf("%d comparisons of the role but %d guards:\n%s", len(comparisons), guarded, text)
+			}
+
+			if !slices.Contains(statement.Args, any("")) {
+				t.Errorf("args = %v, want the empty role bound as given", statement.Args)
+			}
+		})
 	}
 }

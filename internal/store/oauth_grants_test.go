@@ -3,9 +3,12 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -95,6 +98,19 @@ func mustRedirectURI(tb testing.TB, raw string) input.RedirectURI {
 	return uri
 }
 
+// mustLoginResourceID is the production first-party login resource.
+func mustLoginResourceID(tb testing.TB) input.ResourceID {
+	tb.Helper()
+
+	id, err := input.ParseResourceID(resource.ProductionLoginURL, oauthTable)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	return id
+}
+
+// mustResourceID is the production resource.
 func mustResourceID(tb testing.TB) input.ResourceID {
 	tb.Helper()
 
@@ -117,6 +133,26 @@ func mustOAuthScopes(tb testing.TB, raw string) input.OAuthScopes {
 	}
 
 	return scopes
+}
+
+// mustLoginScopes is a first-party login's scope: the names of the login
+// resource, which only a trusted client may ask for.
+func mustLoginScopes(tb testing.TB, raw string) input.OAuthScopes {
+	tb.Helper()
+
+	scopes, err := input.ParseOAuthScopes(raw, true, mustLoginResourceID(tb).Entry())
+	if err != nil {
+		tb.Fatalf("parse scope %q: %v", raw, err)
+	}
+
+	return scopes
+}
+
+// loginAllowlist is the authsu scope names of the production login resource.
+func loginAllowlist(tb testing.TB) []string {
+	tb.Helper()
+
+	return mustLoginResourceID(tb).Entry().AuthsuScopes()
 }
 
 func mustVerifier(tb testing.TB, raw string) input.CodeVerifier {
@@ -553,6 +589,7 @@ func createGrantCases(t *testing.T) []createGrantCase {
 	withAgent.Nonce = &nonce
 	withAgent.ClientName = "デプロイ 🔑"
 	withAgent.Scope = mustOAuthScopes(t, "mcp:write")
+	withAgent.Allowlist = loginAllowlist(t)
 	withAgent.CodeChallenge = mustVerifier(t, strings.Repeat("Zy-._~9", 10)).Challenge()
 	withAgent.SessionID, withAgent.GrantedFrom, withAgent.CodeHash = grantIDAt(9), hashOf(4), hashOf(3)
 	withAgent.RetainUntil, withAgent.CreatedAt = now.Add(12*time.Minute), now.Add(time.Second)
@@ -561,13 +598,29 @@ func createGrantCases(t *testing.T) []createGrantCase {
 	login.ID, login.AgentID = grantIDAt(11), grantNewAgent
 	login.FirstParty, login.FirstPartyMaxActive = true, 25
 	login.FirstPartyName = mustAgentName(t, "Pages 🌐")
-	login.Scope = mustOAuthScopes(t, "mcp:read")
+	login.Resource = mustLoginResourceID(t)
+	login.Scope = mustLoginScopes(t, "openid profile agent:read sandbox:create")
+	login.Allowlist = loginAllowlist(t)
 	login.SessionID, login.GrantedFrom, login.CodeHash = grantIDAt(13), hashOf(6), hashOf(5)
 
 	return []createGrantCase{
 		{name: "an existing agent and no nonce", grant: typical, newAgent: false},
 		{name: "a new agent, a nonce and multibyte names", grant: withAgent, newAgent: true},
 		{name: "a first-party login", grant: login, firstParty: true},
+	}
+}
+
+// grantStatements is how many statements the batch of a consent has: the secret
+// and the grant, one more for the agent a consent creates, and two more for a
+// first-party login (its agent and the write of its list).
+func grantStatements(newAgent, firstParty bool) int {
+	switch {
+	case firstParty:
+		return 4
+	case newAgent:
+		return 3
+	default:
+		return 2
 	}
 }
 
@@ -595,6 +648,58 @@ func firstPartyAgentWant(grant store.NewGrant) wantStatement {
 	}
 }
 
+// firstPartyScopesWant is the write of a first-party login's agent's list: the
+// union of what it holds and the grant's authsu names, pruned to the allowlist,
+// computed in the write, for the owner's active, unsandboxed first-party agent of
+// this client and no other.
+func firstPartyScopesWant(grant store.NewGrant) wantStatement {
+	return wantStatement{
+		fragments: []string{
+			"UPDATE agents SET scopes = (SELECT coalesce(json_group_array(al.value ORDER BY al.key), '[]') " +
+				"FROM json_each(?2) al " +
+				// The allowlist is walked, so only its names are kept, once each and in its order.
+				"WHERE al.value IN (SELECT value FROM json_each(?1)) " +
+				// What the row holds, read in the write; a damaged list reads as empty.
+				"OR al.value IN (SELECT value FROM json_each(CASE WHEN json_valid(agents.scopes) " +
+				"THEN CASE WHEN json_type(agents.scopes) = 'array' THEN agents.scopes ELSE '[]' END ELSE '[]' END)))",
+			// Only the agent authsu keeps for the client: never an agent the user
+			// chose or created, whatever its id, a revoked one or one in a sandbox.
+			"WHERE user_id = ?3 AND revoked_at IS NULL AND sandbox_id IS NULL " +
+				"AND first_party = 1 AND first_party_client = ?4",
+		},
+		args: []any{
+			jsonList(authsuNamesOf(grant)), jsonList(grant.Allowlist), grant.Owner,
+			grant.ClientID.String(),
+		},
+	}
+}
+
+// jsonList is the JSON array text of names, written independently of the code
+// under test.
+func jsonList(names []string) string {
+	encoded, err := json.Marshal(names)
+	if err != nil {
+		panic(err)
+	}
+
+	return string(encoded)
+}
+
+// authsuNamesOf is the names of the grant's scope that its allowlist holds, in
+// the allowlist's order, as the write binds them: spelled out here, not taken from
+// the code under test.
+func authsuNamesOf(grant store.NewGrant) []string {
+	names := []string{}
+
+	for _, name := range grant.Allowlist {
+		if slices.Contains(grant.Scope.Names(), name) {
+			names = append(names, name)
+		}
+	}
+
+	return names
+}
+
 // createGrantWant is the batch a consent must write.
 func createGrantWant(grant store.NewGrant, newAgent, firstParty bool) []wantStatement {
 	var nonce any
@@ -605,7 +710,7 @@ func createGrantWant(grant store.NewGrant, newAgent, firstParty bool) []wantStat
 	var want []wantStatement
 
 	if firstParty {
-		want = append(want, firstPartyAgentWant(grant))
+		want = append(want, firstPartyAgentWant(grant), firstPartyScopesWant(grant))
 	}
 
 	if newAgent {
@@ -620,8 +725,8 @@ func createGrantWant(grant store.NewGrant, newAgent, firstParty bool) []wantStat
 			},
 			// A consent never puts the agent it creates in a sandbox: ?7 is NULL.
 			args: []any{
-				grant.AgentID, grant.NewAgent.Name.String(), "[]", grant.CreatedAt.Unix(), grant.Owner,
-				int64(grant.NewAgent.MaxActive), nil, store.OrgKindSandbox,
+				grant.AgentID, grant.NewAgent.Name.String(), jsonList(authsuNamesOf(grant)),
+				grant.CreatedAt.Unix(), grant.Owner, int64(grant.NewAgent.MaxActive), nil, store.OrgKindSandbox,
 			},
 		})
 	}
@@ -680,14 +785,7 @@ func TestCreateGrantStatements(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			statements := 2
-
-			switch {
-			case test.firstParty, test.newAgent:
-				statements = 3
-			}
-
-			fake := newFake(applied(statements))
+			fake := newFake(applied(grantStatements(test.newAgent, test.firstParty)))
 
 			err := fake.store().CreateGrant(context.Background(), test.grant)
 			checkErr(t, err, nil)
@@ -765,13 +863,13 @@ func TestCreateGrantRefusals(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			grant, statements := cases[0].grant, 2
+			grant, statements := cases[0].grant, grantStatements(false, false)
 
 			switch {
 			case test.newAgent:
-				grant, statements = cases[1].grant, 3
+				grant, statements = cases[1].grant, grantStatements(true, false)
 			case test.firstParty:
-				grant, statements = cases[2].grant, 3
+				grant, statements = cases[2].grant, grantStatements(false, true)
 			}
 
 			fake := newFake(failing(store.Classify(dbError(test.text))))
@@ -869,7 +967,8 @@ func TestCreateGrantRuleFailureIsADefect(t *testing.T) {
 }
 
 // TestCreateGrantFailures holds how a failed or malformed batch is reported, for
-// a consent with an existing agent (two statements) and with a new one (three).
+// a consent with an existing agent (two statements), with a new one (three) and a
+// first-party login (four).
 func TestCreateGrantFailures(t *testing.T) {
 	t.Parallel()
 
@@ -877,12 +976,7 @@ func TestCreateGrantFailures(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			statements := 2
-
-			switch {
-			case test.firstParty, test.newAgent:
-				statements = 3
-			}
+			statements := grantStatements(test.newAgent, test.firstParty)
 
 			runFailures(t, statements, store.CodeGrantCreateFailed, store.CodeGrantCreateRejected, grantsUnavailable,
 				func(s *store.Store) error { return passErr(s.CreateGrant(context.Background(), test.grant)) })
@@ -1129,13 +1223,229 @@ func TestGrantCodes(t *testing.T) {
 	}
 }
 
-// TestGrantAgentsHaveNoScopes pins the scope list of an agent consent creates: a
-// grant carries no authsu scopes, so neither does its agent.
-func TestGrantAgentsHaveNoScopes(t *testing.T) {
+// TestGrantAgentStartsEmpty pins the list an agent that authsu creates for a
+// grant is inserted with when the grant has no authsu names: empty, which is what
+// a third-party client's grant gets.
+func TestGrantAgentStartsEmpty(t *testing.T) {
 	t.Parallel()
 
-	if store.GrantAgentScopes != "[]" {
-		t.Errorf("GrantAgentScopes = %q, want the empty list", store.GrantAgentScopes)
+	for name, got := range map[string]string{
+		"GrantAgentScopes": store.GrantAgentScopes, "FirstPartyAgentScopes": store.FirstPartyAgentScopes,
+	} {
+		if got != "[]" {
+			t.Errorf("%s = %q, want the empty list", name, got)
+		}
+	}
+}
+
+// grantScopeCase is a consent's scope and allowlist and the list its agent is
+// written with: the grant's requested names that the allowlist holds, each once,
+// in the allowlist's order, and nothing else.
+type grantScopeCase struct {
+	name      string
+	resource  func(testing.TB) input.ResourceID
+	scope     string
+	allowlist []string
+	want      []string
+}
+
+func grantScopeCases() []grantScopeCase {
+	login, mcp := mustLoginResourceID, mustResourceID
+	every := []string{"sandbox:create", "sandbox:revoke", "org:read", "agent:create", "agent:read"}
+
+	return []grantScopeCase{
+		{name: "the profile alone adds nothing", resource: login, scope: "profile", allowlist: every, want: []string{}},
+		{name: "openid and profile add nothing", resource: login, scope: "openid profile", allowlist: every,
+			want: []string{}},
+		{name: "one name", resource: login, scope: "profile agent:read", allowlist: every, want: []string{"agent:read"}},
+		{name: "every name", resource: login, allowlist: every, want: every,
+			scope: "openid profile sandbox:create sandbox:revoke org:read agent:create agent:read"},
+		{name: "the allowlist's order, not the request's", resource: login, scope: "agent:read profile sandbox:create",
+			allowlist: every, want: []string{"sandbox:create", "agent:read"}},
+		{name: "a name the allowlist no longer holds is not written", resource: login,
+			scope: "profile sandbox:create org:read", allowlist: []string{"org:read"}, want: []string{"org:read"}},
+		{name: "an empty allowlist writes nothing", resource: login, scope: "profile org:read", allowlist: []string{},
+			want: []string{}},
+		{name: "a third-party resource's names are never authsu's", resource: mcp, scope: "openid mcp:read mcp:write",
+			allowlist: every, want: []string{}},
+	}
+}
+
+// TestCreateGrantWritesTheNamesTheGrantAsksFor holds what the consent binds as
+// the list of the agent it creates, for each of the two kinds authsu creates: the
+// requested names that the allowlist holds, in its order, with the allowlist
+// itself as the pruning set. Nothing the request names that is not in the
+// allowlist is written, whatever it is: the profile, openid, a bundle's or an
+// admin scope's name, or a third-party resource's.
+func TestCreateGrantWritesTheNamesTheGrantAsksFor(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range grantScopeCases() {
+		for _, kind := range []string{"a new agent", "a first-party login"} {
+			t.Run(test.name+", "+kind, func(t *testing.T) {
+				t.Parallel()
+
+				cases := createGrantCases(t)
+				grant := cases[1].grant
+
+				if kind == "a first-party login" {
+					grant = cases[2].grant
+				}
+
+				grant.Resource = test.resource(t)
+				grant.Scope = mustScopeOf(t, grant.Resource, test.scope)
+				grant.Allowlist = test.allowlist
+
+				fake := newFake(applied(grantStatements(kind == "a new agent", kind == "a first-party login")))
+				checkErr(t, fake.store().CreateGrant(context.Background(), grant), nil)
+
+				batch := fake.calls[0]
+
+				if kind == "a new agent" {
+					if got := batch[0].Args[2]; got != jsonList(test.want) {
+						t.Errorf("the new agent is inserted with %v, want %s", got, jsonList(test.want))
+					}
+
+					return
+				}
+
+				// The login's agent is inserted empty and then brought to its list by
+				// the update, which carries the names and the allowlist.
+				if got := batch[0].Args[2]; got != "[]" {
+					t.Errorf("the login's agent is inserted with %v, want []", got)
+				}
+
+				if got := batch[1].Args[:2]; got[0] != jsonList(test.want) || got[1] != jsonList(test.allowlist) {
+					t.Errorf("the update binds %v, want [%s %s]", got, jsonList(test.want), jsonList(test.allowlist))
+				}
+			})
+		}
+	}
+}
+
+// mustScopeOf parses scope for the resource.
+func mustScopeOf(tb testing.TB, target input.ResourceID, raw string) input.OAuthScopes {
+	tb.Helper()
+
+	scopes, err := input.ParseOAuthScopes(raw, true, target.Entry())
+	if err != nil {
+		tb.Fatalf("parse scope %q: %v", raw, err)
+	}
+
+	return scopes
+}
+
+// TestCreateGrantNeverWritesAnAttachedAgent holds that the consent that attaches
+// an agent the user chose has no statement that writes an agent at all, however
+// many authsu names the grant carries and whatever the allowlist: the batch is the
+// code's secret and the grant row, and the grant row only reads the agent. That
+// the grant carries its own claim and cannot widen the agent is the agent's list
+// staying as it was.
+func TestCreateGrantNeverWritesAnAttachedAgent(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range grantScopeCases() {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			grant := createGrantCases(t)[0].grant
+			grant.Resource = test.resource(t)
+			grant.Scope = mustScopeOf(t, grant.Resource, test.scope)
+			grant.Allowlist = test.allowlist
+
+			fake := newFake(applied(2))
+			checkErr(t, fake.store().CreateGrant(context.Background(), grant), nil)
+
+			for i, statement := range fake.calls[0] {
+				query := squash(statement.Query)
+				if strings.Contains(query, "UPDATE agents") || strings.Contains(query, "INTO agents") {
+					t.Errorf("statement %d of an attach writes an agent: %s", i, query)
+				}
+			}
+		})
+	}
+}
+
+// TestGrantListUpdateCannotReachAnotherAgent holds, on the text of the update that
+// brings a first-party login's agent to its list, the conditions that keep it from
+// writing any agent but the one authsu keeps for the client: it names no id, and
+// requires the owner, no revocation, no sandbox, the first-party flag and the
+// client, in the same write. The real SQL of it runs in e2e
+// (TestFirstPartyAgentScopes).
+func TestGrantListUpdateCannotReachAnotherAgent(t *testing.T) {
+	t.Parallel()
+
+	query := squash(packageQueries(t)["grantFirstPartyScopesQuery"])
+
+	for _, fragment := range []string{
+		"UPDATE agents SET scopes =",
+		"WHERE user_id = ?3 AND revoked_at IS NULL AND sandbox_id IS NULL AND first_party = 1 AND first_party_client = ?4",
+	} {
+		if !strings.Contains(query, fragment) {
+			t.Errorf("the update lacks %q: %s", fragment, query)
+		}
+	}
+
+	if strings.Contains(query, " id = ") || strings.Contains(query, ".id =") {
+		t.Errorf("the update selects an agent by id: %s", query)
+	}
+
+	// Nothing but the list is written: the one assignment is the scopes.
+	if strings.Count(query, "SET ") != 1 || !strings.HasPrefix(query, "UPDATE agents SET scopes = (SELECT ") {
+		t.Errorf("the update does not set only the computed list: %s", query)
+	}
+}
+
+// TestGrantListIsComputedInTheWrite holds that the new list is computed from the
+// row in the statement and not read in Go and written back, which would let two
+// sign-ins race and lose a name: the row's own list is read in the SET, and the
+// allowlist is what is walked, so the result is in its order, each name once.
+func TestGrantListIsComputedInTheWrite(t *testing.T) {
+	t.Parallel()
+
+	query := squash(packageQueries(t)["grantFirstPartyScopesQuery"])
+
+	for _, fragment := range []string{
+		// The allowlist is walked, and only its names are kept.
+		"FROM json_each(?2) al",
+		// The aggregate orders its own input, so the result is in the allowlist's order.
+		"json_group_array(al.value ORDER BY al.key)",
+		// A name is kept if the grant asks for it or the agent already holds it.
+		"WHERE al.value IN (SELECT value FROM json_each(?1)) " +
+			"OR al.value IN (SELECT value FROM json_each(CASE WHEN json_valid(agents.scopes) " +
+			"THEN CASE WHEN json_type(agents.scopes) = 'array' THEN agents.scopes ELSE '[]' END ELSE '[]' END))",
+		// An empty union is the empty list, never the empty text the column refuses.
+		"coalesce(json_group_array(al.value ORDER BY al.key), '[]')",
+	} {
+		if !strings.Contains(query, fragment) {
+			t.Errorf("the update lacks %q: %s", fragment, query)
+		}
+	}
+}
+
+// TestGrantAgentScopesFitTheColumn holds the size bound of the list the write
+// sets: it is bounded by the allowlist, so its worst case is every name of it, and
+// that fits agents.scopes (1 to 1024 bytes) however large the list the agent held
+// was, because only the allowlist's names are kept. The empty list is the
+// column's minimum.
+func TestGrantAgentScopesFitTheColumn(t *testing.T) {
+	t.Parallel()
+
+	const columnMax = 1024
+
+	worst := jsonList(loginAllowlist(t))
+	if len(worst) < 1 || len(worst) > columnMax {
+		t.Errorf("the longest list %s is %d bytes, want 1 to %d", worst, len(worst), columnMax)
+	}
+
+	if got := jsonList([]string{}); got != "[]" {
+		t.Errorf("the empty list is %q, want [] (never null, never empty text)", got)
+	}
+
+	// The migration's own CHECK is the bound the test above is held to.
+	if !regexp.MustCompile(`scopes TEXT NOT NULL CHECK \(typeof\(scopes\) = 'text' AND instr\(scopes, char\(0\)\) = 0 ` +
+		`AND length\(cast\(scopes AS BLOB\)\) BETWEEN 1 AND 1024\)`).MatchString(migrations(t)) {
+		t.Errorf("agents.scopes no longer has the size CHECK this test holds the list to")
 	}
 }
 

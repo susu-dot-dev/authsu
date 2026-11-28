@@ -23,6 +23,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/result"
 	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/secret"
@@ -41,15 +42,18 @@ var (
 )
 
 const (
-	testSecret  = "auth-test-secret-0123456789ABCDEFGHIJKLMNOPQ"
-	apiOrigin   = "https://auth.example.com"
-	uiOrigin    = "https://example.com"
-	userID      = "00000000-0000-7000-8000-000000000002"
-	otherUserID = "00000000-0000-7000-8000-0000000000ff"
-	itemID      = "00000000-0000-7000-8000-0000000000aa"
-	otherItemID = "00000000-0000-7000-8000-0000000000bb"
-	roleMember  = "member"
-	adminText   = "admin" // how the role is stored, spelled out
+	testSecret = "auth-test-secret-0123456789ABCDEFGHIJKLMNOPQ"
+	// loginResource is the first-party login resource of the production table,
+	// which the rig's API_ORIGIN selects.
+	loginResource = resource.ProductionLoginURL
+	apiOrigin     = "https://auth.example.com"
+	uiOrigin      = "https://example.com"
+	userID        = "00000000-0000-7000-8000-000000000002"
+	otherUserID   = "00000000-0000-7000-8000-0000000000ff"
+	itemID        = "00000000-0000-7000-8000-0000000000aa"
+	otherItemID   = "00000000-0000-7000-8000-0000000000bb"
+	roleMember    = "member"
+	adminText     = "admin" // how the role is stored, spelled out
 
 	jsonType = "application/json"
 
@@ -98,6 +102,8 @@ type credentialCall struct {
 	kind  string
 	token string
 	now   time.Time
+	// resource is the resource a grant was asked for, "" for a session or a key.
+	resource string
 }
 
 // fakeCredentials is the credential store: active sessions and keys by the
@@ -107,6 +113,9 @@ type credentialCall struct {
 type fakeCredentials struct {
 	sessions map[string]store.ActiveSession
 	keys     map[string]store.ActiveAPIKey
+	// grants are active access tokens by the token that names them, as the
+	// store reports them for the resource they were stored for.
+	grants map[string]fakeGrant
 	// err, when set, is returned by every read.
 	err error
 	// calls is every read, in order.
@@ -115,8 +124,17 @@ type fakeCredentials struct {
 
 func newFakeCredentials() *fakeCredentials {
 	return &fakeCredentials{
-		sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}, err: nil, calls: nil,
+		sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{},
+		grants: map[string]fakeGrant{}, err: nil, calls: nil,
 	}
+}
+
+// fakeGrant is an active access token and the resource its grant is for. The
+// real store finds a token only for the resource it is asked for, so the fake
+// does too.
+type fakeGrant struct {
+	row      store.ActiveGrant
+	resource string
 }
 
 // ResolveSession answers for an active session, honouring a cancelled request
@@ -150,6 +168,28 @@ func (f *fakeCredentials) ResolveAPIKey(
 	row, found := f.keys[token.String()]
 
 	return row, found, nil
+}
+
+// ResolveGrant answers for an active access token of a grant for exactly the
+// resource asked about, as the store does (an access token of another resource
+// is not found), honouring a cancelled request.
+func (f *fakeCredentials) ResolveGrant(
+	ctx context.Context, token input.AccessToken, login input.ResourceID, now time.Time,
+) (store.ActiveGrant, bool, error) {
+	f.calls = append(f.calls,
+		credentialCall{kind: auth.KindGrant, token: token.String(), now: now, resource: login.String()})
+
+	err := f.failure(ctx)
+	if err != nil {
+		return store.ActiveGrant{}, false, err
+	}
+
+	held, found := f.grants[token.String()]
+	if !found || held.resource != login.String() {
+		return store.ActiveGrant{}, false, nil
+	}
+
+	return held.row, true, nil
 }
 
 // failure is why every read fails, or nil.
@@ -224,6 +264,7 @@ func (r *rig) with(settings map[string]string) *rig {
 func (r *rig) deps() auth.Deps {
 	return auth.Deps{
 		Credentials: r.creds,
+		Resources:   resource.Select,
 		Now:         func() time.Time { return r.now },
 		Getenv: func(name string) string {
 			r.envReads++
@@ -478,6 +519,68 @@ func (r *rig) apiKey(spec bearerSpec) auth.Issued {
 	return issued
 }
 
+// grantSpec describes an OAuth access token to issue and store, for the tests of
+// the grant credential.
+type grantSpec struct {
+	// scope is the access token's own scope text, as stored, space-delimited.
+	scope string
+	// role is the owner's role in the stored row.
+	role string
+	// agentScopes is the agent's stored scope list (JSON), read now.
+	agentScopes string
+	// org is the owner's organization in the stored row, "" for none.
+	org string
+	// resource is the resource the grant is for; "" is the deployment's login
+	// resource.
+	resource string
+	// sandbox is the sandbox of the agent in the stored row, "" for none. The real
+	// statement admits no sandboxed agent, so it is "" in practice; a row that
+	// carried one must be confined as any sandboxed agent is.
+	sandbox string
+}
+
+// issueAccessToken issues an access token as the OAuth endpoints do, from the
+// rig's entropy.
+func (r *rig) issueAccessToken() auth.Issued {
+	r.t.Helper()
+
+	issued, err := auth.IssueAccessToken(r.entropy, r.newID, r.now)
+	if err != nil {
+		r.t.Fatalf("IssueAccessToken: %v", err)
+	}
+
+	return issued
+}
+
+// grant issues an access token as spec describes, stores its row as the store
+// would return it, and returns it. The agent is always agentOne's.
+func (r *rig) grant(spec grantSpec) auth.Issued {
+	r.t.Helper()
+
+	issued := r.issueAccessToken()
+
+	role := spec.role
+	if role == "" {
+		role = roleMember
+	}
+
+	target := spec.resource
+	if target == "" {
+		target = loginResource
+	}
+
+	r.creds.grants[issued.Token] = fakeGrant{
+		row: store.ActiveGrant{
+			ID: issued.ID, UserID: userID, Role: role, ExpiresAt: issued.ExpiresAt, OrgID: spec.org,
+			AgentID: agentOne, AgentScopes: spec.agentScopes, Scope: spec.scope,
+			SandboxID: spec.sandbox,
+		},
+		resource: target,
+	}
+
+	return issued
+}
+
 // wantFailure checks the status and the exact body of a failure response, that
 // the failure was logged once under code, and that the cause (when given) is in
 // the log and so not in the body.
@@ -590,6 +693,30 @@ func (r *rig) serveCtx(
 
 	rec := httptest.NewRecorder()
 	auth.Handler(routes, r.deps()).ServeHTTP(rec, httpReq)
+
+	return rec
+}
+
+// serveWithDepsCarried is serveWith over a boundary built with deps, which a test
+// edits to change what the boundary is wired to.
+func (r *rig) serveWithDepsCarried(
+	deps auth.Deps, routes []auth.Route, target string, authorization []string, cookies []*http.Cookie,
+) *httptest.ResponseRecorder {
+	r.t.Helper()
+
+	httpReq := httptest.NewRequestWithContext(r.t.Context(), http.MethodGet, target, nil)
+	httpReq.Header.Set("Content-Type", jsonType)
+
+	for _, value := range authorization {
+		httpReq.Header.Add("Authorization", value)
+	}
+
+	for _, cookie := range cookies {
+		httpReq.AddCookie(cookie)
+	}
+
+	rec := httptest.NewRecorder()
+	auth.Handler(routes, deps).ServeHTTP(rec, httpReq)
 
 	return rec
 }

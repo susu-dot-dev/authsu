@@ -54,6 +54,7 @@ const (
 	noScope
 	forbiddenAccess
 	confined
+	grantRefused
 )
 
 // status is the HTTP status of the outcome.
@@ -76,6 +77,8 @@ func (o scopedOutcome) code() string {
 		return auth.CodeForbidden
 	case confined:
 		return auth.CodeSandboxConfined
+	case grantRefused:
+		return auth.CodeGrantNotAccepted
 	}
 
 	return ""
@@ -478,7 +481,7 @@ func TestAccessOrder(t *testing.T) {
 			name: "an opted-in route then tells an admin with the scope about the session",
 			who: auth.Principal{
 				Role: auth.RoleAdmin, Kind: auth.KindAPIKey, AgentID: agentOne, SandboxID: sandboxOne,
-				Effective: list(scope.DefaultSession).Expand(),
+				Scope: list(scope.DefaultSession), AgentScope: list(scope.DefaultSession),
 			},
 			access:   everything.InSandbox(),
 			wantCode: auth.CodeForbidden, wantText: "a signed-in session is required",
@@ -504,7 +507,8 @@ func TestAccessOrder(t *testing.T) {
 		{
 			name: "an admin with the scope but a key is told it needs a session",
 			who: auth.Principal{
-				Role: auth.RoleAdmin, Kind: auth.KindAPIKey, AgentID: agentOne, Effective: list(scope.DefaultSession).Expand(),
+				Role: auth.RoleAdmin, Kind: auth.KindAPIKey, AgentID: agentOne,
+				Scope: list(scope.DefaultSession), AgentScope: list(scope.DefaultSession),
 			},
 			access:   everything,
 			wantCode: auth.CodeForbidden, wantText: "a signed-in session is required",
@@ -512,7 +516,8 @@ func TestAccessOrder(t *testing.T) {
 		{
 			name: "a session of an agent cannot exist, so agents are the last",
 			who: auth.Principal{
-				Role: auth.RoleAdmin, Kind: auth.KindSession, AgentID: agentOne, Effective: list(scope.DefaultSession).Expand(),
+				Role: auth.RoleAdmin, Kind: auth.KindSession, AgentID: agentOne,
+				Scope: list(scope.DefaultSession), AgentScope: list(scope.DefaultSession),
 			},
 			access:   everything,
 			wantCode: auth.CodeForbidden, wantText: "an agent may not do this",
@@ -542,7 +547,8 @@ func TestAccessPasses(t *testing.T) {
 	t.Parallel()
 
 	session := auth.Principal{
-		Role: auth.RoleAdmin, Kind: auth.KindSession, Effective: list(scope.DefaultSession).Expand(),
+		Role: auth.RoleAdmin, Kind: auth.KindSession,
+		Scope: list(scope.DefaultSession), AgentScope: list(scope.DefaultSession),
 	}
 
 	for name, access := range map[string]auth.Access{

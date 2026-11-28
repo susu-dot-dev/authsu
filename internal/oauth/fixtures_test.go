@@ -32,6 +32,8 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/oauth"
 	"github.com/susu-dot-dev/authsu/internal/resource"
+	"github.com/susu-dot-dev/authsu/internal/result"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -234,6 +236,11 @@ type fakeStore struct {
 	// "owner|client": what agents.first_party_client holds.
 	firstPartyAgents map[string]string
 
+	// agentScopes is agents.scopes by agent id, as a list: what the write sets for
+	// an agent authsu creates for a grant (setAgentScopes) and never for one the
+	// user attached. A missing agent holds none.
+	agentScopes map[string][]string
+
 	// profiles is users.profile by user id, which an exchange reports.
 	profiles map[string]string
 
@@ -262,6 +269,7 @@ func newFakeStore() *fakeStore {
 		used:          map[string]bool{},
 
 		firstPartyAgents: map[string]string{},
+		agentScopes:      map[string][]string{},
 		profiles:         map[string]string{userA: `{"name":"Alice A","email":"alice@example.com"}`},
 	}
 }
@@ -289,6 +297,7 @@ func (f *fakeStore) CreateGrant(_ context.Context, grant store.NewGrant) error {
 		f.agents[grant.AgentID] = grant.Owner
 		f.agentNames[grant.AgentID] = grant.NewAgent.Name.String()
 		f.activeAgents[grant.Owner]++
+		f.agentScopes[grant.AgentID] = f.unionScopes(nil, grant)
 	}
 
 	if grant.FirstParty {
@@ -322,6 +331,7 @@ func (f *fakeStore) ExchangeCode(
 		}
 
 		rotate(g, exchange.Tokens, g.grant.Scope.String(), now)
+		f.supersede(g, now)
 
 		return f.exchanged(g), nil
 	}
@@ -389,7 +399,7 @@ func (f *fakeStore) IntrospectAccessToken(
 			g.alive(now) && f.usable(g) && g.grant.Resource.String() == target.String()
 		if live {
 			return store.ActiveAccessToken{
-				GrantID: g.grant.ID, UserID: g.grant.Owner, AgentID: g.grant.AgentID, ClientID: g.grant.ClientID.String(),
+				UserID: g.grant.Owner, AgentID: g.grant.AgentID, ClientID: g.grant.ClientID.String(),
 				Resource: g.grant.Resource.String(), Scope: g.accessScope, IssuedAt: g.accessIssued,
 				ExpiresAt: g.accessExpires,
 			}, true, nil
@@ -509,6 +519,28 @@ func (f *fakeStore) RevokeGrant(_ context.Context, owner string, id input.ID, no
 	return store.Grant{}, store.ErrNotFound
 }
 
+// supersede is the revocation an exchange makes of the older grants of the same
+// user, client and resource (store.supersedeGrantQuery): those consented before the
+// exchanged grant, by id, which is a UUIDv7. A revocation already due keeps its
+// time.
+func (f *fakeStore) supersede(exchanged *grantRow, now time.Time) {
+	for _, g := range f.rows {
+		older := g.grant.Owner == exchanged.grant.Owner && g.grant.ClientID == exchanged.grant.ClientID &&
+			g.grant.Resource.String() == exchanged.grant.Resource.String() && g.grant.ID < exchanged.grant.ID
+		if !older {
+			continue
+		}
+
+		if g.revokedAt == nil || g.revokedAt.After(now) {
+			g.revokedAt = &now
+		}
+
+		if g.rotated {
+			g.accessRevoked = true
+		}
+	}
+}
+
 // holdFirstParty is the effect of a first-party login's write: the owner's active
 // agent for the client is found, or one is created under the grant's agent id (a
 // revoked one is not found, and no longer counts against the limit), and holds
@@ -527,10 +559,31 @@ func (f *fakeStore) holdFirstParty(grant store.NewGrant) {
 		f.firstPartyAgents[key] = agent
 		f.agents[agent] = grant.Owner
 		f.agentNames[agent] = grant.FirstPartyName.String()
+		f.agentScopes[agent] = []string{}
 		f.activeAgents[grant.Owner]++
 	}
 
+	// The list is set in the same write, to the union of what the agent holds and
+	// what the grant asks for, kept to the allowlist (store.grantFirstPartyScopesQuery).
+	f.agentScopes[agent] = f.unionScopes(f.agentScopes[agent], grant)
+
 	f.rows[len(f.rows)-1].grant.AgentID = agent
+}
+
+// unionScopes is the list an agent authsu writes for a grant ends up with: the
+// allowlist's names, in its order, that the agent holds or the grant asks for.
+// Written as plain Go, apart from the SQL it models, so a test of either checks
+// the other.
+func (f *fakeStore) unionScopes(held []string, grant store.NewGrant) []string {
+	out := []string{}
+
+	for _, name := range grant.Allowlist {
+		if slices.Contains(held, name) || slices.Contains(grant.Scope.Names(), name) {
+			out = append(out, name)
+		}
+	}
+
+	return out
 }
 
 // goodCode reports whether the grant is the exchange's, in everything but the
@@ -556,7 +609,7 @@ func (f *fakeStore) usable(g *grantRow) bool {
 // exchanged is the grant as a rotation reports it.
 func (f *fakeStore) exchanged(g *grantRow) store.Exchanged {
 	out := store.Exchanged{
-		GrantID: g.grant.ID, UserID: g.grant.Owner, AgentID: g.grant.AgentID, ClientID: g.grant.ClientID.String(),
+		UserID: g.grant.Owner, AgentID: g.grant.AgentID, ClientID: g.grant.ClientID.String(),
 		Resource: g.grant.Resource.String(), Scope: g.accessScope, AuthTime: g.authTime,
 		Profile: f.profiles[g.grant.Owner],
 	}
@@ -766,6 +819,10 @@ func served(body string) fetchAnswer {
 type fakeCredentials struct {
 	sessions map[string]store.ActiveSession
 	keys     map[string]store.ActiveAPIKey
+
+	// grants is the fake grant store, whose rows and agent lists an access token
+	// resolves against.
+	grants *fakeStore
 }
 
 // ResolveSession answers for an active session.
@@ -784,6 +841,60 @@ func (f *fakeCredentials) ResolveAPIKey(
 	row, found := f.keys[string(token.Hash())]
 
 	return row, found, nil
+}
+
+// ResolveGrant is the contract of store.ResolveGrant over the fake store: a live
+// access token of a grant for exactly the login resource found by its hash, with
+// the account, the agent and the agent's list as the consent left them, read now.
+// An access token of another resource, of a revoked agent or of an agent no longer
+// the user's is not found.
+func (f *fakeCredentials) ResolveGrant(
+	_ context.Context, token input.AccessToken, login input.ResourceID, now time.Time,
+) (store.ActiveGrant, bool, error) {
+	for _, g := range f.grants.rows {
+		live := g.rotated && bytes.Equal(g.accessHash, token.Hash()) && !g.accessRevoked &&
+			g.accessExpires.After(now) && g.alive(now) && f.grants.usable(g) &&
+			g.grant.Resource.String() == login.String()
+		if !live {
+			continue
+		}
+
+		stored, err := json.Marshal(f.grants.agentScopes[g.grant.AgentID])
+		if err != nil {
+			panic(err)
+		}
+
+		return store.ActiveGrant{
+			ID: g.accessID, UserID: g.grant.Owner, Role: roleMember, ExpiresAt: g.accessExpires, OrgID: "org-1",
+			AgentID: g.grant.AgentID, AgentScopes: string(stored), Scope: g.accessScope,
+		}, true, nil
+	}
+
+	return store.ActiveGrant{}, false, nil
+}
+
+// grantProbeRoutes are routes of authsu's own API as a feature declares them,
+// stood in for here: each opts in to grants with FromGrants and needs one scope,
+// and answers 204 when the boundary lets the request through. They are the real
+// boundary's view of an access token a login was issued (internal/auth), so a
+// test of the consent can follow its agent's list all the way to a permission.
+func grantProbeRoutes() []auth.Route {
+	probe := func(path string, access auth.Access) auth.Route {
+		return auth.Route{
+			Method: http.MethodGet, Path: path, Credential: auth.Authenticated, Access: access,
+			Handle: func(*auth.Call) result.Result[httpapi.Response] {
+				return result.Ok(httpapi.Response{Status: http.StatusNoContent})
+			},
+		}
+	}
+
+	return []auth.Route{
+		probe("/probe/"+string(scope.SandboxCreate), auth.Needs(scope.SandboxCreate).FromGrants()),
+		probe("/probe/"+string(scope.SandboxRevoke), auth.Needs(scope.SandboxRevoke).FromGrants()),
+		probe("/probe/"+string(scope.OrgRead), auth.Needs(scope.OrgRead).FromGrants()),
+		probe("/probe/"+string(scope.AgentCreate), auth.Needs(scope.AgentCreate).FromGrants()),
+		probe("/probe/"+string(scope.AgentRead), auth.Needs(scope.AgentRead).FromGrants()),
+	}
 }
 
 // sequence is a deterministic source of entropy: each read returns bytes that
@@ -829,6 +940,12 @@ type rig struct {
 	signs   int
 	maxAges int
 
+	// tables, when set, selects the resource table for each lookup in the order the
+	// routes make them, so a test can hand the routes a table that changes between
+	// the steps of one request. It is nil for the deployment's own table.
+	tables func(call int, apiOrigin string) resource.Table
+	looked int
+
 	// logged records every error the boundary turned into a response and every
 	// redirect the routes logged.
 	logged  []*apierr.Error
@@ -847,7 +964,7 @@ func newRigWith(t *testing.T, env map[string]string) *rig {
 	rg := &rig{
 		t: t, store: newFakeStore(), env: env,
 		net:   &fakeFetch{answers: map[string]fetchAnswer{}},
-		creds: &fakeCredentials{sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}},
+		creds: nil,
 		// A fixed instant, in whole seconds: the payload carries Unix seconds.
 		now:     time.Date(2030, time.March, 4, 5, 6, 7, 0, time.UTC),
 		entropy: &sequence{reads: 1 << 32},
@@ -858,8 +975,13 @@ func newRigWith(t *testing.T, env map[string]string) *rig {
 
 	rg.net.answers[clientURL] = served(document(clientURL, redirectURL, loopbackURL, localhostURL))
 
-	rg.handler = auth.Handler(oauth.Routes(rg.deps()), auth.Deps{
+	rg.creds = &fakeCredentials{
+		sessions: map[string]store.ActiveSession{}, keys: map[string]store.ActiveAPIKey{}, grants: rg.store,
+	}
+
+	rg.handler = auth.Handler(append(oauth.Routes(rg.deps()), grantProbeRoutes()...), auth.Deps{
 		Credentials: rg.creds,
+		Resources:   resource.Select,
 		Now:         func() time.Time { return rg.now },
 		Getenv:      func(name string) string { return rg.env[name] },
 		Log:         rg.log,
@@ -886,13 +1008,25 @@ func (r *rig) newID() string {
 // read through the rig, so a test may replace it before a request.
 func (r *rig) deps() oauth.Deps {
 	return oauth.Deps{
-		Store: r.store, Resources: resource.Select, Fetch: r.net.do,
+		Store: r.store, Resources: r.selectTable, Fetch: r.net.do,
 		Now:       func() time.Time { return r.now },
 		Entropy:   readerFunc(func(p []byte) (int, error) { return r.entropy.Read(p) }),
 		NewID:     r.newID,
 		MaxAgents: r.maxAges,
 		Log:       r.log,
 	}
+}
+
+// selectTable is the routes' resource table: the deployment's, or the rig's
+// tables hook when a test set one.
+func (r *rig) selectTable(apiOrigin string) resource.Table {
+	if r.tables == nil {
+		return resource.Select(apiOrigin)
+	}
+
+	r.looked++
+
+	return r.tables(r.looked, apiOrigin)
 }
 
 // config is the deployment's configuration, as the routes load it.
@@ -1380,6 +1514,18 @@ func (r *rig) exchanged(edit func(url.Values)) tokenBody {
 	r.t.Helper()
 
 	return wantTokens(r.t, r.postForm(oauth.PathToken, codeForm(r.approve(edit))))
+}
+
+// exchangedFor is exchanged for another client, whose document the rig serves
+// first: the grant is that client's, as the code form's client_id is.
+func (r *rig) exchangedFor(client string) tokenBody {
+	r.t.Helper()
+
+	r.net.answers[client] = served(document(client, redirectURL))
+
+	code := r.approve(setParam("client_id", client))
+
+	return wantTokens(r.t, r.postForm(oauth.PathToken, withParams(codeForm(code), setParam("client_id", client))))
 }
 
 // hashOfToken is the SHA-256 of a token's text, which is what the store records.

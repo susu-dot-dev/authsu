@@ -19,6 +19,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/config"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/store"
 	"github.com/susu-dot-dev/authsu/internal/users"
 )
@@ -188,6 +189,15 @@ func (f *fakeCredentials) ResolveAPIKey(
 	return store.ActiveAPIKey{}, false, f.err
 }
 
+// ResolveGrant finds no grant, as ResolveAPIKey finds no key.
+func (f *fakeCredentials) ResolveGrant(
+	context.Context, input.AccessToken, input.ResourceID, time.Time,
+) (store.ActiveGrant, bool, error) {
+	f.reads++
+
+	return store.ActiveGrant{}, false, f.err
+}
+
 // sequence is deterministic entropy: each read returns bytes that differ from
 // every other read's, so each issued token is distinct.
 type sequence struct{ reads uint64 }
@@ -249,6 +259,7 @@ func newRig(t *testing.T) *rig {
 
 	rg.handler = auth.Handler(users.Routes(users.Deps{Store: rg.store, Now: clock, Log: rg.log}), auth.Deps{
 		Credentials: rg.creds,
+		Resources:   resource.Select,
 		Now:         clock,
 		Getenv:      func(name string) string { return env[name] },
 		Log:         rg.log,

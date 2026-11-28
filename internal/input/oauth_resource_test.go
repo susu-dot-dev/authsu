@@ -431,9 +431,11 @@ func requireEntryFits(t *testing.T, entry resource.Entry) {
 		flaw{len(entry.Scopes)+1 > input.MaxOAuthScopeEntries, "has more scopes than a request may name"},
 	)
 
+	// A third-party resource never defines one of authsu's own scopes. The login
+	// resource defines a fixed list of them, which internal/resource holds.
 	for _, name := range entry.Scopes {
 		_, err := scope.Names([]string{name}).Get()
-		if err == nil {
+		if err == nil && !entry.FirstParty {
 			t.Errorf("%s: %q is one of authsu's own scopes", entry.URL, name)
 		}
 	}
@@ -442,13 +444,56 @@ func requireEntryFits(t *testing.T, entry resource.Entry) {
 	text := strings.Join(append(slices.Clone(entry.Scopes), input.OpenIDScope), " ")
 
 	got, err := input.ParseOAuthScopes(text, true, entry)
-	if err != nil || got.String() != text {
+	if err != nil || got.String() != text || len(text) > input.MaxOAuthScopeBytes {
 		t.Errorf("%s: every scope (%d bytes) is refused: %q, %v", entry.URL, len(text), got.String(), err)
 	}
 
 	defaults, err := input.ParseOAuthScopes("", false, entry)
 	if err != nil || defaults.String() != strings.Join(entry.Defaults, " ") {
 		t.Errorf("%s: defaults = %q, %v", entry.URL, defaults.String(), err)
+	}
+}
+
+// TestLoginResourceFitsWhatAGrantStores: the widest request a client can make of
+// the login resource, every scope it defines plus openid and the two OpenID
+// Connect names it tolerates, fits the bounds a grant is stored under, and so
+// does what is stored from it. A legitimate request therefore never reaches the
+// schema's CHECK, and adding a scope to the resource later fails here, loudly,
+// and not in a client's login.
+func TestLoginResourceFitsWhatAGrantStores(t *testing.T) {
+	t.Parallel()
+
+	for name, table := range map[string]resource.Table{"production": productionTable(), "development": developmentTable()} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			login, found := table.Login()
+			if !found {
+				t.Fatal("no login resource")
+			}
+
+			asked := append(slices.Clone(login.Scopes), input.OpenIDScope, input.EmailScope, input.OfflineAccessScope)
+			text := strings.Join(asked, " ")
+
+			if len(text) > input.MaxOAuthScopeBytes || len(asked) > input.MaxOAuthScopeEntries {
+				t.Fatalf("the widest login request is %d bytes and %d names, over %d and %d",
+					len(text), len(asked), input.MaxOAuthScopeBytes, input.MaxOAuthScopeEntries)
+			}
+
+			got, err := input.ParseFirstPartyScopes(text, true, login)
+			if err != nil {
+				t.Fatalf("the widest login request is refused: %v", err)
+			}
+
+			// email and profile are one scope and offline_access is dropped, so what
+			// is stored is every scope of the login, once, and openid, in the order
+			// they were written.
+			want := strings.Join(append(slices.Clone(login.Scopes), input.OpenIDScope), " ")
+			if got.String() != want || len(got.String()) > input.MaxOAuthScopeBytes {
+				t.Errorf("stored %q (%d bytes), want %q within %d", got.String(), len(got.String()), want,
+					input.MaxOAuthScopeBytes)
+			}
+		})
 	}
 }
 
@@ -545,7 +590,21 @@ func firstPartyScopeCases() []scopeCase {
 		{"an unknown scope", "openid profile admin", true, false, "", false},
 		{"an MCP scope", "openid profile mcp:read", true, false, "", false},
 		{"an MCP scope with email", "email mcp:write", true, false, "", false},
-		{"an authsu scope", string(scope.UserRead), true, false, "", false},
+		{"an admin authsu scope", string(scope.UserRead), true, false, "", false},
+		{"an authsu scope the login does not define", string(scope.KeyCreate), true, false, "", false},
+		{"an authsu bundle", scope.DefaultUser, true, false, "", false},
+		{"an authsu bundle with profile", "profile " + scope.DefaultSession, true, false, "", false},
+		{"an authsu scope, which the login defines", "agent:create", true, true, "agent:create", false},
+		{"profile and an authsu scope", "profile agent:create", true, true, "profile agent:create", false},
+		{"email and an authsu scope: email is the profile, not the first scope",
+			"email sandbox:create", true, true, "profile sandbox:create", false},
+		{"an authsu scope then email", "agent:read email", true, true, "agent:read profile", false},
+		{"every scope of the login, with the tolerated names",
+			"openid email profile offline_access sandbox:create sandbox:revoke org:read agent:create agent:read",
+			true, true, "openid profile sandbox:create sandbox:revoke org:read agent:create agent:read", true},
+		{"an authsu scope twice", "agent:read agent:read", true, false, "", false},
+		{"an authsu scope in another case", "Agent:Read", true, false, "", false},
+		{"an authsu scope with a space inside", "agent: read", true, false, "", false},
 		{"address, which is not offered", "openid address", true, false, "", false},
 		{"phone, which is not offered", "phone", true, false, "", false},
 		{"a repeated profile", "profile profile", true, false, "", false},

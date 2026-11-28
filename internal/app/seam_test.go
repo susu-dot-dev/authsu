@@ -540,9 +540,10 @@ func TestAgentsBelongToTheCaller(t *testing.T) {
 			}
 
 			args := h.exec.calls[1][0].Args
-			want := []any{memberID, nil, int64(6), tt.label, int64(0), nil, nil}
-			if len(args) != len(want) || args[0] != want[0] || args[2] != want[2] || args[3] != want[3] ||
-				args[4] != want[4] || args[5] != want[5] || args[6] != want[6] {
+			want := []any{memberID, nil, int64(6), tt.label, int64(0), nil, nil, "sandbox"}
+
+			// The cursor (argument 1) is the first page's bound and is not compared.
+			if len(args) != len(want) || !slices.Equal(slices.Delete(slices.Clone(args), 1, 2), slices.Delete(want, 1, 2)) {
 				t.Errorf("agent list args = %v, want the caller's id, a page of 5 plus one, the label %v and no confinement",
 					args, tt.label)
 			}

@@ -47,6 +47,13 @@ const (
 	// CodeSandboxInherited is an agent that tried to choose the sandbox of the
 	// agent it creates: it is always its own.
 	CodeSandboxInherited = "agent_sandbox_inherited"
+	// CodeGrantNeedsSandbox is a create through an OAuth grant that named no
+	// sandbox: a grant creates agents only inside a sandbox the user
+	// administers.
+	CodeGrantNeedsSandbox = "grant_requires_sandbox"
+	// CodeGrantScopesExceeded is a create through an OAuth grant that asked for
+	// an agent or key list holding a scope the grant's agent does not.
+	CodeGrantScopesExceeded = "grant_scopes_exceeded"
 	// CodeLabelLimit is a PATCH that would leave an agent with more than
 	// input.MaxLabelsPerAgent labels. Nothing in the request took effect.
 	CodeLabelLimit = "agent_label_limit_reached"
@@ -76,6 +83,12 @@ const MaxBody = 8 << 10
 // Creating is the one route an agent may use, when it is given agent:create, and
 // it is bounded by the rules in create.
 //
+// The list, the read and the create also take an OAuth grant (FromGrants), the
+// one a first-party app holds: it lists and reads the agents that are in a
+// sandbox the user administers (reach), and creates agents only inside one, with
+// lists both the grant's token and its agent hold (resolveGrantScopes). Renaming
+// and revoking never take one.
+//
 // The list, the read and the create opt in to agents of a sandbox (InSandbox),
 // the only routes that do: each therefore owes the boundary that every query it
 // makes is confined to Principal.SandboxID, so that such an agent reaches only
@@ -95,9 +108,9 @@ func Routes(deps Deps) []auth.Route {
 	}
 
 	return []auth.Route{
-		declare(http.MethodGet, collectionPath, auth.Needs(scope.AgentRead).InSandbox(), deps.list),
-		declare(http.MethodPost, collectionPath, auth.Needs(scope.AgentCreate).InSandbox(), deps.create),
-		declare(http.MethodGet, itemPath, auth.Needs(scope.AgentRead).InSandbox(), deps.get),
+		declare(http.MethodGet, collectionPath, auth.Needs(scope.AgentRead).InSandbox().FromGrants(), deps.list),
+		declare(http.MethodPost, collectionPath, auth.Needs(scope.AgentCreate).InSandbox().FromGrants(), deps.create),
+		declare(http.MethodGet, itemPath, auth.Needs(scope.AgentRead).InSandbox().FromGrants(), deps.get),
 		declare(http.MethodPatch, itemPath, auth.Needs(scope.AgentUpdate).WithoutAgents(), deps.patch),
 		declare(http.MethodDelete, itemPath, auth.Needs(scope.AgentRevoke).WithoutAgents(), deps.revoke),
 	}
@@ -156,12 +169,26 @@ func parsePage(query map[string][]string) result.Result[page] {
 // its own sandbox, or only the ordinary ones when it is in none, so a sandbox's
 // agents are neither seen from outside it nor able to see out. Which one it is
 // comes from the credential, never from the request.
+//
+// An OAuth grant is held by an agent but speaks for the user, as the first-party
+// app's sign-in, and what it is for is managing the user's sandboxes: it reaches
+// the agents that are in a sandbox the user administers, so the app can list the
+// agents it created there, and no other. The user's ordinary agents, with their
+// names, labels and scope lists, are none of the app's business, so the grant
+// never reaches them, and neither an agent of a sandbox the user does not
+// administer. The first-party agent is in no sandbox and holds no say in what the
+// grant reaches, so confining by it would hide exactly those agents. Whether the
+// user administers the sandbox is decided in the statement that reads the agent
+// (store.AdministeredSandboxAgents), not here.
 func reach(who auth.Principal) store.AgentReach {
-	if who.AgentID == "" {
+	switch {
+	case who.Kind == auth.KindGrant:
+		return store.AdministeredSandboxAgents(who.UserID)
+	case who.AgentID == "":
 		return store.OwnAgents(who.UserID)
+	default:
+		return store.SandboxAgents(who.UserID, who.SandboxID)
 	}
-
-	return store.SandboxAgents(who.UserID, who.SandboxID)
 }
 
 func (d Deps) list(call *auth.Call) result.Result[httpapi.Response] {
@@ -401,12 +428,15 @@ func (d Deps) write(call *auth.Call, plan creation) result.Result[creation] {
 // member whatever a credential names, so there is nothing to compare here.
 //
 // An agent is bounded by itself. The new agent's scopes are a copy of its own,
-// so they may not be set; its key's scopes must be entries of the creating key's
-// list as written, and default to that list. The literal comparison is what
-// makes it sound: a list contained in another has an expansion contained in the
-// other's however the bundles change later, so the new agent can never do more
-// than the key that created it (docs/permissions_design.md).
+// so they may not be set; its key's scopes must be ones the creating credential
+// may issue (auth.Principal.MayIssue: entries of its own list as written), and
+// default to that list. The comparison is auth's, so the narrowing rule lives
+// in one place (docs/permissions_design.md).
 func resolveScopes(who auth.Principal, req request) result.Result[request] {
+	if who.Kind == auth.KindGrant {
+		return resolveGrantScopes(who, req)
+	}
+
 	if who.AgentID == "" {
 		return result.Ok(userScopes(req))
 	}
@@ -423,11 +453,55 @@ func resolveScopes(who auth.Principal, req request) result.Result[request] {
 		return result.Ok(req)
 	}
 
-	if !req.keyScopes.SubsetOf(who.Scope) {
+	if !who.MayIssue(req.keyScopes) {
 		return result.Fail[request](keyScopesExceeded())
 	}
 
 	return result.Ok(req)
+}
+
+// resolveGrantScopes decides the scope lists for a create through an OAuth
+// grant. The caller is the first-party agent acting through the grant, and the
+// agent's list is the primary permission set, which the token's only narrows
+// (docs/permissions_design.md): what the grant may do is the intersection of the
+// two. So the new agent's list and its key's list must each be entries of BOTH
+// lists as written (auth.Principal.MayIssueWithAgent), which keeps what is created
+// inside the intersection however the bundles change. Because the token's list is
+// the access token's scope narrowed to the login resource's concrete names, it
+// holds no bundle and no admin scope, so nothing issued here can either.
+//
+// An absent list defaults to the literal intersection in the token's order
+// (auth.Principal.Common), the most the grant may issue, as an agent's key's
+// default is its own list. A list that is present is checked as written, so a
+// request that asks for more than either list holds is refused whole and is never
+// trimmed.
+//
+// It differs from an agent's key in one way. The agent a key creates is a copy
+// of its creator, which is right because it lives in the creator's sandbox, and
+// is why the key's rule needs no agent check: the copy carries the agent's list.
+// The agent a grant creates is in a different place (a sandbox, resolveSandbox),
+// so its list is chosen here, and is not copied from the first-party agent's row.
+func resolveGrantScopes(who auth.Principal, req request) result.Result[request] {
+	if req.scopes == nil {
+		req.scopes = who.Common()
+	}
+
+	if req.keyScopes == nil {
+		req.keyScopes = who.Common()
+	}
+
+	if !who.MayIssueWithAgent(req.scopes) || !who.MayIssueWithAgent(req.keyScopes) {
+		return result.Fail[request](grantScopesExceeded())
+	}
+
+	return result.Ok(req)
+}
+
+// grantScopesExceeded is the client's 403 for a create through a grant that
+// asked for a list holding more than the grant does.
+func grantScopesExceeded() *apierr.Error {
+	return apierr.New(apierr.Forbidden, CodeGrantScopesExceeded,
+		"the new agent and its key may only hold scopes both the access token and its agent hold")
 }
 
 // scopesInherited is the client's 403 for an agent that tried to choose the
@@ -453,7 +527,21 @@ func keyScopesExceeded() *apierr.Error {
 // any other sandbox is refused, so a client that expects one is told it did not
 // get it, rather than silently given another. Naming its own is allowed, and
 // the same as naming none.
+//
+// A grant must name a sandbox and creates only inside it: it is how a first-party
+// app manages the user's sandboxes, and an ordinary agent, which would hold the
+// user's whole reach, is never created through one. Which sandboxes it may name
+// is the user's, decided in the write (the user must administer it, and it must
+// not have expired), so a sandbox of another user is a 404 as for the user.
 func resolveSandbox(who auth.Principal, req request) result.Result[request] {
+	if who.Kind == auth.KindGrant {
+		if req.sandbox.String() == "" {
+			return result.Fail[request](grantNeedsSandbox())
+		}
+
+		return result.Ok(req)
+	}
+
 	if who.AgentID == "" {
 		return result.Ok(req)
 	}
@@ -463,6 +551,13 @@ func resolveSandbox(who auth.Principal, req request) result.Result[request] {
 	}
 
 	return result.Ok(req)
+}
+
+// grantNeedsSandbox is the client's 403 for a create through a grant that named
+// no sandbox.
+func grantNeedsSandbox() *apierr.Error {
+	return apierr.New(apierr.Forbidden, CodeGrantNeedsSandbox,
+		"an OAuth access token creates agents only inside a sandbox, which the request must name")
 }
 
 // sandboxInherited is the client's 403 for an agent that tried to choose the
@@ -554,13 +649,28 @@ func (d Deps) plan(call *auth.Call, req request) result.Result[creation] {
 	return result.Ok(creation{
 		agent: store.NewAgent{
 			ID: id, Owner: owner, Name: req.name, Scopes: req.scopes.JSON(), KeyScope: req.keyScopes.JSON(),
-			Labels: req.labels, CreatedBy: call.Principal.AgentID, Sandbox: req.sandbox, MaxActive: MaxAgentsPerUser,
+			Labels: req.labels, CreatedBy: creator(call.Principal), Sandbox: req.sandbox, MaxActive: MaxAgentsPerUser,
 			KeyID: issued.ID, KeyHash: issued.Hash, KeyExpiresAt: issued.ExpiresAt, CreatedAt: now,
 		},
 		token:     token,
 		sealed:    sealed,
 		keyScopes: req.keyScopes,
 	})
+}
+
+// creator is the agent whose row the write copies the new agent's scopes and
+// sandbox from, or "" when the request's own are used. An agent's key copies its
+// agent's, so what it creates is in its place and no more capable. A grant does
+// not: its agent is the first-party agent, whose row is neither where the new
+// agent goes (the request names a sandbox) nor the bound on its list (the
+// grant's, checked in resolveGrantScopes), so the write takes both from the
+// request, as it does for the user, and checks the user administers the sandbox.
+func creator(who auth.Principal) string {
+	if who.Kind == auth.KindGrant {
+		return ""
+	}
+
+	return who.AgentID
 }
 
 // respondCreated is the response to a create, built from what was written: the

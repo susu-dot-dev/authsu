@@ -56,7 +56,9 @@ An agent has a stable identity and any number of credentials that let it act:
 - **API keys scoped to the agent**, which are [secrets](secrets_design.md) like every other credential.
 - **OAuth grants**, for agents that live in other services and fit a standard authorization flow better than a pasted key. Every grant binds to an agent, and how a person's consent creates or picks that agent is in [oauth_design.md](oauth_design.md#grants-belong-to-agents).
 
-An agent can also be created by authsu rather than the user, for a first-party app's sign-in, where there is no screen to choose one on ([oauth_design.md](oauth_design.md#first-party-login)). It is still an agent of the user in every way, and is only marked so that a UI can tell it from the ones the user made.
+An agent can also be created by authsu rather than the user, for a first-party app's sign-in, where there is no screen to choose one on ([oauth_design.md](oauth_design.md#first-party-login)). It is still an agent of the user in every way, and is only marked so that a UI can tell it from the ones the user made. Its scope list is the one a user's agent's is not: authsu sets it when it issues a grant to the agent, to the union of what it holds and the grant's authsu scopes within the login resource's allowlist ([permissions_design.md](permissions_design.md#where-scopes-live)). An agent the user made, or attached to a grant, is only ever changed by the user.
+
+An OAuth grant that holds `agent:create` may create agents only inside a sandbox the user administers, with lists no wider than its own ([oauth_design.md](oauth_design.md#which-routes-take-a-grant-and-why)), so a first-party app can set up a sandbox for software without a way to widen the user's own reach.
 
 As with invitations, the credential is not the identity. A key can be rotated or revoked without touching the agent. Revoking the agent ends all of its credentials, and the audit trail names a stable agent rather than whichever credential was in use.
 

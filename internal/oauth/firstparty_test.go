@@ -229,41 +229,61 @@ func TestTokenAudience(t *testing.T) {
 	}
 }
 
+// firstPartyScope is a scope parameter of a login request and what is stored.
+type firstPartyScope struct {
+	scope  string
+	absent bool
+	// want is the stored scope; empty means the request is refused.
+	want string
+}
+
+// firstPartyScopeCases are what a trusted client may ask the login resource for.
+func firstPartyScopeCases() map[string]firstPartyScope {
+	return map[string]firstPartyScope{
+		"the whole OpenID Connect request":  {scope: "openid email profile offline_access", want: scopeOpenIDLogin},
+		"email alone is the profile":        {scope: "email", want: scopeLogin},
+		"profile alone":                     {scope: "profile", want: scopeLogin},
+		"email and profile are one scope":   {scope: "email profile", want: scopeLogin},
+		"profile and email, in that order":  {scope: "profile email", want: scopeLogin},
+		"openid and email":                  {scope: "openid email", want: scopeOpenIDLogin},
+		"offline_access is dropped":         {scope: "profile offline_access", want: scopeLogin},
+		"no scope is the default":           {absent: true, want: scopeLogin},
+		"offline_access alone is nothing":   {scope: "offline_access"},
+		"openid alone is nothing":           {scope: "openid"},
+		"openid and offline_access":         {scope: "openid offline_access"},
+		"a repeated email":                  {scope: "email email"},
+		"a repeated offline_access":         {scope: "offline_access offline_access profile"},
+		"an MCP scope":                      {scope: "openid profile mcp:read"},
+		"an MCP scope with email":           {scope: "email mcp:write"},
+		"an unknown scope":                  {scope: "openid profile admin"},
+		"an authsu scope the login defines": {scope: "profile agent:create", want: "profile agent:create"},
+		"every scope the login defines": {
+			scope: "openid email profile offline_access sandbox:create sandbox:revoke org:read agent:create agent:read",
+			want:  "openid profile sandbox:create sandbox:revoke org:read agent:create agent:read",
+		},
+		"an authsu scope with no profile":      {scope: "agent:read", want: "agent:read"},
+		"an authsu scope the login lacks":      {scope: "profile key:create"},
+		"an admin scope":                       {scope: "profile user:read"},
+		"a scope near one the login defines":   {scope: "profile agent:Create"},
+		"an authsu scope twice":                {scope: "agent:read agent:read"},
+		"a bundle":                             {scope: "profile default:user"},
+		"the session bundle":                   {scope: "default:session"},
+		"the agent bundle":                     {scope: "profile default:agent"},
+		"a bundle alone":                       {scope: "default:user"},
+		"the bundle's own scopes, not defined": {scope: "profile member:read"},
+		"upper case":                           {scope: "openid PROFILE"},
+		"two spaces":                           {scope: "openid  profile"},
+		"a trailing space":                     {scope: "profile "},
+	}
+}
+
 // TestFirstPartyScopes: what a trusted client may ask the login resource for,
 // and what is stored. email is the profile, offline_access asks for what is
 // always given, neither is stored, and nothing else is tolerated.
 func TestFirstPartyScopes(t *testing.T) {
 	t.Parallel()
 
-	tests := map[string]struct {
-		scope  string
-		absent bool
-		// want is the stored scope; empty means the request is refused.
-		want string
-	}{
-		"the whole OpenID Connect request": {scope: "openid email profile offline_access", want: scopeOpenIDLogin},
-		"email alone is the profile":       {scope: "email", want: scopeLogin},
-		"profile alone":                    {scope: "profile", want: scopeLogin},
-		"email and profile are one scope":  {scope: "email profile", want: scopeLogin},
-		"profile and email, in that order": {scope: "profile email", want: scopeLogin},
-		"openid and email":                 {scope: "openid email", want: scopeOpenIDLogin},
-		"offline_access is dropped":        {scope: "profile offline_access", want: scopeLogin},
-		"no scope is the default":          {absent: true, want: scopeLogin},
-		"offline_access alone is nothing":  {scope: "offline_access"},
-		"openid alone is nothing":          {scope: "openid"},
-		"openid and offline_access":        {scope: "openid offline_access"},
-		"a repeated email":                 {scope: "email email"},
-		"a repeated offline_access":        {scope: "offline_access offline_access profile"},
-		"an MCP scope":                     {scope: "openid profile mcp:read"},
-		"an MCP scope with email":          {scope: "email mcp:write"},
-		"an unknown scope":                 {scope: "openid profile admin"},
-		"an authsu scope":                  {scope: "profile agent:create"},
-		"upper case":                       {scope: "openid PROFILE"},
-		"two spaces":                       {scope: "openid  profile"},
-		"a trailing space":                 {scope: "profile "},
-	}
-
-	for name, tt := range tests {
+	for name, tt := range firstPartyScopeCases() {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -740,6 +760,185 @@ func TestLoginResourceIsExact(t *testing.T) {
 			params.Set("resource", target)
 
 			wantClientError(t, r, r.authorize(params), trustedRedirect, codeInvalidTarget, descInvalidTarget, "xyz")
+		})
+	}
+}
+
+// authsuNames are the authsu scopes the login resource defines, spelled out.
+func authsuNames() []string {
+	return []string{"sandbox:create", "sandbox:revoke", "org:read", "agent:create", "agent:read"}
+}
+
+// authsuAsk is an authorization request edit and the refusal it must meet.
+type authsuAsk struct {
+	edit func(url.Values)
+	// redirect is where the refusal goes, and code and desc what it carries.
+	redirect, code, desc string
+}
+
+// authsuAsks are the ways to ask for a name of authsu's own that are not the
+// trusted client asking the login resource for a name it defines.
+func authsuAsks() map[string]authsuAsk {
+	ordinary := func(v url.Values) {
+		v.Set("client_id", clientURL)
+		v.Set("redirect_uri", redirectURL)
+	}
+	mcp := func(scopes string) func(url.Values) {
+		return func(v url.Values) { v.Set("resource", resourceURL); v.Set("scope", scopes) }
+	}
+	untrustedFor := func(scopes string) func(url.Values) {
+		return func(v url.Values) {
+			ordinary(v)
+			v.Set("scope", scopes)
+		}
+	}
+	badScope := func(edit func(url.Values), redirect string) authsuAsk {
+		return authsuAsk{edit: edit, redirect: redirect, code: "invalid_scope", desc: descInvalidScope}
+	}
+
+	asks := map[string]authsuAsk{}
+
+	for _, name := range authsuNames() {
+		asks["an untrusted client asks the login resource for "+name] = authsuAsk{
+			edit: untrustedFor("profile " + name), redirect: redirectURL, code: codeInvalidTarget, desc: descInvalidTarget,
+		}
+		asks["an untrusted client asks the MCP resource for "+name] = badScope(func(v url.Values) {
+			ordinary(v)
+			mcp("mcp:read " + name)(v)
+		}, redirectURL)
+		asks["a trusted client asks the MCP resource for "+name] = badScope(mcp("mcp:read "+name), trustedRedirect)
+		asks["a trusted client asks the MCP resource for "+name+" alone"] = badScope(mcp(name), trustedRedirect)
+	}
+
+	for name, scopes := range map[string]string{
+		"the user bundle": "profile default:user", "the session bundle": "profile default:session",
+		"the agent bundle": "profile default:agent", "an admin scope": "profile user:read",
+		"an invitation": "profile invitation:create", "a key scope": "profile key:create",
+		"a grant scope": "profile grant:read", "a member scope": "profile member:revoke",
+		"an org update": "profile org:update",
+	} {
+		asks["a trusted client asks the login resource for "+name] = badScope(setParam("scope", scopes), trustedRedirect)
+	}
+
+	return asks
+}
+
+// TestAuthsuScopesAreTheLoginResourcesAlone: a name of authsu's own, which only
+// the login resource defines, is refused at the authorization endpoint for every
+// other way of asking: a client that is not trusted (who is not even told the
+// login resource exists), the MCP resource asked by a trusted client or by anyone
+// else, and a bundle or an admin or undefined authsu scope at the login resource
+// itself. Each is the one fixed error, and nothing is sealed or stored.
+func TestAuthsuScopesAreTheLoginResourcesAlone(t *testing.T) {
+	t.Parallel()
+
+	for name, tt := range authsuAsks() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := loginRig(t)
+			r.net.answers[clientURL] = served(document(clientURL, redirectURL))
+
+			params := loginParams()
+			tt.edit(params)
+
+			wantClientError(t, r, r.authorize(params), tt.redirect, tt.code, tt.desc, "xyz")
+
+			if len(r.store.grants) != 0 {
+				t.Error("a grant was written for a refused request")
+			}
+		})
+	}
+}
+
+// loginRefreshHeld is the scope a login grant is made with in the refresh tests.
+const loginRefreshHeld = "profile agent:read org:read"
+
+// loginRefresh is a refresh scope and its outcome: the scope the new access token
+// carries, or the refusal.
+type loginRefresh struct {
+	scope string
+	// want is the scope the new access token carries, "" when refused, and
+	// code the refusal.
+	want, code string
+}
+
+// loginRefreshes are the refreshes of a login grant that holds loginRefreshHeld.
+func loginRefreshes() map[string]loginRefresh {
+	refused := func(scopes string) loginRefresh { return loginRefresh{scope: scopes, code: "invalid_scope"} }
+	kept := func(scopes string) loginRefresh { return loginRefresh{scope: scopes, want: scopes} }
+
+	return map[string]loginRefresh{
+		"nothing asked is the grant's":            {scope: "", want: loginRefreshHeld},
+		"the grant's own scope":                   kept(loginRefreshHeld),
+		"one scope the grant holds":               kept("agent:read"),
+		"another, in another order":               kept("org:read agent:read"),
+		"the profile alone":                       kept("profile"),
+		"an authsu scope the login defines":       refused("agent:read agent:create"),
+		"an authsu scope the grant does not hold": refused("sandbox:create"),
+		"every scope the login defines": refused(
+			"profile sandbox:create sandbox:revoke org:read agent:create agent:read"),
+		"a scope the login does not define":     refused("agent:read key:create"),
+		"an admin scope":                        refused("user:read"),
+		"the user bundle":                       refused("default:user"),
+		"the agent bundle":                      refused("default:agent"),
+		"the session bundle":                    refused("default:session"),
+		"a scope of the MCP resource":           refused("mcp:read"),
+		"email, which is not stored":            refused("email"),
+		"openid, which the grant does not hold": refused("openid agent:read"),
+		"a repeated scope":                      refused("agent:read agent:read"),
+	}
+}
+
+// TestLoginRefreshNeverWidens: a login grant's authsu scopes can be narrowed by
+// a refresh and never widened, whether by naming a scope the grant does not
+// hold, one the login resource defines, one it does not, a bundle, or a name of
+// another resource; the refusal rotates nothing, and the access token carries
+// exactly the narrower scope that was asked for.
+func TestLoginRefreshNeverWidens(t *testing.T) {
+	t.Parallel()
+
+	for name, tt := range loginRefreshes() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := loginRig(t)
+			params := loginParams()
+			params.Set("scope", loginRefreshHeld)
+
+			first := loginTokens(t, r, params)
+			form := url.Values{
+				"grant_type": {"refresh_token"}, "refresh_token": {first.refresh}, "client_id": {trustedClient},
+			}
+
+			if tt.scope != "" {
+				form.Set("scope", tt.scope)
+			}
+
+			rec := r.postForm(oauth.PathToken, form)
+
+			if tt.code == "" {
+				if got := wantTokens(t, rec); got.scope != tt.want {
+					t.Errorf("scope = %q, want %q", got.scope, tt.want)
+				}
+
+				return
+			}
+
+			wantOAuthError(t, rec, http.StatusBadRequest, tt.code)
+
+			// Nothing was rotated: the token the client holds still works, and the
+			// refresh token is still good.
+			still := decodeObject(t, r.postForm(oauth.PathIntrospect, introspectForm(first.access, loginResource)))
+			if still["active"] != true {
+				t.Error("the access token was replaced by a refresh that was refused")
+			}
+
+			form.Del("scope")
+
+			if got := wantTokens(t, r.postForm(oauth.PathToken, form)); got.scope != loginRefreshHeld {
+				t.Errorf("the refresh token that was refused issued %q afterwards, want %q", got.scope, loginRefreshHeld)
+			}
 		})
 	}
 }

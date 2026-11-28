@@ -75,7 +75,11 @@ type sbView struct {
 	Name      string   `json:"name"`
 	Scopes    []string `json:"scopes"`
 	Status    string   `json:"status"`
+	CreatedAt int64    `json:"createdAt"`
+	Labels    []string `json:"labels"`
 	SandboxID *string  `json:"sandboxId"`
+	// FirstParty is set, and only then present, on a first-party app's agent.
+	FirstParty bool `json:"firstParty"`
 }
 
 // sbCreated is the body of a successful create.

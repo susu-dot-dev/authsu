@@ -36,8 +36,10 @@ func oaIssue(t *testing.T, session string, agent map[string]string) oaIssued {
 	return oaIssued{a: a, tokens: issued, grant: grant}
 }
 
-// TestOAuthTokensAsBearers: the OAuth tokens are never credentials of authsu's own
-// API, and no other credential kind opens an OAuth route that wants a session.
+// TestOAuthTokensAsBearers: the tokens of a grant for the MCP resource are never
+// credentials of authsu's own API (only an access token for the first-party login
+// resource is, and only at a route that opts in), a refresh token and a code never
+// are, and no other credential kind opens an OAuth route that wants a session.
 //
 //nolint:paralleltest // shares one database
 func TestOAuthTokensAsBearers(t *testing.T) {

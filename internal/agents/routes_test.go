@@ -19,7 +19,8 @@ import (
 // is the one write an agent may do, with agent:create. The list, the read and
 // the create are the only routes an agent of a sandbox may use (InSandbox), and
 // the store confines their queries to the sandbox; renaming and revoking are
-// refused to it by the boundary.
+// refused to it by the boundary. The same three are the only ones an OAuth grant
+// may use (FromGrants), and renaming and revoking refuse it.
 func TestRouteDeclarations(t *testing.T) {
 	t.Parallel()
 
@@ -27,9 +28,9 @@ func TestRouteDeclarations(t *testing.T) {
 		method, path string
 		access       auth.Access
 	}{
-		{http.MethodGet, "/api/agent", auth.Needs(scope.AgentRead).InSandbox()},
-		{http.MethodPost, "/api/agent", auth.Needs(scope.AgentCreate).InSandbox()},
-		{http.MethodGet, itemPattern, auth.Needs(scope.AgentRead).InSandbox()},
+		{http.MethodGet, "/api/agent", auth.Needs(scope.AgentRead).InSandbox().FromGrants()},
+		{http.MethodPost, "/api/agent", auth.Needs(scope.AgentCreate).InSandbox().FromGrants()},
+		{http.MethodGet, itemPattern, auth.Needs(scope.AgentRead).InSandbox().FromGrants()},
 		{http.MethodPatch, itemPattern, auth.Needs(scope.AgentUpdate).WithoutAgents()},
 		{http.MethodDelete, itemPattern, auth.Needs(scope.AgentRevoke).WithoutAgents()},
 	}
@@ -74,6 +75,15 @@ func checkDeclared(t *testing.T, route auth.Route, access auth.Access) {
 
 	if route.Access.SessionOnly {
 		t.Error("a route is session-only; the agents API is for keys too, so software can manage agents")
+	}
+
+	if route.Access.GrantAsUserOK {
+		t.Error("a route lets a grant through the refusal of agents; no agent route may")
+	}
+
+	if route.Access.GrantOK == route.Access.NoAgents {
+		t.Errorf("GrantOK = %t with NoAgents = %t: a grant is accepted exactly where agents are",
+			route.Access.GrantOK, route.Access.NoAgents)
 	}
 
 	if route.MaxBody != agents.MaxBody || route.Handle == nil {

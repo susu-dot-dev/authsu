@@ -52,9 +52,9 @@ A token is `susu_<tag>_` followed by 43 base64url characters: 32 bytes from a cr
 | `key` | API key | `Authorization: Bearer` |
 | `code` | OAuth grant, before exchange | the authorization code |
 | `rt` | OAuth grant, after exchange | the refresh token |
-| `at` | OAuth access token | `Authorization: Bearer`, at a resource server |
+| `at` | OAuth access token | `Authorization: Bearer`, at a resource server, and at authsu's own API for the login resource ([oauth_design.md](oauth_design.md#oauth-scopes-and-authsu-scopes)) |
 
-- **The prefix names the kind.** Each place that reads a credential accepts exactly one kind, so a token of the wrong kind is refused by the parser before anything is read from the database. A token that ends up in a log, a chat or a repository says what it is, and secret scanners can recognise it.
+- **The prefix names the kind.** Each place that reads a credential accepts the kinds it is written for (the cookie one, the bearer header two, told apart by the prefix), so a token of the wrong kind is refused by the parser before anything is read from the database. A token that ends up in a log, a chat or a repository says what it is, and secret scanners can recognise it.
 - **The length is fixed.** The parser accepts the exact prefix followed by exactly 43 canonical base64url characters, and refuses anything else, rather than trimming or correcting it. The body can itself contain `_` and `-`, so the prefix is matched as a whole and never found by splitting.
 - **The token carries no claims.** It is random, and nothing can be read from it. Everything about what it grants is on rows the server reads when it is presented (see "Every fact is read live").
 

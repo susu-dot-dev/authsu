@@ -190,7 +190,7 @@ func TestListsHoldOnlyTheCallersAgents(t *testing.T) {
 func TestRenameTakesNoScopes(t *testing.T) {
 	t.Parallel()
 
-	for _, member := range []string{"scopes", "keyScopes"} {
+	for _, member := range []string{fieldScopes, fieldKeyScopes} {
 		t.Run(member, func(t *testing.T) {
 			t.Parallel()
 

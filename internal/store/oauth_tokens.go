@@ -74,9 +74,7 @@ type NewTokens struct {
 // Exchanged is what an exchange or a refresh learned of the grant it rotated,
 // as the rotation left it: what the token response and the ID token need.
 type Exchanged struct {
-	// GrantID is the grant's id, UserID its subject and AgentID the agent that
-	// holds it.
-	GrantID string
+	// UserID is the grant's subject and AgentID the agent that holds it.
 	UserID  string
 	AgentID string
 
@@ -105,12 +103,12 @@ type Exchanged struct {
 }
 
 // readExchanged reads the row an exchange returns, in the order its statement
-// names the columns: grant_id, user_id, agent_id, client_id, resource, scope,
-// nonce, auth_time, profile.
+// names the columns: user_id, agent_id, client_id, resource, scope, nonce,
+// auth_time, profile.
 func readExchanged(r *row) Exchanged {
 	// Struct fields are evaluated in order, which is the column order.
 	return Exchanged{
-		GrantID: r.text(), UserID: r.text(), AgentID: r.text(), ClientID: r.text(), Resource: r.text(),
+		UserID: r.text(), AgentID: r.text(), ClientID: r.text(), Resource: r.text(),
 		Scope: r.text(), Nonce: r.optText(), AuthTime: r.timestamp(), Profile: r.text(),
 	}
 }
@@ -122,7 +120,7 @@ func readExchanged(r *row) Exchanged {
 // instant. The scope, which is the access token's and not always the grant's, is
 // each rotation's own (codeReturning, refreshReturning), between the resource and
 // the nonce.
-const exchangedReturning = `RETURNING id AS grant_id,
+const exchangedReturning = `RETURNING
   (SELECT g.user_id FROM oauth_grants g WHERE g.id = secrets.id) AS user_id,
   (SELECT g.agent_id FROM oauth_grants g WHERE g.id = secrets.id) AS agent_id,
   (SELECT g.client_id FROM oauth_grants g WHERE g.id = secrets.id) AS client_id,
@@ -210,9 +208,9 @@ const codeGrantConditions = `FROM oauth_grants g
 //
 // RETURNING gives the grant as the statement left it, so the outcome and the
 // row are the same instant: no row means nothing matched, and nothing else of
-// the batch (the access token's statements) took effect. The statements after it
-// find their grant by the new refresh hash, which only this UPDATE can have
-// written. Nothing is read again afterwards. The access token of a code exchange
+// the batch (the access token's and supersession statements) took effect. The
+// statements after it find their grant by the new refresh hash, which only this
+// UPDATE can have written. Nothing is read again afterwards. The access token of a code exchange
 // carries the grant's whole scope.
 //
 // The previous hash is not kept, and a code presented again does not revoke
@@ -419,6 +417,87 @@ func accessStatements(tokens NewTokens, scope any, now time.Time) []Statement {
 	}
 }
 
+// supersededGrants selects the grants a code exchange supersedes, over the alias
+// g: the same user's, for the same client and the same resource, whose consent
+// came before that of the exchanged grant. The exchanged grant is the one whose
+// secret holds the new refresh hash, which only the rotation's UPDATE can have
+// written (256 random bits), so when the rotation matched nothing there is no such
+// grant and nothing is selected. Its user, client, resource and id are read from
+// its own row here, in the write, and not from anything the caller read before.
+//
+// The order is the order of consent, not of exchange. A grant's id is a UUIDv7
+// made at consent (and is the order grants are listed in), so the smaller id is the
+// earlier consent; the secret's created_at is the same instant but in whole
+// seconds, which cannot order two consents of one second. Two sign-ins that race
+// therefore end the same way whichever code is exchanged last: the newer consent
+// survives, as far as the ids are in the order of the consents. Exchanging the
+// newer first revokes the older, whose code or refresh token then fails; exchanging
+// the older first lets it work until the newer is exchanged; and an older code
+// exchanged after the newer one finds itself revoked and is refused, and in any
+// case selects only still older grants, never the newer one. The comparison is
+// strict, so a grant never supersedes itself. Grants already revoked are selected
+// too and keep their earlier time (the revocation writes only where it would bring
+// one forward). The agent is not part of it: it is shared by the user's grants for
+// the client and is never revoked here.
+//
+// "As far as the ids are in order" is the one assumption, and it is best effort
+// across Worker isolates: the id generator keeps ids strictly increasing within
+// one isolate (a lock and a counter), but two isolates that make ids in the same
+// millisecond, or a clock stepping backwards, can give the later consent the
+// smaller id, and the earlier one then wins. It cannot leave two live grants once
+// both are exchanged (the smaller id is always the one ended) or end a grant by
+// exchanging an older one, so the cost is which of two near-simultaneous sign-ins
+// of one user, client and resource survives. A grant's id that is not a UUIDv7
+// (the column's CHECK allows any 36 characters) would order arbitrarily; none is
+// ever written.
+//
+// Arguments: ?1 the new refresh hash, ?2 the grant kind.
+const supersededGrants = `SELECT g.id FROM oauth_grants g
+             JOIN oauth_grants ng ON ng.user_id = g.user_id AND ng.client_id = g.client_id
+                                 AND ng.resource = g.resource AND g.id < ng.id
+             JOIN secrets ns ON ns.id = ng.id AND ns.kind = ?2 AND ns.hash = ?1`
+
+// supersedeGrantQuery revokes the secrets of the grants an exchange supersedes
+// (supersededGrants), now: their refresh tokens and unexchanged codes stop at once.
+// It runs in the exchange's batch after the rotation and matches only when the
+// rotation did, so a refused exchange (a wrong verifier, an expired, replayed or
+// revoked code) revokes nothing. A grant already revoked keeps its earlier time and
+// one scheduled for later is brought forward, as for every revoke.
+//
+// Arguments: ?1 the new refresh hash, ?2 the grant kind, ?3 revoked_at (unix
+// seconds).
+const supersedeGrantQuery = `
+UPDATE secrets
+SET revoked_at = ?3
+WHERE (revoked_at IS NULL OR revoked_at > ?3)
+  AND id IN (` + supersededGrants + `)`
+
+// supersedeAccessQuery revokes the access tokens of the same grants, under the same
+// conditions, so a superseded grant's access token does not outlive it by its
+// lifetime: introspection and the API read the grant's secret as well, but the
+// secrets table is kept honest, as for grantRevokeAccessQuery.
+//
+// Arguments: ?1 the new refresh hash, ?2 the grant kind, ?3 revoked_at (unix
+// seconds).
+const supersedeAccessQuery = `
+UPDATE secrets
+SET revoked_at = ?3
+WHERE (revoked_at IS NULL OR revoked_at > ?3)
+  AND id IN (SELECT t.id FROM oauth_access_tokens t
+             WHERE t.grant_id IN (` + supersededGrants + `))`
+
+// supersedeStatements are the two statements that follow a code exchange's access
+// token statements in the same batch: they end the grants it supersedes and their
+// access tokens. A refresh issues no new grant and supersedes nothing.
+func supersedeStatements(tokens NewTokens, now time.Time) []Statement {
+	args := []any{tokens.RefreshHash, KindOAuthGrant, now.Unix()}
+
+	return []Statement{
+		{Query: supersedeGrantQuery, Args: args},
+		{Query: supersedeAccessQuery, Args: slices.Clone(args)},
+	}
+}
+
 // CodeExchange is an authorization code presented at the token endpoint, with
 // what it is checked against and what it is exchanged for.
 type CodeExchange struct {
@@ -448,8 +527,21 @@ type CodeExchange struct {
 // ExchangeCode exchanges an authorization code for the grant's first refresh
 // token and access token, as one batch: the rotation, which carries every
 // condition and reports the grant (see rotateCodeQuery), the diagnosis of a
-// rotation that matched nothing, and the access token's statements, which write
-// only if the rotation matched.
+// rotation that matched nothing, and the access token's statements and the
+// supersession of older grants, which write only if the rotation matched.
+//
+// # Supersession
+//
+// A grant is one live (user, client, resource): when a new grant's code is
+// exchanged, the same user's grants for the same client and the same resource that
+// were consented before it are revoked with their access tokens, in the same batch
+// and so atomically with the exchange (supersedeGrantQuery, supersedeAccessQuery).
+// It happens at the exchange and not at consent, so a sign-in that is abandoned
+// (its code never exchanged) cannot end the grant that works; it applies to every
+// client alike. Which grant is older is the order of consent (the id, a UUIDv7),
+// not of exchange, so the newest consent survives whichever of two concurrent
+// sign-ins is exchanged last. A refused exchange supersedes nothing, and no agent
+// is revoked.
 //
 // It returns ErrInvalidGrant when nothing matched, and ErrInvalidTarget when the
 // code is live and right in every way and only the resource it named is not the
@@ -472,7 +564,9 @@ func (s *Store) ExchangeCode(ctx context.Context, exchange CodeExchange, now tim
 		tokens.RefreshHash, tokens.RefreshExpiresAt.Unix())}
 	diagnose := Statement{Query: diagnoseCodeQuery, Args: conditions}
 
-	return s.rotate(ctx, o, rotationOf{rotate: rotate, diagnose: diagnose, scope: nil}, tokens, now)
+	return s.rotate(ctx, o, rotationOf{
+		rotate: rotate, diagnose: diagnose, scope: nil, after: supersedeStatements(tokens, now),
+	}, tokens, now)
 }
 
 // resourceArg is the argument of an optional resource: its URL, or NULL.
@@ -533,7 +627,7 @@ func (s *Store) Refresh(ctx context.Context, exchange RefreshExchange, now time.
 		scope, tokens.RefreshHash, tokens.RefreshExpiresAt.Unix())}
 	diagnose := Statement{Query: diagnoseRefreshQuery, Args: conditions}
 
-	return s.rotate(ctx, o, rotationOf{rotate: rotate, diagnose: diagnose, scope: scope}, tokens, now)
+	return s.rotate(ctx, o, rotationOf{rotate: rotate, diagnose: diagnose, scope: scope, after: nil}, tokens, now)
 }
 
 // scopeArgs are the two arguments of a requested scope: its names as a JSON array
@@ -561,6 +655,11 @@ type rotationOf struct {
 	rotate   Statement
 	diagnose Statement
 	scope    any
+
+	// after are the statements that follow the access token's in the batch, and
+	// run only if the rotation matched: a code exchange's supersession of older
+	// grants (supersedeStatements). A refresh has none.
+	after []Statement
 }
 
 // rotate runs a rotation, its diagnosis and the statements that give its grant its
@@ -571,6 +670,7 @@ func (s *Store) rotate(
 	ctx context.Context, o op, r rotationOf, tokens NewTokens, now time.Time,
 ) (Exchanged, error) {
 	statements := append([]Statement{r.rotate, r.diagnose}, accessStatements(tokens, r.scope, now)...)
+	statements = append(statements, r.after...)
 
 	results, err := s.run(ctx, o, statements...)
 	if err != nil {
@@ -619,11 +719,13 @@ func (d diagnosis) refusal(found bool) error {
 	}
 }
 
-// introspectQuery reads a presented access token's hash, as resolveSessionQuery
-// reads a session's: the access token's secret, its own row, the grant, the
-// grant's secret, the account and the agent in one statement, so whether the
-// token is live, whose it is and what it was granted all come from the same
-// instant. A token carries nothing that could go stale.
+// liveAccessTokenConditions are the tables and the conditions under which a
+// presented access token is live: its secret, its own row, the grant, the grant's
+// secret, the account and the agent. They are one constant, the FROM and WHERE of
+// both introspectQuery and resolveGrantQuery, so the two reads of an access token
+// cannot disagree about what live means, and a condition added to one is in the
+// other; the statements differ only in what they select, and in the resource the
+// grant must be for (?4).
 //
 // The token is live only if all of these hold:
 //
@@ -639,18 +741,11 @@ func (d diagnosis) refusal(found bool) error {
 //   - the grant is for exactly the resource asked about, by exact comparison, so
 //     a token for one resource is not live at another.
 //
-// A token that fails any of them has no row, and the answers are
-// indistinguishable. The scope is the access token's own (a refresh may have
-// narrowed it from the grant's, and it is never wider): at a resource it is the
-// only limit, and the agent and the account contribute liveness only. The
-// token's hash is not selected.
-//
 // Arguments, by number: ?1 the token's hash, ?2 the access kind, ?3 now (unix
 // seconds), ?4 resource, ?5 the grant kind.
-const introspectQuery = `
-SELECT g.id AS grant_id, g.user_id AS user_id, g.agent_id AS agent_id, g.client_id AS client_id,
-       g.resource AS resource, t.scope AS scope, s.created_at AS issued_at, s.expires_at AS expires_at
-FROM secrets s
+//
+//nolint:gosec // SQL naming the secrets table, not a credential
+const liveAccessTokenConditions = `FROM secrets s
 JOIN oauth_access_tokens t ON t.id = s.id AND t.kind = s.kind
 JOIN oauth_grants g ON g.id = t.grant_id
 JOIN secrets gs ON gs.id = g.id AND gs.kind = g.kind
@@ -666,12 +761,31 @@ WHERE s.hash = ?1
   AND a.sandbox_id IS NULL
   AND g.resource = ?4`
 
+// introspectQuery reads a presented access token's hash, as resolveSessionQuery
+// reads a session's: the access token's secret, its own row, the grant, the
+// grant's secret, the account and the agent in one statement, so whether the
+// token is live, whose it is and what it was granted all come from the same
+// instant. A token carries nothing that could go stale.
+//
+// The token is live under liveAccessTokenConditions, shared with
+// resolveGrantQuery. A token that fails any of them has no row, and the answers are
+// indistinguishable. The scope is the access token's own (a refresh may have
+// narrowed it from the grant's, and it is never wider): at a resource it is the
+// only limit, and the agent and the account contribute liveness only. The
+// token's hash is not selected.
+//
+// Arguments, by number: ?1 the token's hash, ?2 the access kind, ?3 now (unix
+// seconds), ?4 resource, ?5 the grant kind.
+const introspectQuery = `
+SELECT g.user_id AS user_id, g.agent_id AS agent_id, g.client_id AS client_id,
+       g.resource AS resource, t.scope AS scope, s.created_at AS issued_at, s.expires_at AS expires_at
+` + liveAccessTokenConditions
+
 // ActiveAccessToken is an access token that may be used, with what it was
 // granted. The caller adds what is not stored: the issuer, the token type.
 type ActiveAccessToken struct {
-	// GrantID is the grant the token was issued under, and UserID the account
-	// it speaks for (the subject). AgentID is the agent that holds the grant.
-	GrantID string
+	// UserID is the account it speaks for (the subject). AgentID is the agent
+	// that holds the grant.
 	UserID  string
 	AgentID string
 
@@ -705,9 +819,114 @@ func (s *Store) IntrospectAccessToken(
 		func(r *row) ActiveAccessToken {
 			// Struct fields are evaluated in order, which is the column order.
 			return ActiveAccessToken{
-				GrantID: r.text(), UserID: r.text(), AgentID: r.text(), ClientID: r.text(), Resource: r.text(),
+				UserID: r.text(), AgentID: r.text(), ClientID: r.text(), Resource: r.text(),
 				Scope: r.text(), IssuedAt: r.timestamp(), ExpiresAt: r.timestamp(),
 			}
+		})
+}
+
+// resolveGrantQuery reads a presented access token's hash as a credential of
+// authsu's own API, as introspectQuery reads it for a resource server: the access
+// token's secret, its own row, the grant, the grant's secret, the account and the
+// agent in one statement, so whether the token is live, whose it is, what it
+// carries and what the agent now allows all come from the same instant.
+//
+// The token resolves only if every condition of introspectQuery holds, and
+// the grant's resource is the one given (?4): the deployment's first-party login
+// resource, compared as a whole string. Only that resource's tokens are good at
+// authsu's own API, so a token for another resource (the MCP resource's) has no
+// row here, however live it is.
+//
+// What is read beyond introspection is what authsu's own API needs to judge the
+// request: the account's role now (users.role, never a copy), its organization,
+// the agent's scope list as stored now (agents.scopes, the primary permission set
+// the token only narrows) and the access token's own scope, which a refresh may
+// have narrowed from the grant's (never wider). The agent is joined on the grant's
+// own agent_id and is required: every grant has one. A sandboxed agent matches no
+// row (a.sandbox_id IS NULL), as in introspectQuery: authsu's own API trusts a
+// grant only for an agent that is in no sandbox, so there is no sandbox to
+// carry.
+//
+// A token that fails any condition has no row, and the answers are
+// indistinguishable. The token's hash is not selected.
+//
+// Arguments, by number: ?1 the token's hash, ?2 the access kind, ?3 now (unix
+// seconds), ?4 the login resource's URL, ?5 the grant kind.
+const resolveGrantQuery = `
+SELECT s.id AS id, g.user_id AS user_id, u.role AS role, s.expires_at AS expires_at, u.org_id AS org_id,
+       g.agent_id AS agent_id, a.scopes AS agent_scopes, t.scope AS scope,
+       a.sandbox_id AS sandbox_id
+` + liveAccessTokenConditions
+
+// ActiveGrant is an OAuth access token that may be used at authsu's own API, with
+// the account and agent it acts for. It is the grant's counterpart of
+// ActiveAPIKey: every field is read now, in the statement that found the token.
+type ActiveGrant struct {
+	// ID is the access token's secret id: the identifier it is listed and
+	// revoked by.
+	ID string
+
+	// UserID is the account whose authority the token carries, and Role the
+	// account's current role.
+	UserID string
+	Role   string
+
+	// ExpiresAt is when the token stops being active.
+	ExpiresAt time.Time
+
+	// OrgID is the standard organization the account belongs to.
+	OrgID string
+
+	// AgentID is the agent that holds the grant, which every grant has, and
+	// AgentScopes its scope list as stored, read now.
+	AgentID     string
+	AgentScopes string
+
+	// Scope is the access token's own scope, space-delimited, as stored: the
+	// grant's, or the narrower list a refresh asked for. It names the resource's
+	// scopes and may hold openid and profile, which are not authsu's.
+	Scope string
+
+	// SandboxID is the sandbox the agent that holds the grant is confined to,
+	// read with it. The conditions of the statement (a.sandbox_id IS NULL) make
+	// it always "", so no grant resolves for a sandboxed agent; it is read and
+	// not assumed so that the credential's SandboxID is the row's and a grant of a
+	// sandboxed agent, were the condition ever relaxed, would be confined by the
+	// boundary (Access.InSandbox) and not silently unconfined.
+	SandboxID string
+}
+
+// ResolveGrant reads the access token the token names as a credential of authsu's
+// own API, if it is live at now for exactly loginResource: not revoked or
+// expired, its grant not revoked or expired, its account and agent not revoked,
+// the agent in no sandbox and the grant for the login resource. It reports false
+// otherwise, so an unknown, wrong-kind, expired, revoked, revoked-agent,
+// revoked-user, sandboxed-agent and other-resource token are indistinguishable.
+//
+// It is introspection's read with what authsu's own API needs added, and shares
+// its operation codes with the resolution of a session and a key, because it is
+// that: the resolution of a presented credential.
+func (s *Store) ResolveGrant(
+	ctx context.Context, token input.AccessToken, loginResource input.ResourceID, now time.Time,
+) (ActiveGrant, bool, error) {
+	o := op{failed: CodeSessionVerifyFailed, rejected: CodeSessionVerifyRejected, description: sessionsDescription}
+
+	return find(ctx, s, o,
+		Statement{Query: resolveGrantQuery, Args: []any{
+			token.Hash(), KindOAuthAccess, now.Unix(), loginResource.String(), KindOAuthGrant,
+		}},
+		func(r *row) ActiveGrant {
+			// Struct fields are evaluated in order, which is the column order.
+			grant := ActiveGrant{
+				ID: r.text(), UserID: r.text(), Role: r.text(), ExpiresAt: r.timestamp(), OrgID: r.text(),
+				AgentID: r.text(), AgentScopes: r.text(), Scope: r.text(), SandboxID: "",
+			}
+
+			if sandbox := r.optText(); sandbox != nil {
+				grant.SandboxID = *sandbox
+			}
+
+			return grant
 		})
 }
 

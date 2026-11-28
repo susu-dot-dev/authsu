@@ -371,7 +371,8 @@ func TestGrantPathMustBeAnID(t *testing.T) {
 
 // TestGrantRevoke: revoking a grant ends it and its tokens at once, answers with the
 // grant as the write left it and touches nothing else: another grant of the same
-// user still works.
+// user still works. The other is another client's, because a second grant of the
+// same client and resource would have superseded the first.
 func TestGrantRevoke(t *testing.T) {
 	t.Parallel()
 
@@ -379,7 +380,7 @@ func TestGrantRevoke(t *testing.T) {
 	cookie, _ := r.signIn(userA)
 
 	one := r.exchanged(nil)
-	two := r.exchanged(nil)
+	two := r.exchangedFor(otherClientURL)
 
 	r.now = r.now.Add(time.Minute)
 
@@ -399,8 +400,14 @@ func TestGrantRevoke(t *testing.T) {
 		t.Error("the revoked grant's tokens work")
 	}
 
-	if !r.active(two.access) || !r.refreshWorks(two.refresh) {
+	// Checked in this order: the refresh replaces the access token.
+	if !r.active(two.access) {
 		t.Error("another grant of the user stopped working")
+	}
+
+	other := r.postForm(oauth.PathToken, withParams(refreshForm(two.refresh), setParam("client_id", otherClientURL)))
+	if other.Code != http.StatusOK {
+		t.Errorf("the refresh token of another grant of the user = %d, want it to work", other.Code)
 	}
 }
 

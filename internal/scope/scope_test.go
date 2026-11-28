@@ -736,3 +736,50 @@ func TestSubsetImpliesExpansionSubset(t *testing.T) {
 }
 
 func sortScopes(s []scope.Scope) { slices.Sort(s) }
+
+// TestAListIsASetInEveryWayItIsUsed holds that the order of a list is never
+// significant to what it grants or what may be issued from it: Expand, SubsetOf
+// and the intersection of two lists are the same for every ordering of the same
+// names. It is why the order a stored list happens to be written in (the
+// first-party agent's list, set by a statement that does not promise one, see
+// store.grantScopesExpr) carries no authority.
+func TestAListIsASetInEveryWayItIsUsed(t *testing.T) {
+	t.Parallel()
+
+	orders := []scope.List{
+		{"sandbox:create", "org:read", "agent:read"},
+		{"agent:read", "org:read", "sandbox:create"},
+		{"org:read", "agent:read", "sandbox:create"},
+		{"org:read", scope.DefaultAgent, "agent:read", "sandbox:create"},
+		{scope.DefaultAgent, "sandbox:create", "agent:read", "org:read"},
+	}
+
+	for i, a := range orders {
+		for j, b := range orders {
+			same := slices.Equal(sortedCopy(a), sortedCopy(b))
+
+			if same && !equalSets(a.Expand(), b.Expand()) {
+				t.Errorf("orders %d and %d hold the same names and expand differently", i, j)
+			}
+
+			if same && (!a.SubsetOf(b) || !b.SubsetOf(a)) {
+				t.Errorf("orders %d and %d hold the same names and are not subsets of each other", i, j)
+			}
+
+			if !equalSets(a.Expand().Intersect(b.Expand()), b.Expand().Intersect(a.Expand())) {
+				t.Errorf("the intersection of %d and %d depends on the order of the operands", i, j)
+			}
+		}
+	}
+}
+
+// sortedCopy is the names of a list in sorted order.
+func sortedCopy(l scope.List) []string {
+	names := slices.Clone([]string(l))
+	slices.Sort(names)
+
+	return names
+}
+
+// equalSets reports whether two sets hold the same scopes.
+func equalSets(a, b scope.Set) bool { return slices.Equal(a.Sorted(), b.Sorted()) }

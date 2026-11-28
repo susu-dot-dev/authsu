@@ -154,6 +154,10 @@ func readOrgStanding(r *row) orgStanding {
 // about a user's own organization (members.go) puts that column between the
 // halves (callerSeesTargetOrg and the others there).
 const (
+	// platformOverride holds when the caller is the platform administrator the
+	// role ?3 names, and never for the empty role.
+	platformOverride = `(?3 <> '' AND actor.role = ?3)`
+
 	// orgSubjectFrom opens both conditions, and the expression naming the
 	// organization they are about follows it: a one-row table, so that the
 	// condition after it can name the organization as subject.org_id.
@@ -164,14 +168,14 @@ const (
 	// administrator. A sandbox's administrator does not belong to it, and sees
 	// it as its administrator.
 	callerSeesOrgTo = ` AS org_id) subject, users actor WHERE actor.id = ?2 AND actor.revoked_at IS NULL
-    AND (actor.role = ?3 OR actor.org_id = subject.org_id
+    AND (` + platformOverride + ` OR actor.org_id = subject.org_id
          OR EXISTS (SELECT 1 FROM org_admins oa WHERE oa.org_id = subject.org_id AND oa.user_id = actor.id)))`
 
 	// callerAdministersOrgTo closes the condition that the caller administers
 	// the organization: has an org_admins row for it, or is a platform
 	// administrator. Membership alone is not enough.
 	callerAdministersOrgTo = ` AS org_id) subject, users actor WHERE actor.id = ?2 AND actor.revoked_at IS NULL
-    AND (actor.role = ?3
+    AND (` + platformOverride + `
          OR EXISTS (SELECT 1 FROM org_admins oa WHERE oa.org_id = subject.org_id AND oa.user_id = actor.id)))`
 
 	// callerSeesOrg holds when the caller may read organization ?1, and
@@ -389,7 +393,8 @@ FROM orgs o
 WHERE o.id IN (
     SELECT id FROM (SELECT g.id AS id FROM orgs g
                     WHERE g.id < ?2
-                      AND EXISTS (SELECT 1 FROM users a WHERE a.id = ?1 AND a.revoked_at IS NULL AND a.role = ?4)
+                      AND EXISTS (SELECT 1 FROM users a
+                                  WHERE a.id = ?1 AND a.revoked_at IS NULL AND ?4 <> '' AND a.role = ?4)
                     ORDER BY g.id DESC LIMIT ?3)
     UNION
     SELECT id FROM (SELECT oa.org_id AS id FROM org_admins oa

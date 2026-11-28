@@ -257,8 +257,8 @@ func TestQueriesAreFound(t *testing.T) {
 		"keyListQuery", "keyGetQuery", "insertUserKeyQuery", "keyRenameQuery", "keyRevokeQuery",
 		"insertGrantQuery", "grantListQuery", "grantGetQuery", "grantRevokeQuery", "grantRevokeAccessQuery",
 		"rotateCodeQuery", "rotateRefreshQuery", "replaceAccessQuery", "insertAccessSecretQuery",
-		"insertAccessRowQuery", "introspectQuery", "revokeRefreshTokenQuery", "revokeRefreshAccessQuery",
-		"revokeAccessTokenQuery",
+		"insertAccessRowQuery", "introspectQuery", "resolveGrantQuery", "revokeRefreshTokenQuery", "revokeRefreshAccessQuery",
+		"revokeAccessTokenQuery", "supersedeGrantQuery", "supersedeAccessQuery",
 		"insertSandboxQuery", "insertCreatorAdminQuery", "callerStandingQuery", "getOrgQuery",
 		"listOrgsQuery", "renameOrgQuery", "orgStandingQuery", "deleteSandboxQuery",
 		"listMembersQuery", "memberStandingQuery", "promoteMemberQuery", "demoteMemberQuery",
@@ -870,6 +870,9 @@ func operations(t *testing.T) map[string]func(*store.Store) {
 		},
 		"IntrospectAccessToken": func(s *store.Store) {
 			_, _, _ = s.IntrospectAccessToken(ctx, mustAccessToken(t, 3), mustResourceID(t), farthest)
+		},
+		"ResolveGrant": func(s *store.Store) {
+			_, _, _ = s.ResolveGrant(ctx, mustAccessToken(t, 3), mustLoginResourceID(t), farthest)
 		},
 		"RevokeRefreshToken": func(s *store.Store) {
 			_ = s.RevokeRefreshToken(ctx, mustRefreshToken(t, 3), oauthWorstClientID(t), farthest)

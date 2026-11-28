@@ -26,7 +26,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Budget history: 3.0 MB, 3.3 MB, 3.4 MB (agents), now 4.2 MB for the OAuth
+# Budget history: 3.0 MB, 3.3 MB, 3.4 MB (agents), 4.2 MB for the OAuth
 # authorization server. It grew from 3.06 MB to 3.95 MB: the RS256 signer and the
 # PKCS#8 key parse link crypto/rsa and crypto/x509, whose PKCS#8 parser pulls in
 # crypto/internal/fips140/mldsa (about 270 KB, linked only because x509 can parse
@@ -36,7 +36,12 @@ cd "$(dirname "$0")/.."
 # 4.22 MB, 32 KB): a hand-written JSON-RPC handler over encoding/json, which is
 # already linked. A library for it would have added about 1.8 MB, which is why
 # there is none.
-MAX_WASM_BYTES="${MAX_WASM_BYTES:-4300000}"
+#
+# Then 4.5 MB for OAuth grants at authsu's own API: the grant credential, its
+# resolver and the sandbox and agent routes that accept it add about 24 KB of
+# feature code and link no new package. The budget stays about 250 KB above the
+# build.
+MAX_WASM_BYTES="${MAX_WASM_BYTES:-4500000}"
 TOP="${TOP:-15}"
 
 # Heavy packages that are NOT in the baseline build, so seeing one linked means

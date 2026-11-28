@@ -196,7 +196,7 @@ func (d Deps) settle(
 		})})
 	}
 
-	return d.grant(call, pending, chosen, now).
+	return d.grant(call, cfg, pending, chosen, now).
 		Map(func(code string) ConsentResponse {
 			return ConsentResponse{Redirect: responseURL(cfg, pending.request, url.Values{paramCode: {code}})}
 		})
@@ -218,13 +218,15 @@ func responseURL(cfg config.Config, request pendingRequest, params url.Values) s
 // grant that holds it, and returns the code, which is shown once and never
 // stored: only its hash is. The ids come from NewID: the grant's is the code's
 // secret id and stays the grant's for its life, and a new agent's is a second.
-func (d Deps) grant(call *auth.Call, pending opened, chosen answer, now time.Time) result.Result[string] {
+func (d Deps) grant(
+	call *auth.Call, cfg config.Config, pending opened, chosen answer, now time.Time,
+) result.Result[string] {
 	return result.Of(auth.IssueGrantCode(d.Entropy, d.NewID, now)).
 		MapErr(func(cause error) error {
 			return apierr.New(apierr.Internal, CodeIssueFailed, "could not issue the authorization code").WithCause(cause)
 		}).
 		Then(func(code auth.Issued) (string, error) {
-			err := d.Store.CreateGrant(call.Request.Context, d.newGrant(call, pending, chosen, code, now))
+			err := d.Store.CreateGrant(call.Request.Context, d.newGrant(call, cfg, pending, chosen, code, now))
 
 			return code.Token, refused(err)
 		})
@@ -240,7 +242,9 @@ func (d Deps) grant(call *auth.Call, pending opened, chosen answer, now time.Tim
 // the sealed request, which stays valid for up to PendingLifetime after it was
 // sealed, which is before now: a row removed sooner would let a replay of the
 // request create a second grant and agent.
-func (d Deps) newGrant(call *auth.Call, pending opened, chosen answer, code auth.Issued, now time.Time) store.NewGrant {
+func (d Deps) newGrant(
+	call *auth.Call, cfg config.Config, pending opened, chosen answer, code auth.Issued, now time.Time,
+) store.NewGrant {
 	request := pending.request
 
 	grant := store.NewGrant{
@@ -249,6 +253,7 @@ func (d Deps) newGrant(call *auth.Call, pending opened, chosen answer, code auth
 		Resource: request.resource, Scope: request.scope, CodeChallenge: request.challenge, Nonce: request.nonce,
 		SessionID: call.Principal.SecretID, GrantedFrom: hashOf(pending.sealed),
 		CodeHash: code.Hash, RetainUntil: now.Add(PendingLifetime), CreatedAt: now,
+		Allowlist: d.allowlist(cfg),
 	}
 
 	switch {
@@ -267,6 +272,21 @@ func (d Deps) newGrant(call *auth.Call, pending opened, chosen answer, code auth
 	}
 
 	return grant
+}
+
+// allowlist is the authsu scope names of the deployment's first-party login
+// resource now: the most the agent that authsu writes for a grant can hold, and
+// what its list is pruned to (store.NewGrant.Allowlist). A table without a login
+// resource has none. It is the login resource's, not the grant's own resource's,
+// so a grant of a third-party resource still carries it, and has no name in it
+// that its scope could hold: a third-party scope is never an authsu name.
+func (d Deps) allowlist(cfg config.Config) []string {
+	login, found := d.table(cfg).Login()
+	if !found {
+		return []string{}
+	}
+
+	return login.AuthsuScopes()
 }
 
 // refused maps the refusals of store.CreateGrant to the client's answers; any

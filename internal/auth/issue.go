@@ -23,6 +23,13 @@ const (
 	// KindAPIKey is a key presented as a bearer token, by a user's software or
 	// by an agent.
 	KindAPIKey = store.KindAPIKey
+	// KindGrant is an OAuth access token presented as a bearer token at
+	// authsu's own API. It is the kind the store records for the secret
+	// (store.KindOAuthAccess): a grant is held by an agent, and its access
+	// token is the credential. Like an API key it is limited by its own scope
+	// list and narrowed by its agent's, but no route accepts it unless the
+	// route's Access opts in (Access.FromGrants).
+	KindGrant = store.KindOAuthAccess
 )
 
 // Lifetimes of the credentials auth issues. They are policy, set here and not

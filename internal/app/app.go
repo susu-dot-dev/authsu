@@ -103,7 +103,9 @@ func NewHandler(platform Platform) http.Handler {
 		}),
 	)
 
-	deps := auth.Deps{Credentials: db, Now: time.Now, Getenv: platform.Getenv, Log: platform.Log}
+	deps := auth.Deps{
+		Credentials: db, Resources: resource.Select, Now: time.Now, Getenv: platform.Getenv, Log: platform.Log,
+	}
 
 	// The MCP endpoint runs each tool as a request to the routes above, through
 	// a table that does not hold the endpoint itself, so a tool can reach every

@@ -33,6 +33,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
 	"github.com/susu-dot-dev/authsu/internal/registration"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/store"
 )
@@ -226,6 +227,14 @@ func (c noCredentials) ResolveAPIKey(
 	return store.ActiveAPIKey{}, false, nil
 }
 
+func (c noCredentials) ResolveGrant(
+	context.Context, input.AccessToken, input.ResourceID, time.Time,
+) (store.ActiveGrant, bool, error) {
+	c.t.Error("an open route resolved an access token")
+
+	return store.ActiveGrant{}, false, nil
+}
+
 // rig is one deployment under test: the real boundary and routes over a fake
 // store, with a clock, entropy and ids the test controls.
 type rig struct {
@@ -300,6 +309,7 @@ func (r *rig) deps() registration.Deps {
 func (r *rig) handler() http.Handler {
 	return auth.Handler(registration.Routes(r.deps()), auth.Deps{
 		Credentials: noCredentials{t: r.t},
+		Resources:   resource.Select,
 		Now:         func() time.Time { return r.now },
 		Getenv:      r.getenv,
 		Log:         func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },

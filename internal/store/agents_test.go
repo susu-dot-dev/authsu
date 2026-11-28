@@ -470,7 +470,7 @@ func checkAgentPage(t *testing.T, page store.AgentPage, fake *fakeExec, test age
 		ids[i] = agent.ID
 	}
 
-	checkPage(t, pageResult{ids: ids, next: page.Next, args: fake.calls[0][0].Args, argc: 7, idAt: agentIDAt},
+	checkPage(t, pageResult{ids: ids, next: page.Next, args: fake.calls[0][0].Args, argc: 8, idAt: agentIDAt},
 		pageWant{size: test.size, ids: test.agents, next: test.next})
 }
 
@@ -547,10 +547,12 @@ type listStatementCase struct {
 	before string
 	rows   int64
 
-	// label, confined, confinedTo and sandbox are the arguments the filters
-	// and the reach become: NULL (nil) for none.
+	// label, mode, confinedTo and sandbox are the arguments the filters and the
+	// reach become: NULL (nil) for none. mode is the reach's: 0 for every agent of
+	// the owner, 1 for one sandbox's (or the ordinary ones'), 2 for the agents of
+	// the sandboxes the owner administers.
 	label      any
-	confined   int64
+	mode       int64
 	confinedTo any
 	sandbox    any
 }
@@ -561,35 +563,41 @@ func listStatementCases(t *testing.T) []listStatementCase {
 
 	return []listStatementCase{
 		{name: "first page", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t), limit: mustAgentLimit(t),
-			filter: mustAgentFilter(t), before: "", rows: 26, label: nil, confined: 0, confinedTo: nil, sandbox: nil},
+			filter: mustAgentFilter(t), before: "", rows: 26, label: nil, mode: 0, confinedTo: nil, sandbox: nil},
 		{name: "after a cursor", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t, agentCursorID),
 			limit: mustAgentLimit(t, "7"), filter: mustAgentFilter(t), before: agentCursorID, rows: 8,
-			label: nil, confined: 0, confinedTo: nil, sandbox: nil},
+			label: nil, mode: 0, confinedTo: nil, sandbox: nil},
 		{name: "filtered by a label", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t),
 			limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t, "prod"), before: "", rows: 4,
-			label: "prod", confined: 0, confinedTo: nil, sandbox: nil},
+			label: "prod", mode: 0, confinedTo: nil, sandbox: nil},
 		{name: "filtered, after a cursor", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t, agentCursorID),
 			limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t, "a.b_c-1"), before: agentCursorID, rows: 4,
-			label: "a.b_c-1", confined: 0, confinedTo: nil, sandbox: nil},
+			label: "a.b_c-1", mode: 0, confinedTo: nil, sandbox: nil},
 		{name: "filtered by a sandbox", reach: store.OwnAgents(agentOwner), cursor: mustAgentCursor(t),
 			limit: mustAgentLimit(t, "3"), filter: mustAgentSandboxFilter(t, agentSandbox), before: "", rows: 4,
-			label: nil, confined: 0, confinedTo: nil, sandbox: agentSandbox},
+			label: nil, mode: 0, confinedTo: nil, sandbox: agentSandbox},
 		{name: "an agent of a sandbox is confined to it", reach: store.SandboxAgents(agentOwner, agentSandbox),
 			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t), before: "", rows: 4,
-			label: nil, confined: 1, confinedTo: agentSandbox, sandbox: nil},
+			label: nil, mode: 1, confinedTo: agentSandbox, sandbox: nil},
 		{name: "an ordinary agent is confined to none", reach: store.SandboxAgents(agentOwner, ""),
 			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t), before: "", rows: 4,
-			label: nil, confined: 1, confinedTo: nil, sandbox: nil},
+			label: nil, mode: 1, confinedTo: nil, sandbox: nil},
 		{name: "a confined agent filtering by another sandbox", reach: store.SandboxAgents(agentOwner, agentSandbox),
 			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentSandboxFilter(t, agentOtherSandbox),
-			before: "", rows: 4, label: nil, confined: 1, confinedTo: agentSandbox, sandbox: agentOtherSandbox},
+			before: "", rows: 4, label: nil, mode: 1, confinedTo: agentSandbox, sandbox: agentOtherSandbox},
 		{name: "everything at once", reach: store.SandboxAgents(agentOwner, agentSandbox),
 			cursor: mustAgentCursor(t, agentCursorID), limit: mustAgentLimit(t, "2"),
 			filter: store.AgentFilter{
 				Label:   mustAgentFilter(t, "prod").Label,
 				Sandbox: mustAgentSandboxFilter(t, agentSandbox).Sandbox,
 			},
-			before: agentCursorID, rows: 3, label: "prod", confined: 1, confinedTo: agentSandbox, sandbox: agentSandbox},
+			before: agentCursorID, rows: 3, label: "prod", mode: 1, confinedTo: agentSandbox, sandbox: agentSandbox},
+		{name: "a grant reaches the sandboxes the owner administers", reach: store.AdministeredSandboxAgents(agentOwner),
+			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentFilter(t), before: "", rows: 4,
+			label: nil, mode: 2, confinedTo: nil, sandbox: nil},
+		{name: "a grant filtering by a sandbox", reach: store.AdministeredSandboxAgents(agentOwner),
+			cursor: mustAgentCursor(t), limit: mustAgentLimit(t, "3"), filter: mustAgentSandboxFilter(t, agentSandbox),
+			before: "", rows: 4, label: nil, mode: 2, confinedTo: nil, sandbox: agentSandbox},
 	}
 }
 
@@ -628,15 +636,16 @@ func TestListAgentsStatement(t *testing.T) {
 					// per agent however many labels it has, and NULL is no filter.
 					"AND (?4 IS NULL OR EXISTS (SELECT 1 FROM agent_labels f WHERE f.agent_id = agents.id AND f.label = ?4))",
 					// The reach: a confined caller matches its own sandbox by IS,
-					// so NULL is the ordinary agents and nothing else.
-					"AND (?5 = 0 OR sandbox_id IS ?6)",
+					// so NULL is the ordinary agents and nothing else; a grant only
+					// agents of a sandbox the owner administers.
+					"AND " + reachSQL("?5", "?6", "?8"),
 					// The sandbox filter only narrows.
 					"AND (?7 IS NULL OR sandbox_id = ?7)",
 					"ORDER BY id DESC",
 					"LIMIT ?3",
 				},
 				args: []any{
-					agentOwner, before, test.rows, test.label, test.confined, test.confinedTo, test.sandbox,
+					agentOwner, before, test.rows, test.label, test.mode, test.confinedTo, test.sandbox, store.OrgKindSandbox,
 				},
 			})
 		})
@@ -663,12 +672,13 @@ func TestGetAgentStatement(t *testing.T) {
 	tests := []struct {
 		name       string
 		reach      store.AgentReach
-		confined   int64
+		mode       int64
 		confinedTo any
 	}{
 		{"the user", store.OwnAgents(agentOwner), 0, nil},
 		{"an agent of a sandbox", store.SandboxAgents(agentOwner, agentSandbox), 1, agentSandbox},
 		{"an ordinary agent", store.SandboxAgents(agentOwner, ""), 1, nil},
+		{"a grant", store.AdministeredSandboxAgents(agentOwner), 2, nil},
 	}
 
 	for _, test := range tests {
@@ -684,9 +694,9 @@ func TestGetAgentStatement(t *testing.T) {
 				fragments: []string{
 					"SELECT id, name, scopes, revoked_at, created_at,",
 					"sandbox_id, first_party FROM agents",
-					"WHERE id = ?1 AND user_id = ?2 AND (?3 = 0 OR sandbox_id IS ?4)",
+					"WHERE id = ?1 AND user_id = ?2 AND " + reachSQL("?3", "?4", "?5"),
 				},
-				args: []any{agentTarget, agentOwner, test.confined, test.confinedTo},
+				args: []any{agentTarget, agentOwner, test.mode, test.confinedTo, store.OrgKindSandbox},
 			})
 		})
 	}
@@ -703,11 +713,13 @@ func TestAgentReach(t *testing.T) {
 		owner    string
 		confined bool
 		sandbox  string
+		granted  bool
 	}{
-		{"the zero reach", store.AgentReach{}, "", false, ""},
-		{"the user", store.OwnAgents(agentOwner), agentOwner, false, ""},
-		{"an agent of a sandbox", store.SandboxAgents(agentOwner, agentSandbox), agentOwner, true, agentSandbox},
-		{"an ordinary agent", store.SandboxAgents(agentOwner, ""), agentOwner, true, ""},
+		{"the zero reach", store.AgentReach{}, "", false, "", false},
+		{"the user", store.OwnAgents(agentOwner), agentOwner, false, "", false},
+		{"an agent of a sandbox", store.SandboxAgents(agentOwner, agentSandbox), agentOwner, true, agentSandbox, false},
+		{"an ordinary agent", store.SandboxAgents(agentOwner, ""), agentOwner, true, "", false},
+		{"a grant", store.AdministeredSandboxAgents(agentOwner), agentOwner, false, "", true},
 	}
 
 	for _, test := range tests {
@@ -715,9 +727,9 @@ func TestAgentReach(t *testing.T) {
 			t.Parallel()
 
 			if test.reach.Owner() != test.owner || test.reach.Confined() != test.confined ||
-				test.reach.Sandbox() != test.sandbox {
-				t.Errorf("reach = %q, %v, %q; want %q, %v, %q", test.reach.Owner(), test.reach.Confined(),
-					test.reach.Sandbox(), test.owner, test.confined, test.sandbox)
+				test.reach.Sandbox() != test.sandbox || test.reach.Administered() != test.granted {
+				t.Errorf("reach = %q, %v, %q, %v; want %q, %v, %q, %v", test.reach.Owner(), test.reach.Confined(),
+					test.reach.Sandbox(), test.reach.Administered(), test.owner, test.confined, test.sandbox, test.granted)
 			}
 		})
 	}
@@ -1828,4 +1840,56 @@ func TestAgentsFirstPageSortsAboveEveryID(t *testing.T) {
 			t.Errorf("id character %q does not sort below %q", c, store.AgentsFirstPage)
 		}
 	}
+}
+
+// TestAgentReachIsOneRule holds that the list and the read are given the same
+// reach condition: the text each carries, from "(?N = 0" to the end of the
+// administered branch, is the same but for the numbers of its placeholders, so
+// the two statements cannot disagree about what a reach allows. The grant's
+// branch (mode 2) requires the owner to administer the agent's sandbox, in the
+// statement.
+func TestAgentReachIsOneRule(t *testing.T) {
+	t.Parallel()
+
+	queries := packageQueries(t)
+
+	numbered := regexp.MustCompile(`\?\d`)
+	reach := regexp.MustCompile(`\(\?\d = 0 OR .*?ra\.user_id = agents\.user_id\)\)\)`)
+
+	conditions := map[string]string{}
+
+	for _, name := range []string{"agentListQuery", "agentGetQuery"} {
+		found := reach.FindAllString(squash(queries[name]), -1)
+		if len(found) != 1 {
+			t.Fatalf("%s holds %d reach conditions, want one:\n%s", name, len(found), squash(queries[name]))
+		}
+
+		conditions[name] = numbered.ReplaceAllString(found[0], "?")
+	}
+
+	if conditions["agentListQuery"] != conditions["agentGetQuery"] {
+		t.Errorf("the reach differs:\n%s\n%s", conditions["agentListQuery"], conditions["agentGetQuery"])
+	}
+
+	for name, text := range conditions {
+		for _, want := range []string{
+			"? = 0 OR (? = 1 AND agents.sandbox_id IS ?)",
+			"(? = 2 AND EXISTS (SELECT 1 FROM orgs rg JOIN org_admins ra ON ra.org_id = rg.id " +
+				"WHERE rg.id = agents.sandbox_id AND rg.kind = ? AND ra.user_id = agents.user_id))",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s: the reach lacks %q:\n%s", name, want, text)
+			}
+		}
+	}
+}
+
+// reachSQL is the reach condition of a statement that binds the mode, the confining
+// sandbox and the sandbox kind at the placeholders given, written out here on
+// purpose: changing what a reach allows is a change to security behaviour, and must
+// change these lines with it.
+func reachSQL(mode, sandbox, kind string) string {
+	return "(" + mode + " = 0 OR (" + mode + " = 1 AND agents.sandbox_id IS " + sandbox + ") " +
+		"OR (" + mode + " = 2 AND EXISTS (SELECT 1 FROM orgs rg JOIN org_admins ra ON ra.org_id = rg.id " +
+		"WHERE rg.id = agents.sandbox_id AND rg.kind = " + kind + " AND ra.user_id = agents.user_id)))"
 }

@@ -52,13 +52,18 @@ Unknown names are refused wherever a list is written, because a typo should fail
 | Layer | Held as | Can it change while the credential is valid? |
 |---|---|---|
 | User | Their role. It gates admin scopes; it is not mapped to bundles. | Yes, so it is read live |
-| Agent | Its scope list, written when it is created | No, for now |
+| Agent | Its scope list, written when it is created | Only when authsu issues a grant to an agent it created for that grant (the first-party login's, or a new one made at consent): the union of what it holds and the grant's authsu scopes, pruned to the login resource's allowlist. Never for an agent the user attached |
 | API key | Its scope list, written when it is issued | No |
+| OAuth grant (the login resource's) | The authsu names in its access token's scope, within the login resource's allowlist now | The token's scope never widens; the allowlist is read live |
 | Session | Always `default:session` | No |
+
+**The agent's list is its primary permission set, and every credential it holds only narrows it.** A key and a grant are alike in this: each stores a claim of what it may do, and the agent's list, read now, is the ceiling.
 
 **A credential's scopes are fixed when it is issued**, and nothing changes them afterwards. Whatever can change, the role, the account's standing, the agent's standing, is read on every request, in the same read that resolves the credential ([secrets_design.md](secrets_design.md)). A credential carries nothing: the scopes are stored with it and read with it.
 
-Every list is written out in full when it is created. Nothing ever means "the default" by being absent, and an empty list is a valid, deliberate value: a credential that can use only the routes that need no scope.
+**An agent's list changes in one way: authsu writes it when it issues a grant to an agent it created for that grant**, in the same batch as the grant ([oauth_design.md](oauth_design.md#grants-belong-to-agents)). Only the first-party login's agent and a new agent made at a consent are ever written, and an agent the user chose to attach is never changed. The new list is the union of what the agent holds and the grant's authsu scopes, kept to the login resource's allowlist and written in its order. A union never silently narrows an agent whose keys depend on its list, and pruning means a scope removed from the allowlist is gone from the agent at its next sign-in. The agent's list is therefore still the primary permission set: a grant only ever asks for names the user's own sign-in already approved, and what a token may do is still its list narrowed by the agent's.
+
+Every list is written out in full when it is written. Nothing ever means "the default" by being absent, and an empty list is a valid, deliberate value: a credential that can use only the routes that need no scope.
 
 ## Effective permissions
 
@@ -75,7 +80,9 @@ effective = E(credential scopes)
 
 A credential may list scopes its holder does not have, an admin scope on a member's key for instance. That is harmless, because the role gate refuses them, but they are latent: if the holder is later promoted, the credential gains them. That is the price of creating credentials with plain defaults, and it is why defaults are bundles rather than snapshots.
 
-A request presents exactly one credential, read from one place: a session from its cookie, an API key from `Authorization: Bearer`. A request carrying both is ambiguous and is refused without either being resolved. Each place accepts exactly one kind of credential, so a session cannot be passed off as an API key or the reverse.
+A request presents exactly one credential, read from one place: a session from its cookie, an API key or an OAuth grant's access token from `Authorization: Bearer`. A request carrying both is ambiguous and is refused without either being resolved. The cookie accepts only a session, and the header only the two bearer kinds, told apart by the token's own tag (`susu_key_`, `susu_at_`), so a session cannot be passed off as a key, a refresh token is not a credential at all, and a key is never resolved as a grant or the reverse.
+
+An OAuth grant is an API key in everything the calculation above says, with one difference in kind: it is a credential held by an outside service, and the routes were written for sessions and keys. So a route accepts it only by saying so (`FromGrants()` in its Access), as a sandboxed agent is refused unless a route says `InSandbox()`; the check is first, has its own code, and holds on open routes and on routes that refuse agents. Only a grant for the deployment's first-party login resource counts, and what it holds is limited to that resource's concrete, non-admin authsu scope names ([oauth_design.md](oauth_design.md#oauth-scopes-and-authsu-scopes)).
 
 ## Checks outside scopes
 
@@ -85,7 +92,9 @@ Some requirements are about *what kind of credential* is in use, not what it is 
 - **The administrator role**, for any route that needs an admin scope, checked together with the scope.
 - **An agent is acting**: every credential an agent holds names the agent, so a route can refuse agents whatever scopes they hold. Renaming and revoking an agent do, because agents are flat under their user. So do the actions that change who administers an organization or who is revoked.
 
-A route declares all of this as data, so reviewing permissions is reading a table, and leaving it out fails when the routes are built. The checks run in a fixed order, all after the credential is known to be valid: the role for an admin scope, then the scope, then session-only, then agents.
+A route that refuses agents refuses an OAuth grant too, since a grant has an agent, unless it also says `GrantsAsUser()`, which relaxes only that for a grant (an agent's API key is still refused) and only on a route that opts in with `FromGrants()` ([oauth_design.md](oauth_design.md#which-routes-take-a-grant-and-why)). A new route that refuses agents is therefore still closed to grants.
+
+A route declares all of this as data, so reviewing permissions is reading a table, and leaving it out fails when the routes are built. The checks run in a fixed order, all after the credential is known to be valid: an OAuth grant on a route that does not accept one, a sandboxed agent on a route that is not for sandboxes, the role for an admin scope, then the scope, then session-only, then agents.
 
 ## Issuing keys
 
@@ -118,7 +127,15 @@ effective(new) = E(new key) ∩ E(new agent)
                = effective(creator)
 ```
 
-An agent cannot create an agent more capable than the credential it used, and since agents cannot obtain keys any other way, there is no second path to check.
+An agent cannot create an agent more capable than the credential it used, and since agents cannot obtain keys any other way, there is no second path to check, apart from one that is not an agent's key: an OAuth grant, which creates agents in a sandbox.
+
+**An OAuth grant** (the first-party app's sign-in) does not copy the creating agent, because the agent it makes is in a sandbox and not beside the creator, so it chooses the lists and the bound is applied to them. Each of the new agent's list and its key's list must be entries, as written, of both the access token's list and the acting agent's list, which is the same containment as above taken against each layer:
+
+```
+effective(new) ⊆ E(token) ∩ E(acting agent) = effective(the grant)
+```
+
+An absent list defaults to those common entries in the token's order. A request that asks for an entry in only one of the lists is refused whole.
 
 The new agent's scopes are copied from the creating agent *inside the write*, not taken from the request, and the write requires that agent to belong to the owner and still be active. An agent revoked between being resolved and creating an agent therefore creates nothing. The new agent is an ordinary agent of the same user, and nothing records which agent created it.
 

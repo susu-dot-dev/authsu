@@ -15,6 +15,7 @@ import (
 	"github.com/susu-dot-dev/authsu/internal/auth"
 	"github.com/susu-dot-dev/authsu/internal/httpapi"
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/resource"
 	"github.com/susu-dot-dev/authsu/internal/secret"
 	"github.com/susu-dot-dev/authsu/internal/session"
 	"github.com/susu-dot-dev/authsu/internal/store"
@@ -159,6 +160,15 @@ func (f *fakeCredentials) ResolveAPIKey(
 	return row.key, true, nil
 }
 
+// ResolveGrant finds no grant, and is recorded like the other reads.
+func (f *fakeCredentials) ResolveGrant(
+	_ context.Context, token input.AccessToken, _ input.ResourceID, now time.Time,
+) (store.ActiveGrant, bool, error) {
+	f.calls = append(f.calls, resolveCall{kind: auth.KindGrant, hash: string(token.Hash()), now: now})
+
+	return store.ActiveGrant{}, false, f.err
+}
+
 // forget removes the active secret with this id, which is what revoking it does.
 func (f *fakeCredentials) forget(id string) {
 	for hash, row := range f.rows {
@@ -251,6 +261,7 @@ func (r *rig) routes() []auth.Route {
 func (r *rig) handler() http.Handler {
 	return auth.Handler(r.routes(), auth.Deps{
 		Credentials: r.creds,
+		Resources:   resource.Select,
 		Now:         func() time.Time { return r.authNow },
 		Getenv:      func(string) string { return "" },
 		Log:         func(_ httpapi.Request, failure *apierr.Error) { r.logged = append(r.logged, failure) },

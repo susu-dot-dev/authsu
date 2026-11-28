@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/susu-dot-dev/authsu/internal/input"
+	"github.com/susu-dot-dev/authsu/internal/scope"
 )
 
 // Error codes of the OAuth grant operations. They are stable: clients and
@@ -32,12 +34,17 @@ const grantsDescription = "grants are temporarily unavailable"
 const grantsFirstPage = "g"
 
 // maxGrantStatements is the most statements CreateGrant runs: the agent, the code's
-// secret and the grant.
-const maxGrantStatements = 3
+// secret, the grant and, for a first-party login, the update of its agent's list.
+const maxGrantStatements = 4
 
-// GrantAgentScopes is the scope list of an agent that consent creates: empty. A
-// grant carries no authsu scopes, so an agent made for one holds none either.
-// The write binds it as an argument, so no caller can give such an agent more.
+// GrantAgentScopes is the scope list an agent that authsu creates for a grant is
+// inserted with when the grant has no authsu names to add: empty. It is what a
+// third-party client's grant gets, because the names of such a resource are never
+// authsu's (the agent's list stays empty, and the grant can do nothing at authsu's
+// API). A grant that has authsu names (a first-party login's) is given them by the
+// write: a new consent agent is inserted with them, and a first-party login's
+// agent, which may already exist, is brought to the union by
+// grantFirstPartyScopesQuery. An agent the user chose to attach is never written.
 const GrantAgentScopes = "[]"
 
 // The refusals of CreateGrant. Each is the consent write's own reason for
@@ -70,8 +77,10 @@ var (
 	ErrSessionInactive = errors.New("the approving session is no longer active")
 )
 
-// FirstPartyAgentScopes is the scope list of the agent a first-party login
-// creates: empty, as for any agent consent creates (GrantAgentScopes).
+// FirstPartyAgentScopes is the scope list the insert gives the agent of a
+// first-party login when it creates it: empty, as for any agent authsu creates
+// for a grant (GrantAgentScopes). The update that follows in the same batch
+// (grantFirstPartyScopesQuery) sets the list the grant's scopes make.
 const FirstPartyAgentScopes = GrantAgentScopes
 
 // GrantAgent is an agent that consent creates for a grant.
@@ -96,7 +105,11 @@ type NewGrant struct {
 
 	// AgentID is the agent that holds the grant. With NewAgent nil it is an
 	// existing agent of the owner, which must be active; with NewAgent set it is
-	// the id of the agent to create, a fresh UUIDv7 (GrantAgentScopes, none).
+	// the id of the agent to create, a fresh UUIDv7, which is inserted with the
+	// grant's authsu names pruned to the allowlist (none for a grant of a
+	// third-party resource, whose names are never authsu's). An existing agent is
+	// never written: its list stays as it was, and the grant, which carries its own
+	// claim, cannot widen it.
 	AgentID  string
 	NewAgent *GrantAgent
 
@@ -106,9 +119,21 @@ type NewGrant struct {
 	// under AgentID with the name FirstPartyName if the owner has none, and
 	// otherwise finds. It is an ordinary agent, flagged first_party, so it is
 	// listed, counted against the limit and revocable. NewAgent must be nil.
+	//
+	// The agent's list is the union of what it holds and the grant's authsu
+	// scopes, kept to the login resource's allowlist (AgentScopes).
 	FirstParty          bool
 	FirstPartyName      input.AgentName
 	FirstPartyMaxActive int
+
+	// Allowlist is the authsu scope names of the first-party login resource now
+	// (resource.Entry.AuthsuScopes), in their order: the most an agent that authsu
+	// writes for a grant can ever be given, and the pruning set of every list the
+	// write sets, so a name removed from it is dropped at the next sign-in. It
+	// bounds the list's size, which therefore fits the agents.scopes CHECK whatever
+	// the agent held (TestGrantAgentScopesFitTheColumn). A grant whose scope holds
+	// none of its names (a third-party resource's) adds nothing.
+	Allowlist []string
 
 	// What the user approved, stored on the grant as it is: the client, the name
 	// its metadata document gave it, the redirect URI, the resource, the scopes
@@ -239,6 +264,73 @@ WHERE u.id = ?5
        OR ` + ownerHasRoomForAgent + `)
 ON CONFLICT DO NOTHING`
 
+// grantScopesExpr is the new scope list of a first-party login's agent, computed
+// in the write from what the row holds. That is what makes two
+// sign-ins racing end in the union and never in whichever wrote last (reading the
+// list in Go and writing it back would be a check and a set):
+//
+//   - it is the union of the names the agent holds and the grant's authsu names
+//     (?1, a JSON array of the requested names that are in the allowlist);
+//   - pruned to the allowlist (?2, a JSON array, the login resource's authsu
+//     names now): a name the allowlist does not hold is dropped, so a scope
+//     removed from it is gone at the next sign-in, and so is anything else the
+//     row held (a bundle, a name the code no longer knows). The result cannot
+//     outgrow the allowlist, so it fits the column's size CHECK whatever the
+//     agent held;
+//   - each name once, because it is built by walking the allowlist and keeping a
+//     name either side holds, and in the allowlist's order: the aggregate orders
+//     its own input (json_group_array(x ORDER BY y)), which SQLite promises and
+//     which needs 3.44 (November 2023). Cloudflare publishes no D1 version and
+//     sqlite_version() is not allowed there, but the syntax is accepted and
+//     honoured on D1 (checked with `wrangler d1 execute --remote` against the
+//     production database, where json_group_array(x ORDER BY y DESC) returns the
+//     reverse order) and by the local D1 the tests run on. If a D1 or tooling
+//     change ever dropped it, the statement would be a syntax error that fails
+//     every first-party sign-in, and the e2e run is what would catch it. Nothing
+//     depends on the order for correctness: scope.List is a set (Expand, Has,
+//     SubsetOf and every comparison ignore order).
+//
+// A union never narrows what the agent holds within the allowlist: the agent's
+// other credentials (its keys) are bounded by this list, so a sign-in that asks
+// for less must not cut them. A stored list that is not a JSON array reads as
+// empty (the guards on json_valid and json_type, as scope.Read reads it), so a
+// damaged row is repaired by the next sign-in and cannot make the statement fail,
+// which would fail the whole batch. The result is "[]" and never empty text.
+const grantScopesExpr = `(SELECT coalesce(json_group_array(al.value ORDER BY al.key), '[]')
+              FROM json_each(?2) al
+              WHERE al.value IN (SELECT value FROM json_each(?1))
+                 OR al.value IN (SELECT value FROM json_each(CASE WHEN json_valid(agents.scopes)
+                        THEN CASE WHEN json_type(agents.scopes) = 'array' THEN agents.scopes ELSE '[]' END
+                        ELSE '[]' END)))`
+
+// grantFirstPartyScopesQuery sets the scope list of a first-party login's agent,
+// in the batch of its consent, after the insert that created or found it and
+// before the grant row, to grantScopesExpr. The agent's list is the primary
+// permission set of everything it holds (docs/permissions_design.md), so the
+// statement is built to be unable to touch any agent but the one authsu keeps for
+// the client. (A new agent of a third-party consent needs no update: it is
+// inserted with the grant's names, and an INSERT can write no row but its own.)
+//
+//   - the agent is found as the grant row finds it: the owner's (?3), not
+//     revoked, in no sandbox, flagged first_party and kept for this client
+//     (first_party_client = ?4). An agent the user chose or created has
+//     first_party 0 and first_party_client NULL, and so can never match, whatever
+//     the caller passes; a revoked one is not it either, the insert created a
+//     fresh agent in its place;
+//   - no id is an argument and nothing else of the row is written.
+//
+// A statement that matches no row writes nothing and is not an error: when the
+// insert refused (the owner is revoked or at the limit) the grant row fails the
+// batch, which takes this with it.
+//
+// Arguments, by number: ?1 the grant's authsu names, ?2 the allowlist (both of
+// grantScopesExpr), ?3 the owner, ?4 the client_id.
+const grantFirstPartyScopesQuery = `
+UPDATE agents
+SET scopes = ` + grantScopesExpr + `
+WHERE user_id = ?3 AND revoked_at IS NULL AND sandbox_id IS NULL
+  AND first_party = 1 AND first_party_client = ?4`
+
 // CreateGrant writes a grant for an approved request as one batch: the agent
 // when the user chose to create one (for a first-party login, the agent authsu
 // keeps for the client, created if the owner has none), the secret of the authorization code, and
@@ -274,17 +366,38 @@ func (s *Store) CreateGrant(ctx context.Context, grant NewGrant) error {
 
 	statements := make([]Statement, 0, maxGrantStatements)
 
+	// The names the grant asks for that are authsu's own: the requested names that
+	// the allowlist holds, never the others (openid, profile, a third-party
+	// resource's), each once, in the allowlist's order. The allowlist prunes in the
+	// write too. Both are bound as JSON arrays and are never "null".
+	names := scope.List(authsuNames(grant)).JSON()
+	allowlist := scope.List(grant.Allowlist).JSON()
+
+	// The agent, then (for a first-party login) the write of its list, then the
+	// secret and the grant. The list is written after the insert, which creates
+	// the row it finds, and before the grant row, which fails the batch when the
+	// grant cannot stand, so that a refused grant (a replay, a session that ended,
+	// the limit) takes the list with it: the batch is one transaction. Only the
+	// two kinds of agent authsu creates for a grant are written. An existing agent
+	// the user chose is never written, by this code or by any statement of it.
 	switch {
 	case grant.FirstParty:
 		statements = append(statements,
 			Statement{Query: insertFirstPartyAgentQuery, Args: []any{
 				grant.AgentID, grant.FirstPartyName.String(), FirstPartyAgentScopes, created, grant.Owner,
 				int64(grant.FirstPartyMaxActive), grant.ClientID.String(),
+			}},
+			Statement{Query: grantFirstPartyScopesQuery, Args: []any{
+				names, allowlist, grant.Owner, grant.ClientID.String(),
 			}})
 	case grant.NewAgent != nil:
-		statements = append(statements, agentInsert(
-			grant.AgentID, grant.NewAgent.Name.String(), GrantAgentScopes, created, grant.Owner,
-			grant.NewAgent.MaxActive, ""))
+		// A new agent is created with its list: an INSERT cannot touch any row but
+		// the one it creates, which is the proof that no agent the user attached is
+		// written (an UPDATE could only guess, from the row's own columns, which
+		// agents this batch made).
+		statements = append(statements,
+			agentInsert(grant.AgentID, grant.NewAgent.Name.String(), names, created, grant.Owner,
+				grant.NewAgent.MaxActive, ""))
 	}
 
 	firstParty := int64(0)
@@ -304,6 +417,19 @@ func (s *Store) CreateGrant(ctx context.Context, grant NewGrant) error {
 	_, err := s.run(ctx, o, statements...)
 
 	return refuseGrant(err, grant.NewAgent != nil || grant.FirstParty)
+}
+
+// authsuNames is the names of the grant's scope that are in its allowlist, each
+// once, in the allowlist's order (the order every list the write sets has): what
+// the grant adds to the list of an agent authsu writes for it. A name the
+// allowlist does not hold (openid, profile, a third-party resource's scope) is
+// never written.
+func authsuNames(grant NewGrant) []string {
+	requested := grant.Scope.Names()
+
+	return slices.DeleteFunc(slices.Clone(grant.Allowlist), func(name string) bool {
+		return !slices.Contains(requested, name)
+	})
 }
 
 // refuseGrant names the refusal a failed CreateGrant batch is: see CreateGrant.
