@@ -101,7 +101,7 @@ func TestRevoke(t *testing.T) {
 		},
 	}
 
-	runOutcomes(t, routes()[2], cases)
+	runOutcomes(t, routeNamed(opRevoke), cases)
 }
 
 // TestRevokeYourself: nothing in the route treats the caller's own account
@@ -115,7 +115,7 @@ func TestRevokeYourself(t *testing.T) {
 	self.Role = roleAdmin
 	self.RevokedAt = new(clockAt.Unix())
 
-	rt := routes()[2]
+	rt := routeNamed(opRevoke)
 	rt.target = itemPrefix + adminID
 
 	runOutcomes(t, rt, []outcomeCase{
@@ -159,7 +159,7 @@ func TestRevokeReadsTheClockOncePerRequest(t *testing.T) {
 	want := []storeCall{
 		{op: opRevoke, id: targetID, caller: adminID, role: roleAdmin, now: first},
 		{op: opRevoke, id: targetID, caller: adminID, role: roleAdmin, now: second},
-		readCall(opGet, targetID),
+		getCall(targetID),
 	}
 
 	wantCalls(t, rg.store.calls, want)

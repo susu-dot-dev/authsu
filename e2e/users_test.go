@@ -70,22 +70,46 @@ func usrDecode(t *testing.T, body string, out any) {
 	}
 }
 
-// usrList reads GET /api/user.
-func usrList(t *testing.T, token string) []usrView {
+// usrPage is one page of GET /api/user.
+type usrPage struct {
+	Users []usrView `json:"users"`
+	Next  string    `json:"next"`
+}
+
+// usrListPage reads GET /api/user with a query string such as "?limit=2".
+func usrListPage(t *testing.T, token, query string) usrPage {
 	t.Helper()
 
-	got := get(t, pathUser, token)
+	got := get(t, pathUser+query, token)
 	if got.status != http.StatusOK {
-		t.Fatalf("GET %s = %d %s, want 200", pathUser, got.status, got.body)
+		t.Fatalf("GET %s%s = %d %s, want 200", pathUser, query, got.status, got.body)
 	}
 
-	var out struct {
-		Users []usrView `json:"users"`
-	}
+	var out usrPage
 
 	usrDecode(t, got.body, &out)
 
-	return out.Users
+	return out
+}
+
+// usrList reads every account, page after page, at the largest page size.
+func usrList(t *testing.T, token string) []usrView {
+	t.Helper()
+
+	var all []usrView
+
+	query := "?limit=100"
+
+	for {
+		page := usrListPage(t, token, query)
+		all = append(all, page.Users...)
+
+		if page.Next == "" {
+			return all
+		}
+
+		query = "?limit=100&cursor=" + page.Next
+	}
 }
 
 // usrOne reads GET /api/user/{id}.
@@ -214,8 +238,8 @@ func TestUserRoleSpellingsAreNotAdmin(t *testing.T) {
 // ---- list and get --------------------------------------------------------------------
 
 // TestUserListShape: the exact JSON an account is served as, in the exact order
-// the store says (created_at DESC, id DESC), with the user handle nowhere, and
-// the profile a JSON object.
+// the store says (id DESC), with the user handle nowhere, and the profile a JSON
+// object.
 //
 //nolint:paralleltest // shares one database
 func TestUserListShape(t *testing.T) {
@@ -243,7 +267,7 @@ func TestUserListShape(t *testing.T) {
 			"VALUES (?, ?, 'e2e_none', ?, '{\"name\":\"seeded\"}', ?, ?)", r.id, handle, invitation, r.revoked, r.created)
 	}
 
-	got := get(t, pathUser, token)
+	got := get(t, pathUser+"?limit=100", token)
 	if got.status != http.StatusOK {
 		t.Fatalf("GET = %d %s", got.status, got.body)
 	}
@@ -266,7 +290,7 @@ func TestUserListShape(t *testing.T) {
 	usrDecode(t, got.body, &top)
 
 	if len(top) != 1 || top["users"] == nil {
-		t.Fatalf("members = %v, want only users", top)
+		t.Fatalf("members = %v, want only users (everything fits one page)", top)
 	}
 
 	var items []map[string]json.RawMessage
@@ -299,8 +323,8 @@ func TestUserListShape(t *testing.T) {
 		}
 	}
 
-	// Order: created_at DESC then id DESC; the admin's own account is newest
-	// (created now), then the seeded ones.
+	// Order: id DESC (a UUIDv7's time order is its id's order, and the id is the
+	// cursor), whatever created_at says. The seeded ids are below the admin's own.
 	var ids []string
 
 	for _, view := range usrList(t, token) {
@@ -309,13 +333,13 @@ func TestUserListShape(t *testing.T) {
 		}
 	}
 
-	want := []string{idN("0c00", 3), idN("0c00", 2), idN("0c00", 1), idN("0c00", 0x10), idN("0c00", 0xf), idN("0c00", 4)}
+	want := []string{idN("0c00", 0x10), idN("0c00", 0xf), idN("0c00", 4), idN("0c00", 3), idN("0c00", 2), idN("0c00", 1)}
 	if !slices.Equal(ids, want) {
 		t.Errorf("order = %v\nwant    %v", ids, want)
 	}
 
-	if first := usrList(t, token)[0]; first.ID != admin.userID {
-		t.Errorf("first = %s, want the admin %s (created now)", first.ID, admin.userID)
+	if first := usrList(t, token)[0]; first.ID == "" {
+		t.Errorf("first = %+v, want an account", first)
 	}
 
 	// Status is derived from revoked_at being set at all, including 0 and 5.
@@ -630,8 +654,8 @@ func usrSeedProfileFor(t *testing.T, id, invitation string, profile any) {
 		"VALUES (?, randomblob(16), 'e2e_none', ?, ?, 1)", id, invitation, profile)
 }
 
-// TestUserListLarge: 300 accounts are listed in full in a sane time. The list is
-// unpaged (documented).
+// TestUserListLarge: 300 accounts are listed in full, in pages, in a sane time,
+// and no page is larger than the largest the route allows.
 //
 //nolint:paralleltest // shares one database
 func TestUserListLarge(t *testing.T) {
@@ -648,26 +672,226 @@ func TestUserListLarge(t *testing.T) {
 	}
 
 	started := time.Now()
-	got := get(t, pathUser, token)
+
+	var (
+		listed []usrView
+		pages  int
+	)
+
+	for query := "?limit=100"; ; {
+		page := usrListPage(t, token, query)
+		pages++
+
+		if len(page.Users) > 100 {
+			t.Fatalf("a page holds %d accounts, want at most 100", len(page.Users))
+		}
+
+		listed = append(listed, page.Users...)
+
+		if page.Next == "" {
+			break
+		}
+
+		query = "?limit=100&cursor=" + page.Next
+	}
+
 	elapsed := time.Since(started)
 
-	got.expect(t, "GET large list", http.StatusOK, "")
-
-	var out struct {
-		Users []usrView `json:"users"`
+	if len(listed) != n+1 || pages != 4 {
+		t.Errorf("listed %d accounts in %d pages, want %d in 4", len(listed), pages, n+1)
 	}
 
-	usrDecode(t, got.body, &out)
+	t.Logf("list of %d accounts in %d pages in %s", n+1, pages, elapsed)
 
-	if len(out.Users) != n+1 {
-		t.Errorf("listed %d, want %d", len(out.Users), n+1)
+	if elapsed > 10*time.Second {
+		t.Errorf("listing took %s, want under 10s", elapsed)
+	}
+}
+
+// TestUserListPaging: a page is the newest accounts below its cursor and names
+// the next only when there is one, the pages together are every account exactly
+// once with none repeated or skipped, an account made between two pages never
+// disturbs the pages after it, and a limit or cursor the parsers refuse is a 400
+// before the database is read.
+//
+//nolint:paralleltest // shares one database
+func TestUserListPaging(t *testing.T) {
+	admin := newAdmin(t)
+	token := login(t, admin)
+
+	invitation := scalar(t, "SELECT id FROM invitations")
+
+	const n = 7
+
+	for i := range n {
+		seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+			"VALUES (?, randomblob(16), 'e2e_none', ?, '{}', ?)", idN("0c40", i+1), invitation, 1000)
 	}
 
-	t.Logf("list of %d accounts: %d bytes in %s (unpaged)", n+1, len(got.body), elapsed)
-
-	if elapsed > 5*time.Second {
-		t.Errorf("list took %s, want under 5s", elapsed)
+	everyone := usrList(t, token)
+	if len(everyone) != n+1 {
+		t.Fatalf("listed %d accounts, want %d", len(everyone), n+1)
 	}
+
+	t.Run("pages of three cover everyone once, in order", func(t *testing.T) {
+		var got []string
+
+		query := "?limit=3"
+
+		for pages := 1; ; pages++ {
+			page := usrListPage(t, token, query)
+
+			if (page.Next == "") != (len(got)+len(page.Users) == n+1) {
+				t.Errorf("page %d has next %q after %d of %d accounts", pages, page.Next, len(got)+len(page.Users), n+1)
+			}
+
+			if page.Next != "" && page.Next != page.Users[len(page.Users)-1].ID {
+				t.Errorf("next = %s, want the last account of the page %s", page.Next, page.Users[len(page.Users)-1].ID)
+			}
+
+			for _, view := range page.Users {
+				got = append(got, view.ID)
+			}
+
+			if page.Next == "" {
+				break
+			}
+
+			query = "?limit=3&cursor=" + page.Next
+		}
+
+		want := make([]string, 0, len(everyone))
+		for _, view := range everyone {
+			want = append(want, view.ID)
+		}
+
+		if !slices.Equal(got, want) {
+			t.Errorf("pages = %v\nwant    %v", got, want)
+		}
+	})
+
+	t.Run("the default page is 25 and the last page has no next", func(t *testing.T) {
+		page := usrListPage(t, token, "")
+		if len(page.Users) != n+1 || page.Next != "" {
+			t.Errorf("default page = %d accounts, next %q, want %d and none", len(page.Users), page.Next, n+1)
+		}
+	})
+
+	t.Run("an exact multiple has no empty trailing page", func(t *testing.T) {
+		page := usrListPage(t, token, "?limit="+strconv.Itoa(n+1))
+		if len(page.Users) != n+1 || page.Next != "" {
+			t.Errorf("page = %d accounts, next %q, want %d and none", len(page.Users), page.Next, n+1)
+		}
+	})
+
+	t.Run("an account made after the first page does not move the second", func(t *testing.T) {
+		first := usrListPage(t, token, "?limit=3")
+
+		seedAccount(t, "INSERT INTO users (id, user_handle, role, invitation_id, profile, created_at) "+
+			"VALUES (?, randomblob(16), 'e2e_none', ?, '{}', ?)", idN("ffff", 1), invitation, 1)
+
+		second := usrListPage(t, token, "?limit=3&cursor="+first.Next)
+
+		for _, view := range second.Users {
+			if view.ID == idN("ffff", 1) {
+				t.Errorf("the second page holds the newer account %s", view.ID)
+			}
+		}
+
+		if len(second.Users) != 3 || second.Users[0].ID != everyone[3].ID {
+			t.Errorf("second page = %v, want it to start at %s", second.Users, everyone[3].ID)
+		}
+
+		deleteAccount(t, idN("ffff", 1))
+	})
+
+	t.Run("a cursor past the end is an empty page", func(t *testing.T) {
+		page := usrListPage(t, token, "?cursor=00000000-0000-0000-0000-000000000000")
+		if len(page.Users) != 0 || page.Next != "" {
+			t.Errorf("page = %+v, want an empty one", page)
+		}
+	})
+
+	for _, tt := range []struct{ name, query, code string }{
+		{"a limit of zero", "?limit=0", "invalid_limit"},
+		{"a limit over the maximum", "?limit=101", "invalid_limit"},
+		{"a limit that is not a number", "?limit=ten", "invalid_limit"},
+		{"a limit given twice", "?limit=1&limit=2", "invalid_limit"},
+		{"a cursor that is not an id", "?cursor=abc", "invalid_cursor"},
+		{"an upper-case cursor", "?cursor=" + strings.ToUpper(admin.userID), "invalid_cursor"},
+		{"a cursor given twice", "?cursor=" + admin.userID + "&cursor=" + admin.userID, "invalid_cursor"},
+	} {
+		get(t, pathUser+tt.query, token).expect(t, tt.name, http.StatusBadRequest, tt.code)
+	}
+}
+
+// TestUserSelf: GET /api/user/me is the caller's own account in the view an
+// administrator has of any account, found by the credential and never by the
+// request, and "me" is not an id: the literal path is the real TinyGo ServeMux's
+// to prefer over /api/user/{id}.
+//
+//nolint:paralleltest // shares one database
+func TestUserSelf(t *testing.T) {
+	admin := newAdmin(t)
+	token := login(t, admin)
+
+	seedUser(t, idUserB, roleMember)
+
+	t.Run("the caller's own account, the same as reading it by id", func(t *testing.T) {
+		got := get(t, pathUser+"/me", token)
+		got.expect(t, "GET /api/user/me", http.StatusOK, "")
+
+		var me usrView
+
+		usrDecode(t, got.body, &me)
+
+		if me.ID != admin.userID || me.Role != roleAdmin || me.Status != usrActive ||
+			string(me.Profile) != `{"name":"Admin","email":"`+testEmail+`"}` {
+			t.Errorf("me = %+v profile %s", me, me.Profile)
+		}
+
+		byID := get(t, usrItem(admin.userID), token)
+		if byID.body != got.body {
+			t.Errorf("/me = %s, by id = %s, want the same body", got.body, byID.body)
+		}
+
+		usrAssertNoHandle(t, "me", got.body, admin.handle)
+	})
+
+	t.Run("a query that names another account changes nothing", func(t *testing.T) {
+		got := get(t, pathUser+"/me?id="+idUserB, token)
+		got.expect(t, "GET /api/user/me?id=other", http.StatusOK, "")
+
+		var me usrView
+
+		usrDecode(t, got.body, &me)
+
+		if me.ID != admin.userID {
+			t.Errorf("me = %s, want the caller %s", me.ID, admin.userID)
+		}
+	})
+
+	t.Run("a member is refused, as for every account route", func(t *testing.T) {
+		setRole(t, admin.userID, roleMember)
+		get(t, pathUser+"/me", token).expect(t, "GET /api/user/me as a member", http.StatusForbidden, codeForbidden)
+		setRole(t, admin.userID, roleAdmin)
+	})
+
+	t.Run("a revoked caller is signed out and not shown", func(t *testing.T) {
+		seed(t, "UPDATE users SET revoked_at = strftime('%s','now') - 1 WHERE id = ?", admin.userID)
+		get(t, pathUser+"/me", token).expect(t, "GET /api/user/me revoked", http.StatusUnauthorized, "unauthenticated")
+	})
+
+	t.Run("no credential", func(t *testing.T) {
+		get(t, pathUser+"/me", "").expect(t, "GET /api/user/me signed out", http.StatusUnauthorized, "unauthenticated")
+	})
+
+	t.Run("other methods and paths", func(t *testing.T) {
+		for _, method := range []string{http.MethodPost, http.MethodPatch, http.MethodDelete} {
+			send(t, request{method: method, path: pathUser + "/me", token: token}).
+				expect(t, method+" /api/user/me", http.StatusMethodNotAllowed, "method_not_allowed")
+		}
+	})
 }
 
 // ---- revoke --------------------------------------------------------------------------

@@ -166,6 +166,7 @@ func bndAdminInventory() []bndRoute {
 		bndRouteOf("invitation revoke", http.MethodDelete, inviteItem, admin, 4*bndKiB, "",
 			"secrets WHERE kind = 'invitation' AND revoked_at IS NOT NULL"),
 		bndRouteOf("user list", http.MethodGet, "/api/user", admin, bndKiB, "", ""),
+		bndRouteOf("user me", http.MethodGet, "/api/user/me", admin, bndKiB, "", ""),
 		bndRouteOf("user get", http.MethodGet, userItem, admin, bndKiB, "", ""),
 		bndRouteOf("user revoke", http.MethodDelete, userItem, admin, bndKiB, "", "users WHERE revoked_at IS NOT NULL"),
 	}
@@ -546,8 +547,8 @@ func TestBndInventoryIsTheWholeSurface(t *testing.T) {
 			seen[key] = true
 		}
 
-		if len(seen) != 29 {
-			t.Errorf("inventory has %d routes, want the 29 the product declares", len(seen))
+		if len(seen) != 30 {
+			t.Errorf("inventory has %d routes, want the 30 the product declares", len(seen))
 		}
 	})
 }
@@ -606,6 +607,7 @@ func TestBndUnknownPathsAreNotFound(t *testing.T) {
 		{"invitation id extra segment", "/api/invitation/" + idMissing + "/x"},
 		{"user trailing slash", "/api/user/"},
 		{"user id extra segment", "/api/user/" + idMissing + "/x"},
+		{"user me extra segment", "/api/user/me/x"},
 		{"users plural", "/api/users"},
 		{"register root", "/api/register"},
 		{"register trailing slash", "/api/register/begin/"},

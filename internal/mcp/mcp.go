@@ -1,6 +1,7 @@
 // Package mcp is the admin MCP endpoint (docs/mcp_design.md): one POST route,
-// /mcp, that speaks JSON-RPC 2.0 to a coding harness and offers a few tools,
-// each of which is one of authsu's own REST routes under a name and a schema.
+// /mcp, that speaks JSON-RPC 2.0 to a coding harness and offers tools to manage
+// invitations, accounts, organizations and their members, each of which is one
+// of authsu's own REST routes under a name and a schema.
 //
 // # A tool is a request to a route
 //
@@ -19,6 +20,14 @@
 // why every tool is in a table the route-table tests range over (see the app
 // package's seam tests): a tool that did not name a route that refuses a member
 // would be a hole.
+//
+// A tool's arguments become the request in one of a few ways (the arguments
+// type of tools.go): none, an id, the route's JSON body as it came, an id with
+// one body member, a page (limit and cursor, parsed by the route's own parsers
+// before they are written into the query), and an account's id or the word "me",
+// which reaches the route of the caller's own account. In every way a value the
+// route parses is parsed by the route's parser, so a tool and a route refuse the
+// same input with the same code.
 //
 // Only an API key is accepted. The REST routes are reached with the
 // Authorization header alone, so a browser session (a cookie) would pass this
@@ -70,7 +79,7 @@ const MaxBody = 16 << 10
 // changes what it takes.
 const (
 	ServerName    = "authsu"
-	ServerVersion = "1"
+	ServerVersion = "2"
 )
 
 // CodeAPIKeyRequired is a request to /mcp made with a credential that is not an

@@ -190,7 +190,7 @@ func TestInitialize(t *testing.T) {
 
 	initialized := func(version string) string {
 		return `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"` + version + `",` +
-			`"capabilities":{"tools":{}},"serverInfo":{"name":"authsu","version":"1"}}}`
+			`"capabilities":{"tools":{}},"serverInfo":{"name":"authsu","version":"2"}}}`
 	}
 
 	initial := func(params string) string {
